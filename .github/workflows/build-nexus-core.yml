@@ -41,8 +41,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    runs-on: ubuntu-latest
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
     steps:
       - name: Check out official sing-box source
         shell: bash
@@ -71,6 +75,7 @@ jobs:
           go build -trimpath -tags "$tags" \
             -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${shared_ldflags} -s -w -buildid=" \
             -o sing-box ./cmd/sing-box
+          # amd64/arm64 各自在原生 runner 上构建，可直接执行验证
           ./sing-box version | tee version.txt
           grep -q 'with_v2ray_api' version.txt
           mkdir -p "../dist/sing-box-${VERSION}-linux-${GOARCH}"
