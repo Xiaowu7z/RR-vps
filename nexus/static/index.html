@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>RR Nexus · 星枢</title>
+  <link rel="stylesheet" href="/app.css?v=3">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <section id="login-screen" class="login-screen">
+    <div class="login-card glass">
+      <div class="brand brand-large"><span class="brand-mark">RR</span><span><b>RR Nexus</b><small>星枢管理控制台</small></span></div>
+      <div class="login-copy">
+        <span class="eyebrow">SECURE CONTROL PLANE</span>
+        <h1>管理你的节点网络</h1>
+        <p>每台设备独立凭据、独立订阅、独立流量，一处完成管理。</p>
+      </div>
+      <form id="login-form" class="stack-form">
+        <label>管理员账号<input name="username" autocomplete="username" maxlength="32" required></label>
+        <label>密码或一次性恢复码<input name="password" type="password" autocomplete="current-password" maxlength="512" required></label>
+        <button class="button primary wide" type="submit"><span>安全登录</span><span aria-hidden="true">→</span></button>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+      <div class="trust-row"><span>Argon2id</span><span>CSRF 防护</span><span>安全会话</span><span>登录限流</span></div>
+    </div>
+  </section>
+
+  <div id="console" class="console hidden">
+    <aside class="sidebar glass">
+      <div class="brand"><span class="brand-mark">RR</span><span><b>RR Nexus</b><small>星枢控制平面</small></span></div>
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">⌂</span><span>总览</span></button>
+        <button class="nav-item" data-view="traffic"><span class="nav-icon">⌁</span><span>流量</span></button>
+        <button class="nav-item" data-view="server"><span class="nav-icon">▤</span><span>服务器</span></button>
+        <button class="nav-item" data-view="firewall"><span class="nav-icon">⛨</span><span>防火墙</span></button>
+        <button class="nav-item" data-view="devices"><span class="nav-icon">◇</span><span>设备与用户</span></button>
+        <button class="nav-item" data-view="remote"><span class="nav-icon">⛁</span><span>多服务器</span></button>
+        <button class="nav-item" data-view="security"><span class="nav-icon">◈</span><span>访问与安全</span></button>
+        <button class="nav-item" data-view="audit"><span class="nav-icon">≋</span><span>审计日志</span></button>
+      </nav>
+      <div class="side-foot">
+        <div class="security-chip"><span class="pulse"></span><span><b id="side-health">控制平面在线</b><small id="side-health-note">正在读取实时统计</small></span></div>
+        <div class="legal-note">本项目仅供技术交流与自有服务器管理研究使用，不提供任何网络访问服务；使用者须遵守当地法律法规、VPS 服务商条款与 Cloudflare 政策，并自行承担全部责任。</div>
+        <button id="logout-button" class="nav-item logout"><span class="nav-icon">↗</span><span>退出登录</span></button>
+      </div>
+    </aside>
+
+    <main class="main-shell">
+      <header class="topbar">
+        <div><span class="eyebrow">RR NEXUS / <span id="view-kicker">OVERVIEW</span></span><h1 id="view-title">运行总览</h1></div>
+        <div class="top-actions"><span id="last-refresh" class="last-refresh">等待刷新</span><span id="version-badge" class="mode-badge" title="脚本与内核版本">版本加载中</span><span id="mode-badge" class="mode-badge">本地模式</span><button id="refresh-button" class="icon-button" title="立即刷新" aria-label="立即刷新">↻</button></div>
+      </header>
+
+      <section id="view-overview" class="view active-view">
+        <div id="bruteforce-alert" class="bruteforce-alert hidden" role="alert">
+          <span class="bf-icon">⚠</span>
+          <span id="bruteforce-alert-text" class="bf-text"></span>
+          <button id="bruteforce-alert-close" class="bf-close" aria-label="关闭告警">×</button>
+        </div>
+        <div class="hero glass">
+          <div class="hero-copy"><span class="eyebrow">LIVE NETWORK CONTROL</span><h2>每个用户，都清清楚楚。</h2><p>独立凭据、实时流量、额度与到期策略统一管理；所有变更事务化同步到 sing-box。</p><div class="hero-actions"><button class="button primary" data-open-create>＋ 添加设备</button><button class="button secondary" data-jump="traffic">查看实时流量</button></div></div>
+          <div class="network-orbit" aria-hidden="true"><div class="orbit-ring ring-one"></div><div class="orbit-ring ring-two"></div><div class="orbit-core">RR</div><i></i><i></i><i></i></div>
+        </div>
+        <div class="metric-grid five">
+          <article class="metric-card glass"><span class="metric-icon cyan">◇</span><div><span class="metric-label">设备总数</span><strong id="metric-total">—</strong><small id="metric-enabled-note">等待数据</small></div></article>
+          <article class="metric-card glass"><span class="metric-icon green">✓</span><div><span class="metric-label">当前启用</span><strong id="metric-enabled">—</strong><small>正在生效</small></div></article>
+          <article class="metric-card glass"><span class="metric-icon purple">⇅</span><div><span class="metric-label">累计流量</span><strong id="metric-traffic">—</strong><small id="metric-traffic-note">上下行合计</small></div></article>
+          <article class="metric-card glass"><span class="metric-icon blue">⌁</span><div><span class="metric-label">实时速率</span><strong id="metric-speed">—</strong><small>上传 + 下载</small></div></article>
+          <article class="metric-card glass"><span class="metric-icon amber">◈</span><div><span class="metric-label">访问模式</span><strong id="metric-mode">—</strong><small id="metric-domain">回环访问</small></div></article>
+        </div>
+        <div class="dashboard-grid">
+          <article class="panel glass chart-panel"><div class="panel-head"><div><span class="eyebrow">TRAFFIC PULSE</span><h3>最近 24 小时</h3></div><div class="legend"><span class="upload">上传</span><span class="download">下载</span></div></div><div class="chart-wrap"><canvas id="overview-chart"></canvas><div id="overview-chart-empty" class="chart-empty">产生流量后这里会绘制趋势</div></div></article>
+          <article class="panel glass"><div class="panel-head"><div><span class="eyebrow">CORE SERVICES</span><h3>服务健康</h3></div><span id="traffic-live-badge" class="live-badge pending"><i></i>检测中</span></div><div id="service-list" class="service-list"></div></article>
+        </div>
+      </section>
+
+      <section id="view-traffic" class="view">
+        <div class="section-toolbar"><div><span class="eyebrow">REAL-TIME ACCOUNTING</span><h2>实时流量中心</h2><p>按设备身份聚合所有已启用协议，每 5 秒读取一次上行和下行。</p></div><span id="traffic-status" class="status-banner pending"><i></i><span>正在连接统计内核</span></span></div>
+        <div class="traffic-metrics">
+          <article class="traffic-metric glass upload-card"><small>累计上传</small><strong id="traffic-upload">—</strong><span id="traffic-upload-rate">↑ —/s</span></article>
+          <article class="traffic-metric glass download-card"><small>累计下载</small><strong id="traffic-download">—</strong><span id="traffic-download-rate">↓ —/s</span></article>
+          <article class="traffic-metric glass total-card"><small>累计总流量</small><strong id="traffic-total">—</strong><span>所有设备合计</span></article>
+        </div>
+        <article class="panel glass traffic-chart-panel"><div class="panel-head"><div><span class="eyebrow">24-HOUR WINDOW</span><h3>上下行趋势</h3></div><div class="legend"><span class="upload">上传</span><span class="download">下载</span></div></div><div class="chart-wrap large"><canvas id="traffic-chart"></canvas><div id="traffic-chart-empty" class="chart-empty">暂时没有统计样本</div></div></article>
+        <article class="panel glass ranking-panel"><div class="panel-head"><div><span class="eyebrow">PER DEVICE</span><h3>设备流量排行</h3></div><small id="ranking-count">0 个设备</small></div><div class="table-scroll"><table class="data-table"><thead><tr><th>设备</th><th>状态</th><th>上传</th><th>下载</th><th>总流量</th><th>额度</th><th>最近统计</th></tr></thead><tbody id="traffic-ranking"></tbody></table></div><div id="traffic-ranking-empty" class="table-empty hidden">创建设备并产生流量后，会在这里逐项显示。</div></article>
+      </section>
+
+      <section id="view-devices" class="view">
+        <div class="section-toolbar"><div><span class="eyebrow">ISOLATED IDENTITIES</span><h2>设备与用户</h2><p>每个条目拥有独立凭据、订阅、二维码、流量和生命周期。</p></div><button id="add-device-button" class="button primary">＋ 添加设备</button></div>
+        <div class="device-toolbar glass"><label class="search-box"><span>⌕</span><input id="device-search" type="search" placeholder="搜索设备名称或 ID"></label><div class="filter-group" role="group" aria-label="设备状态筛选"><button class="filter-button active" data-filter="all">全部</button><button class="filter-button" data-filter="active">运行中</button><button class="filter-button" data-filter="paused">已停用</button></div><span id="device-result-count" class="result-count">0 个设备</span></div>
+        <div id="device-grid" class="device-grid"></div>
+        <div id="device-empty" class="empty-state glass hidden"><span>◇</span><h3>还没有设备</h3><p>添加第一台设备后，RR Nexus 会生成一套完全独立的连接凭据。</p><button class="button secondary" data-open-create>添加设备</button></div>
+        <div id="device-no-result" class="empty-state glass hidden"><span>⌕</span><h3>没有匹配的设备</h3><p>请修改搜索词或状态筛选。</p></div>
+      </section>
+
+      <section id="view-remote" class="view">
+        <div class="section-toolbar"><div><span class="eyebrow">MULTI-SERVER FLEET</span><h2>多服务器管理</h2><p>一个界面查看全部 VPS 状态；点击卡片进入该服务器的远程管理（设备、流量、防火墙等全部操作）。</p></div><div class="toolbar-actions"><button class="button primary" id="rs-add-open">＋ 添加服务器</button><button class="button ghost" id="rs-refresh">↻ 立即刷新</button></div></div>
+        <div id="rs-empty" class="empty-state glass"><span>🛰️</span><h3>还没有管理任何服务器</h3><p>在被管 VPS 的「访问与安全 → 远程钥匙」生成接入钥匙，粘贴到这里即可，支持无上限添加。</p></div>
+        <div id="rs-grid" class="rs-grid"></div>
+        <div id="rs-detail" class="hidden">
+          <div class="section-toolbar"><div><span class="eyebrow">REMOTE CONTROL</span><h2 id="rs-detail-title">远程服务器</h2><p id="rs-detail-sub"></p></div><div class="toolbar-actions"><button class="button ghost" id="rs-update-btn" title="检查该服务器脚本版本并远程升级">🔄 检查更新</button><button class="button primary" id="rs-device-add">＋ 添加设备</button><button class="button ghost" id="rs-back">← 返回总览</button></div></div>
+          <div id="rs-update-box" class="rs-update-box hidden"></div>
+          <div id="rs-device-grid" class="device-grid"></div>
+          <div id="rs-device-empty" class="empty-state glass hidden"><span>◇</span><h3>该服务器还没有设备</h3><p>点击上方「添加设备」远程创建。</p></div>
+        </div>
+      </section>
+
+      <section id="view-security" class="view">
+        <div class="section-toolbar"><div><span class="eyebrow">ACCESS &amp; POLICY</span><h2>访问与安全</h2><p>先看清当前入口，再管理身份、策略、恢复和日志。</p></div></div>
+        <article class="access-mode-panel glass">
+          <div class="access-heading"><div><span class="eyebrow">ACCESS MODE</span><h3>面板访问模式</h3><p>面板进程始终只监听服务器回环地址，不把 7900 直接暴露到公网。</p></div><span id="security-current-mode" class="current-mode">当前：本地模式</span></div>
+          <div class="mode-cards">
+            <div id="local-mode-card" class="mode-card active"><div class="mode-card-top"><span class="mode-symbol">⌁</span><span class="recommended">推荐</span></div><h4>本地隧道</h4><p>在自己的电脑建立 SSH 隧道，再访问 127.0.0.1:7900。</p><span class="mode-feature">✓ 不开放管理端口</span><span class="mode-feature">✓ 适合个人管理</span></div>
+            <div id="public-mode-card" class="mode-card"><div class="mode-card-top"><span class="mode-symbol">◎</span><span class="mode-tag">HTTPS</span></div><h4>公网域名</h4><p>通过 Nginx 与 Let's Encrypt 证书提供 HTTPS 入口。</p><span class="mode-feature">✓ 域名证书保护</span><span class="mode-feature">✓ 适合多地点管理</span></div>
+          </div>
+          <div id="ssh-guide" class="ssh-guide">
+            <div class="guide-title"><span class="step-number">1</span><div><b>在你自己的电脑打开终端</b><small>Windows 打开 PowerShell；macOS / Linux 打开“终端”。不要在 VPS 当前窗口执行。</small></div></div>
+            <div class="command-box"><code id="ssh-command">正在生成 SSH 命令…</code><button id="copy-ssh-command" class="copy-button">复制命令</button></div>
+            <div class="guide-steps"><div><span class="step-number">2</span><p><b>粘贴命令并回车</b><small>看到 <code>root@服务器IP's password:</code> 后，输入服务器 root 密码再回车。密码输入时不显示字符是正常的。</small></p></div><div><span class="step-number">3</span><p><b>保持终端窗口不要关闭</b><small>隧道成功后终端通常保持空白。打开 <a id="local-panel-link" href="http://127.0.0.1:7900" target="_blank" rel="noopener">http://127.0.0.1:7900</a>；用完按 Ctrl+C。</small></p></div></div>
+          </div>
+          <div id="public-guide" class="public-guide hidden"><b>公网面板地址</b><a id="public-panel-link" href="#" target="_blank" rel="noopener">尚未配置域名</a><small>证书、域名和模式切换请在服务器终端运行 <code>rr</code>，进入 RR Nexus 菜单操作。</small></div>
+        </article>
+        <div class="settings-grid">
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">◈</span><div><small>MANAGEMENT</small><h3>管理身份安全</h3></div></div><div class="setting-row"><span><b>密码存储</b><small>Argon2id 不可逆哈希</small></span><em class="safe">已保护</em></div><div class="setting-row"><span><b>会话策略</b><small>HttpOnly · SameSite=Strict · 12 小时</small></span><em>自动</em></div><div class="setting-row"><span><b>登录保护</b><small>5 次失败后限流 30 分钟</small></span><em class="safe">开启</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⇅</span><div><small>TRAFFIC POLICY</small><h3>流量与额度</h3></div></div><div class="setting-row"><span><b>采集周期</b><small>按设备身份统计上下行</small></span><em>5 秒</em></div><div class="setting-row"><span><b>额度执行</b><small>达到上限后自动撤销节点访问</small></span><em class="safe">实时</em></div><div class="setting-row"><span><b>趋势保留</b><small>5 分钟聚合样本</small></span><em>7 天</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">◇</span><div><small>DEVICE SECRETS</small><h3>设备凭据</h3></div></div><div class="setting-row"><span><b>独立身份</b><small>不同设备不共享 UUID / 密码</small></span><em class="safe">隔离</em></div><div class="setting-row"><span><b>独立订阅</b><small>每台设备使用随机私有令牌</small></span><em class="safe">隔离</em></div><div class="setting-row"><span><b>删除生效</b><small>旧凭据立即从核心配置撤销</small></span><em>事务化</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⌗</span><div><small>RECOVERY</small><h3>运行与恢复</h3></div></div><div class="setting-row"><span><b>恢复码</b><small>8 个一次性离线恢复码</small></span><em>一次性</em></div><div class="setting-row"><span><b>配置同步</b><small>失败时回滚设备修改</small></span><em class="safe">原子</em></div><div class="setting-row"><span><b>服务守护</b><small>rr-nexus 失败自动重启</small></span><em class="safe">开启</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">✓</span><div><small>HEALTH</small><h3>健康与可用性</h3></div></div><div class="setting-row"><span><b>节点核心</b><small id="security-core-note">等待服务状态</small></span><em id="security-core-state">检测中</em></div><div class="setting-row"><span><b>统计通道</b><small id="security-stats-note">等待实时采集</small></span><em id="security-stats-state">检测中</em></div><div class="setting-row"><span><b>管理面板</b><small>仅回环监听</small></span><em class="safe">在线</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">≋</span><div><small>PRIVACY</small><h3>隐私与审计</h3></div></div><div class="setting-row"><span><b>操作审计</b><small>登录、创建、修改、删除</small></span><em class="safe">记录</em></div><div class="setting-row"><span><b>订阅目录</b><small>服务端权限 0700</small></span><em>私有</em></div><div class="setting-row"><span><b>数据库</b><small>本机 SQLite · 权限 0600</small></span><em>本地</em></div></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⛁</span><div><small>MULTI-SERVER</small><h3>远程钥匙（多服务器管理）</h3></div></div><div class="setting-row"><span><b>签发状态</b><small id="rs-key-state-note">仅公网证书（域名 + Let's Encrypt）面板可签发</small></span><em id="rs-key-state">检测中</em></div><div id="rs-key-box-wrap" class="hidden"><div class="rs-keybox"><span class="rs-keybox-tag">接入钥匙 · 发给主面板管理员</span><code id="rs-key-text"></code></div><div class="toolbar-actions"><button class="button ghost" id="rs-key-copy">📋 复制钥匙</button><button class="button danger ghost" id="rs-key-revoke">🗑 吊销全部并重新生成</button></div></div><div class="toolbar-actions"><button class="button primary" id="rs-key-issue">＋ 生成接入钥匙</button></div><p class="form-hint">安全说明：钥匙由本面板 256 位密钥签发（HMAC-SHA256 防伪），主面板只能持用、无法伪造；任何篡改立即失效；远程操作全部记录审计日志；钥匙验证失败自动锁定来源 IP。</p></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⇩</span><div><small>SCRIPT UPDATE</small><h3>脚本更新</h3></div></div><div class="setting-row"><span><b>当前版本</b><small>主面板脚本</small></span><em id="local-ver">检测中</em></div><div class="setting-row"><span><b>更新方式</b><small>下载校验 → 原子替换 → 自动拉起</small></span><em class="safe">官方</em></div><div id="local-update-box" class="rs-update-box hidden"></div><div class="toolbar-actions"><button class="button ghost" id="local-update-btn">🔄 检查更新</button><button class="button primary" id="local-update-run-btn">⬆ 一键升级</button></div><p class="form-hint">升级期间面板会重启数次，页面短暂断连属正常现象；升级进程与面板进程隔离，重启不影响任务。完成后自动切换到新版本，无需登录服务器。</p></article>
+        </div>
+        <button id="change-password-button" class="button secondary">修改密码</button>
+      
+        <div class="legal-note legal-block">法律声明：本面板与 RR-vps 脚本仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将其用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任。</div>
+      </section>
+
+      <section id="view-server" class="view">
+        <div class="server-grid">
+          <div class="stat-card glass" id="srv-about">
+            <div class="stat-card-head"><span class="stat-card-title">◈ 关于</span></div>
+            <div class="srv-kv"><span>系统</span><b id="srv-os">—</b></div>
+            <div class="srv-kv"><span>主机</span><b id="srv-host">—</b></div>
+            <div class="srv-kv"><span>启动时长</span><b id="srv-uptime">—</b></div>
+            <div class="srv-kv"><span>负载 1/5/15</span><b id="srv-load">—</b></div>
+          </div>
+          <div class="stat-card glass" id="srv-cpu">
+            <div class="stat-card-head"><span class="stat-card-title">⬡ CPU 使用率</span></div>
+            <div class="srv-big-row"><span class="srv-big" id="srv-cpu-pct">—</span><div class="srv-detail" id="srv-cpu-detail"></div></div>
+            <canvas id="srv-cpu-chart" width="640" height="120"></canvas>
+            <div class="srv-model" id="srv-cpu-model">—</div>
+          </div>
+          <div class="stat-card glass" id="srv-mem">
+            <div class="stat-card-head"><span class="stat-card-title">▥ 内存使用率</span></div>
+            <div class="srv-big-row"><span class="srv-big" id="srv-mem-pct">—</span><div class="srv-detail" id="srv-mem-detail"></div></div>
+            <div class="srv-bar"><div class="srv-bar-fill" id="srv-mem-bar"></div></div>
+            <div class="srv-sub" id="srv-mem-sub">—</div>
+          </div>
+          <div class="stat-card glass" id="srv-swap">
+            <div class="stat-card-head"><span class="stat-card-title">▤ Swap 交换内存</span></div>
+            <div class="srv-big-row"><span class="srv-big" id="srv-swap-pct">—</span><div class="srv-detail" id="srv-swap-detail"></div></div>
+            <div class="srv-bar"><div class="srv-bar-fill" id="srv-swap-bar"></div></div>
+            <div class="srv-sub" id="srv-swap-sub">—</div>
+          </div>
+          <div class="stat-card glass" id="srv-disk">
+            <div class="stat-card-head"><span class="stat-card-title">◉ 磁盘</span></div>
+            <div id="srv-disk-list"></div>
+          </div>
+          <div class="stat-card glass" id="srv-net">
+            <div class="stat-card-head"><span class="stat-card-title">◍ 网络</span></div>
+            <div id="srv-net-list"></div>
+          </div>
+          <div class="stat-card glass" id="srv-unlock">
+            <div class="stat-card-head"><span class="stat-card-title">▶ 流媒体解锁</span><button class="icon-button" id="unlock-refresh" title="重新检测">↻</button></div>
+            <div id="srv-unlock-list"><p class="form-hint">加载中…</p></div>
+            <div class="srv-sub" id="srv-unlock-note"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-firewall" class="view">
+        <div class="stat-card glass" id="fw-perm">
+          <div class="stat-card-head"><span class="stat-card-title">⛨ 权限状态</span></div>
+          <div id="fw-perm-body">检测中…</div>
+        </div>
+        <div class="stat-card glass" id="fw-ports">
+          <div class="stat-card-head"><span class="stat-card-title">端口开关（白名单内）</span></div>
+          <div id="fw-port-list">加载中…</div>
+        </div>
+        <div class="stat-card glass" id="fw-ipmode">
+          <div class="stat-card-head"><span class="stat-card-title">⇅ 出入站分流</span></div>
+          <div class="srv-kv"><span>当前入口</span><b id="fw-entry-now">—</b></div>
+          <div class="srv-kv"><span>当前出口</span><b id="fw-outbound-now">—</b></div>
+          <div class="fw-mode-row">
+            <select id="fw-entry-select">
+              <option value="auto">自动入口</option><option value="ipv4">仅 IPv4 入口</option><option value="ipv6">仅 IPv6 入口</option>
+            </select>
+            <select id="fw-outbound-select">
+              <option value="auto">系统自动出口</option><option value="prefer_ipv4">IPv4 优先</option><option value="prefer_ipv6">IPv6 优先</option>
+              <option value="ipv4_only">仅 IPv4 出口</option><option value="ipv6_only">仅 IPv6 出口</option>
+            </select>
+            <button class="action-button" id="fw-apply-ipmode">应用分流</button>
+          </div>
+          <p class="form-hint" id="fw-ipmode-msg"></p>
+        </div>
+        <div class="stat-card glass" id="fw-tutorial">
+          <div class="stat-card-head"><span class="stat-card-title">📖 权限教程：把防火墙权限交给面板</span></div>
+          <div class="fw-tutorial-body">
+            <p>面板通过 <code>rr --fw-*</code> 命令操作 iptables。若下方权限状态显示异常，按以下步骤在服务器上操作：</p>
+            <p><b>1. 确认面板服务以 root 运行：</b><br><code>systemctl show rr-nexus -p User</code><br>输出 <code>User=root</code> 即正常。</p>
+            <p><b>2. 若不是 root：</b><br><code>sudo systemctl edit rr-nexus</code>，写入：<br><code>[Service]<br>User=root</code><br>然后 <code>sudo systemctl restart rr-nexus</code>。</p>
+            <p><b>3. 验证 iptables 可用：</b><br><code>iptables -L INPUT -n --line-numbers | head -20</code><br>能看到规则列表即正常。</p>
+            <p><b>4. 测试面板通道：</b><br><code>rr --fw-ports</code><br>能输出 JSON 端口清单即完成授权。</p>
+            <p class="form-hint">说明：面板只允许操作脚本白名单内的端口（节点端口 / 订阅端口 / SSH / 面板端口），其他端口一律拒绝，防止误操作。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-audit" class="view">
+        <div class="section-toolbar"><div><span class="eyebrow">ACCOUNTABILITY</span><h2>审计日志</h2><p>最近 30 条登录、设备变更、额度执行与退出记录。</p></div><button id="audit-refresh" class="button secondary">刷新日志</button></div>
+        <article class="panel glass"><div id="audit-list" class="audit-list"></div></article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="device-dialog" class="modal glass">
+    <form id="device-form" method="dialog">
+      <div class="modal-head"><div><span class="eyebrow">NEW IDENTITY</span><h2>添加设备</h2></div><button type="button" class="close-button" data-close-dialog>×</button></div>
+      <label>设备备注<input name="name" maxlength="64" placeholder="例如：主力手机" required></label>
+      <div class="form-row"><label>额度（GB，0 为不限，支持小数如 0.1 = 100MB）<input name="quota_gb" type="number" min="0" max="10240" step="0.1" value="0"></label><label>到期日期（可选）<input name="expires_at" type="date"></label></div>
+      <p class="form-hint">创建后会生成全新的独立凭据，并同步到所有已启用协议。</p>
+      <p id="device-form-error" class="form-error" role="alert"></p>
+      <div class="modal-actions"><button type="button" class="button ghost" data-close-dialog>取消</button><button type="submit" class="button primary">创建并同步</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="links-dialog" class="modal links-modal glass">
+    <div class="modal-head"><div><span class="eyebrow">PRIVATE SHARE</span><h2 id="links-title">设备连接信息</h2></div><button type="button" class="close-button" data-close-links>×</button></div>
+    <div id="links-status" class="links-status"></div>
+    <div id="subscription-box" class="subscription-box hidden"><small>独立订阅地址（按客户端工具选择）</small><div id="subscription-urls"></div></div>
+    <div id="links-list" class="links-list"></div>
+  </dialog>
+
+  <dialog id="reset-dialog" class="modal glass">
+    <form id="reset-form" class="stack-form" autocomplete="off">
+      <div class="modal-head"><div><span class="eyebrow">QUOTA RESET</span><h2>重置流量</h2></div><button type="button" class="close-button" data-close-reset>×</button></div>
+      <p class="form-hint">设备：<b id="reset-device-name"></b></p>
+      <p class="form-hint">当前用量：<b id="reset-current"></b></p>
+      <label>新额度（GB，留空保持原额度，0 为不限）<input id="reset-quota-input" name="quota_gb" type="number" min="0" max="10240" step="0.1" placeholder="留空保持原额度"></label>
+      <p class="form-hint">支持小数：0.1 GB = 100 MB。重置后已用流量归零，设备立即恢复访问，自动删除倒计时取消。</p>
+      <p id="reset-form-error" class="form-error" role="alert"></p>
+      <div class="modal-actions"><button type="button" class="button ghost" data-close-reset>取消</button><button type="submit" id="reset-submit" class="button primary">重置并同步</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="rs-add-dialog" class="modal"><form id="rs-add-form" method="dialog" class="stack-form" autocomplete="off">
+    <div class="modal-head"><div><span class="eyebrow">MULTI-SERVER</span><h2>添加服务器</h2></div><button type="button" class="close-button" data-rs-add-close>×</button></div>
+    <label>服务器名称（可选，留空用钥匙内置名称）<input name="rs_name" maxlength="64" placeholder="如：香港 HKS4"></label>
+    <label>接入钥匙（一行密文）<textarea name="rs_cred" rows="4" required placeholder="rrmgr1.xxxx… 从副面板「访问与安全 → 远程钥匙」生成"></textarea></label>
+    <p class="form-hint">添加时会立即向副面板验证钥匙真伪与连通性，验证通过才保存。副面板吊销后此钥匙自动失效。</p>
+    <p id="rs-add-error" class="form-error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="button ghost" data-rs-add-close>取消</button><button type="submit" id="rs-add-submit" class="button primary">验证并添加</button></div>
+  </form></dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/app.js?v=11" defer></script>
+
+  <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
+    <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>
+    <label>旧密码<input name="old_password" type="password" required></label>
+    <label>新密码<input name="new_password" type="password" required></label>
+    <label>确认新密码<input name="password_again" type="password" required></label>
+    <div id="password-form-error" class="form-error hidden"></div>
+    <button type="submit" class="button primary wide">更新密码</button>
+  </form></dialog>
+
+</body>
+</html>

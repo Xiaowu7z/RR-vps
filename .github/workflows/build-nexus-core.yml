@@ -1,0 +1,126 @@
+name: Build RR Nexus traffic core
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+  push:
+    paths:
+      - ".github/workflows/build-nexus-core.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rr-nexus-core
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve latest stable sing-box release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(curl -fsSL --retry 3 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: RR-vps-builder' \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest)
+          tag=$(jq -r '.tag_name // empty' <<<"$release_json")
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out official sing-box source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ needs.version.outputs.tag }}" \
+            https://github.com/SagerNet/sing-box.git sing-box
+
+      - name: Set up Go from upstream go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Build API-enabled core
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd sing-box
+          tags="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api"
+          shared_ldflags=$(tr -d '\r\n' < release/LDFLAGS)
+          export CGO_ENABLED=0 GOOS=linux GOARCH GOTOOLCHAIN=local
+          go build -trimpath -tags "$tags" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${shared_ldflags} -s -w -buildid=" \
+            -o sing-box ./cmd/sing-box
+          ./sing-box version | tee version.txt
+          grep -q 'with_v2ray_api' version.txt
+          mkdir -p "../dist/sing-box-${VERSION}-linux-${GOARCH}"
+          install -m 755 sing-box "../dist/sing-box-${VERSION}-linux-${GOARCH}/sing-box"
+          cp LICENSE "../dist/sing-box-${VERSION}-linux-${GOARCH}/LICENSE"
+          cd ../dist
+          tar -czf "rr-sing-box-${VERSION}-linux-${GOARCH}.tar.gz" \
+            "sing-box-${VERSION}-linux-${GOARCH}"
+
+      - name: Upload architecture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rr-sing-box-${{ matrix.arch }}
+          path: dist/rr-sing-box-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rr-sing-box-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums and build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum rr-sing-box-*.tar.gz | LC_ALL=C sort > SHA256SUMS
+          printf '%s\n' \
+            "SING_BOX_VERSION=${{ needs.version.outputs.version }}" \
+            "SING_BOX_TAG=${{ needs.version.outputs.tag }}" \
+            "BUILD_TAG=with_v2ray_api" \
+            "SOURCE=https://github.com/SagerNet/sing-box/tree/${{ needs.version.outputs.tag }}" \
+            > BUILD_INFO
+
+      - name: Publish RR Nexus core release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete rr-nexus-core --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes 2>/dev/null || true
+          gh release create rr-nexus-core release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "RR Nexus traffic core · sing-box ${{ needs.version.outputs.version }}" \
+            --notes "Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every Monday or on demand."

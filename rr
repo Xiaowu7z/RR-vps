@@ -1,0 +1,90 @@
+#!/bin/bash
+
+RR_LIB_DIR="/usr/local/lib/rr"
+RR_MODULE_DIR="${RR_LIB_DIR}/modules"
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "请使用 root 用户运行 rr。" >&2
+    exit 1
+fi
+
+if [ ! -d "$RR_MODULE_DIR" ]; then
+    echo "RR-vps 模块目录不存在：${RR_MODULE_DIR}" >&2
+    echo "请重新运行安装命令修复。" >&2
+    exit 1
+fi
+
+module_count=0
+for rr_module in "$RR_MODULE_DIR"/*.sh; do
+    [ -f "$rr_module" ] || continue
+    # shellcheck disable=SC1090
+    if ! source "$rr_module"; then
+        echo "RR-vps 模块加载失败：${rr_module}" >&2
+        exit 1
+    fi
+    module_count=$((module_count + 1))
+done
+unset rr_module
+
+if [ "$module_count" -lt 2 ] || ! declare -F main_menu >/dev/null 2>&1; then
+    echo "RR-vps 模块不完整，请重新运行安装命令修复。" >&2
+    exit 1
+fi
+
+case "${1:-}" in
+    --post-update)
+        post_update_migrate
+        exit $?
+        ;;
+    --sync-subscriptions)
+        migrate_config_schema && generate_node_and_sub
+        exit $?
+        ;;
+    --sync-devices)
+        migrate_config_schema && sync_nexus_devices
+        exit $?
+        ;;
+    --update-now)
+        # 非交互远程升级入口（面板多服务器远程升级调用）
+        # stdin 关闭使 do_update 内的 read 直接失败不阻塞；升级成功后
+        # post_update_migrate 会拉起 sing-box 守护与新版面板（rr-nexus）。
+        do_update < /dev/null
+        exit $?
+        ;;
+    --health-check)
+        ensure_runtime_health
+        exit $?
+        ;;
+    --version|-v)
+        echo "RR-vps ${SCRIPT_VERSION}"
+        exit 0
+        ;;
+    --fw-ports)
+        nexus_fw_ports_json
+        exit $?
+        ;;
+    --fw-toggle)
+        nexus_fw_toggle "${2:-}" "${3:-}"
+        exit $?
+        ;;
+    --fw-ipmode)
+        # 用法: rr --fw-ipmode auto|ipv4|ipv6 [auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only]
+        entry_val="${2:-}"
+        outbound_val="${3:-}"
+        load_config_with_defaults || exit 1
+        case "$entry_val" in auto|ipv4|ipv6) ;; *) entry_val="$ENTRY_IP_MODE" ;; esac
+        case "$outbound_val" in auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;; *) outbound_val="$OUTBOUND_IP_MODE" ;; esac
+        if apply_ip_preferences "$entry_val" "$outbound_val"; then
+            echo "{\"ok\":true,\"entry\":\"$entry_val\",\"outbound\":\"$outbound_val\"}"
+            exit 0
+        fi
+        echo '{"ok":false,"error":"ip_mode_apply_failed"}'
+        exit 1
+        ;;
+    --ver-info)
+        nexus_ver_info_json
+        exit $?
+        ;;
+esac
+
+main_menu
