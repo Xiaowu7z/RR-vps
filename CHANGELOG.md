@@ -2,6 +2,17 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 6.6.11 - P2 修复：防火墙关闭拒绝基线 + 设备同步 O(n) 合并
+
+### 修复（P2 ×2）
+- **防火墙 close 无拒绝基线**：INPUT 默认策略 ACCEPT 时，删除放行规则后端口依然可达。现在 `close_protocol_firewall` 在链尾补一条 `DROP`（comment: argo-rr-managed-block），关闭=明确拒绝；`open_protocol_firewall` 先删该 DROP 再放行，语义闭环（iptables/ip6tables/ufw 三路一致，不影响其他服务）
+- **设备操作 O(n)**：批量设备变更（如批量删除）触发 N 次全量重建（每次 13-53s），面板被拖到 504。`sync_devices` 加合并窗口：同步进行中时新请求标记 pending 秒回，执行完 drain 兜住期间全部变更——批量 20 并发实测从 20 次重建合并为 2 次
+
+### 验证
+- 防火墙（CS1 实机）：open=HTTP 200 连通 → close=DROP 在位+连接超时拒绝 → re-open=HTTP 200 恢复；规则无残留
+- debounce（本地并发单测）：20 并发调用全部 True、实际执行 2 次（首+尾 drain）
+- 面板 smoke：CS1 加载新 rr_nexus.py 重启后 active、HTTP 200
+
 ## 6.6.10 - P1 修复：grpcio 旧版面板 CPU 死循环
 
 ### 修复（P1）

@@ -116,15 +116,27 @@ open_protocol_firewall() {
     is_valid_port "$proto_port" || return 1
     case "$proto_type" in tcp|udp) ;; *) return 1 ;; esac
     if command -v ufw &> /dev/null; then
+        ufw --force delete deny "$proto_port/$proto_type" comment "$FIREWALL_BLOCK_COMMENT" >/dev/null 2>&1 || true
         ufw allow "$proto_port/$proto_type" comment "$FIREWALL_COMMENT" >/dev/null 2>&1 || true
     fi
     if command -v iptables &> /dev/null; then
+        # 先移除 close 时插入的拒绝基线，再放行（幂等）
+        while iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
+            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1; do
+            iptables -D INPUT -p "$proto_type" --dport "$proto_port" \
+                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || break
+        done
         iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
             -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
             iptables -I INPUT -p "$proto_type" --dport "$proto_port" \
                 -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT 2>/dev/null || true
     fi
     if command -v ip6tables &> /dev/null; then
+        while ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
+            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1; do
+            ip6tables -D INPUT -p "$proto_type" --dport "$proto_port" \
+                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || break
+        done
         ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
             -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
             ip6tables -I INPUT -p "$proto_type" --dport "$proto_port" \
@@ -143,6 +155,7 @@ close_protocol_firewall() {
 
     if command -v ufw >/dev/null 2>&1; then
         ufw --force delete allow "$proto_port/$proto_type" comment "$FIREWALL_COMMENT" >/dev/null 2>&1 || true
+        ufw --force deny "$proto_port/$proto_type" comment "$FIREWALL_BLOCK_COMMENT" >/dev/null 2>&1 || true
     fi
     while command -v iptables >/dev/null 2>&1 && \
           iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
@@ -156,6 +169,21 @@ close_protocol_firewall() {
         ip6tables -D INPUT -p "$proto_type" --dport "$proto_port" \
             -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || break
     done
+    # P2 修复：关闭 = 显式拒绝基线。INPUT 默认策略是 ACCEPT，只删放行规则
+    # 端口依然可达（无拒绝基线）；在链尾补一条 DROP，关闭后连接被明确拒绝。
+    # open 时会先删掉这条 DROP 再放行，语义闭环且不影响其他服务。
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
+            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || \
+            iptables -A INPUT -p "$proto_type" --dport "$proto_port" \
+                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP 2>/dev/null || true
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
+            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || \
+            ip6tables -A INPUT -p "$proto_type" --dport "$proto_port" \
+                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP 2>/dev/null || true
+    fi
     save_firewall
 }
 

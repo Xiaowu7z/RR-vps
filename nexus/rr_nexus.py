@@ -771,6 +771,12 @@ class NexusState:
         self.login_failures: dict[str, list[int]] = {}
         self.login_lock = threading.Lock()
         self.sync_lock = threading.Lock()
+        # P2 O(n) 修复：同步合并窗口。批量设备操作（如批量删除 N 台）会触发
+        # N 次 sync_devices，每次都是全量重建（O(设备数)）；合并后只执行
+        # 首尾两次，中间请求直接标记 pending 秒回，避免串行重建把面板拖到 504。
+        self._sync_state_lock = threading.Lock()
+        self._sync_inflight = False
+        self._sync_pending = False
         self.traffic = TrafficCollector(self)
 
     def _lockout_for_count(self, count: int, window: int) -> int:
@@ -909,6 +915,29 @@ class NexusState:
         return row
 
     def sync_devices(self) -> tuple[bool, str]:
+        # P2 O(n) 合并窗口：已有同步在执行时，本次请求只标记 pending 秒回，
+        # 由正在执行的同步完成后 drain（再跑一轮兜住期间的所有变更）。
+        with self._sync_state_lock:
+            if self._sync_inflight:
+                self._sync_pending = True
+                return True, "queued"
+            self._sync_inflight = True
+        try:
+            while True:
+                ok, detail = self._do_sync_once()
+                if not ok:
+                    return False, detail
+                with self._sync_state_lock:
+                    if not self._sync_pending:
+                        break
+                    self._sync_pending = False
+        finally:
+            with self._sync_state_lock:
+                self._sync_inflight = False
+
+        return True, ""
+
+    def _do_sync_once(self) -> tuple[bool, str]:
         with self.sync_lock:
             try:
                 result = subprocess.run(
