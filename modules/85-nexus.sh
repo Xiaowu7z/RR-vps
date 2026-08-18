@@ -538,7 +538,27 @@ nexus_install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     apt-get -o DPkg::Lock::Timeout=120 install -y \
-        python3 python3-argon2 python3-grpcio qrencode sqlite3 jq || return 1
+        python3 python3-pip python3-argon2 qrencode sqlite3 jq || return 1
+    # P1 修复：grpcio < 1.43 在 Ubuntu 22.04 上会导致面板 CPU 死循环
+    # （apt 源的 python3-grpcio 在 Ubuntu 22.04 为 1.41，过旧）。
+    # 统一改用 pip 安装 >= 1.43（pip 自带版本比较，幂等：已装新版则跳过）。
+    if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
+        # Debian 12 / Ubuntu 24.04 存在 PEP 668 限制
+        python3 -m pip install --break-system-packages -q "grpcio>=1.43" || return 1
+    else
+        # Ubuntu 22.04 及更早无 PEP 668
+        python3 -m pip install -q "grpcio>=1.43" || return 1
+    fi
+    # 卸载 apt 版 python3-grpcio（若有），避免与 pip 版并存导致导入冲突
+    if dpkg -l python3-grpcio >/dev/null 2>&1; then
+        apt-get -o DPkg::Lock::Timeout=120 remove -y python3-grpcio >/dev/null 2>&1 || true
+    fi
+    # 验证安装结果：版本必须 >= 1.43
+    if ! python3 -c 'import grpc; v = grpc.__version__.split("."); raise SystemExit(0 if int(v[0]) > 1 or (int(v[0]) == 1 and int(v[1]) >= 43) else 1)'; then
+        echo -e "${RED}错误：grpcio 版本低于 1.43（存在 CPU 死循环缺陷），安装失败${RESET}" >&2
+        return 1
+    fi
+    return 0
 }
 
 nexus_write_config() {

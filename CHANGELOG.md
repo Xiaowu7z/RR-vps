@@ -2,6 +2,16 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 6.6.10 - P1 修复：grpcio 旧版面板 CPU 死循环
+
+### 修复（P1）
+- grpcio < 1.43 在 Ubuntu 22.04 上会导致 Nexus 面板 CPU 死循环（apt 源 python3-grpcio 为 1.41，过旧）
+- `nexus_install_dependencies` 改用 pip 统一安装 `grpcio>=1.43`（兼容 PEP 668：Debian 12 / Ubuntu 24.04 自动加 `--break-system-packages`），并卸载 apt 版避免并存冲突，装后强制校验版本
+- 幂等：已装新版时 pip 自带版本比较直接跳过；更新流程面板重启后自动加载新版
+
+### 验证
+- 三系统实机（Debian 12 / Ubuntu 22.04 / Ubuntu 24.04）：依赖函数 FN_RC=0、grpcio 1.83.0、面板重启后 3 分钟观察 CPU 0.2%（无死循环）
+
 ## 6.6.9 - 稳定基线（系统级审计修复版，全量实机验证 103 PASS/0 FAIL）
 
 ### 修复（7 个产品缺陷全闭环）
