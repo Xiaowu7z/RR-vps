@@ -993,10 +993,13 @@ ensure_naive_certificate() {
         echo -e "${YELLOW}正在安装 certbot（Let's Encrypt 官方客户端）……${RESET}"
         apt-get install -y certbot >/dev/null 2>&1 || { echo -e "${RED}[失败] certbot 安装失败。${RESET}" >&2; return 1; }
     fi
-    mkdir -p /var/www/rr-nexus-certbot
+    # 6.6.15：root umask 077（DMIT 模板等）会让目录 700/文件 600，
+    # nginx(www-data) 读不了挑战文件 → LE 403。显式 chmod + umask 022。
+    mkdir -p /var/www/rr-nexus-certbot/.well-known/acme-challenge
+    chmod 755 /var/www/rr-nexus-certbot /var/www/rr-nexus-certbot/.well-known /var/www/rr-nexus-certbot/.well-known/acme-challenge
     echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let's Encrypt 真证书……${RESET}"
-    if ! certbot certonly --webroot -w /var/www/rr-nexus-certbot -d "$naive_domain" \
-        -m "$le_email" --agree-tos --non-interactive --quiet 2>/dev/null; then
+    if ! (umask 022 && certbot certonly --webroot -w /var/www/rr-nexus-certbot -d "$naive_domain" \
+        -m "$le_email" --agree-tos --non-interactive --quiet 2>/dev/null); then
         echo -e "${RED}[失败] 证书申请失败：请确认 ${naive_domain} 已解析到本机公网 IP、80 端口可访问；如日志提示邮箱被拒（invalid email），请在 /etc/argo_vmess.conf 添加 LE_EMAIL=你的邮箱 后重试。${RESET}" >&2
         return 1
     fi

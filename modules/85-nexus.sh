@@ -946,8 +946,12 @@ nexus_enable_public_https() {
     else
         # 自定义端口：webroot 验证签证书（不碰 443），再手写独立端口 HTTPS server
         local webroot="/var/www/rr-nexus-certbot"
-        mkdir -p "$webroot"
-        if ! certbot certonly --webroot -w "$webroot" -d "$domain" -m "$email" --agree-tos --non-interactive; then
+        # 6.6.15：机器 root umask 077（如 DMIT 模板）时 mkdir/certbot 生成的
+        # 目录为 700、挑战文件为 600，nginx(www-data) 读取报 Permission denied
+        # 导致 LE 验证 403。显式 chmod 目录链 + umask 022 子壳跑 certbot。
+        mkdir -p "$webroot/.well-known/acme-challenge"
+        chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge"
+        if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$domain" -m "$email" --agree-tos --non-interactive); then
             echo -e "${RED}[失败] Let's Encrypt 证书签发失败。请检查域名解析和 80 端口入站后重试。${RESET}"
             nexus_remove_public_proxy
             return 1

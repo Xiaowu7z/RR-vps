@@ -2,6 +2,15 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 6.6.15 - 修复 LE 证书 403（root umask 077 权限链）
+
+### 修复
+- DMIT 等模板 root umask 077：mkdir 出 700 目录、certbot 写 600 文件，
+  nginx(www-data) 读挑战文件 Permission denied → LE 验证 403（五哥实机复现）
+- 面板域名模式与 NaiveProxy 的 webroot 流程：显式 chmod 755 目录链
+  （webroot/.well-known/acme-challenge）+ umask 022 子壳跑 certbot（文件 644）
+- 实机对比：Vultr（umask 022）一次过，DMIT（umask 077）403——现已强制权限
+
 ## 6.6.14 - 修复面板域名模式 LE 证书 404（nginx 未 reload）
 
 ### 修复
