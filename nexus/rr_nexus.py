@@ -2695,6 +2695,9 @@ class Handler(BaseHTTPRequestHandler):
             if not link:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "no_subscription_url"})
                 return
+        elif query.get("raw", [""])[0].startswith(("http://", "https://")):
+            # 6.6.16：订阅地址列表每项二维码——前端直接传 URL 生成
+            link = query["raw"][0]
         else:
             links = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
             try:

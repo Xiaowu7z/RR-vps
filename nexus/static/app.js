@@ -499,7 +499,7 @@ async function openLinks(device) {
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
     box.classList.toggle("hidden", urls.length === 0);
-    $("#subscription-urls").innerHTML = urls.map((item, idx) => `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code>${idx === 0 ? `<img class="sub-qr" src="/api/devices/${encodeURIComponent(device.id)}/qr?sub=1" alt="总订阅二维码">` : ""}<button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button></div>`).join("");
+    $("#subscription-urls").innerHTML = urls.map((item, idx) => `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" src="/api/devices/${encodeURIComponent(device.id)}/qr?raw=${encodeURIComponent(item.url)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button></div>`).join("");
     list.innerHTML = data.links.length ? data.links.map((link, index) => `<div class="link-row"><img src="/api/devices/${encodeURIComponent(device.id)}/qr?index=${index}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-open-qr="${index}">打开二维码</button></div></div>`).join("") : '<p class="form-hint">当前没有启用的节点协议。</p>';
     list.dataset.links = JSON.stringify(data.links);
     list.dataset.device = device.id;

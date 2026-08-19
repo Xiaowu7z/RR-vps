@@ -264,7 +264,7 @@ rr_fetch_release() {
     echo "[RR-vps] 正在下载发布清单……"
 rr_download "${RR_RAW_BASE}/rr-bundle.tar.gz" "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null && \
 actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}') && \
-[ "$actual" = "06b09c89db7c4ae07a7c830fd0109494790a4714458c82f47a1a8936bdd16216" ] && \
+[ "$actual" = "b1a5d7efae1460fdf87c89aaefa6285d30f0c741299a8bf6555e2fa64e28cb5b" ] && \
 tar -xzf "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" --strip-components=1 2>/dev/null && \
 cp "$PAYLOAD_DIR/manifest.sha256" "$STAGE_ROOT/manifest.sha256" && \
 rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" && \
