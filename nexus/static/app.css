@@ -367,3 +367,12 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .rs-update-row.warn { background: rgba(245, 200, 108, .07); border-color: rgba(245, 200, 108, .25); }
 .rs-detail-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
 @media (max-width: 640px) { .rs-grid { grid-template-columns: 1fr; } .rs-addr { display: none; } }
+
+
+/* 6.6.17 订阅二维码放大弹窗 */
+.sub-qr-wrap { cursor: zoom-in; flex-shrink: 0; }
+.qr-modal { position: fixed; inset: 0; background: rgba(8, 13, 25, .78); display: none; align-items: center; justify-content: center; z-index: 1000; backdrop-filter: blur(3px); }
+.qr-modal.open { display: flex; }
+.qr-modal-box { background: #fff; border-radius: 16px; padding: 20px; text-align: center; box-shadow: 0 18px 60px rgba(0, 0, 0, .5); }
+.qr-modal-box img { width: 320px; height: 320px; image-rendering: pixelated; display: block; }
+.qr-modal-hint { margin-top: 14px; font-size: 12px; color: #556; cursor: pointer; }
