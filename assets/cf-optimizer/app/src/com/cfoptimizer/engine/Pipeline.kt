@@ -58,6 +58,35 @@ object Pipeline {
         concurrency = 4, preConcurrency = 8, microConcurrency = 6, fullConcurrency = 1
     )
 
+    // Phase 2.7：亚洲入口狩猎。先用 trace 小流量发现 POP，再把亚洲入口送入 Micro / Full。
+    // Full 仍为 10MB；决赛扩大到 18 个，以避免只看 Top5 导致漏掉 HKG/NRT/SIN。
+    val ASIA_HUNT = ModeParams(
+        topDomains = 36, preBytes = 96_000L, microBytes = 1_000_000L,
+        fullBytes = 10_000_000L, fullRounds = 2, finalDomains = 20,
+        concurrency = 6, preConcurrency = 12, microConcurrency = 8, fullConcurrency = 1
+    )
+
+    private val ASIA_POP_ORDER = listOf("HKG", "NRT", "SIN", "ICN", "TPE")
+
+    fun popPriority(pop: String): Int = when (pop.uppercase()) {
+        "HKG" -> 5
+        "NRT" -> 4
+        "SIN" -> 3
+        "ICN" -> 2
+        "TPE" -> 1
+        else -> 0
+    }
+
+    fun isAsiaTarget(pop: String): Boolean = popPriority(pop) > 0
+
+    fun prefixOf(ip: String): String = if (ip.contains(':')) {
+        val parts = ip.split(':').filter { it.isNotEmpty() }
+        (parts.take(3).joinToString(":")) + "::/48"
+    } else {
+        val p = ip.split('.')
+        if (p.size == 4) "${p[0]}.${p[1]}.${p[2]}.0/24" else ip
+    }
+
     data class Stage(val name: String, val current: Int = 0, val total: Int = 0) {
         override fun toString(): String = if (total > 0) "$name $current/$total" else name
     }
@@ -81,6 +110,29 @@ object Pipeline {
         val uniqueIps: List<String>
     )
 
+    data class PopCandidate(
+        val ip: String,
+        val pop: String,
+        val loc: String,
+        val prefix: String,
+        val domains: List<String>,
+        val priority: Int
+    )
+
+    data class PopDiscovery(
+        val counts: Map<String, Int>,
+        val candidates: List<PopCandidate>,
+        val ipToPop: Map<String, String>,
+        val ipToLoc: Map<String, String>
+    )
+
+    data class FamilyRunResult(
+        val ranked: List<Ranker.DomainMetric>,
+        val asiaRanked: List<Ranker.DomainMetric>,
+        val invalid: Boolean,
+        val discovery: PopDiscovery? = null
+    )
+
     /** finalist 的所有 Full 数据，按 IP 保存，POP/失败状态不会被最后一轮覆盖。 */
     data class DomainResult(
         val domain: String,
@@ -88,7 +140,8 @@ object Pipeline {
         val addresses: List<String>,
         val microProbes: Map<String, IpProbe>,
         val fullProbesByIp: Map<String, List<IpProbe>>,
-        val baselineMbps: Double = 0.0
+        val baselineMbps: Double = 0.0,
+        val discoveryPops: Map<String, String> = emptyMap()
     ) {
         fun toMetric(): Ranker.DomainMetric {
             val fullAttempts = addresses.flatMap { fullProbesByIp[it] ?: emptyList() }
@@ -159,28 +212,66 @@ object Pipeline {
                 ipPops = ipPops,
                 ipLoc = ipLocs,
                 baselineMbps = baselineMbps,
-                baselineRatioPct = if (baselineMbps > 0.0 && avgComplete > 0.0) avgComplete * 100.0 / baselineMbps else 0.0
+                baselineRatioPct = if (baselineMbps > 0.0 && avgComplete > 0.0) avgComplete * 100.0 / baselineMbps else 0.0,
+                primaryPop = run {
+                    val pops = addresses.mapNotNull { ip ->
+                        val fullPop = (fullProbesByIp[ip] ?: emptyList()).lastOrNull { it.ok && it.colo.isNotEmpty() }?.colo
+                        (fullPop ?: discoveryPops[ip])?.takeIf { it.isNotEmpty() }
+                    }
+                    if (pops.isEmpty()) "" else if (pops.distinct().size == 1) pops.first() else "混合(${pops.distinct().joinToString("/")})"
+                },
+                edgeScore = run {
+                    val priorities = addresses.map { ip ->
+                        val fullPop = (fullProbesByIp[ip] ?: emptyList()).lastOrNull { it.ok && it.colo.isNotEmpty() }?.colo
+                        popPriority(fullPop ?: discoveryPops[ip].orEmpty())
+                    }
+                    // 域名会随机解析多个地址，因此以最差地址作为入口价值，避免 HKG+LAX 混合域名虚高。
+                    if (priorities.isEmpty()) 0 else priorities.minOrNull() ?: 0
+                },
+                popDrift = addresses.any { ip ->
+                    val before = discoveryPops[ip].orEmpty()
+                    val after = (fullProbesByIp[ip] ?: emptyList()).lastOrNull { it.ok && it.colo.isNotEmpty() }?.colo.orEmpty()
+                    before.isNotEmpty() && after.isNotEmpty() && !before.equals(after, ignoreCase = true)
+                }
             )
         }
     }
 
-    /** 建立一次 DNS Snapshot；调用方负责 CfRanges.refresh() 在此之前完成。 */
-    suspend fun buildSnapshot(domains: List<String>, family: String, log: (String) -> Unit): Snapshot {
+    /**
+     * 建立一次 DNS Snapshot；Phase 2.7 改为有界并发 DNS，避免 500~1000 域名池串行解析卡数分钟。
+     * 解析结果先 awaitAll，再单线程合并，保持快照稳定且无并发 Map 竞态。
+     */
+    suspend fun buildSnapshot(
+        domains: List<String>,
+        family: String,
+        log: (String) -> Unit,
+        onProgress: (Int, Int) -> Unit = { _, _ -> }
+    ): Snapshot = coroutineScope {
         val wantV6 = family == "IPv6"
+        val names = domains.map { it.trim().lowercase() }.filter { it.isNotEmpty() }.distinct()
+        val sem = Semaphore(24)
+        val done = AtomicInteger(0)
+        val resolved = names.map { name ->
+            async {
+                sem.withPermit {
+                    coroutineContext.ensureActive()
+                    val addrs = try { InetAddress.getAllByName(name) } catch (_: Exception) { emptyArray<InetAddress>() }
+                    val validIps = addrs
+                        .filter { (wantV6 && it is Inet6Address) || (!wantV6 && it !is Inet6Address) }
+                        .filter { CfRanges.isCloudflare(it) }
+                        .mapNotNull { it.hostAddress }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                    val n = done.incrementAndGet()
+                    onProgress(n, names.size)
+                    name to validIps
+                }
+            }
+        }.awaitAll()
+
         val domainToIps = LinkedHashMap<String, List<String>>()
         val ipToDomains = LinkedHashMap<String, MutableSet<String>>()
-
-        for (d in domains) {
-            coroutineContext.ensureActive()  // 2.6.0：停止测速——域名间取消检查（DNS 本身阻塞不可中断）
-            val name = d.trim().lowercase()
-            if (name.isEmpty()) continue
-            val addrs = try { InetAddress.getAllByName(name) } catch (_: Exception) { continue }
-            val validIps = addrs
-                .filter { (wantV6 && it is Inet6Address) || (!wantV6 && it !is Inet6Address) }
-                .filter { CfRanges.isCloudflare(it) }
-                .mapNotNull { it.hostAddress }
-                .filter { it.isNotEmpty() }
-                .distinct()
+        for ((name, validIps) in resolved) {
             if (validIps.isEmpty()) continue
             domainToIps[name] = validIps
             for (ip in validIps) ipToDomains.getOrPut(ip) { LinkedHashSet() }.add(name)
@@ -193,7 +284,7 @@ object Pipeline {
             uniqueIps = ipToDomains.keys.toList()
         )
         log("DNS 快照($family)：有效域名 ${snapshot.domainToIps.size}，去重 Cloudflare IP ${snapshot.uniqueIps.size}")
-        return snapshot
+        snapshot
     }
 
     /** Full 总 attempt 数：至少覆盖所有 IP 一次，同时满足 profile 的最小轮数。 */
@@ -257,25 +348,48 @@ object Pipeline {
         }.distinct()
     }
 
-    /** 域名聚合 Pre 排序。 */
-    private fun rankDomainsByPre(preByDomain: Map<String, List<IpProbe>>): List<String> {
-        data class Agg(val domain: String, val floor: Double, val rate: Double, val ttfb: Double, val varPct: Double)
+    /** 域名聚合 Pre 排序；亚洲狩猎时先看该域名所有地址的最差 POP 权重。 */
+    private fun rankDomainsByPre(
+        preByDomain: Map<String, List<IpProbe>>,
+        snapshot: Snapshot,
+        discoveryPops: Map<String, String>,
+        asiaHunt: Boolean
+    ): List<String> {
+        data class Agg(
+            val domain: String,
+            val popScore: Int,
+            val floor: Double,
+            val rate: Double,
+            val ttfb: Double,
+            val varPct: Double
+        )
         return preByDomain.map { (d, probes) ->
             val ok = probes.count { it.ok }
             val failed = probes.size - ok
             val speeds = probes.map { if (it.ok) it.completeMbps else 0.0 }
+            val ips = snapshot.domainToIps[d] ?: emptyList()
+            val priorities = ips.map { popPriority(discoveryPops[it].orEmpty()) }
             Agg(
                 d,
+                if (priorities.isEmpty()) 0 else priorities.minOrNull() ?: 0,
                 Ranker.addressFloor(speeds, failed),
                 Ranker.addressSuccessRate(ok, probes.size),
                 Ranker.medianTtfb(probes.map { it.ttfbMs }),
                 Ranker.variation(speeds)
             )
         }.sortedWith(
-            compareByDescending<Agg> { it.floor }
-                .thenByDescending { it.rate }
-                .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
-                .thenBy { it.varPct }
+            if (asiaHunt) {
+                compareByDescending<Agg> { it.popScore }
+                    .thenByDescending { it.floor }
+                    .thenByDescending { it.rate }
+                    .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
+                    .thenBy { it.varPct }
+            } else {
+                compareByDescending<Agg> { it.floor }
+                    .thenByDescending { it.rate }
+                    .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
+                    .thenBy { it.varPct }
+            }
         ).map { it.domain }
     }
 
@@ -285,14 +399,17 @@ object Pipeline {
         params: ModeParams,
         networkInvalid: () -> Boolean,
         onStage: (Stage) -> Unit,
-        log: (String) -> Unit
-    ): Pair<List<Ranker.DomainMetric>, Boolean> = coroutineScope {
+        log: (String) -> Unit,
+        asiaHunt: Boolean = false
+    ): FamilyRunResult = coroutineScope {
         val family = snapshot.family
-        if (snapshot.domainToIps.isEmpty()) return@coroutineScope Pair(emptyList(), false)
+        if (snapshot.domainToIps.isEmpty()) {
+            return@coroutineScope FamilyRunResult(emptyList(), emptyList(), false, null)
+        }
 
         var invalid = false
         fun checkNet(): Boolean {
-            if (!isActive) return true  // 2.6.0：停止测速——协程取消立即短路
+            if (!isActive) return true
             if (networkInvalid()) {
                 invalid = true
                 log("!! 网络已变化 → INVALID_NETWORK_CHANGED（本轮作废）")
@@ -301,9 +418,69 @@ object Pipeline {
             return false
         }
 
+        // [0] Phase 2.7 亚洲入口发现：只拉 /cdn-cgi/trace，不下载大文件。
+        var discovery: PopDiscovery? = null
+        val discoveryPops = LinkedHashMap<String, String>()
+        val discoveryLocs = LinkedHashMap<String, String>()
+        if (asiaHunt) {
+            val sem = Semaphore(12)
+            val completed = AtomicInteger(0)
+            onStage(Stage("POP 发现 $family", 0, snapshot.uniqueIps.size))
+            val rows = snapshot.uniqueIps.map { ip ->
+                async {
+                    sem.withPermit {
+                        if (checkNet()) return@withPermit Triple(ip, "", "")
+                        val (colo, loc) = ProbeEngine.probeTrace(ip, 5) {}
+                        val done = completed.incrementAndGet()
+                        onStage(Stage("POP 发现 $family", done, snapshot.uniqueIps.size))
+                        Triple(ip, colo.uppercase(), loc.uppercase())
+                    }
+                }
+            }.awaitAll()
+            if (checkNet()) return@coroutineScope FamilyRunResult(emptyList(), emptyList(), true, null)
+            for ((ip, pop, loc) in rows) {
+                discoveryPops[ip] = pop
+                discoveryLocs[ip] = loc
+            }
+            val candidates = snapshot.uniqueIps.map { ip ->
+                val pop = discoveryPops[ip].orEmpty()
+                PopCandidate(
+                    ip = ip,
+                    pop = if (pop.isEmpty()) "UNKNOWN" else pop,
+                    loc = discoveryLocs[ip].orEmpty(),
+                    prefix = prefixOf(ip),
+                    domains = (snapshot.ipToDomains[ip] ?: emptySet()).toList().sorted(),
+                    priority = popPriority(pop)
+                )
+            }.sortedWith(
+                compareByDescending<PopCandidate> { it.priority }
+                    .thenBy { it.pop }
+                    .thenBy { it.prefix }
+                    .thenBy { it.ip }
+            )
+            val counts = candidates.groupingBy { it.pop }.eachCount().toSortedMap()
+            discovery = PopDiscovery(counts, candidates, discoveryPops.toMap(), discoveryLocs.toMap())
+
+            val summary = ASIA_POP_ORDER.joinToString(" · ") { p -> "$p=${counts[p] ?: 0}" }
+            val far = candidates.count { it.priority == 0 && it.pop != "UNKNOWN" }
+            val unknown = counts["UNKNOWN"] ?: 0
+            log("$family POP 发现：$summary · 非目标=$far · 未知=$unknown")
+            if ((counts["HKG"] ?: 0) == 0) log("$family 本轮未发现 HKG Cloudflare 入口")
+
+            // /24(/48) 命中统计：用于识别“这一片地址更容易进 HKG/NRT”。
+            val goodPrefixes = candidates.filter { it.priority > 0 }
+                .groupBy { it.prefix }
+                .mapValues { (_, v) -> v.groupingBy { it.pop }.eachCount() }
+                .entries.sortedByDescending { e -> e.value.values.sum() }
+                .take(10)
+            if (goodPrefixes.isNotEmpty()) {
+                log("$family 亚洲 Prefix 热点：" + goodPrefixes.joinToString(" | ") { (prefix, m) ->
+                    "$prefix ${m.entries.sortedByDescending { it.value }.joinToString("/") { "${it.key}:${it.value}" }}"
+                })
+            }
+        }
+
         // [1] Pre：每个 unique IP 一次。
-        // Phase 2.2.1：用 Semaphore 做滑动并发，不再 chunked 后等待整批最慢 IP。
-        // 进度按“完成数”递增，避免 9/97、8/97 这种看似倒退的显示。
         val preCache = LinkedHashMap<String, IpProbe>()
         val preSemaphore = Semaphore(params.preConcurrency)
         val preCompleted = AtomicInteger(0)
@@ -321,7 +498,8 @@ object Pipeline {
                     val probe = IpProbe(
                         ip = ip, ok = r.ok, tcpMs = r.tcpMs, tlsMs = r.tlsMs,
                         ttfbMs = r.ttfbMs, payloadMbps = r.payloadMbps,
-                        completeMbps = r.completeTransferMbps, colo = r.colo, loc = r.loc
+                        completeMbps = r.completeTransferMbps,
+                        colo = discoveryPops[ip].orEmpty(), loc = discoveryLocs[ip].orEmpty()
                     )
                     val done = preCompleted.incrementAndGet()
                     onStage(Stage("初筛 $family", done, snapshot.uniqueIps.size))
@@ -329,7 +507,7 @@ object Pipeline {
                 }
             }
         }.awaitAll()
-        if (checkNet()) return@coroutineScope Pair(emptyList(), true)
+        if (checkNet()) return@coroutineScope FamilyRunResult(emptyList(), emptyList(), true, discovery)
         for ((ip, probe) in preBatch) preCache[ip] = probe
         log("$family 初筛完成：${preCache.values.count { it.ok }}/${snapshot.uniqueIps.size} IP 可用")
 
@@ -340,14 +518,14 @@ object Pipeline {
                 preByDomain.getOrPut(d) { mutableListOf() }.add(probe)
             }
         }
-        val rankedDomains = rankDomainsByPre(preByDomain)
+        val rankedDomains = rankDomainsByPre(preByDomain, snapshot, discoveryPops, asiaHunt)
         val microDomains = LinkedHashSet<String>()
         if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) microDomains.add(BASELINE_DOMAIN)
         for (d in rankedDomains) {
             if (microDomains.size >= params.topDomains) break
             microDomains.add(d)
         }
-        log("$family 入围小流量筛选：${microDomains.joinToString(", ")}${if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) "（含基准）" else ""}")
+        log("$family 入围小流量筛选：${microDomains.size} 个域名${if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) "（含基准）" else ""}")
 
         // [3] Micro：对晋级域名涉及的 unique IP 仅测试一次，再映射回所有域名。
         val microIps = microDomains.flatMap { snapshot.domainToIps[it] ?: emptyList() }.distinct()
@@ -368,7 +546,8 @@ object Pipeline {
                     val probe = IpProbe(
                         ip = ip, ok = r.ok, tcpMs = r.tcpMs, tlsMs = r.tlsMs,
                         ttfbMs = r.ttfbMs, payloadMbps = r.payloadMbps,
-                        completeMbps = r.completeTransferMbps, colo = r.colo, loc = r.loc
+                        completeMbps = r.completeTransferMbps,
+                        colo = discoveryPops[ip].orEmpty(), loc = discoveryLocs[ip].orEmpty()
                     )
                     val done = microCompleted.incrementAndGet()
                     onStage(Stage("小流量筛选 $family", done, microIps.size))
@@ -376,37 +555,65 @@ object Pipeline {
                 }
             }
         }.awaitAll()
-        if (checkNet()) return@coroutineScope Pair(emptyList(), true)
+        if (checkNet()) return@coroutineScope FamilyRunResult(emptyList(), emptyList(), true, discovery)
         for ((ip, probe) in microBatch) microCache[ip] = probe
         log("$family 小流量筛选完成：去重 IP ${microCache.size} 个（共享 IP 自动复用）")
 
         // [4] Micro Floor 只决定 finalists；Baseline 强制进 Full。
-        data class MicroAgg(val domain: String, val floor: Double, val rate: Double, val ttfb: Double)
+        data class MicroAgg(
+            val domain: String,
+            val popScore: Int,
+            val primaryPop: String,
+            val floor: Double,
+            val rate: Double,
+            val ttfb: Double
+        )
         val microAggs = microDomains.map { d ->
             val ips = snapshot.domainToIps[d] ?: emptyList()
             val probes = ips.map { microCache[it] ?: IpProbe(it, ok = false) }
             val ok = probes.count { it.ok }
             val failed = probes.size - ok
+            val pops = ips.map { discoveryPops[it].orEmpty() }.filter { it.isNotEmpty() }
+            val primaryPop = if (pops.isNotEmpty() && pops.distinct().size == 1) pops.first() else if (pops.isEmpty()) "" else "MIXED"
+            val priorities = ips.map { popPriority(discoveryPops[it].orEmpty()) }
             MicroAgg(
                 d,
+                if (priorities.isEmpty()) 0 else priorities.minOrNull() ?: 0,
+                primaryPop,
                 Ranker.addressFloor(probes.map { if (it.ok) it.completeMbps else 0.0 }, failed),
                 Ranker.addressSuccessRate(ok, probes.size),
                 Ranker.medianTtfb(probes.map { it.ttfbMs })
             )
         }.sortedWith(
-            compareByDescending<MicroAgg> { it.floor }
-                .thenByDescending { it.rate }
-                .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
+            if (asiaHunt) {
+                compareByDescending<MicroAgg> { it.popScore }
+                    .thenByDescending { it.floor }
+                    .thenByDescending { it.rate }
+                    .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
+            } else {
+                compareByDescending<MicroAgg> { it.floor }
+                    .thenByDescending { it.rate }
+                    .thenBy { if (it.ttfb < 0) Double.MAX_VALUE else it.ttfb }
+            }
         )
 
         val finalists = LinkedHashSet<String>()
         if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) finalists.add(BASELINE_DOMAIN)
+        if (asiaHunt) {
+            // HKG 优先，同时保留 NRT/SIN/ICN/TPE 和少量远端对照，避免只盯单一区域。
+            val quotas = linkedMapOf("HKG" to 8, "NRT" to 3, "SIN" to 3, "ICN" to 2, "TPE" to 2)
+            for ((pop, quota) in quotas) {
+                microAggs.asSequence().filter { it.primaryPop == pop }.take(quota).forEach { finalists.add(it.domain) }
+            }
+            // 非亚洲最快对照最多 2 个。
+            microAggs.asSequence().filter { it.popScore == 0 }.take(2).forEach { finalists.add(it.domain) }
+        }
         for (m in microAggs) {
             if (finalists.size >= params.finalDomains) break
             finalists.add(m.domain)
         }
-        val finalistList = finalists.toList()
-        log("$family 决赛名单：${finalistList.joinToString(", ")}${if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) "（含基准）" else ""}")
+        val finalistList = finalists.take(params.finalDomains)
+        log("$family 决赛名单(${finalistList.size})：${finalistList.joinToString(", ")}${if (snapshot.domainToIps.containsKey(BASELINE_DOMAIN)) "（含基准）" else ""}")
         log("$family 当前晋级组合理论流量 ≈ ${"%.1f".format(estimateTrafficMb(snapshot, params, microDomains.toList(), finalistList))} MB")
 
         // [5] Full：每个 finalist Snapshot IP 至少 1 次；额外轮次再轮转。
@@ -416,14 +623,14 @@ object Pipeline {
         val results = ArrayList<DomainResult>()
 
         for (d in finalistList) {
-            if (checkNet()) return@coroutineScope Pair(emptyList(), true)
+            if (checkNet()) return@coroutineScope FamilyRunResult(emptyList(), emptyList(), true, discovery)
             val ips = snapshot.domainToIps[d] ?: emptyList()
             val schedule = fullSchedules[d] ?: emptyList()
             val fullByIp = LinkedHashMap<String, MutableList<IpProbe>>()
             for (ip in ips) fullByIp[ip] = mutableListOf()
 
             for ((roundIndex, ip) in schedule.withIndex()) {
-                if (checkNet()) return@coroutineScope Pair(emptyList(), true)
+                if (checkNet()) return@coroutineScope FamilyRunResult(emptyList(), emptyList(), true, discovery)
                 onStage(Stage("完整测速 $family $d", fullDone + 1, fullTotal))
                 val r = ProbeEngine.probeDownload(ip, params.fullBytes, FULL_TIMEOUT_SEC, includeTrace = true) {}
                 val probe = IpProbe(
@@ -433,11 +640,15 @@ object Pipeline {
                 )
                 fullByIp.getOrPut(ip) { mutableListOf() }.add(probe)
                 if (!r.ok) log("$d 完整测速 第 ${roundIndex + 1}/${schedule.size} 轮 失败（$ip）：${r.error}")
+                if (asiaHunt) {
+                    val before = discoveryPops[ip].orEmpty()
+                    if (before.isNotEmpty() && r.colo.isNotEmpty() && !before.equals(r.colo, true)) {
+                        log("⚠ POP 漂移 $ip：$before → ${r.colo}")
+                    }
+                }
                 fullDone++
-                // 降温间隔：大流量连续下载是发热主源，轮间短停让 CPU/基带散热
                 delay(300)
             }
-            // 域间降温：让下一个域名开始前设备短暂散热
             delay(400)
 
             val microForDomain = ips.associateWith { ip -> microCache[ip] ?: IpProbe(ip, ok = false) }
@@ -447,13 +658,20 @@ object Pipeline {
                     family = family,
                     addresses = ips,
                     microProbes = microForDomain,
-                    fullProbesByIp = fullByIp.mapValues { it.value.toList() }
+                    fullProbesByIp = fullByIp.mapValues { it.value.toList() },
+                    discoveryPops = discoveryPops
                 )
             )
         }
 
         onStage(Stage("排名 $family"))
-        Pair(Ranker.rank(results.map { it.toMetric() }), invalid)
+        val metrics = results.map { it.toMetric() }
+        FamilyRunResult(
+            ranked = Ranker.rank(metrics),
+            asiaRanked = if (asiaHunt) Ranker.rankAsia(metrics) else Ranker.rank(metrics),
+            invalid = invalid,
+            discovery = discovery
+        )
     }
 
     /** 本机 Cloudflare 基准（正常 DNS 解析后，指定协议族）。 */

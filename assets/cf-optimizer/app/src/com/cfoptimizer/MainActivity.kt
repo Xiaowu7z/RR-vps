@@ -72,7 +72,8 @@ class MainActivity : Activity() {
     private var unregisterNetWatch: (() -> Unit)? = null
 
     private var protocolMode = "Dual"      // IPv4 / IPv6 / Dual
-    private var profileMode = "均衡"   // Phase 2.4: 唯一均衡模式
+    private var profileMode = "均衡"        // 均衡 / 亚洲入口狩猎
+    private var lineLabelMode = "自动"       // 自动 / 中国移动 / 中国电信 / 中国联通
     private var builtinDomains: List<String> = emptyList()
 
     // ---- 日志节流 ----
@@ -175,6 +176,26 @@ class MainActivity : Activity() {
                 protocolMode = sel; refreshStatus()
             })
 
+            addView(sectionLabel("测速模式"))
+            addView(buildSegmented(
+                listOf("均衡", "亚洲入口狩猎"),
+                labels = listOf("均衡", "亚洲入口狩猎"),
+                initial = "均衡"
+            ) { sel ->
+                profileMode = sel; refreshStatus()
+            })
+            addView(dataLine("亚洲入口狩猎：先发现 POP，优先 HKG > NRT > SIN > ICN > TPE", 11.5f, C_MUTED))
+
+            addView(sectionLabel("线路标签"))
+            addView(buildSegmented(
+                listOf("自动", "中国移动", "中国电信", "中国联通"),
+                labels = listOf("自动", "移动", "电信", "联通"),
+                initial = "自动"
+            ) { sel ->
+                lineLabelMode = sel; refreshStatus()
+            })
+            addView(dataLine("Wi-Fi 无法可靠自动识别宽带运营商，测试电信/移动宽带时建议手动选择。", 11.5f, C_MUTED))
+
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(18)
@@ -215,7 +236,17 @@ class MainActivity : Activity() {
             topMargin = dp(16)
         })
 
-        homeView = root
+        val homeScroll = ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            setBackgroundColor(C_BG)
+            addView(root, android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        }
+        homeView = homeScroll
     }
 
     // ================= 测速页 =================
@@ -442,8 +473,14 @@ class MainActivity : Activity() {
     @SuppressLint("SetTextI18n")
     private fun refreshStatus() {
         val info = NetEnv.detect(this)
-        statusText.text = "网络：${info.label}"
+        val line = effectiveLineLabel(info)
+        statusText.text = "网络：${info.label} · 模式：$profileMode · 线路：$line"
         protoLabel.text = "已选：$protocolMode"
+    }
+
+    private fun effectiveLineLabel(info: NetEnv.NetInfo): String = when (lineLabelMode) {
+        "中国移动", "中国电信", "中国联通" -> lineLabelMode
+        else -> info.carrier.ifEmpty { "未标记" }
     }
 
     private fun loadDomains(): List<String> {
@@ -634,7 +671,8 @@ class MainActivity : Activity() {
 
     @SuppressLint("SetTextI18n")
     private fun launchRun(info: NetEnv.NetInfo) {
-        val params = Pipeline.BALANCED  // Phase 2.4: 唯一均衡模式
+        val asiaHunt = profileMode == "亚洲入口狩猎"
+        val params = if (asiaHunt) Pipeline.ASIA_HUNT else Pipeline.BALANCED
         val families = when (protocolMode) {
             "IPv4" -> listOf("IPv4")
             "IPv6" -> listOf("IPv6")
@@ -662,7 +700,7 @@ class MainActivity : Activity() {
 
         job = scope.launch {
             try {
-            appendLog("=== 开始（均衡模式 / ${families.joinToString("+")} / VPN=${if (info.vpnActive) "是" else "否"}）===")
+            appendLog("=== 开始（$profileMode / ${families.joinToString("+")} / 线路=${effectiveLineLabel(info)} / VPN=${if (info.vpnActive) "是" else "否"}）===")
             setStage("准备中")
             CfRanges.refresh()
             appendLog("Cloudflare 网段：IPv4=${if (CfRanges.v4FromOnline) "在线" else "内置备用"} IPv6=${if (CfRanges.v6FromOnline) "在线" else "内置备用"}")
@@ -682,18 +720,26 @@ class MainActivity : Activity() {
             val snapshots = mutableMapOf<String, Pipeline.Snapshot>()
             for (f in activeFamilies) {
                 setStage("解析 $f DNS 快照")
-                val snap = Pipeline.buildSnapshot(builtinDomains, f) { appendLog("  $it") }
+                val snap = Pipeline.buildSnapshot(
+                    builtinDomains, f,
+                    log = { appendLog("  $it") },
+                    onProgress = { done, total ->
+                        if (done == total || done % 25 == 0) setStage("解析 $f DNS $done/$total")
+                    }
+                )
                 snapshots[f] = snap
                 val mb = Pipeline.estimateTrafficUpperBoundMb(snap, params)
                 appendLog("$f 预计最大流量 ≈ ${"%.0f".format(mb)} MB")
             }
 
             val allResults = HashMap<String, List<Ranker.DomainMetric>>()
+            val allAsiaResults = HashMap<String, List<Ranker.DomainMetric>>()
+            val allDiscoveries = HashMap<String, Pipeline.PopDiscovery?>()
             var anyInvalid = false
             var familyIdx = 0
             for (family in activeFamilies) {
                 appendLog("--- $family 测速流程 ---")
-                val (ranked, invalid) = Pipeline.runFamily(
+                val familyResult = Pipeline.runFamily(
                     snapshot = snapshots[family]!!,
                     params = params,
                     networkInvalid = { networkChanged.get() },
@@ -701,18 +747,22 @@ class MainActivity : Activity() {
                         if (s.total > 0) {
                             stopDots()
                             setStage("正在${s.name} ${s.current}/${s.total}")
-                            val base = familyIdx * 50
-                            setStageProgress(base + (s.current * 50 / s.total))
+                            val familySpan = if (activeFamilies.size <= 1) 90 else 45
+                            val base = familyIdx * familySpan
+                            setStageProgress(base + (s.current * familySpan / s.total))
                         } else {
                             setStage(s.name)
                             animateDots(s.name)
                             setProgressBusy()
                         }
                     },
-                    log = { appendLog("  $it") }
+                    log = { appendLog("  $it") },
+                    asiaHunt = asiaHunt
                 )
-                if (invalid) anyInvalid = true
-                allResults[family] = ranked
+                if (familyResult.invalid) anyInvalid = true
+                allResults[family] = familyResult.ranked
+                allAsiaResults[family] = familyResult.asiaRanked
+                allDiscoveries[family] = familyResult.discovery
                 familyIdx++
             }
 
@@ -728,7 +778,7 @@ class MainActivity : Activity() {
             appendLog("=== 完成 ===")
             if (anyInvalid) appendLog("⚠ 本轮含 INVALID_NETWORK_CHANGED，不进入直连长期排行榜")
             saveHistory(allResults, activeFamilies, anyInvalid)
-            runOnUiThread { showResults(allResults, activeFamilies, anyInvalid) }
+            runOnUiThread { showResults(allResults, allAsiaResults, allDiscoveries, activeFamilies, anyInvalid, asiaHunt) }
             unregisterNetWatch?.invoke()
             unregisterNetWatch = null
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -791,8 +841,11 @@ class MainActivity : Activity() {
     @SuppressLint("SetTextI18n")
     private fun showResults(
         all: Map<String, List<Ranker.DomainMetric>>,
+        asiaAll: Map<String, List<Ranker.DomainMetric>>,
+        discoveries: Map<String, Pipeline.PopDiscovery?>,
         families: List<String>,
-        invalid: Boolean
+        invalid: Boolean,
+        asiaHunt: Boolean
     ) {
         resultContainer.removeAllViews()
         if (invalid) {
@@ -803,30 +856,41 @@ class MainActivity : Activity() {
         }
         for (family in families) {
             val ranked = all[family] ?: continue
+            val asiaRanked = asiaAll[family] ?: ranked
+            val discovery = discoveries[family]
+
             resultContainer.addView(TextView(this).apply {
-                text = "$family 排行榜"
-                textSize = 17f
+                text = if (asiaHunt) "$family · 亚洲入口狩猎" else "$family 排行榜"
+                textSize = 18f
                 setTypeface(null, Typeface.BOLD)
                 setTextColor(C_ACCENT)
                 setPadding(0, dp(20), 0, dp(8))
             })
-            if (ranked.isEmpty()) {
-                resultContainer.addView(TextView(this).apply {
-                    text = "（无有效结果）"
-                    setTextColor(C_MUTED)
-                })
-                continue
+
+            if (asiaHunt && discovery != null) {
+                addPopDiscoverySummary(discovery)
+                val targetPops = listOf("HKG", "NRT", "SIN", "ICN", "TPE")
+                for (pop in targetPops) {
+                    val matches = asiaRanked.filter { it.primaryPop == pop }
+                    if (matches.isNotEmpty()) addMetricSection("$pop 榜", matches.take(10), ranked)
+                }
+                val mixed = asiaRanked.filter { it.primaryPop.startsWith("混合") }
+                if (mixed.isNotEmpty()) addMetricSection("混合 POP", mixed.take(10), ranked)
+                addMetricSection("亚洲入口综合榜", asiaRanked.take(20), ranked)
+                addMetricSection("全局速度榜", ranked.take(20), ranked)
+                addDiscoveryIpList(discovery)
+            } else {
+                if (ranked.isEmpty()) {
+                    resultContainer.addView(TextView(this).apply {
+                        text = "（无有效结果）"
+                        setTextColor(C_MUTED)
+                    })
+                    continue
+                }
+                addMetricSection("完整排行榜", ranked.take(20), ranked)
             }
+
             val baseline = ranked.firstOrNull { it.domain == Pipeline.BASELINE_DOMAIN }
-            ranked.take(12).forEachIndexed { i, m ->
-                resultContainer.addView(
-                    resultCard(i, m, baseline),
-                    LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { bottomMargin = dp(10) }
-                )
-            }
             if (baseline != null) {
                 val champ = ranked.firstOrNull()
                 val verdict = verdictText(champ, baseline)
@@ -840,6 +904,80 @@ class MainActivity : Activity() {
             }
         }
         switchTo(resultView, "result")
+    }
+
+    private fun addMetricSection(
+        title: String,
+        metrics: List<Ranker.DomainMetric>,
+        globalRanked: List<Ranker.DomainMetric>
+    ) {
+        resultContainer.addView(TextView(this).apply {
+            text = title
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(C_TEXT)
+            setPadding(0, dp(14), 0, dp(7))
+        })
+        if (metrics.isEmpty()) {
+            resultContainer.addView(dataLine("（无结果）", 12f, C_MUTED))
+            return
+        }
+        val baseline = globalRanked.firstOrNull { it.domain == Pipeline.BASELINE_DOMAIN }
+        metrics.forEachIndexed { i, m ->
+            resultContainer.addView(
+                resultCard(i, m, baseline),
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { bottomMargin = dp(8) }
+            )
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun addPopDiscoverySummary(discovery: Pipeline.PopDiscovery) {
+        val target = listOf("HKG", "NRT", "SIN", "ICN", "TPE")
+        val targetCount = target.sumOf { discovery.counts[it] ?: 0 }
+        val unknown = discovery.counts["UNKNOWN"] ?: 0
+        val other = (discovery.candidates.size - targetCount - unknown).coerceAtLeast(0)
+        val box = cardContainer {
+            addView(dataLine("亚洲 POP 发现", 15f, C_TEXT, true))
+            addView(dataLine(
+                target.joinToString(" · ") { "$it ${discovery.counts[it] ?: 0}" },
+                13f, C_SUB, true
+            ))
+            addView(dataLine("其他 $other · 未知 $unknown · 总去重 IP ${discovery.candidates.size}", 12f, C_MUTED))
+            if ((discovery.counts["HKG"] ?: 0) == 0) {
+                addView(dataLine("本轮未发现 HKG Cloudflare 入口", 12.5f, C_RED, true))
+            } else {
+                addView(dataLine("已发现 HKG，Full 阶段会再次 trace 验证是否发生 POP 漂移", 12f, C_GREEN))
+            }
+        }
+        resultContainer.addView(box, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(10) })
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun addDiscoveryIpList(discovery: Pipeline.PopDiscovery) {
+        resultContainer.addView(TextView(this).apply {
+            text = "POP 发现 IP（前 50）"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(C_TEXT)
+            setPadding(0, dp(16), 0, dp(7))
+        })
+        discovery.candidates.take(50).forEachIndexed { i, c ->
+            val domains = c.domains.take(3).joinToString(", ")
+            val row = dataLine(
+                "${i + 1}. ${c.pop} · ${c.ip} · ${c.prefix}${if (domains.isNotEmpty()) "\n   $domains" else ""}",
+                11.5f,
+                if (c.priority > 0) C_SUB else C_MUTED
+            )
+            row.setPadding(dp(8), dp(5), dp(8), dp(5))
+            row.setOnClickListener { copyText(c.ip, "IP") }
+            resultContainer.addView(row)
+        }
     }
 
     // ================= 历史记录（Phase 2.4） =================
@@ -856,7 +994,7 @@ class MainActivity : Activity() {
                 champMbps = "%.1f".format(c.avgCompleteMbps)
                 val baseline = fam0.firstOrNull { it.domain == Pipeline.BASELINE_DOMAIN }
                 verdict = if (baseline != null) verdictText(c, baseline) else "无基准"
-                fam0.take(12).forEachIndexed { i, m ->
+                fam0.take(50).forEachIndexed { i, m ->
                     results.add(
                         HistoryStore.ResultLine(
                             rank = i + 1,
@@ -880,13 +1018,13 @@ class MainActivity : Activity() {
                 HistoryStore.HistoryEntry(
                     id = System.currentTimeMillis(),
                     ts = System.currentTimeMillis(),
-                    modeLabel = "均衡模式",
+                    modeLabel = profileMode,
                     families = families.joinToString("+"),
                     networkLabel = info.label,
                     vpn = info.vpnActive,
                     invalid = invalid,
                     wifiSsid = info.wifiSsid,
-                    carrier = info.carrier,
+                    carrier = effectiveLineLabel(info),
                     phoneModel = info.phoneModel,
                     champ = champ,
                     champMbps = champMbps,
@@ -985,7 +1123,7 @@ class MainActivity : Activity() {
         val badges = buildString {
             if (e.invalid) append(" [无效]")
         }
-        card.addView(dataLine("$time · ${e.families} · ${e.networkLabel}$badges", 13f, C_SUB, true))
+        card.addView(dataLine("$time · ${e.modeLabel} · ${e.families} · ${e.networkLabel}$badges", 13f, C_SUB, true))
         val env = buildString {
             if (e.wifiSsid.isNotEmpty()) append("WiFi：${e.wifiSsid}")
             if (e.carrier.isNotEmpty()) { if (isNotEmpty()) append(" · "); append("运营商：${e.carrier}") }
@@ -1128,6 +1266,16 @@ class MainActivity : Activity() {
         return card
     }
 
+    private fun copyText(value: String, label: String) {
+        try {
+            val cm = getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+            android.widget.Toast.makeText(this, "已复制：$value", android.widget.Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+            android.widget.Toast.makeText(this, "复制失败", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
     // 复制域名到剪贴板
     private fun copyDomain(domain: String) {
         try {
@@ -1167,6 +1315,14 @@ class MainActivity : Activity() {
                 "稳定性 ${Ranker.stabilityLabel(m.variationPct, m.successRatePct)}",
             12.5f, C_SUB
         ))
+        if (m.primaryPop.isNotEmpty()) {
+            card.addView(dataLine(
+                "入口：${m.primaryPop} · Edge Score ${m.edgeScore}${if (m.popDrift) " · ⚠ POP 漂移" else ""}",
+                12f,
+                if (m.edgeScore > 0 && !m.popDrift) C_GREEN else C_SUB,
+                bold = m.edgeScore > 0
+            ))
+        }
         if (m.ipPops.isNotEmpty()) {
             card.addView(dataLine("节点 POP：${m.ipPops.joinToString("  ")}", 12f, C_SUB))
         }

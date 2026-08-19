@@ -24,8 +24,8 @@ object HistoryTest {
             champ = "www.openai.com", champMbps = "168.9",
             verdict = "建议替换当前基准 → www.openai.com",
             results = listOf(
-                ResultLine(1, "www.openai.com", "168.9", "156.0", "100%", "172.64.154.211 HKG"),
-                ResultLine(2, "www.npmjs.com \"quoted\" \\ slash", "15.6", "15.3", "100%", "")
+                ResultLine(1, "www.openai.com", "168.9", "156.0", "100%", "", pops = "172.64.154.211 HKG"),
+                ResultLine(2, "www.npmjs.com \"quoted\" \\ slash", "15.6", "15.3", "100%", "", pops = "")
             )
         )
         val json = HistoryStore.serialize(listOf(e, e))
