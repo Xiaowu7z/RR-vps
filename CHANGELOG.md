@@ -2,6 +2,13 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 6.6.14 - 修复面板域名模式 LE 证书 404（nginx 未 reload）
+
+### 修复
+- nexus_write_nginx_site / nexus_write_nginx_custom_port 写完 server 块只做 nginx -t
+  不 reload——nginx 继续跑 default 站，acme-challenge 请求 404，Let's Encrypt 签发失败
+- 现在语法检查通过后立即 reload（reload 失败退级 restart），新配置即时生效
+
 ## 6.6.13 - 修复面板安装 typing_extensions 冲突（6.6.10 回归）
 
 ### 修复

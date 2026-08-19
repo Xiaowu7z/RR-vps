@@ -853,7 +853,11 @@ EOF
     chmod 644 "$tmp"
     mv -f "$tmp" "$NEXUS_NGINX_SITE"
     ln -sfn "$NEXUS_NGINX_SITE" /etc/nginx/sites-enabled/rr-nexus.conf
-    nginx -t
+    # 语法通过后必须 reload，否则新写的 server 块不生效（仍走 default 站
+    # 导致 LE acme-challenge 404，证书签发失败——6.6.14 修复）
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+    fi
 }
 
 nexus_write_nginx_custom_port() {
@@ -911,7 +915,9 @@ EOF
     chmod 644 "$tmp"
     mv -f "$tmp" "${NEXUS_NGINX_SITE}.port"
     ln -sfn "${NEXUS_NGINX_SITE}.port" /etc/nginx/sites-enabled/rr-nexus-port.conf
-    nginx -t
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+    fi
 }
 
 nexus_enable_public_https() {
