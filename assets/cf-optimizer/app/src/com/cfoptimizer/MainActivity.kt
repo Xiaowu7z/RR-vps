@@ -68,6 +68,7 @@ class MainActivity : Activity() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var job: Job? = null
+    private var currentPage = "home"  // 2.6.0：手势/返回键定位当前页面
     private var unregisterNetWatch: (() -> Unit)? = null
 
     private var protocolMode = "Dual"      // IPv4 / IPv6 / Dual
@@ -90,7 +91,7 @@ class MainActivity : Activity() {
         buildHome()
         buildRun()
         buildResult()
-        setContentView(homeView)
+        switchTo(homeView, "home")
         refreshStatus()
     }
 
@@ -286,6 +287,27 @@ class MainActivity : Activity() {
             topMargin = dp(12)
         })
 
+        root.addView(Button(this).apply {
+            text = "返回主页"
+            textSize = 15f
+            setAllCaps(false)
+            setTextColor(C_MUTED)
+            background = rounded(C_CARD, 12, C_STROKE)
+            setOnClickListener {
+                job?.cancel()
+                stopDots()
+                stopSweep()
+                switchTo(homeView, "home")
+                refreshStatus()
+                android.widget.Toast.makeText(
+                    this@MainActivity, "已返回主页", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(8)
+        })
+
         root.addView(TextView(this).apply {
             text = "运行日志"
             textSize = 13f
@@ -362,7 +384,7 @@ class MainActivity : Activity() {
             setAllCaps(false)
             setTextColor(C_ACCENT)
             background = rounded(C_CARD, 10, C_ACCENT)
-            setOnClickListener { setContentView(homeView); refreshStatus() }
+            setOnClickListener { switchTo(homeView, "home"); refreshStatus() }
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(12)
@@ -622,7 +644,7 @@ class MainActivity : Activity() {
         job?.cancel()
         logQueue.clear()
         logLines.clear()
-        setContentView(runView)
+        switchTo(runView, "run")
         logView.text = ""
         stageText.text = "准备中…"
         startSweep()
@@ -696,6 +718,11 @@ class MainActivity : Activity() {
 
             stopDots()
             stopSweep()
+            // 2.6.1：取消兜底——runFamily 内部以 invalid 正常返回时，
+            // 这里强制抛 CancellationException 走停止收尾，不显示结果页
+            if (!kotlin.coroutines.coroutineContext.isActive) {
+                throw kotlinx.coroutines.CancellationException("已停止")
+            }
             setStageProgress(100)
             setStage("完成")
             appendLog("=== 完成 ===")
@@ -712,7 +739,7 @@ class MainActivity : Activity() {
                 unregisterNetWatch?.invoke()
                 unregisterNetWatch = null
                 runOnUiThread {
-                    setContentView(homeView)
+                    switchTo(homeView, "home")
                     refreshStatus()
                     android.widget.Toast.makeText(
                         this@MainActivity, "测速已停止", android.widget.Toast.LENGTH_SHORT
@@ -721,6 +748,43 @@ class MainActivity : Activity() {
                 throw e
             }
         }
+    }
+
+    // 2.6.0：视图切换包装 + 手势/系统返回统一处理
+    private fun switchTo(v: android.view.View, page: String) {
+        currentPage = page
+        setContentView(v)
+    }
+
+    private fun goBack(): Boolean {
+        return when (currentPage) {
+            "run" -> {
+                job?.cancel()
+                stopDots()
+                stopSweep()
+                switchTo(homeView, "home")
+                refreshStatus()
+                android.widget.Toast.makeText(
+                    this, "测速已停止", android.widget.Toast.LENGTH_SHORT
+                ).show()
+                true
+            }
+            "result", "history_list" -> {
+                switchTo(homeView, "home")
+                refreshStatus()
+                true
+            }
+            "history_detail" -> {
+                showHistoryList()
+                true
+            }
+            else -> false  // home：交系统（退出应用）
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onBackPressed() {
+        if (!goBack()) super.onBackPressed()
     }
 
     // ================= 结果渲染（一次性构建，不重绘） =================
@@ -775,7 +839,7 @@ class MainActivity : Activity() {
                 })
             }
         }
-        setContentView(resultView)
+        switchTo(resultView, "result")
     }
 
     // ================= 历史记录（Phase 2.4） =================
@@ -900,12 +964,12 @@ class MainActivity : Activity() {
             setAllCaps(false)
             setTextColor(Color.WHITE)
             background = rounded(C_ACCENT, 12)
-            setOnClickListener { setContentView(homeView); refreshStatus() }
+            setOnClickListener { switchTo(homeView, "home"); refreshStatus() }
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(12)
         })
-        setContentView(root)
+        switchTo(root, "history_list")
     }
 
     @SuppressLint("SetTextI18n", "SimpleDateFormat")
@@ -1035,7 +1099,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(12)
         })
-        setContentView(root)
+        switchTo(root, "history_detail")
     }
 
     private fun historyResultCard(r: HistoryStore.ResultLine): View {
