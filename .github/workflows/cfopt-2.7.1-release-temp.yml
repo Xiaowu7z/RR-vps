@@ -5,6 +5,11 @@ on:
     branches: [cfopt-2.7.1-release]
     paths:
       - '.github/workflows/cfopt-2.7.1-release-temp.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/cfopt-2.7.1-release-temp.yml'
+      - 'assets/cf-optimizer/**'
 
 permissions:
   contents: write
