@@ -4,8 +4,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlin.coroutines.coroutineContext
 import java.util.concurrent.atomic.AtomicInteger
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -162,12 +165,13 @@ object Pipeline {
     }
 
     /** 建立一次 DNS Snapshot；调用方负责 CfRanges.refresh() 在此之前完成。 */
-    fun buildSnapshot(domains: List<String>, family: String, log: (String) -> Unit): Snapshot {
+    suspend fun buildSnapshot(domains: List<String>, family: String, log: (String) -> Unit): Snapshot {
         val wantV6 = family == "IPv6"
         val domainToIps = LinkedHashMap<String, List<String>>()
         val ipToDomains = LinkedHashMap<String, MutableSet<String>>()
 
         for (d in domains) {
+            coroutineContext.ensureActive()  // 2.6.0：停止测速——域名间取消检查（DNS 本身阻塞不可中断）
             val name = d.trim().lowercase()
             if (name.isEmpty()) continue
             val addrs = try { InetAddress.getAllByName(name) } catch (_: Exception) { continue }
@@ -288,6 +292,7 @@ object Pipeline {
 
         var invalid = false
         fun checkNet(): Boolean {
+            if (!isActive) return true  // 2.6.0：停止测速——协程取消立即短路
             if (networkInvalid()) {
                 invalid = true
                 log("!! 网络已变化 → INVALID_NETWORK_CHANGED（本轮作废）")

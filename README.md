@@ -62,7 +62,7 @@ rr --version
 
 Cloudflare IP 优选 Android 工具，为节点订阅挑选速度最优的 Cloudflare IP + 域名组合。原生 Kotlin，权限最小化（仅联网），无广告。
 
-- 最新版 **2.5.0** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
+- 最新版 **2.6.0** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk)（2.5.0 存档：[assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)）
 - 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + `build.sh` 构建脚本 + 134 域名池）
 - 功能：优选 IP 探测、吞吐三口径测速、IPv4/IPv6 独立管线、基线守擂对比、50 条历史记录
 - 详情见 [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)

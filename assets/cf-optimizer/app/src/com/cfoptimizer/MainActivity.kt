@@ -277,6 +277,9 @@ class MainActivity : Activity() {
             setOnClickListener {
                 job?.cancel()
                 appendLog(">>> 停止请求已发出")
+                android.widget.Toast.makeText(
+                    this@MainActivity, "已发出停止请求", android.widget.Toast.LENGTH_SHORT
+                ).show()
             }
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -636,6 +639,7 @@ class MainActivity : Activity() {
         }
 
         job = scope.launch {
+            try {
             appendLog("=== 开始（均衡模式 / ${families.joinToString("+")} / VPN=${if (info.vpnActive) "是" else "否"}）===")
             setStage("准备中")
             CfRanges.refresh()
@@ -700,6 +704,22 @@ class MainActivity : Activity() {
             runOnUiThread { showResults(allResults, activeFamilies, anyInvalid) }
             unregisterNetWatch?.invoke()
             unregisterNetWatch = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 2.6.0：停止测速收尾——清理动画、回到首页、明确提示
+                stopDots()
+                stopSweep()
+                appendLog("=== 测速已停止 ===")
+                unregisterNetWatch?.invoke()
+                unregisterNetWatch = null
+                runOnUiThread {
+                    setContentView(homeView)
+                    refreshStatus()
+                    android.widget.Toast.makeText(
+                        this@MainActivity, "测速已停止", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+                throw e
+            }
         }
     }
 

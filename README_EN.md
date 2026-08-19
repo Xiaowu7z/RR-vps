@@ -62,7 +62,7 @@ Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to rem
 
 An Android tool that scans Cloudflare edge IPs and domains to find the fastest combination for your node subscriptions. Native Kotlin, minimal permissions (network only), no ads.
 
-- Latest **2.5.0** APK: [assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
+- Latest **2.6.0** APK: [assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk] (2.5.0 archive: [assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
 - Full source: [assets/cf-optimizer/](assets/cf-optimizer/) (`app/` project + `test/` suite + `build.sh` + 134-domain pool)
 - Features: preferred-IP probing, triple-metric throughput, IPv4/IPv6 pipelines, baseline champion comparison, 50-entry history
 - Details: [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
