@@ -6,9 +6,19 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **6.6.9** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **6.6.18** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
 ## One-command installation
+
+Supported systems (full test matrix passed, 2026-08):
+
+| System | Support | Notes |
+| --- | --- | --- |
+| **Debian 12 (bookworm)** | ⭐ Recommended | Most thoroughly verified; first choice |
+| Ubuntu 22.04 (jammy) | ✅ Supported | Fully tested |
+| Ubuntu 24.04 (noble) | ✅ Supported | Fully tested |
+
+Other Debian/Ubuntu derivatives are untested and not guaranteed.
 
 Become root first:
 
@@ -47,6 +57,15 @@ rr --version
 ```
 
 Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to remove RR-vps. The uninstall result prints the project URL and reinstall command for future use.
+
+## Companion tool: CF Domain Optimizer (Android)
+
+An Android tool that scans Cloudflare edge IPs and domains to find the fastest combination for your node subscriptions. Native Kotlin, minimal permissions (network only), no ads.
+
+- Latest **2.5.0** APK: [assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
+- Full source: [assets/cf-optimizer/](assets/cf-optimizer/) (`app/` project + `test/` suite + `build.sh` + 134-domain pool)
+- Features: preferred-IP probing, triple-metric throughput, IPv4/IPv6 pipelines, baseline champion comparison, 50-entry history
+- Details: [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
 
 ## Features
 

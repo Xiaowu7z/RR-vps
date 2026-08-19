@@ -6,9 +6,19 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**6.6.9** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**6.6.18** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
 ## 一键安装
+
+支持系统（2026-08 全量矩阵实测通过）：
+
+| 系统 | 支持度 | 说明 |
+| --- | --- | --- |
+| **Debian 12（bookworm）** | ⭐ 主推 | 验证最充分，三协议/四协议/面板全链路实测通过，推荐首选 |
+| Ubuntu 22.04（jammy） | ✅ 支持 | 完整实测通过 |
+| Ubuntu 24.04（noble） | ✅ 支持 | 完整实测通过 |
+
+其他 Debian/Ubuntu 衍生版本未测试，不保证兼容。
 
 先切换到 root：
 
@@ -47,6 +57,15 @@ rr --version
 ```
 
 更新请选择主菜单 `8`；卸载请选择主菜单 `6`，再输入 `UNINSTALL` 二次确认。卸载完成后终端会再次显示项目地址和重新安装命令。
+
+## 配套工具：CF 域名优选（Android）
+
+Cloudflare IP 优选 Android 工具，为节点订阅挑选速度最优的 Cloudflare IP + 域名组合。原生 Kotlin，权限最小化（仅联网），无广告。
+
+- 最新版 **2.5.0** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
+- 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + `build.sh` 构建脚本 + 134 域名池）
+- 功能：优选 IP 探测、吞吐三口径测速、IPv4/IPv6 独立管线、基线守擂对比、50 条历史记录
+- 详情见 [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
 
 ## 主要功能
 
