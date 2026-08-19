@@ -222,7 +222,9 @@ ensure_runtime_health() {
     if ! is_subscription_pid "$sub_pid" || \
        [ ! -s "${SUB_ROOT}/${UUID}/jhsub.txt" ] || \
        [ ! -s "${SUB_ROOT}/${UUID}/client.json" ]; then
-        generate_node_and_sub >/dev/null 2>&1 || true
+        # 订阅自愈加超时保护：重建含公网入口探测，网络异常时不能拖垮
+        # 整个健康检查链（此前实测一次网络抖动把链条卡住导致订阅迟迟未拉起）。
+        timeout 90 generate_node_and_sub >/dev/null 2>&1 || true
     fi
     return 0
 }
