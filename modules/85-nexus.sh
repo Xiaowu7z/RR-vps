@@ -539,22 +539,39 @@ nexus_install_dependencies() {
     apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     apt-get -o DPkg::Lock::Timeout=120 install -y \
         python3 python3-pip python3-argon2 qrencode sqlite3 jq || return 1
-    # P1 修复：grpcio < 1.43 在 Ubuntu 22.04 上会导致面板 CPU 死循环
-    # （apt 源的 python3-grpcio 在 Ubuntu 22.04 为 1.41，过旧）。
-    # 统一改用 pip 安装 >= 1.43（pip 自带版本比较，幂等：已装新版则跳过）。
-    if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
-        # Debian 12 / Ubuntu 24.04 存在 PEP 668 限制
-        python3 -m pip install --break-system-packages -q "grpcio>=1.43" || return 1
-    else
-        # Ubuntu 22.04 及更早无 PEP 668
-        python3 -m pip install -q "grpcio>=1.43" || return 1
+
+    # P1 修复：grpcio < 1.43 在 Ubuntu 22.04 上会导致面板 CPU 死循环。
+    # 优先级：已装新版跳过 → apt 源版（Debian12=1.51 / Ubuntu24=1.60 直接满足，
+    # 且不引入 pip 依赖冲突）→ 最后才 pip 兜底（仅 Ubuntu22 需要，源版 1.41）。
+    grpcio_version_ok() {
+        python3 -c 'import grpc; v = grpc.__version__.split("."); raise SystemExit(0 if int(v[0]) > 1 or (int(v[0]) == 1 and int(v[1]) >= 43) else 1)' 2>/dev/null
+    }
+    if grpcio_version_ok; then
+        return 0
     fi
-    # 卸载 apt 版 python3-grpcio（若有），避免与 pip 版并存导致导入冲突
+    if apt-get -o DPkg::Lock::Timeout=120 install -y python3-grpcio >/dev/null 2>&1 && grpcio_version_ok; then
+        return 0
+    fi
+
+    # pip 兜底：卸载 apt 旧版（Ubuntu22 的 1.41），改从 PyPI 装 >=1.43。
+    # 坑：apt 装的 typing_extensions 无 pip RECORD 文件，pip 升级它时报
+    # "Cannot uninstall typing_extensions" 导致整个安装失败——
+    # 先 --ignore-installed 装 pip 版 shadow 掉 debian 版（/usr/local/lib 优先）。
     if dpkg -l python3-grpcio >/dev/null 2>&1; then
         apt-get -o DPkg::Lock::Timeout=120 remove -y python3-grpcio >/dev/null 2>&1 || true
     fi
+    local pip_extra=""
+    if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
+        pip_extra="--break-system-packages"
+    fi
+    python3 -m pip install $pip_extra -q --ignore-installed typing_extensions 2>/dev/null || true
+    python3 -m pip install $pip_extra -q "grpcio>=1.43" || {
+        echo -e "${RED}错误：pip 安装 grpcio 失败（网络或依赖冲突），面板安装中止。${RESET}" >&2
+        return 1
+    }
+
     # 验证安装结果：版本必须 >= 1.43
-    if ! python3 -c 'import grpc; v = grpc.__version__.split("."); raise SystemExit(0 if int(v[0]) > 1 or (int(v[0]) == 1 and int(v[1]) >= 43) else 1)'; then
+    if ! grpcio_version_ok; then
         echo -e "${RED}错误：grpcio 版本低于 1.43（存在 CPU 死循环缺陷），安装失败${RESET}" >&2
         return 1
     fi

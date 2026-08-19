@@ -2,6 +2,17 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 6.6.13 - 修复面板安装 typing_extensions 冲突（6.6.10 回归）
+
+### 修复
+- 6.6.10 起 grpcio 统一 pip 安装，在 Ubuntu 24.04 上 pip 升级 apt 版 typing_extensions
+  时报 "Cannot uninstall typing_extensions 4.10.0, RECORD file not found" 导致面板装不上
+- 新策略：已装新版跳过 → apt 源版优先（Debian12=1.51/Ubuntu24=1.60，无 pip 冲突）
+  → 仅 Ubuntu22（源版 1.41）走 pip 兜底，兜底前先 --ignore-installed 装 pip 版
+  typing_extensions shadow 掉 debian 版（/usr/local/lib 优先）
+- 实机验证：CS2 Ubuntu22 卸净重装走 pip 兜底 1.83 面板 active；CS3 半删残留异常态
+  亦兜底成功；面板服务不受影响
+
 ## 6.6.12 - 订阅服务自愈链加固
 
 ### 修复
