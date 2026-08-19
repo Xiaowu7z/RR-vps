@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RR优选 Phase 2.3 — CLI 构建（无 Android Studio）
+# RR优选 Phase 2.7 — CLI 构建（无 Android Studio）
 # 工具链：RRAV JDK17 + build-tools r34 + kotlinc 1.9.25 + OkHttp jars
 set -euo pipefail
 
@@ -65,8 +65,8 @@ fi
 "$BT/apksigner" sign --ks "$PROJ/cfopt-debug.keystore" --ks-key-alias cfopt \
   --ks-pass pass:cfoptdebug --key-pass pass:cfoptdebug \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
-  --out "$PROJ/CF-Optimizer-2.6.0-debug.apk" "$BUILD/apk/app.aligned.apk"
+  --out "$PROJ/CF-Optimizer-2.7.0-debug.apk" "$BUILD/apk/app.aligned.apk"
 
 echo "=== 构建完成 ==="
-"$BT/apksigner" verify -v "$PROJ/CF-Optimizer-2.6.0-debug.apk" | head -5
-ls -la "$PROJ/CF-Optimizer-2.6.0-debug.apk"
+"$BT/apksigner" verify -v "$PROJ/CF-Optimizer-2.7.0-debug.apk" | head -5
+ls -la "$PROJ/CF-Optimizer-2.7.0-debug.apk"

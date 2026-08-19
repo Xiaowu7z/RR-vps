@@ -60,11 +60,13 @@ rr --version
 
 ## 配套工具：CF 域名优选（Android）
 
-Cloudflare IP 优选 Android 工具，为节点订阅挑选速度最优的 Cloudflare IP + 域名组合。原生 Kotlin，权限最小化（仅联网），无广告。
+Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudflare IP + 域名入口组合。原生 Kotlin，权限最小化（仅联网与网络状态），无广告。
 
-- 最新版 **2.6.0** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk)（2.5.0 存档：[assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)）
-- 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + `build.sh` 构建脚本 + 134 域名池）
-- 功能：优选 IP 探测、吞吐三口径测速、IPv4/IPv6 独立管线、基线守擂对比、50 条历史记录
+- 最新版 **2.7.1** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.7.1.apk](assets/cf-optimizer/CF-Optimizer-2.7.1.apk)（2.6.0 / 2.5.0 继续保留存档）
+- 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + Gradle/CLI 构建文件 + **1000 域名候选池**）
+- 模式：均衡测速 + **亚洲入口狩猎**；亚洲入口优先 HKG > NRT > SIN > ICN > TPE，并在 Full 阶段复验 POP 漂移
+- 功能：IPv4/IPv6/双栈独立管线、Cloudflare IP/POP/Prefix 发现、Nexus 基准守擂、Final Address Floor、TTFB/成功率/波动、50 条历史记录
+- 2.7.1：修复主页无法向下滚动导致“历史测试”入口不可达
 - 详情见 [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
 
 ## 主要功能

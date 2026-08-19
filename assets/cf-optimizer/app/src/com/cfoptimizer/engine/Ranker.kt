@@ -44,7 +44,11 @@ object Ranker {
         val ipPops: List<String> = emptyList(),
         val ipLoc: List<String> = emptyList(),
         val baselineMbps: Double = 0.0,
-        val baselineRatioPct: Double = 0.0
+        val baselineRatioPct: Double = 0.0,
+        // Phase 2.7: 亚洲入口狩猎元数据
+        val primaryPop: String = "",
+        val edgeScore: Int = 0,
+        val popDrift: Boolean = false
     ) {
         val mbPerSec: Double get() = avgCompleteMbps / 8.0
 
@@ -107,6 +111,21 @@ object Ranker {
                 .thenByDescending { it.minCompleteMbps }
                 .thenByDescending { it.avgCompleteMbps }
                 .thenByDescending { it.addressSuccessRatePct }
+                .thenBy { it.variationPct }
+                .thenBy { if (it.medianTtfbMs < 0) Double.MAX_VALUE else it.medianTtfbMs }
+        )
+    }
+
+
+    /** 亚洲入口榜：先看入口价值，再看 Final Floor / 可靠性 / 吞吐。 */
+    fun rankAsia(metrics: List<DomainMetric>): List<DomainMetric> {
+        return metrics.sortedWith(
+            compareByDescending<DomainMetric> { it.edgeScore }
+                .thenBy { it.popDrift }
+                .thenByDescending { it.addressFloorMbps }
+                .thenByDescending { it.successRatePct }
+                .thenByDescending { it.minCompleteMbps }
+                .thenByDescending { it.avgCompleteMbps }
                 .thenBy { it.variationPct }
                 .thenBy { if (it.medianTtfbMs < 0) Double.MAX_VALUE else it.medianTtfbMs }
         )

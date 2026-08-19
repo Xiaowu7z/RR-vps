@@ -64,8 +64,8 @@ fun main() {
     // ===== 6. DNS Snapshot 固定：同输入同结果；domain→IP 与 IP→domain 互逆一致 =====
     run {
         val domains = listOf("www.cloudflare.com", "cloudflare.com")
-        val s1 = Pipeline.buildSnapshot(domains, "IPv4") {}
-        val s2 = Pipeline.buildSnapshot(domains, "IPv4") {}
+        val s1 = kotlinx.coroutines.runBlocking { Pipeline.buildSnapshot(domains, "IPv4") {} }
+        val s2 = kotlinx.coroutines.runBlocking { Pipeline.buildSnapshot(domains, "IPv4") {} }
         val domainIpsSame = s1.domainToIps == s2.domainToIps
         // 互逆：domainToIps 中每个 (d, ips) 在 ipToDomains 中都有 d
         var inverseOk = true

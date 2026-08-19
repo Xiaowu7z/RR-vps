@@ -187,7 +187,7 @@ fun main() {
         "one.one.one.one", "www.nexusmods.com"
     )
     val snap = try {
-        Pipeline.buildSnapshot(domains, "IPv6") {}
+        kotlinx.coroutines.runBlocking { Pipeline.buildSnapshot(domains, "IPv6") {} }
     } catch (e: Exception) {
         Pipeline.Snapshot("IPv6", emptyMap(), emptyMap(), emptyList())
     }
