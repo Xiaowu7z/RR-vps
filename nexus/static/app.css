@@ -369,3 +369,5 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 @media (max-width: 640px) { .rs-grid { grid-template-columns: 1fr; } .rs-addr { display: none; } }
 
 
+
+.preline { white-space: pre-line; }

@@ -252,7 +252,7 @@ function renderDevices() {
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(up_rate)}</span><span class="r-down">↓ ${formatRate(down_rate)}</span></div>
-      <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i style="width:${percent.toFixed(1)}%"></i></div>` : ""}</div>
+      <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
       <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span><span><small>最近统计</small><b>${escapeHtml(updated)}</b></span></div>
       <div class="device-actions"><button data-action="links">链接与二维码</button><button data-action="reset">重置流量</button><button data-action="toggle">${device.enabled ? "暂停" : "启用"}</button><button class="danger" data-action="delete" title="删除">×</button></div>
     </article>`;
@@ -281,7 +281,7 @@ function renderRanking(devices) {
     const quota = Number(device.quota_bytes || 0);
     const used = Number(device.used_bytes || 0);
     const ratio = quota ? Math.min(100, used / quota * 100) : 0;
-    return `<tr><td><span class="rank">${index + 1}</span><span class="table-device"><b>${escapeHtml(device.name)}</b><small>${escapeHtml(device.id)}</small></span></td><td><span class="table-status ${device.active ? "" : "off"}">${statusLabel(device)}</span></td><td class="upload-text">↑ ${formatBytes(device.uploaded_bytes)}</td><td class="download-text">↓ ${formatBytes(device.downloaded_bytes)}</td><td><b>${formatBytes(used)}</b></td><td>${quota ? `<span>${ratio.toFixed(0)}%</span><div class="mini-progress"><i style="width:${ratio}%"></i></div>` : "不限"}</td><td>${escapeHtml(relativeTime(device.traffic_updated_at))}</td></tr>`;
+    return `<tr><td><span class="rank">${index + 1}</span><span class="table-device"><b>${escapeHtml(device.name)}</b><small>${escapeHtml(device.id)}</small></span></td><td><span class="table-status ${device.active ? "" : "off"}">${statusLabel(device)}</span></td><td class="upload-text">↑ ${formatBytes(device.uploaded_bytes)}</td><td class="download-text">↓ ${formatBytes(device.downloaded_bytes)}</td><td><b>${formatBytes(used)}</b></td><td>${quota ? `<span>${ratio.toFixed(0)}%</span><div class="mini-progress"><i data-w="${ratio}"></i></div>` : "不限"}</td><td>${escapeHtml(relativeTime(device.traffic_updated_at))}</td></tr>`;
   }).join("");
 }
 
@@ -680,7 +680,7 @@ function renderServerStats(data) {
 
   el("srv-disk-list").innerHTML = (data.disks || []).map(dk => `
     <div class="srv-device-row">
-      <svg viewBox="0 0 40 40" class="srv-ring"><circle cx="20" cy="20" r="16" class="ring-bg"/><circle cx="20" cy="20" r="16" class="ring-fg" style="stroke-dasharray:${(dk.percent||0).toFixed(1)} 100" transform="rotate(-90 20 20)"/><text x="20" y="25" class="ring-text">${dk.percent}%</text></svg>
+      <svg viewBox="0 0 40 40" class="srv-ring"><circle cx="20" cy="20" r="16" class="ring-bg"/><circle cx="20" cy="20" r="16" class="ring-fg" data-dash="${(dk.percent||0).toFixed(1)}" transform="rotate(-90 20 20)"/><text x="20" y="25" class="ring-text">${dk.percent}%</text></svg>
       <div class="srv-device-info"><b>${escapeHtml(dk.device)} (${escapeHtml(dk.mount)})</b><small>已用 ${formatBytes(dk.used)} / ${formatBytes(dk.total)}</small><small>读 ${formatRateHuman(dk.read_bps)} | 写 ${formatRateHuman(dk.write_bps)}</small></div>
     </div>`).join("") || '<p class="form-hint">无磁盘信息</p>';
 
@@ -838,6 +838,22 @@ state.remoteServers = [];
 state.remoteActive = null;
 state.remoteCred = "";
 state.remoteDevices = [];
+
+// CSP style-src 'self' 拦截内联 style 属性（HTML 属性保留但 CSSOM 拒绝），
+// 所有进度条宽度改经 CSSOM 赋值；MutationObserver 覆盖全部渲染路径。
+function applyBarWidths(root) {
+  const scope = root || document;
+  scope.querySelectorAll(".quota-track i[data-w], .mini-progress i[data-w], .rs-bar i[data-w]").forEach(el => {
+    el.style.width = Math.min(100, Math.max(0, Number(el.dataset.w) || 0)) + "%";
+  });
+  scope.querySelectorAll(".ring-fg[data-dash]").forEach(el => {
+    el.style.strokeDasharray = el.dataset.dash + " 100";
+  });
+}
+applyBarWidths();
+new MutationObserver(mutations => {
+  for (const m of mutations) if (m.addedNodes.length) applyBarWidths(document);
+}).observe(document.body, { childList: true, subtree: true });
 state._rsPrevTraffic = {};
 state.remoteTimer = null;
 
@@ -887,8 +903,8 @@ function renderRemoteServers(servers) {
     <div class="rs-card ${online ? "" : "offline"}" data-rs-open="${s.id}">
       <div class="rs-card-head"><span class="rs-dot ${online ? "on" : "off"}"></span><span class="rs-name">${escapeHtml(s.name)}</span><span class="rs-addr">${escapeHtml(s.addr || "")}</span></div>
       <div class="rs-metrics">
-        <div class="rs-metric"><div class="k">CPU</div><div class="v">${online ? cpu + "%" : "—"}</div><div class="rs-bar"><i style="width:${Math.min(100, cpu)}%"></i></div></div>
-        <div class="rs-metric"><div class="k">内存</div><div class="v">${online ? mem + "%" : "—"}</div><div class="rs-bar"><i style="width:${Math.min(100, mem)}%"></i></div></div>
+        <div class="rs-metric"><div class="k">CPU</div><div class="v">${online ? cpu + "%" : "—"}</div><div class="rs-bar"><i data-w="${Math.min(100, cpu)}"></i></div></div>
+        <div class="rs-metric"><div class="k">内存</div><div class="v">${online ? mem + "%" : "—"}</div><div class="rs-bar"><i data-w="${Math.min(100, mem)}"></i></div></div>
         <div class="rs-metric"><div class="k">总用量</div><div class="v">${online ? used : "—"}</div></div>
       </div>
       <div class="rs-chips">${chips.join("")}</div>
@@ -975,7 +991,7 @@ async function rsRunUpdate() {
           let hint = `⏳ 升级进行中（${Math.round((i + 1) * 5 / 60)} 分钟）…副面板重启属正常现象`;
           if (st.stalled) hint = `⚠️ 疑似卡住：升级日志 ${st.heartbeat_seconds ?? "?"} 秒无更新，最多再等 8 分钟将自动中止`;
           if (tail) hint += `\n📄 ${escapeHtml(tail)}`;
-          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span style="white-space:pre-line">${hint}</span></div>`;
+          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${hint}</span></div>`;
         }
       } catch (e) { /* 副面板重启中，连接失败属预期 */ }
     }
@@ -1050,7 +1066,7 @@ async function localRunUpdate() {
           let hint = `⏳ 升级进行中（${Math.round((i + 1) * 5 / 60)} 分钟）…面板重启属正常现象`;
           if (st.stalled) hint = `⚠️ 疑似卡住：升级日志 ${st.heartbeat_seconds ?? "?"} 秒无更新，最多再等 8 分钟将自动中止`;
           if (tail) hint += `\n📄 ${escapeHtml(tail)}`;
-          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span style="white-space:pre-line">${hint}</span></div>`;
+          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${hint}</span></div>`;
         }
       } catch (e) { /* 面板重启中，连接失败属预期 */ }
     }
@@ -1099,6 +1115,7 @@ function rsBack() {
 async function rsLoadDevices() {
   try {
     const data = await rsRemoteApi("GET", "/api/devices");
+    state.remoteDevices = data.devices || [];
     renderRemoteDevices(data.devices || []);
   } catch (e) { toast(e.message, true); }
 }
@@ -1121,7 +1138,7 @@ function renderRemoteDevices(devices) {
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rsRateOf(device.id, device.uploaded_bytes))}</span><span class="r-down">↓ ${formatRate(rsRateOf(device.id, device.downloaded_bytes, true))}</span></div>
-      <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i style="width:${percent.toFixed(1)}%"></i></div>` : ""}</div>
+      <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
       <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span></div>
       <div class="device-actions">
         <button data-rs-links="${escapeHtml(device.id)}">链接与二维码</button>
