@@ -244,7 +244,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .r-down { color: #ff7490; font-weight: 700; }
 
 .links-status { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
-.status-pill { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.05); color: rgba(225,232,240,.9); }
+.links-status .status-pill { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.05); color: rgba(225,232,240,.9); }
 .status-on { border-color: rgba(52,211,153,.45); color: #34d399; background: rgba(52,211,153,.08); }
 .status-off { border-color: rgba(248,113,113,.4); color: #f87171; background: rgba(248,113,113,.08); }
 .status-argo { border-color: rgba(96,165,250,.4); color: #60a5fa; background: rgba(96,165,250,.08); }

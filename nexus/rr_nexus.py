@@ -1487,6 +1487,11 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 self.handle_remote_servers_list(session)
             return
+        if path == "/api/remote/qr":
+            session = self.require_session()
+            if session:
+                self.handle_remote_qr(query)
+            return
         if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "links" and DEVICE_ID_RE.fullmatch(segments[2]):
             session = self.require_session()
             if session:
@@ -2005,6 +2010,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.OK, SERVER_STATS.refresh()); return
             if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "links" and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_device_links(segments[2]); return
+            if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "qr" and DEVICE_ID_RE.fullmatch(segments[2]):
+                # 远程二维码：图片无法走 JSON 代理，转 base64 返回给主面板透传
+                qquery = {k: [str(v)] for k, v in (inner or {}).items() if v not in (None, "")}
+                status, payload = self._qr_png_bytes(segments[2], qquery)
+                if status == HTTPStatus.OK and isinstance(payload, bytes):
+                    self.send_json(HTTPStatus.OK, {"png_b64": base64.b64encode(payload).decode("ascii")})
+                else:
+                    self.send_json(status, payload)
+                return
         elif method == "POST":
             if path == "/api/update/check":
                 self.handle_update_check(); return
@@ -2192,6 +2206,40 @@ class Handler(BaseHTTPRequestHandler):
         status, result = self.remote_http_call(row["addr"], row["port"], row["cred"], method, path, inner, timeout=call_timeout)
         STATE.store.audit(session["username"], "remote_proxy", "{} {}".format(method, path), self.remote_ip, "-> {}".format(row["name"]))
         self.send_json(status if status in range(200, 600) else HTTPStatus.BAD_GATEWAY, result)
+
+    def handle_remote_qr(self, query: dict[str, list[str]]) -> None:
+        """主面板图片透传：拉取副面板设备的二维码 PNG（副面板经 remote/call 返回 base64）。"""
+        server_id = query.get("server_id", [""])[0]
+        device_id = query.get("device_id", [""])[0]
+        if not str(server_id).isdigit() or not DEVICE_ID_RE.fullmatch(device_id):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "bad_request"})
+            return
+        with STATE.store.connect() as db:
+            row = db.execute("SELECT cred,addr,port FROM remote_servers WHERE id=?", (int(server_id),)).fetchone()
+        if not row:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+            return
+        qr_query = {}
+        if query.get("sub", [""])[0]:
+            qr_query["sub"] = query["sub"][0]
+        if query.get("raw", [""])[0]:
+            qr_query["raw"] = query["raw"][0]
+        if query.get("index", [""])[0]:
+            qr_query["index"] = query["index"][0]
+        status, result = self.remote_http_call(
+            row["addr"], row["port"], row["cred"], "GET",
+            "/api/devices/{}/qr".format(device_id), qr_query,
+        )
+        png_b64 = (result or {}).get("png_b64", "") if isinstance(result, dict) else ""
+        if status != 200 or not png_b64:
+            self.send_json(HTTPStatus.BAD_GATEWAY, {"error": "remote_qr_failed", "message": "副面板二维码生成失败（HTTP {}）".format(status)})
+            return
+        try:
+            png = base64.b64decode(png_b64)
+        except Exception:
+            self.send_json(HTTPStatus.BAD_GATEWAY, {"error": "remote_qr_failed", "message": "副面板二维码数据无效"})
+            return
+        self.send_bytes(HTTPStatus.OK, png, "image/png")
 
     def handle_login(self) -> None:
         locked, retry_after = STATE.client_is_locked(self.remote_ip)
@@ -2666,17 +2714,17 @@ class Handler(BaseHTTPRequestHandler):
                 return f"http://{host}:{sub_port}/nexus/{token}.txt"
         return ""
 
-    def handle_device_qr(self, device_id: str, query: dict[str, list[str]]) -> None:
+    def _qr_png_bytes(self, device_id: str, query: dict[str, list[str]]):
+        """生成设备链接二维码 PNG。返回 (status, payload)：成功 payload 为 bytes，
+        失败为错误 dict。handle_device_qr（本地）与远程 qr 透传共用。"""
         device = self.device_record(device_id)
         path = self.subscription_file(device_id)
         if not device or not path.is_file():
-            self.send_json(HTTPStatus.NOT_FOUND, {"error": "links_not_found"})
-            return
+            return HTTPStatus.NOT_FOUND, {"error": "links_not_found"}
         if query.get("sub", ["0"])[0] == "1":
             link = self._subscription_txt_url(device)
             if not link:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "no_subscription_url"})
-                return
+                return HTTPStatus.BAD_REQUEST, {"error": "no_subscription_url"}
         elif query.get("raw", [""])[0].startswith(("http://", "https://")):
             # 6.6.16：订阅地址列表每项二维码——前端直接传 URL 生成
             link = query["raw"][0]
@@ -2686,13 +2734,18 @@ class Handler(BaseHTTPRequestHandler):
                 index = int(query.get("index", ["0"])[0])
                 link = links[index]
             except (ValueError, IndexError):
-                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_link_index"})
-                return
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid_link_index"}
         result = subprocess.run(["qrencode", "-t", "PNG", "-s", "6", "-m", "2", "-o", "-", link], capture_output=True, timeout=5, check=False)
         if result.returncode != 0:
-            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "qr_generation_failed"})
-            return
-        self.send_bytes(HTTPStatus.OK, result.stdout, "image/png")
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "qr_generation_failed"}
+        return HTTPStatus.OK, result.stdout
+
+    def handle_device_qr(self, device_id: str, query: dict[str, list[str]]) -> None:
+        status, payload = self._qr_png_bytes(device_id, query)
+        if status == HTTPStatus.OK and isinstance(payload, bytes):
+            self.send_bytes(HTTPStatus.OK, payload, "image/png")
+        else:
+            self.send_json(status, payload)
 
     def handle_public_subscription(self, device_id: str, token: str, fmt: str = "txt") -> None:
         if STATE.config.mode != "public":

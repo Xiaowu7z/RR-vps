@@ -589,11 +589,15 @@ $("#device-grid").addEventListener("click", event => {
 $("#links-dialog").addEventListener("click", event => {
   const copy = event.target.closest("[data-copy-link]");
   const open = event.target.closest("[data-open-qr]");
+  const rOpen = event.target.closest("[data-remote-open-qr]");
   const copySub = event.target.closest("[data-copy-sub-url]");
+  const rOpenSub = event.target.closest("[data-remote-open-sub-qr]");
   const links = JSON.parse($("#links-list").dataset.links || "[]");
   if (copy) copyText(links[Number(copy.dataset.copyLink)] || "");
   if (open) window.open(`/api/devices/${encodeURIComponent($("#links-list").dataset.device)}/qr?index=${Number(open.dataset.openQr)}`, "_blank", "noopener");
+  if (rOpen) window.open(decodeURIComponent(rOpen.dataset.remoteOpenQr), "_blank", "noopener");
   if (copySub) copyText(copySub.dataset.copySubUrl || "");
+  if (rOpenSub) window.open(decodeURIComponent(rOpenSub.dataset.remoteOpenSubQr), "_blank", "noopener");
 });
 window.addEventListener("resize", () => requestAnimationFrame(renderCharts));
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.csrf) refreshLive(false); });
@@ -1119,15 +1123,44 @@ function renderRemoteDevices(devices) {
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i style="width:${percent.toFixed(1)}%"></i></div>` : ""}</div>
       <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span></div>
       <div class="device-actions">
-        <button class="button tiny" data-rs-toggle="${escapeHtml(device.id)}">${enabled ? "停用" : "启用"}</button>
-        <button class="button tiny ghost" data-rs-reset="${escapeHtml(device.id)}">重置流量</button>
-        <button class="button tiny danger" data-rs-del="${escapeHtml(device.id)}">删除</button>
+        <button data-rs-links="${escapeHtml(device.id)}">链接与二维码</button>
+        <button data-rs-reset="${escapeHtml(device.id)}">重置流量</button>
+        <button data-rs-toggle="${escapeHtml(device.id)}">${enabled ? "暂停" : "启用"}</button>
+        <button class="danger" data-rs-del="${escapeHtml(device.id)}" title="删除">×</button>
       </div>
     </article>`;
   }).join("");
+  $$("#rs-device-grid [data-rs-links]").forEach(btn => btn.addEventListener("click", () => rsOpenLinks(btn.dataset.rsLinks)));
   $$("#rs-device-grid [data-rs-toggle]").forEach(btn => btn.addEventListener("click", () => rsToggleDevice(btn.dataset.rsToggle)));
   $$("#rs-device-grid [data-rs-reset]").forEach(btn => btn.addEventListener("click", () => rsResetDevice(btn.dataset.rsReset)));
   $$("#rs-device-grid [data-rs-del]").forEach(btn => btn.addEventListener("click", () => rsDeleteDevice(btn.dataset.rsDel)));
+}
+
+async function rsOpenLinks(id) {
+  const device = (state.remoteDevices || []).find(d => String(d.id) === String(id));
+  if (!device) { toast("未找到该设备，请刷新重试", true); return; }
+  const list = $("#links-list");
+  $("#links-title").textContent = `${device.name} · 连接信息（远程服务器）`;
+  list.innerHTML = '<p class="form-hint">正在生成…</p>';
+  $("#links-dialog").showModal();
+  try {
+    const data = await rsRemoteApi("GET", `/api/devices/${id}/links`);
+    const box = $("#subscription-box");
+    const urls = data.subscription_urls || [];
+    box.classList.toggle("hidden", urls.length === 0);
+    const qrUrlOf = (params) => `/api/remote/qr?server_id=${state.remoteActive}&device_id=${encodeURIComponent(id)}&${params}`;
+    $("#subscription-urls").innerHTML = urls.map((item) => {
+      const qrUrl = qrUrlOf(`raw=${encodeURIComponent(item.url)}`);
+      return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" src="${qrUrl}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-remote-open-sub-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div>`;
+    }).join("");
+    list.innerHTML = data.links.length ? data.links.map((link, index) => {
+      const qrUrl = qrUrlOf(`index=${index}`);
+      return `<div class="link-row"><img src="${qrUrl}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-remote-open-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div></div>`;
+    }).join("") : '<p class="form-hint">当前没有启用的节点协议。</p>';
+    list.dataset.links = JSON.stringify(data.links);
+    list.dataset.device = id;
+    list.dataset.remote = "1";
+  } catch (error) { list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`; }
 }
 
 function rsRateOf(id, bytes, isDown) {
