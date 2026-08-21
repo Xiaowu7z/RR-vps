@@ -1111,12 +1111,13 @@ function renderRemoteDevices(devices) {
     const quota = Number(device.quota_bytes || 0);
     const used = Number(device.used_bytes || 0);
     const percent = quota ? Math.min(100, used / quota * 100) : 0;
-    const enabled = device.enabled === 1;
+    const enabled = device.enabled === 1 || device.enabled === true;
+    const active = device.active === true || device.active === 1 || enabled;
     const quotaLabel = quota ? `${formatBytes(used)} / ${formatBytes(quota)}` : `${formatBytes(used)} · 不限`;
     const expiry = device.expires_at || "长期有效";
     return `
     <article class="device-card glass ${enabled ? "" : "disabled"}" data-rs-dev="${escapeHtml(device.id)}">
-      <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${enabled ? "" : "off"}"><i></i>${enabled ? "在线" : "已停用"}</span></div>
+      <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${active ? "" : "off"}"><i></i>${statusLabel(device)}</span></div>
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rsRateOf(device.id, device.uploaded_bytes))}</span><span class="r-down">↓ ${formatRate(rsRateOf(device.id, device.downloaded_bytes, true))}</span></div>
