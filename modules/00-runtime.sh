@@ -13,7 +13,7 @@ RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_BRANCH="main"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
-SCRIPT_VERSION="6.6.18"
+SCRIPT_VERSION="7.0.1"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"  # 干净URL+?t=防CDN旧缓存(2026-08)
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LOCAL_MANIFEST="${RR_LIB_DIR}/manifest.sha256"

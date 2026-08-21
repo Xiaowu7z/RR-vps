@@ -6,7 +6,7 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**6.6.18** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.0.1** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
 ## 一键安装
 
