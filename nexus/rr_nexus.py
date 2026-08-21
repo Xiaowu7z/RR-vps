@@ -2447,7 +2447,15 @@ class Handler(BaseHTTPRequestHandler):
         now = utc_now()
         with STATE.store.connect() as db:
             if db.execute("SELECT COUNT(*) FROM devices").fetchone()[0] >= MAX_DEVICES:
-                self.send_json(HTTPStatus.CONFLICT, {"error": "device_limit_reached"})
+                self.send_json(HTTPStatus.CONFLICT, {"error": "device_limit_reached", "message": "设备数量已达到 500 台安全上限"})
+                return
+            # 设备备注名唯一：避免用户误以为失败而重复提交产生同名设备
+            dup = db.execute("SELECT id FROM devices WHERE name=?", (values["name"],)).fetchone()
+            if dup:
+                self.send_json(
+                    HTTPStatus.CONFLICT,
+                    {"error": "duplicate_name", "message": "设备备注「{}」已存在（{}），请勿重复添加；若刚才已提交，请直接刷新列表查看".format(values["name"], dup["id"])},
+                )
                 return
             db.execute(
                 "INSERT INTO devices(id,name,credential,subscription_token,enabled,"
@@ -2460,7 +2468,11 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.store.connect() as db:
                 db.execute("DELETE FROM devices WHERE id=?", (device_id,))
             STATE.sync_devices()
-            self.send_json(HTTPStatus.CONFLICT, {"error": "node_sync_failed", "detail": detail})
+            self.send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "node_sync_failed", "detail": detail,
+                 "message": "节点配置同步失败，本次添加已回滚：{}".format(detail[:120])},
+            )
             return
         STATE.store.audit(session["username"], "device_create", device_id, self.remote_ip, values["name"])
         self.send_json(HTTPStatus.CREATED, {"ok": True, "id": device_id})

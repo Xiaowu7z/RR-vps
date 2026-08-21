@@ -19,9 +19,26 @@ function errorText(code) {
     invalid_name: "设备备注需为 1–64 个可见字符。",
     invalid_quota: "额度范围应为 0–10240 GB。",
     invalid_expiry: "到期日期格式不正确。",
-    node_sync_failed: "节点同步失败，变更已回滚。",
+    invalid_request: "请求数据无效，请刷新页面后重试。",
+    invalid_enabled: "启停参数无效，请刷新页面后重试。",
+    node_sync_failed: "节点配置同步失败，变更已回滚。",
     device_limit_reached: "设备数量已达到 500 台安全上限。",
+    duplicate_name: "设备备注已存在，请勿重复添加。若刚才已提交过，请刷新列表查看结果。",
+    device_not_found: "未找到该设备（可能已被删除），请刷新列表。",
+    empty_update: "没有需要修改的内容。",
     authentication_required: "会话已过期，请重新登录。",
+    bad_request: "请求无效，请刷新页面后重试。",
+    not_found: "请求的资源不存在。",
+    unreachable: "副面板连接失败：目标服务器无法访问（离线、防火墙拦截或证书异常）。",
+    remote_unsupported: "副面板版本过旧，不支持此操作，请先远程升级副面板。",
+    remote_error: "副面板执行出错，请查看副面板日志。",
+    invalid_remote_cred: "接入钥匙无效（伪造、篡改或已被吊销）。",
+    invalid_cred_format: "钥匙格式无效（应为 rrmgr1. 开头的一行密文）。",
+    already_exists: "该服务器已添加，请勿重复添加。",
+    limit_reached: "已达到可管理的服务器数量上限。",
+    cred_rejected: "副面板拒绝了这把钥匙，请重新生成接入钥匙。",
+    network_error: "网络连接中断：服务器未响应（可能正在同步节点配置）。若刚提交过操作，请刷新页面查看结果，勿重复提交。",
+    remote_call_failed: "远程操作失败，请检查副面板状态后重试。",
   };
   return messages[code] || "操作未完成，请稍后重试。";
 }
@@ -31,14 +48,22 @@ async function api(path, options = {}) {
   if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   if (headers["Content-Type"] === "application/json" && typeof options.body === "object") options.body = JSON.stringify(options.body);
   if (state.csrf && !["GET", "HEAD"].includes(options.method || "GET")) headers["X-CSRF-Token"] = state.csrf;
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  let response;
+  try {
+    response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  } catch (networkError) {
+    const error = new Error(errorText("network_error"));
+    error.code = "network_error";
+    throw error;
+  }
   const contentType = response.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await response.json() : null;
   if (!response.ok) {
     if (response.status === 401 && path !== "/api/login") showLogin();
-    const error = new Error(errorText(data?.error));
+    const error = new Error(data?.message || errorText(data?.error));
     error.code = data?.error;
     error.detail = data?.detail;
+    error.serverMessage = data?.message || "";
     throw error;
   }
   return data;
@@ -808,6 +833,9 @@ loadVersionBadge();
 state.remoteServers = [];
 state.remoteActive = null;
 state.remoteCred = "";
+state.remoteDevices = [];
+state._rsPrevTraffic = {};
+state.remoteTimer = null;
 
 function rsRemoteApi(method, path, body) {
   return api("/api/remote/proxy", { method: "POST", body: { server_id: state.remoteActive, method, path, body } });
@@ -1051,9 +1079,13 @@ async function rsOpenDetail(id) {
   $("#rs-detail-sub").textContent = `${server.addr} · 远程管理（副面板全权限）`;
   $("#rs-update-box").classList.add("hidden");
   await rsLoadDevices();
+  if (state.remoteTimer) clearInterval(state.remoteTimer);
+  state.remoteTimer = setInterval(rsLoadDevices, 3000);
 }
 
 function rsBack() {
+  if (state.remoteTimer) { clearInterval(state.remoteTimer); state.remoteTimer = null; }
+  state._rsPrevTraffic = {};
   state.remoteActive = null;
   $("#rs-detail").classList.add("hidden");
   $("#view-remote .section-toolbar").classList.remove("hidden");
@@ -1083,6 +1115,7 @@ function renderRemoteDevices(devices) {
       <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${enabled ? "" : "off"}"><i></i>${enabled ? "在线" : "已停用"}</span></div>
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
+      <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rsRateOf(device.id, device.uploaded_bytes))}</span><span class="r-down">↓ ${formatRate(rsRateOf(device.id, device.downloaded_bytes, true))}</span></div>
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i style="width:${percent.toFixed(1)}%"></i></div>` : ""}</div>
       <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span></div>
       <div class="device-actions">
@@ -1097,12 +1130,25 @@ function renderRemoteDevices(devices) {
   $$("#rs-device-grid [data-rs-del]").forEach(btn => btn.addEventListener("click", () => rsDeleteDevice(btn.dataset.rsDel)));
 }
 
+function rsRateOf(id, bytes, isDown) {
+  // 远程设备实时速率：与 local 面板同款差分算法，独立命名空间
+  const nowTs = Date.now();
+  const prev = (state._rsPrevTraffic[id] || { up: 0, down: 0, ts: nowTs - 3000 });
+  const elapsed = Math.max(1, (nowTs - prev.ts) / 1000);
+  const rate = Math.max(0, ((bytes || 0) - (isDown ? prev.down : prev.up)) / elapsed);
+  if (isDown) state._rsPrevTraffic[id] = { up: prev.up, down: bytes || 0, ts: nowTs };
+  else state._rsPrevTraffic[id] = { up: bytes || 0, down: prev.down, ts: nowTs };
+  return rate;
+}
+
 async function rsToggleDevice(id) {
-  const card = $(`[data-rs-dev="${id}"]`);
-  const enabled = card && !card.classList.contains("disabled");
+  const device = (state.remoteDevices || []).find(d => String(d.id) === String(id));
+  if (!device) { toast("未找到该设备，请刷新重试", true); return; }
+  const enabled = device.enabled === 1 || device.enabled === true;
   try {
     await rsRemoteApi("PATCH", `/api/devices/${id}`, { enabled: !enabled });
     toast(enabled ? "设备已停用（断网）" : "设备已启用");
+    delete state._rsPrevTraffic[id];
     rsLoadDevices();
   } catch (e) { toast(e.message, true); }
 }
