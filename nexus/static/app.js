@@ -415,6 +415,9 @@ async function loadAudit() {
 async function refreshLive(notify = false) {
   await Promise.all([loadOverview(notify), loadDevices(notify), loadTraffic(notify)]);
   if (state.activeView === "audit") await loadAudit();
+  if (state.activeView === "firewall") await loadFirewall();
+  if (state.activeView === "server") await loadServerStats();
+  if (state.activeView === "remote" && !state.remoteActive) await loadRemoteServers();
 }
 
 function openCreate() {
@@ -825,7 +828,12 @@ $("#fw-apply-ipmode")?.addEventListener("click", async () => {
   msg.textContent = "应用中（会重建配置并重启节点，约 5 秒）…";
   try {
     const result = await api("/api/firewall/ip-mode", { method: "POST", body: JSON.stringify({ entry, outbound }) });
-    if (result.ok) { msg.textContent = `✅ 已应用：入口 ${result.entry} · 出口 ${result.outbound}`; }
+    if (result.ok) {
+      msg.textContent = `✅ 已应用：入口 ${result.entry} · 出口 ${result.outbound}`;
+      $("#fw-entry-now").textContent = result.entry || entry;
+      $("#fw-outbound-now").textContent = result.outbound || outbound;
+      loadFirewall();
+    }
     else { msg.textContent = `❌ 应用失败：${result.error || "未知错误"}`; }
   } catch (e) { msg.textContent = `❌ ${e.message}`; }
 });
@@ -891,7 +899,7 @@ function renderRemoteServers(servers) {
       const svc = s.services["sing-box"] === "active";
       chips.push(`<span class="rs-chip ${svc ? "g" : "r"}">节点 ${svc ? "在线" : "离线"}</span>`);
     }
-    chips.push(`<span class="rs-chip b">${s.enabled ?? s.devices ?? 0} 设备在线</span>`);
+    chips.push(`<span class="rs-chip b">${s.active_devices ?? "—"} 实时在线 · ${s.enabled ?? s.devices ?? 0} 启用</span>`);
     chips.push(`<span class="rs-chip">${s.ver ? "v" + s.ver : "版本未知"}</span>`);
     if (s.ping) chips.push(`<span class="rs-chip">${s.ping} ms</span>`);
     if (!online) {

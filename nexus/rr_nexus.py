@@ -1200,11 +1200,20 @@ class MediaUnlockChecker:
             else:
                 tag, status = ("unknown", "⚠ 无法判断")
         elif name == "ChatGPT":
-            code, loc, _ = self._get("https://chatgpt.com/")
+            # 数据中心 IP 直接访问 chatgpt.com 常被 CF 拦截（403）误判为地区封锁；
+            # cdn-cgi/trace 返回出口真实信息：200+loc=US 即 CF 放行且出口在美国（OpenAI 支持区）
+            code, _, body = self._get("https://chatgpt.com/cdn-cgi/trace", timeout=8)
             if code == 200:
-                tag, status = ("unlock", "✅ 可用")
+                m = re.search(r"(?m)^loc=([A-Za-z]{2})", body)
+                region = m.group(1).upper() if m else ""
+                if region == "US":
+                    tag, status = ("unlock", "✅ 可用（美国）")
+                elif region:
+                    tag, status = ("unlock", f"✅ 可用（{region}）")
+                else:
+                    tag, status = ("unlock", "✅ 可用")
             elif code == 403:
-                tag, status = ("blocked", "❌ 不支持地区")
+                tag, status = ("blocked", "❌ 数据中心 IP 受限")
             else:
                 tag, status = ("unknown", "⚠ 无法判断")
         elif name == "TikTok":
@@ -2153,6 +2162,7 @@ class Handler(BaseHTTPRequestHandler):
                 result["online"] = True
                 result["devices"] = (body.get("devices") or {}).get("total", 0)
                 result["enabled"] = (body.get("devices") or {}).get("enabled", 0)
+                result["active_devices"] = (body.get("devices") or {}).get("active", 0)
                 used = int((body.get("devices") or {}).get("used", 0) or 0)
                 result["used_gb"] = round(used / 1024 ** 3, 2)
                 result["services"] = body.get("services") or {}
@@ -2289,20 +2299,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_overview(self) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
+        active_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat(timespec="seconds")
         with STATE.store.connect() as db:
             counts = db.execute(
                 "SELECT COUNT(*) total, COALESCE(SUM(CASE WHEN enabled=1 "
                 "AND (expires_at IS NULL OR expires_at='' OR expires_at>=?) "
                 "AND (quota_bytes=0 OR used_bytes<quota_bytes) THEN 1 ELSE 0 END),0) enabled, "
+                "COALESCE(SUM(CASE WHEN enabled=1 AND traffic_updated_at IS NOT NULL "
+                "AND traffic_updated_at>=? THEN 1 ELSE 0 END),0) active, "
                 "COALESCE(SUM(used_bytes),0) used, "
                 "COALESCE(SUM(uploaded_bytes),0) uploaded, "
                 "COALESCE(SUM(downloaded_bytes),0) downloaded FROM devices",
-                (today,),
+                (today, active_cutoff),
             ).fetchone()
         service_states: dict[str, str] = {}
         for service in ("sing-box", "rr-nexus", "cloudflared"):
             result = subprocess.run(["systemctl", "is-active", service], text=True, capture_output=True, timeout=3, check=False)
-            service_states[service] = result.stdout.strip() or "inactive"
+            state = result.stdout.strip() or "inactive"
+            if service == "cloudflared" and state != "active":
+                # 快速隧道模式（TUNNEL_MODE=1）无 systemd 服务，进程存活即运行中
+                try:
+                    pg = subprocess.run(["pgrep", "-x", "cloudflared"], capture_output=True, timeout=3, check=False)
+                    if pg.returncode == 0:
+                        state = "active"
+                except Exception:
+                    pass
+            service_states[service] = state
         security_info = {"recent_lockouts": 0, "locked_ips": 0}
         try:
             since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()

@@ -259,7 +259,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .srv-kv span { color: var(--muted); }
 .srv-kv b { font-weight: 600; color: var(--text); }
 .srv-big-row { display: flex; align-items: baseline; gap: 14px; margin: 2px 0 8px; }
-.srv-big { font-size: 40px; font-weight: 700; letter-spacing: -.02em; color: var(--pink); font-variant-numeric: tabular-nums; }
+.srv-big { font-size: 40px; font-weight: 700; letter-spacing: -.02em; color: var(--pink); font-variant-numeric: tabular-nums; display: inline-block; min-width: 100px; }
 .srv-detail { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .srv-model { font-size: 12px; color: var(--faint); margin-top: 6px; }
 .srv-bar { height: 8px; border-radius: 999px; background: rgba(255,255,255,.07); overflow: hidden; }
@@ -285,6 +285,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .fw-off { color: var(--red); border-color: rgba(255,116,132,.4); background: rgba(255,116,132,.07); }
 .fw-mode-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .fw-mode-row select { background: rgba(255,255,255,.05); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 7px 10px; font-size: 12.5px; }
+.fw-mode-row select option { background: #10182a; color: #dbe3ef; }
 .fw-ok { color: var(--green); font-size: 13px; }
 .fw-bad { color: var(--amber); font-size: 13px; }
 .fw-tutorial-body p { font-size: 12.5px; color: var(--muted); line-height: 1.65; margin: 8px 0; }

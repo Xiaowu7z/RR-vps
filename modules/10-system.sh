@@ -404,7 +404,13 @@ nexus_fw_known_ports() {
 }
 
 nexus_fw_port_open() {
-    # $1=port $2=proto；0=开 1=关
+    # $1=port $2=proto；0=放行 1=关闭
+    # 真实状态：端口实际被监听（节点协议已开启）即视为放行；
+    # 防火墙 ACCEPT 规则存在也算放行（任一满足）
+    case "$2" in
+        tcp) ss -H -ltn "sport = :$1" 2>/dev/null | grep -q LISTEN && return 0 ;;
+        udp) ss -H -lun "sport = :$1" 2>/dev/null | grep -qE "UNCONN|ESTAB" && return 0 ;;
+    esac
     iptables -C INPUT -p "$2" --dport "$1" -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1
 }
 
