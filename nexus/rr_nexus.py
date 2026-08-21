@@ -2432,6 +2432,27 @@ class Handler(BaseHTTPRequestHandler):
                     raise
         except Exception as e:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)[:100]})
+    def _deferred_sync(self, actor: str, action: str, device_id: str, note: str) -> None:
+        """后台线程执行节点同步：HTTP 响应先返回，sing-box 重启引起的瞬时断连
+        （管理员若经本节点代理上网会被掐断）不再让前端误判为失败。
+        同步结果只落审计（<action>_synced / <action>_sync_failed），不阻塞请求。"""
+        def _run() -> None:
+            try:
+                ok, detail = STATE.sync_devices()
+                STATE.store.audit(
+                    actor,
+                    "{}_synced".format(action) if ok else "{}_sync_failed".format(action),
+                    device_id,
+                    "local",
+                    detail or note,
+                )
+            except Exception as exc:  # 后台兜底：绝不抛出到线程外
+                try:
+                    STATE.store.audit(actor, "{}_sync_error".format(action), device_id, "local", str(exc)[:200])
+                except Exception:
+                    pass
+        threading.Thread(target=_run, daemon=True).start()
+
     def handle_create_device(self, session: sqlite3.Row) -> None:
         payload = self.read_json()
         if payload is None:
@@ -2463,19 +2484,13 @@ class Handler(BaseHTTPRequestHandler):
                 "expires_at,created_at,updated_at) VALUES(?,?,?,?,1,?,0,0,0,NULL,?,?,?)",
                 (device_id, values["name"], credential, subscription_token, values["quota_bytes"], values.get("expires_at"), now, now),
             )
-        ok, detail = STATE.sync_devices()
-        if not ok:
-            with STATE.store.connect() as db:
-                db.execute("DELETE FROM devices WHERE id=?", (device_id,))
-            STATE.sync_devices()
-            self.send_json(
-                HTTPStatus.CONFLICT,
-                {"error": "node_sync_failed", "detail": detail,
-                 "message": "节点配置同步失败，本次添加已回滚：{}".format(detail[:120])},
-            )
-            return
         STATE.store.audit(session["username"], "device_create", device_id, self.remote_ip, values["name"])
-        self.send_json(HTTPStatus.CREATED, {"ok": True, "id": device_id})
+        self._deferred_sync(session["username"], "device_create", device_id, values["name"])
+        self.send_json(
+            HTTPStatus.CREATED,
+            {"ok": True, "id": device_id, "sync": "deferred",
+             "message": "设备已添加，节点配置正在后台同步（几秒后生效，不影响现有用户在线）"},
+        )
 
     def handle_reset_device(self, session: sqlite3.Row, device_id: str) -> None:
         """重置设备流量：used/uploaded/downloaded 归零；可选同时修改额度（quota_gb）。
@@ -2510,24 +2525,11 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE devices SET quota_bytes=?,quota_reached_at=NULL WHERE id=?",
                     (new_quota, device_id),
                 )
-        ok, detail = STATE.sync_devices()
-        if not ok:
-            with STATE.store.connect() as db:
-                db.execute(
-                    "UPDATE devices SET used_bytes=?,uploaded_bytes=?,downloaded_bytes=?,"
-                    "traffic_updated_at=?,quota_bytes=?,quota_reached_at=?,updated_at=? WHERE id=?",
-                    (
-                        old["used_bytes"], old["uploaded_bytes"], old["downloaded_bytes"],
-                        old["traffic_updated_at"], old["quota_bytes"],
-                        old["quota_reached_at"], old["updated_at"], device_id,
-                    ),
-                )
-            STATE.sync_devices()
-            self.send_json(HTTPStatus.CONFLICT, {"error": "node_sync_failed", "detail": detail})
-            return
         detail = f"quota_gb={payload.get('quota_gb')}" if new_quota is not None else "keep_quota"
         STATE.store.audit(session["username"], "device_reset", device_id, self.remote_ip, detail)
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        self._deferred_sync(session["username"], "device_reset", device_id, detail)
+        self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
+                                       "message": "流量已重置，节点配置正在后台同步"})
 
     def handle_update_device(self, session: sqlite3.Row, device_id: str) -> None:
         payload = self.read_json()
@@ -2550,26 +2552,10 @@ class Handler(BaseHTTPRequestHandler):
             # 增加额度（新额度 > 已用流量）时清除"额度用尽"时间戳，取消 15 天自动删除倒计时
             if values.get("quota_bytes", 0) > old["used_bytes"]:
                 db.execute("UPDATE devices SET quota_reached_at=NULL WHERE id=?", (device_id,))
-        ok, detail = STATE.sync_devices()
-        if not ok:
-            with STATE.store.connect() as db:
-                db.execute(
-                    "UPDATE devices SET name=?,credential=?,subscription_token=?,enabled=?,"
-                    "quota_bytes=?,used_bytes=?,uploaded_bytes=?,downloaded_bytes=?,"
-                    "traffic_updated_at=?,expires_at=?,updated_at=? WHERE id=?",
-                    (
-                        old["name"], old["credential"], old["subscription_token"],
-                        old["enabled"], old["quota_bytes"], old["used_bytes"],
-                        old["uploaded_bytes"], old["downloaded_bytes"],
-                        old["traffic_updated_at"], old["expires_at"], old["updated_at"],
-                        device_id,
-                    ),
-                )
-            STATE.sync_devices()
-            self.send_json(HTTPStatus.CONFLICT, {"error": "node_sync_failed", "detail": detail})
-            return
         STATE.store.audit(session["username"], "device_update", device_id, self.remote_ip, ",".join(values.keys()))
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        self._deferred_sync(session["username"], "device_update", device_id, ",".join(values.keys()))
+        self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
+                                       "message": "修改已保存，节点配置正在后台同步"})
 
     def handle_delete_device(self, session: sqlite3.Row, device_id: str) -> None:
         STATE.traffic.collect_once(trigger_sync=False)
@@ -2579,26 +2565,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "device_not_found"})
                 return
             db.execute("DELETE FROM devices WHERE id=?", (device_id,))
-        ok, detail = STATE.sync_devices()
-        if not ok:
-            with STATE.store.connect() as db:
-                db.execute(
-                    "INSERT INTO devices(id,name,credential,subscription_token,enabled,"
-                    "quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,"
-                    "expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        old["id"], old["name"], old["credential"],
-                        old["subscription_token"], old["enabled"], old["quota_bytes"],
-                        old["used_bytes"], old["uploaded_bytes"], old["downloaded_bytes"],
-                        old["traffic_updated_at"], old["expires_at"], old["created_at"],
-                        old["updated_at"],
-                    ),
-                )
-            STATE.sync_devices()
-            self.send_json(HTTPStatus.CONFLICT, {"error": "node_sync_failed", "detail": detail})
-            return
         STATE.store.audit(session["username"], "device_delete", device_id, self.remote_ip, old["name"])
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        self._deferred_sync(session["username"], "device_delete", device_id, old["name"])
+        self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
+                                       "message": "设备已删除，节点配置正在后台同步"})
 
     def device_record(self, device_id: str) -> sqlite3.Row | None:
         with STATE.store.connect() as db:

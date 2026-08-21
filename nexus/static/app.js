@@ -434,7 +434,7 @@ async function createDevice(event) {
     await api("/api/devices", { method: "POST", body: JSON.stringify({ name: values.get("name"), quota_gb: Number(values.get("quota_gb") || 0), expires_at: values.get("expires_at") || "" }) });
     $("#device-dialog").close();
     await refreshLive();
-    toast("设备已创建，独立凭据已同步。");
+    toast("设备已创建，节点配置正在后台同步（不影响现有用户在线）。");
   } catch (error) { $("#device-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message; }
   finally { submit.disabled = false; }
 }
@@ -1183,7 +1183,7 @@ async function rsCreateDevice() {
   if (expiry === null) return;
   try {
     await rsRemoteApi("POST", "/api/devices", { name, quota_gb: Number(quota) || 0, expires_at: expiry });
-    toast("设备已创建，订阅已生成");
+    toast("设备已创建，节点配置正在后台同步");
     rsLoadDevices();
   } catch (e) { toast(e.message, true); }
 }
