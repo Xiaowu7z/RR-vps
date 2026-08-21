@@ -882,7 +882,7 @@ async function loadRemoteServers() {
 
 function renderRemoteServers(servers) {
   state.remoteServers = servers.map(s => ({ ...rsServerById(s.id), ...s }));
-  $("#rs-grid").innerHTML = servers.map(s => {
+  $("#rs-grid").innerHTML = state.remoteServers.map(s => {
     const online = Boolean(s.online);
     const cpu = Number(s.cpu || 0), mem = Number(s.mem || 0);
     const used = s.used_gb != null ? `${s.used_gb} GB` : "—";
