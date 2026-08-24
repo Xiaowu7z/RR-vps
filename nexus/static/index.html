@@ -113,7 +113,7 @@
 
       <section id="view-optimizer" class="view">
         <div class="section-toolbar">
-          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最佳的 CF Edge 入口。测速全部在浏览器本地完成，服务器只静态托管工具、不参与测速、不上传任何数据。</p></div>
+          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最适合作为<strong>代理入口</strong>的 CF Edge 域名（优先连接稳定性，并以 openai.com / deepl.com / cloudflare.com 黄金参考做基准门禁）。测速全部在浏览器本地完成，服务器只静态托管工具、不参与测速、不上传任何数据。</p></div>
           <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始本地测速</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
         </div>
         <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
@@ -152,7 +152,7 @@
             </select>
           </div>
         </div>
-        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP 测速。本工具优化的是「当前网络环境下 Cloudflare Edge 入口域名」的表现，而非强制指定 IP。</p>
+        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP 测速，也无法逐个候选下载 5MB 真实吞吐。本工具优化的是「当前网络环境下 CF Edge 代理入口的连接稳定性」（连续 trace 复用 + 成功率 + POP 质量），以 speed.cloudflare.com 实测吞吐作为环境参考，并用 openai.com / deepl.com / cloudflare.com 黄金参考做基准门禁。</p>
         <div id="optimizer-custom-wrap" class="optimizer-custom-wrap">
           <label>用户扩展池（可选，一行一个，不影响默认域名池）</label>
           <textarea id="optimizer-custom-input" class="optimizer-custom-input" rows="2" placeholder="例如：&#10;aaa.trycloudflare.com&#10;bbb.example.com"></textarea>
@@ -165,6 +165,7 @@
         </div>
         <div id="optimizer-best" class="optimizer-best hidden"></div>
         <div id="optimizer-recommendation" class="optimizer-recommendation hidden"></div>
+        <div id="optimizer-benchmark" class="optimizer-benchmark hidden"></div>
         <div id="optimizer-asia" class="optimizer-asia hidden"></div>
         <div id="optimizer-results" class="optimizer-results hidden"></div>
         <div id="optimizer-history" class="optimizer-history"></div>

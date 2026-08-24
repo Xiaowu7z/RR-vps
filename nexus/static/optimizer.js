@@ -62,48 +62,58 @@ const DOWNLOAD_BYTES = 2 * 1024 * 1024;
 const STORAGE_KEY = "rr_edge_optimizer";
 const BLACKLIST_KEY = "rr_edge_optimizer_blacklist";
 const CUSTOM_DOMAINS_KEY = "rr_edge_optimizer_custom_domains";
-// 用途评分权重（五哥确认版，按用途动态切换，不改变基础测试流程只改权重）
+const HISTORY_KEY = "rr_edge_optimizer_history";   // 每域名历史测速记录（供「历史表现」维度 + 时间衰减）
+const HISTORY_N = 7;                               // 历史表现：最近 7 次滑动平均
+const HISTORY_HALFLIFE_MS = 7 * 24 * 3600 * 1000;  // 时间衰减半衰期 7 天
+const BENCHMARK_DOMAINS = ["openai.com", "deepl.com", "cloudflare.com"];  // 黄金参考（不参与排名）
+const BENCHMARK_GATE = 0.7;                        // 门禁：candidateCore < benchmarkMedian × 0.7 禁止推荐
+// 用途评分权重（v4 最终确认版，按用途动态切换，模块化：加用途只需加一个 key）
 // web 网页访问：可用性40 / TTFB30 / 稳定20 / DNS10
-// proxy 代理节点：可用性35 / 真实响应性能25 / 稳定性25 / 延迟15（默认，RR-vps 主用途）
-// download 下载：可用性30 / 吞吐40 / 稳定20 / 延迟10
-// 用途评分权重（五哥最终确认版，模块化：加用途只需加一个 key，不改评分引擎）
-// web 网页访问：可用性40 / TTFB30 / 稳定20 / DNS10
-// proxy 代理节点（默认）：可用性35 / Edge复用稳定性25 / CF吞吐25 / 延迟10 / DNS5
+// proxy 代理节点（默认，v4 重定位 = 代理入口稳定性，非网页速度）：
+//   稳定连接35 / 成功率20 / CF环境吞吐参考15 / POP质量10 / 历史表现10 / TTFB5 / DNS5
 // download 下载：可用性30 / 吞吐40 / 稳定20 / 延迟10
 const SCORE_PRESETS = {
   web:      { availability: 40, ttfb: 30, stability: 20, dns: 10 },
-  proxy:    { availability: 35, edgeStability: 25, cfThroughput: 25, latency: 10, dns: 5 },
+  proxy:    { connStability: 35, successRate: 20, envThroughput: 15, popQuality: 10, history: 10, ttfb: 5, dns: 5 },
   download: { availability: 30, throughput: 40, stability: 20, latency: 10 },
 };
 const USE_LABELS = { web: "网页访问", proxy: "代理节点", download: "大流量下载" };
 const USE_WEIGHT_TEXT = {
   web: "可用性40% · TTFB30% · 稳定20% · DNS10%",
-  proxy: "可用性35% · Edge复用稳定性25% · CF吞吐25% · 延迟10% · DNS5%",
+  proxy: "稳定连接35% · 成功率20% · 环境吞吐15% · POP10% · 历史10% · TTFB5% · DNS5%",
   download: "可用性30% · 吞吐40% · 稳定20% · 延迟10%",
 };
 
 // 评分维度计算器（纯函数，返回 0-1 归一化值；加维度只需加一个 key）
 const SCORE_DIMENSIONS = {
-  // 可用性：多轮 trace 成功率
+  // 可用性：多轮 trace 成功率（web/download）
   availability: (m) => m.successRate,
   // TTFB（网页访问）：中位首字节，50ms 满分，800ms 归零
   ttfb: (m) => (m.medianTtfb >= 0 ? Math.max(0, 1 - m.medianTtfb / 800) : 0),
-  // 延迟（代理/下载）：同 TTFB，语义为连接延迟
+  // 延迟（下载）：同 TTFB，语义为连接延迟
   latency: (m) => (m.medianTtfb >= 0 ? Math.max(0, 1 - m.medianTtfb / 800) : 0),
-  // 稳定/波动：多轮 TTFB 的 CV（波动小=稳定）
+  // 稳定/波动（web/download）：多轮 TTFB 的 CV（波动小=稳定）
   stability: (m) => (1 - Math.min(1, m.cv)),
   // DNS：DoH 解析耗时，2000ms 归零
   dns: (m) => (m.dnsMs >= 0 ? Math.max(0, 1 - m.dnsMs / 2000) : 0.5),
-  // Edge 复用稳定性：连续 trace 复用连接，连续成功率 70% + TTFB 波动 30%
-  edgeStability: (m) => {
+  // 吞吐（下载）：同 CF 环境吞吐
+  throughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 100) : 0),
+
+  // ===== v4 proxy 维度 =====
+  // 稳定连接（35%）：连续 trace 复用连接，连续成功率 70% + TTFB 波动 30%
+  connStability: (m) => {
     const es = m.edgeStability;
     if (!es || !es.samples) return 0;
     return es.successRate * 0.7 + (1 - Math.min(1, es.ttfbCV)) * 0.3;
   },
-  // CF 出口吞吐：speed.cloudflare.com/__down（共享基准值，一次测速）
-  cfThroughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 100) : 0),
-  // 吞吐（下载）：同 CF 出口吞吐
-  throughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 100) : 0),
+  // 成功率（20%）：多轮 trace 成功率
+  successRate: (m) => m.successRate,
+  // CF 环境吞吐参考（15%）：speed.cloudflare.com/__down 实测（全局共享，不区分候选，只反映环境）
+  envThroughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 60) : 0),
+  // POP 质量（10%）：路由落点 colo 的运营商优先级（亚洲 POP 高分，美国 POP 低分）
+  popQuality: (m) => popQualityScore(m.colo),
+  // 历史表现（10%）：localStorage 历史测速（最近 7 次滑动平均 + 时间衰减，无历史 0.5）
+  history: (m) => historyScore(m.domain),
 };
 
 // 候选 CF 域名池（内嵌在工具文件中，服务器仅静态托管此文件，域名池随之分发）
@@ -508,6 +518,71 @@ function computeScore(result, mode, ctx) {
   return score;
 }
 
+// POP 质量评分：路由落点 colo 的运营商优先级（亚洲 POP 高分，美国 POP 低分）
+function popQualityScore(pop) {
+  if (!pop) return 0.2;
+  const pri = popPriority(pop);
+  if (pri > 0) return 0.2 + (pri / 5) * 0.8;  // HKG=1.0 / NRT=0.84 / SIN=0.68 / ICN=0.52 / TPE=0.36
+  return 0.2;  // 非亚洲 POP（LAX 等）：0.2
+}
+
+// 历史表现（方案B）：最近 7 次滑动平均 + 时间衰减（7 天半衰期）；无历史 = 0.5 中性
+function historyScore(domain) {
+  const arr = loadHistory()[domain] || [];
+  if (!arr.length) return 0.5;
+  const now = Date.now();
+  const recent = arr.slice(-HISTORY_N);
+  let wsum = 0, sum = 0;
+  for (const rec of recent) {
+    const age = Math.max(0, now - (rec.t || 0));
+    const w = Math.pow(0.5, age / HISTORY_HALFLIFE_MS);
+    sum += (rec.s / 100) * w;
+    wsum += w;
+  }
+  return wsum > 0 ? Math.max(0, Math.min(1, sum / wsum)) : 0.5;
+}
+
+// 历史记录：读 / 写（每域名存 {s: 评分0-100, t: 时间戳}，最多保留 20 次）
+function loadHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "{}"); } catch (_e) { return {}; }
+}
+function saveHistoryScores(results) {
+  if (!results || !results.length) return;
+  const hist = loadHistory();
+  const now = Date.now();
+  for (const m of results) {
+    if (!m || !m.domain) continue;
+    if (!hist[m.domain]) hist[m.domain] = [];
+    hist[m.domain].push({ s: m.score != null ? m.score : 0, t: now });
+    if (hist[m.domain].length > 20) hist[m.domain] = hist[m.domain].slice(-20);
+  }
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(hist)); } catch (_e) {}
+}
+
+// Benchmark 核心得分（稳定连接 35 + 成功率 20，归一化到 0-1；门禁对比用）
+function benchmarkCore(bm) {
+  return (SCORE_DIMENSIONS.connStability(bm) * 35 + SCORE_DIMENSIONS.successRate(bm) * 20) / 55;
+}
+
+// Benchmark 测速：测 3 个黄金参考（openai/deepl/cloudflare）的连通性 + 稳定连接（不参与候选排名）
+async function probeBenchmark(signal) {
+  const list = [];
+  for (const domain of BENCHMARK_DOMAINS) {
+    if (OptimizerState.aborted) break;
+    const rounds = [];
+    for (let r = 0; r < ROUNDS; r++) {
+      if (OptimizerState.aborted) break;
+      const res = await probeTrace(domain, PROBE_TIMEOUT_MS, signal);
+      rounds.push(res);
+    }
+    const m = buildMetrics(domain, rounds, null, "benchmark");
+    m.edgeStability = await probeEdgeStability(domain, EDGE_STABILITY_ROUNDS, signal);
+    m.benchmarkCore = benchmarkCore(m);
+    list.push(m);
+  }
+  return list;
+}
+
 // 读取选择器值（带默认值兜底）
 function readSelect(sel, fallback) {
   const el = $o(sel);
@@ -650,6 +725,7 @@ async function optimizerStart() {
   stopBtn.classList.remove("hidden");
   hideEl("#optimizer-best");
   hideEl("#optimizer-recommendation");
+  hideEl("#optimizer-benchmark");
   hideEl("#optimizer-asia");
   hideEl("#optimizer-results");
   showEl("#optimizer-progress-wrap");
@@ -685,11 +761,17 @@ async function optimizerStart() {
     }
     if (OptimizerState.vpnDetected) showVpnBanner();
 
-    // 1.5) CF 出口吞吐基准：一次测速，所有候选共享（proxy/download 需要，避免 1000 域名×下载耗流量）
+    // 1.5) CF 环境吞吐基准：一次测速，所有候选共享（proxy/download 需要，避免 1000 域名×下载耗流量）
     let dl = { ok: false, mbps: 0, bytes: 0 };
     if (mode === "proxy" || mode === "download") {
-      setProgress(7, "测试 CF 出口吞吐（基准）…");
+      setProgress(7, "测试 CF 环境吞吐基准…");
       dl = await probeDownload(OptimizerState.controller.signal);
+    }
+    // 1.6) Benchmark 黄金参考（仅 proxy 模式，用于门禁对比，不参与候选排名）
+    let benchmarks = [];
+    if (mode === "proxy") {
+      setProgress(7, "测试黄金参考 openai/deepl/cloudflare…");
+      benchmarks = await probeBenchmark(OptimizerState.controller.signal);
     }
 
     // 2) Stage 1：轻量探测（batch 50/批，/cdn-cgi/trace 短超时，过滤失败）
@@ -795,12 +877,26 @@ async function optimizerStart() {
     OptimizerState.ipv6Results = results.filter((m) => m.ipv6);
     OptimizerState.asiaResults = results.filter((m) => isAsiaTarget(m.colo));
 
+    // 5.5) Benchmark 门禁：推荐核心 vs 黄金参考中位数（仅 proxy 模式）
+    let benchmarkMedian = -1;
+    let gateAllowed = true;
+    if (mode === "proxy" && benchmarks.length) {
+      const cores = benchmarks.map((bm) => bm.benchmarkCore).filter((c) => Number.isFinite(c) && c >= 0);
+      if (cores.length) {
+        benchmarkMedian = median(cores);
+        const candidateCore = benchmarkCore(results[0]);
+        gateAllowed = benchmarkMedian < 0 || candidateCore >= benchmarkMedian * BENCHMARK_GATE;
+      }
+    }
+
     // 6) 渲染 + 推荐理由 + 保存
     renderBest(results[0], dl);
-    renderRecommendation(results[0], dl);
+    renderBenchmarkCompare(results[0], benchmarks, benchmarkMedian, gateAllowed);
+    renderRecommendation(results[0], dl, gateAllowed);
     renderAsiaHunt(OptimizerState.asiaResults);
     renderResults(results, dl, total, stage1.length, stage2List.length);
     saveLocal(results[0], dl);
+    saveHistoryScores(results);
     setProgress(100, "完成");
 
     if (OptimizerState.egressChanged) {
@@ -912,7 +1008,39 @@ function renderBest(best, dl) {
   }
 }
 
-function renderRecommendation(best, dl) {
+// Benchmark 黄金参考对比 + 门禁结果
+function renderBenchmarkCompare(best, benchmarks, benchmarkMedian, gateAllowed) {
+  const box = $o("#optimizer-benchmark");
+  if (!box) return;
+  if (OptimizerState.use !== "proxy") { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  const candidateCore = benchmarkCore(best);
+  const ratio = benchmarkMedian > 0 ? Math.round((candidateCore / benchmarkMedian) * 100) : -1;
+  const rows = benchmarks.map((bm) => {
+    const core = bm.benchmarkCore != null ? `${(bm.benchmarkCore * 100).toFixed(0)}%` : "—";
+    const sr = `${(bm.successRate * 100).toFixed(0)}%`;
+    return `<tr><td>${escapeHtmlO(bm.domain)}</td><td>${escapeHtmlO(bm.colo || "—")}</td><td>${sr}</td><td>${core}</td></tr>`;
+  }).join("");
+  const gateHtml = gateAllowed
+    ? `<div class="opt-gate opt-gate-pass">✓ 推荐入口核心稳定性达到黄金参考基准，可作为代理入口</div>`
+    : `<div class="opt-gate opt-gate-fail">✗ 推荐入口核心稳定性低于黄金参考基准（${(benchmarkMedian * 100).toFixed(0)}%），当前网络下不建议作为代理入口</div>`;
+  box.innerHTML = `
+    <article class="panel glass">
+      <div class="panel-head"><div><span class="eyebrow">BENCHMARK</span><h3>黄金参考对比</h3><p>推荐入口 vs openai.com / deepl.com / cloudflare.com 稳定性基准（核心 = 稳定连接 + 成功率）</p></div></div>
+      <div class="table-scroll"><table class="data-table">
+        <thead><tr><th>参考域名</th><th>POP</th><th>成功率</th><th>核心稳定性</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4">无黄金参考数据</td></tr>'}</tbody>
+      </table></div>
+      <div class="opt-bench-summary">
+        <div class="opt-bench-item"><label>推荐入口核心</label><strong>${(candidateCore * 100).toFixed(0)}%</strong></div>
+        <div class="opt-bench-item"><label>黄金基准中位数</label><strong>${benchmarkMedian >= 0 ? (benchmarkMedian * 100).toFixed(0) + "%" : "—"}</strong></div>
+        <div class="opt-bench-item"><label>性能比</label><strong>${ratio >= 0 ? ratio + "%" : "—"}</strong></div>
+      </div>
+      ${gateHtml}
+    </article>`;
+}
+
+function renderRecommendation(best, dl, gateAllowed) {
   if (!best) return;
   const box = $o("#optimizer-recommendation");
   if (!box) return;
@@ -928,11 +1056,11 @@ function renderRecommendation(best, dl) {
   if (mode === "proxy") {
     const es = best.edgeStability;
     if (es && es.samples) {
-      reasons.push(`Edge 复用稳定性 ${(es.successRate * 100).toFixed(0)}%（连续 ${es.samples} 次复用连接）`);
-      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（Edge 复用稳定）");
+      reasons.push(`稳定连接 ${(es.successRate * 100).toFixed(0)}%（连续 ${es.samples} 次复用连接）`);
+      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（连接稳定）");
       else reasons.push("TTFB 波动较大（连接可能频繁重建）");
     }
-    if (dl && dl.ok) reasons.push(`CF 出口吞吐 ${dl.mbps.toFixed(1)} Mbps（共享基准）`);
+    if (dl && dl.ok) reasons.push(`CF 环境吞吐 ${dl.mbps.toFixed(1)} Mbps（参考）`);
   } else {
     if (best.medianTtfb >= 0 && best.medianTtfb < 300) reasons.push(`低 TTFB ${ttfb}`);
   }
@@ -941,9 +1069,13 @@ function renderRecommendation(best, dl) {
     if (best.cv < 0.3) reasons.push("速度稳定（波动小）");
     else reasons.push("波动较大，晚间可能不稳定");
   }
+  const gateWarn = (mode === "proxy" && gateAllowed === false)
+    ? `<div class="opt-gate opt-gate-fail">⚠ 该入口核心稳定性低于黄金参考基准，当前网络下不建议作为代理入口（详见「黄金参考对比」）。</div>`
+    : "";
   box.innerHTML = `
     <article class="panel glass">
       <div class="panel-head"><div><span class="eyebrow">WHY</span><h3>推荐理由</h3><p>用途：${USE_LABELS[mode] || "代理节点"}</p></div></div>
+      ${gateWarn}
       <div class="opt-reason-list">
         ${reasons.map((r) => `<div class="opt-reason-item">${escapeHtmlO(r)}</div>`).join("")}
       </div>

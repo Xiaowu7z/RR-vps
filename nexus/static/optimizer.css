@@ -282,3 +282,46 @@
 @media (max-width: 640px) {
   .opt-dual-grid { grid-template-columns: 1fr; }
 }
+
+/* ---- v4：黄金参考对比 + 门禁 ---- */
+.optimizer-benchmark { margin-top: 14px; }
+.opt-bench-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.opt-bench-item {
+  border-radius: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, .02);
+}
+.opt-bench-item label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.opt-bench-item strong { font-size: 16px; color: var(--text); }
+.opt-gate {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 600;
+}
+.opt-gate-pass {
+  color: #6ce6ce;
+  border: 1px solid rgba(108, 230, 206, .4);
+  background: rgba(108, 230, 206, .08);
+}
+.opt-gate-fail {
+  color: #ff7a7a;
+  border: 1px solid rgba(255, 122, 122, .4);
+  background: rgba(255, 122, 122, .08);
+}
+@media (max-width: 640px) {
+  .opt-bench-summary { grid-template-columns: 1fr; }
+}
