@@ -61,12 +61,12 @@ rr_manifest_is_valid() {
         $2 == "rr" { launcher = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
-        $2 ~ /^nexus\/static\/(index\.html|app\.css|app\.js)$/ { nexus_assets++; next }
+        $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         $2 == "install.sh" { next }
         { exit 1 }
         END {
             if (!launcher || modules < 2) exit 1
-            if (!nexus_app || nexus_assets != 3) exit 1
+            if (!nexus_app || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
 }
