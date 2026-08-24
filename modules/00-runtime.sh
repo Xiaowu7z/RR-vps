@@ -12,6 +12,9 @@ RESET="\033[0m"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_BRANCH="main"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
+RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
+RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
+RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
 SCRIPT_VERSION="7.0.1"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"  # 干净URL+?t=防CDN旧缓存(2026-08)
@@ -32,6 +35,7 @@ MIN_SINGBOX_VERSION="1.12.0"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 UPDATE_AVAILABLE=false
 UPDATE_CHECK_STATE="latest"    # H15 三态：latest / available / failed
+UPDATE_CHECK_ERROR=""
 SCRIPT_VER_STATUS="${GREEN}v${SCRIPT_VERSION}（最新）${RESET}"
 SINGBOX_CONFIG_CHANGED=false
 HEALTH_CHECK_DONE=false

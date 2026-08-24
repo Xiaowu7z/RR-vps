@@ -4,6 +4,8 @@ RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_BRANCH="main"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
+RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
+RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LAUNCHER="/usr/local/bin/rr"
@@ -27,6 +29,13 @@ rr_error() {
 rr_download() {
     local source_url="$1"
     local target_file="$2"
+    local cache_buster=""
+    local relative_path=""
+
+    cache_buster=$(date +%s)
+    case "$source_url" in
+        "${RR_RAW_BASE}/"*) relative_path="${source_url#"${RR_RAW_BASE}/"}" ;;
+    esac
 
     if [ -n "$RR_GITHUB_MIRROR" ]; then
         if command -v curl >/dev/null 2>&1; then
@@ -41,14 +50,33 @@ rr_download() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 180 \
             -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
-            "${source_url}?t=$(date +%s)" -o "$target_file"
+            "${source_url}?t=${cache_buster}" -o "$target_file" 2>/dev/null && return 0
+        if [ -n "$relative_path" ]; then
+            curl -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
+                -H "Accept: application/vnd.github.raw+json" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" \
+                -o "$target_file" 2>/dev/null && return 0
+            curl -4 -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
+                "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" \
+                -o "$target_file" 2>/dev/null && return 0
+        fi
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout=15 --tries=3 \
-            -O "$target_file" "${source_url}?t=$(date +%s)"
+            -O "$target_file" "${source_url}?t=${cache_buster}" && return 0
+        if [ -n "$relative_path" ]; then
+            wget -q --timeout=15 --tries=2 \
+                --header="Accept: application/vnd.github.raw+json" \
+                -O "$target_file" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" && return 0
+            wget -4 -q --timeout=15 --tries=2 \
+                -O "$target_file" "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" && return 0
+        fi
     else
         rr_error "缺少 curl/wget，无法下载 RR-vps。"
         return 1
     fi
+    rr_error "无法从 GitHub Raw、GitHub API 或 CDN 下载：${relative_path:-$source_url}"
+    return 1
 }
 
 rr_manifest_is_valid() {
@@ -264,7 +292,7 @@ rr_fetch_release() {
     echo "[RR-vps] 正在下载发布清单……"
 rr_download "${RR_RAW_BASE}/rr-bundle.tar.gz" "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null && \
 actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}') && \
-[ "$actual" = "a4213e3398dfb74af1bfc022d729d46c03306ac17f6730fbc8a104ce4b221a80" ] && \
+[ "$actual" = "edf7b59ee8f1725bba3d12dc3794e502e043d5aa67bf80c9f990413290deee73" ] && \
 tar -xzf "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" --strip-components=1 2>/dev/null && \
 cp "$PAYLOAD_DIR/manifest.sha256" "$STAGE_ROOT/manifest.sha256" && \
 rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" && \

@@ -5,16 +5,56 @@ rr_download_file() {
     local source_url="$1"
     local target_file="$2"
     local timeout_seconds="${3:-10}"
+    local cache_buster=""
+    local relative_path=""
+
+    cache_buster=$(date +%s)
+    case "$source_url" in
+        "${RR_RAW_BASE}/"*) relative_path="${source_url#"${RR_RAW_BASE}/"}" ;;
+    esac
+
+    # 用户显式配置的 GitHub 代理优先；兼容 https://ghproxy/... 这类
+    # “代理前缀 + 原始 URL”形式。失败后继续走官方源和内置回退。
+    if [ -n "${RR_GITHUB_MIRROR:-}" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
+                "${RR_GITHUB_MIRROR}${source_url}" -o "$target_file" 2>/dev/null && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout="$timeout_seconds" --tries=2 \
+                -O "$target_file" "${RR_GITHUB_MIRROR}${source_url}" 2>/dev/null && return 0
+        fi
+    fi
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
-            "${source_url}?t=$(date +%s)" -o "$target_file"
+            -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+            "${source_url}?t=${cache_buster}" -o "$target_file" 2>/dev/null && return 0
+        if [ -n "$relative_path" ]; then
+            # GitHub 官方 Contents API 可绕过 raw.githubusercontent.com 的
+            # DNS/路由故障；raw media type 让响应直接成为文件内容。
+            curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
+                -H "Accept: application/vnd.github.raw+json" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" \
+                -o "$target_file" 2>/dev/null && return 0
+            curl -4 -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
+                "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" \
+                -o "$target_file" 2>/dev/null && return 0
+        fi
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout="$timeout_seconds" --tries=3 \
-            -O "$target_file" "${source_url}?t=$(date +%s)"
+            -O "$target_file" "${source_url}?t=${cache_buster}" && return 0
+        if [ -n "$relative_path" ]; then
+            wget -q --timeout="$timeout_seconds" --tries=2 \
+                --header="Accept: application/vnd.github.raw+json" \
+                -O "$target_file" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" && return 0
+            wget -4 -q --timeout="$timeout_seconds" --tries=2 \
+                -O "$target_file" "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" && return 0
+        fi
     else
         return 1
     fi
+    return 1
 }
 
 rr_manifest_is_valid() {
@@ -52,10 +92,18 @@ rr_health_log() {
     # 默认置 failed 并显示"检查失败"，下载/校验任一失败时保持该态，绝不误报"已是最新"。
     UPDATE_AVAILABLE=false
     UPDATE_CHECK_STATE="failed"
+    UPDATE_CHECK_ERROR=""
     SCRIPT_VER_STATUS="${YELLOW}检查失败（网络不可用）${RESET}"
     remote_manifest=$(mktemp /tmp/rr-manifest-check.XXXXXX) || return 0
-    if ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3 || \
-       ! rr_manifest_is_valid "$remote_manifest"; then
+    if ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3; then
+        UPDATE_CHECK_ERROR="GitHub Raw、API 与 CDN 均不可达"
+        SCRIPT_VER_STATUS="${YELLOW}检查失败（下载链路不可用）${RESET}"
+        rm -f "$remote_manifest"
+        return 0
+    fi
+    if ! rr_manifest_is_valid "$remote_manifest"; then
+        UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"
+        SCRIPT_VER_STATUS="${YELLOW}检查失败（远程清单无效）${RESET}"
         rm -f "$remote_manifest"
         return 0
     fi
@@ -250,8 +298,7 @@ do_update() {
     local local_ver="${SCRIPT_VERSION:-0}"
 
     if [ -n "$bundle_tmp" ] && [ -n "$bundle_stage" ] && \
-       curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
-           -o "$bundle_tmp" "${bundle_url}?t=$(date +%s)" 2>/dev/null && \
+       rr_download_file "$bundle_url" "$bundle_tmp" 10 && \
        [ -s "$bundle_tmp" ] && \
        tar -xzf "$bundle_tmp" -C "$bundle_stage" 2>/dev/null; then
         # --- 完整性校验：成员数 + 关键文件 + 语法 + 版本合法 ---
@@ -326,7 +373,7 @@ do_update() {
     # ============================================================
     check_update
     if [ "${UPDATE_CHECK_STATE:-latest}" = "failed" ]; then
-        echo -e "${YELLOW}[提示] 版本检查失败（网络不可用），本次未执行更新，当前节点未改动。${RESET}"
+        echo -e "${YELLOW}[提示] 版本检查失败：${UPDATE_CHECK_ERROR:-未知原因}；本次未执行更新，当前节点未改动。${RESET}"
         read -p "按回车键返回..." || true
         return 1
     fi

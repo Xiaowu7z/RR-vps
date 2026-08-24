@@ -485,6 +485,13 @@ grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
 # D10：cron worker 必须用绝对路径调 rr，且 cron 条目必须补齐 PATH
 grep -Fq '"/usr/local/bin/rr", "--sync-devices"' modules/90-auto-update.sh
 grep -Fq 'PATH=/usr/local/bin:/usr/bin:/bin' modules/90-auto-update.sh
+# 更新链路必须在 GitHub Raw 不可达时回退到官方 Contents API 和 CDN；
+# bundle 高速更新也必须复用同一下载函数，不能另写仅支持 Raw 的 curl。
+grep -Fq 'RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"' modules/00-runtime.sh install.sh
+grep -Fq 'RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"' modules/00-runtime.sh install.sh
+grep -Fq 'Accept: application/vnd.github.raw+json' modules/60-update.sh install.sh
+grep -Fq 'rr_download_file "$bundle_url" "$bundle_tmp" 10' modules/60-update.sh
+grep -Fq 'UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"' modules/60-update.sh
 # D10：孤儿清理必须覆盖按客户端拆分的订阅文件（-vl/-v2rayn/-v2rayng/-sr/-nekobox）
 grep -Fq -- '${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt"' modules/85-nexus.sh
 grep -Fq -- '${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt"' modules/85-nexus.sh
