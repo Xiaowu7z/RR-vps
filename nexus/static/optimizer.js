@@ -10,9 +10,10 @@
  *   4. 测速对象是 CF 域名（间接测其命中的 Cloudflare Edge IP 段），
  *      不宣称"浏览器绑定指定 IP 测速"。Edge IP 由浏览器通过 DNS-over-HTTPS 实时解析。
  *
- * 与 Android 版 CF Optimizer 的关系：
+ * 与 Android 版 CF Optimizer 的关系（对齐其分层测速思想）：
  *   Android = IP 精准探测版（FixedDns + 指定 IP）
  *   Web     = 浏览器本地 CF Edge 优选版（真实用户网络环境测试）
+ *   分层策略对齐 Pipeline.kt：候选池（1000 域名）→ 小流量筛选 → 决赛名单 → 完整测速。
  */
 
 const OptimizerState = {
@@ -20,12 +21,12 @@ const OptimizerState = {
   aborted: false,
   controller: null,
   domains: [],           // 候选 CF 域名列表（内嵌，无需请求服务器）
-  results: [],           // 每域名聚合结果
+  results: [],           // 决赛域名聚合结果
   egressIp: "",          // 首次 trace 检测到的出口 IP
   egressChanged: false,  // 测速过程中出口 IP 是否变化
   vpnDetected: false,    // 是否检测到 VPN/代理特征
   networkType: "",       // WiFi / Mobile / ...
-  rounds: 3,             // 每域名测速轮次
+  rounds: 3,             // 决赛域名精确测速轮次
 };
 
 // POP 权重：亚洲入口偏好，仅作软偏好，最终由实际测速结果主导。
@@ -35,26 +36,218 @@ const POP_WEIGHT = {
 };
 const POP_WEIGHT_DEFAULT = 0.65;
 
-// 下载测速字节数（可选档位：流量预估提示用）
-const DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2MB
-const PROBE_TIMEOUT_MS = 8000;
-const CONCURRENCY = 8;
-
+// 分层测速常量（对齐 Android Pipeline.kt 的 micro → full）
+const BASELINE_DOMAIN = "www.nexusmods.com"; // 基准域名（必进决赛）
+const FINAL_DOMAINS = 20;      // 决赛域名数（对齐 Android finalDomains 慢档）
+const MICRO_CONCURRENCY = 25;  // 筛选阶段并发
+const MICRO_TIMEOUT_MS = 3500; // 筛选阶段短超时（快速淘汰慢域名）
+const CONCURRENCY = 8;         // 精确测速阶段并发
+const PROBE_TIMEOUT_MS = 8000; // 精确测速超时
+const DOWNLOAD_BYTES = 2 * 1024 * 1024; // 下载测速 2MB
 const STORAGE_KEY = "rr_edge_optimizer";
 
 // 候选 CF 域名池（内嵌在工具文件中，服务器仅静态托管此文件，域名池随之分发）
 const OPTIMIZER_DOMAINS = [
-  "speed.cloudflare.com", "www.cloudflare.com", "blog.cloudflare.com",
-  "developers.cloudflare.com", "radar.cloudflare.com", "www.nexusmods.com",
-  "www.4chan.org", "www.canva.com", "www.fiverr.com", "www.indeed.com",
-  "www.shopify.com", "www.chess.com", "www.codepen.io", "www.dribbble.com",
-  "www.deepl.com", "www.sentry.io", "www.ngrok.com", "www.digitalocean.com",
-  "www.vultr.com", "www.docker.com", "www.gitlab.com", "www.medium.com",
-  "www.namecheap.com", "www.discourse.org", "www.producthunt.com",
-  "www.behance.net", "www.unsplash.com", "www.imgur.com", "www.fandom.com",
-  "www.speedtest.net", "www.mozilla.org", "www.python.org", "www.npmjs.com",
-  "www.jsdelivr.com", "discord.com", "www.patreon.com", "www.quora.com",
-  "www.coinmarketcap.com", "www.grammarly.com", "www.cloudflare-ipfs.com",
+  "www.nexusmods.com", "nexusmods.com", "www.cloudflare.com", "cloudflare.com", "blog.cloudflare.com",
+  "developers.cloudflare.com", "speed.cloudflare.com", "radar.cloudflare.com", "community.cloudflare.com", "dash.cloudflare.com",
+  "pages.cloudflare.com", "workers.cloudflare.com", "www.cloudflarestatus.com", "cloudflarestatus.com", "cloudflare-dns.com",
+  "www.cloudflare-dns.com", "one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com", "www.trycloudflare.com", "trycloudflare.com",
+  "pages.dev", "workers.dev", "warp.dev", "cloudflareclient.com", "www.cloudflareclient.com",
+  "cloudflareinsights.com", "www.cloudflareinsights.com", "www.4chan.org", "4chan.org", "www.canva.com",
+  "canva.com", "www.fiverr.com", "fiverr.com", "www.indeed.com", "indeed.com",
+  "www.pexels.com", "pexels.com", "www.shopify.com", "shopify.com", "www.chess.com",
+  "chess.com", "www.itch.io", "itch.io", "www.codepen.io", "codepen.io",
+  "www.dribbble.com", "dribbble.com", "www.deepl.com", "deepl.com", "www.sentry.io",
+  "sentry.io", "www.bitly.com", "bitly.com", "www.ngrok.com", "ngrok.com",
+  "www.digitalocean.com", "digitalocean.com", "www.vultr.com", "vultr.com", "www.linode.com",
+  "linode.com", "www.docker.com", "docker.com", "www.gitlab.com", "gitlab.com",
+  "www.medium.com", "medium.com", "www.genius.com", "genius.com", "www.tawk.to",
+  "tawk.to", "www.namecheap.com", "namecheap.com", "www.cloudflare.net", "cloudflare.net",
+  "www.discourse.org", "discourse.org", "www.letterboxd.com", "letterboxd.com", "www.producthunt.com",
+  "producthunt.com", "www.behance.net", "behance.net", "www.unsplash.com", "unsplash.com",
+  "www.imgur.com", "imgur.com", "www.fandom.com", "fandom.com", "www.archiveofourown.org",
+  "archiveofourown.org", "www.curseforge.com", "curseforge.com", "www.speedtest.net", "speedtest.net",
+  "www.mozilla.org", "mozilla.org", "www.python.org", "python.org", "www.rust-lang.org",
+  "rust-lang.org", "www.npmjs.com", "npmjs.com", "www.npmjs.org", "npmjs.org",
+  "www.jsdelivr.com", "jsdelivr.com", "www.stackshare.io", "stackshare.io", "www.cloudflare-ipfs.com",
+  "cf-ipfs.com", "discord.com", "www.discord.com", "www.patreon.com", "patreon.com",
+  "www.quora.com", "quora.com", "www.coinmarketcap.com", "coinmarketcap.com", "www.grammarly.com",
+  "grammarly.com", "www.notion.so", "notion.so", "www.openai.com", "openai.com",
+  "www.reddit.com", "reddit.com", "www.twitch.tv", "twitch.tv", "www.udemy.com",
+  "udemy.com", "www.coursera.org", "coursera.org", "www.khanacademy.org", "khanacademy.org",
+  "wbinsights.com", "yuanshen.com", "goodreads.com", "rt.ru", "l-err.biz",
+  "sky.com", "b2clogin.com", "vk.com", "goodsync.com", "nuancemobility.net",
+  "myip.com", "razorpay.com", "impact-ad.jp", "google.com.mx", "rambler.ru",
+  "gotolstoy.com", "discogs.com", "360.cn", "amap.com", "awswaf.com",
+  "sndcdn.com", "krisp.ai", "disquscdn.com", "xero.com", "pendo.io",
+  "189.cn", "me.com", "exponea.com", "brightcove.net", "bidswitch.net",
+  "atmtd.com", "tq-tungsten.com", "gdms.cloud", "drdrab.com", "conversionsapigateway.com",
+  "zdbb.net", "pop-convert.com", "force.com", "google.ge", "gnezdo.ru",
+  "ruckus.cloud", "securly.com", "fireoscaptiveportal.com", "tnt-ea.com", "mgslb.com",
+  "redditspace.com", "ubnt.com", "latamairlines.com", "dmrtb.com", "snarutox.com",
+  "google.kz", "mjedge.net", "wps.com", "wondershare.cc", "mmechocaptiveportal.com",
+  "dattobackup.com", "packetstream.io", "nintendo.com", "kumulos.com", "t-static.ru",
+  "warnermediacdn.com", "yandex.fi", "qianwen.com", "litatom.com", "reson8.com",
+  "blockchain.info", "infocyte.com", "myfitnesspal.com", "google.org", "haplat.net",
+  "belkin.com", "google.at", "ns1p.net", "parastorage.com", "nytimes.com",
+  "appnexusgslb.com", "online-metrix.net", "comfylink.com", "gcore.com", "hepsiburada.com",
+  "byte008.com", "docusign.com", "adsensecustomsearchads.com", "usgovcloudapi.net", "depositphotos.com",
+  "yeastar.com", "ldmnq.com", "aviasales.com", "ttvnw.net", "365scores.com",
+  "ixigua.com", "solaredge.com", "calendly.com", "refinery89.com", "7tv.io",
+  "amplitude.com", "opera-api.com", "cdn-fileserver.com", "bcbd123.com", "lunalabs.io",
+  "hola.org", "languagetoolplus.com", "nflxext.com", "adpushup.com", "bol.com",
+  "wfcdn.com", "adobeccstatic.com", "omnisendlink.com", "mercadolibre.com.mx", "apibay.org",
+  "ghost.io", "soundcloud.com", "elasticbeanstalk.com", "huobi.pro", "loox.io",
+  "appdome.com", "colnsedge.com", "mist.com", "opera.technology", "emc.com",
+  "crpt.ru", "cars.com", "tdatamaster.com", "fedoraproject.org", "live-video.net",
+  "bricks-co.com", "oracleinfinity.io", "coolzcloud.com", "sleepnumber.com", "cloud.globo",
+  "digitalaudience.io", "ladesk.com", "aidata.io", "mdpi.com", "tpmn.io",
+  "ebayimg.com", "corel.com", "ask.com", "cloudflare-gateway.com", "adstk.io",
+  "indriverapp.com", "shallspark.com", "mediav.com", "kwai-pay.com", "toast.com",
+  "voltaxservices.io", "clover.com", "cbssports.com", "conviva.com", "zg-api.com",
+  "docker.io", "vps-vids.com", "lgtvcommon.com", "1905.com", "homeconnecthca.com",
+  "clarocdn.com.br", "yandex.com.tr", "lenovomm.com", "adp.com", "casasbahia.com.br",
+  "tildacdn.com", "grofers.com", "railway.app", "netgear.com", "okx.cab",
+  "verkada.com", "tdnsstic1.cn", "sendbird.com", "google.bt", "changeip.com",
+  "adobestats.io", "douyinstatic.com", "activision.com", "dialmyapp.com", "apkpure.com",
+  "a-b-c-8.com", "noaa.gov", "zaloapp.com", "adobeprimetime.com", "ele.me",
+  "web.id", "outlook.com", "everesttech.net", "ebaydesc.com", "itbakit.com",
+  "rbstsystems.live", "fandango.com", "puicdn.com", "tubi.video", "gotomeeting.com",
+  "quillbot.com", "pb.com", "weglot.com", "dalyfeds.com", "printercloud.com",
+  "zillowstatic.com", "scribd.com", "zscloud.net", "sweatco.in", "idealmedia.io",
+  "gototraining.com", "iubenda.com", "jumpcloud.com", "nexthink.cloud", "google.com.py",
+  "instabug.com", "assets-yammer.com", "sportradarserving.com", "oaiusercontent.com", "salesforce-scrt.com",
+  "google.com.jm", "country.is", "onetag-sys.com", "chewy.com", "cloudsink.net",
+  "priceline.com", "mygaru.com", "ca.gov", "eufylife.com", "tiktokw.eu",
+  "espncricinfo.com", "marriott.com", "typeform.com", "google.hr", "google.al",
+  "esportesdasorte.bet.br", "pastebin.com", "zeronaught.com", "alfabank.ru", "mova-tech.com",
+  "genieesspv.jp", "affirm.com", "myip.link", "etahub.com", "google.cg",
+  "ivi.ru", "zscaler.net", "deviantart.com", "metricswpsh.com", "qantas.com",
+  "wareztv.io", "olx.com.br", "accuweather.com", "bradesco.com.br", "ttdns2.com",
+  "quago.io", "pinterest.com", "hexagon-analytics.com", "disney-plus.net", "openxcdn.net",
+  "protonmail.ch", "fbsbx.com", "googleapis.cn", "wwstat.com", "ipleak.net",
+  "bilibili.com", "codedish.co", "centrastage.net", "bcebos.com", "usercentrics.eu",
+  "tivo.com", "dreame.tech", "ac.in", "intsig.net", "go.com",
+  "lenovo.com", "signal.org", "google.sr", "samsungcloudsolution.net", "zohopublic.com",
+  "im-apps.net", "biahosted.com", "skinnycrawlinglax.com", "windows.com", "netcoresmartech.com",
+  "google.lk", "mcas.ms", "dzeninfra.ru", "ttwstatic.com", "vorwerk-digital.com",
+  "kinopoisk.ru", "urban-vpn.com", "unmsapp.com", "volcgtm.com", "cambaddies.com",
+  "like-video.com", "wandera.com", "tatum.io", "bromium-online.com", "archlinux.org",
+  "samsung.com", "viafoura.co", "listdl.com", "tailscale.io", "richaudience.com",
+  "cpanel.net", "pcloud.com", "eyeota.net", "adx.ws", "sophosupd.com",
+  "loom.com", "glance.com", "gofastchat.com", "samsungosp.com", "monitoring360.io",
+  "nereserv.com", "saygames.io", "ad4m.at", "zdn.vn", "intelbrasp2p.com.br",
+  "oracle.com", "apollo.io", "amazon.pl", "joinwebinar.com", "sgsnssdk.com",
+  "imgsmail.ru", "discord.gg", "optimizely.com", "scw.cloud", "nbc.com",
+  "freepik.com", "opera.software", "zzpxy.top", "kwaipros.com", "advertising.com",
+  "ampproject.org", "flirtify.com", "wiley.com", "octobrowser.net", "kontur.ru",
+  "tpmn.co.kr", "zoom.us", "zencdn.net", "tianwenca.com", "fbcdn.net",
+  "youngle.tech", "ecobee.com", "certum.pl", "weathercn.com", "google.com.tw",
+  "apitd.net", "jetbrains.com", "myfoscam.com", "intercom.io", "pbs.org",
+  "doppiocdn.net", "smartthings.com", "usercontent.goog", "capitaloneshopping.com", "allawnos.com",
+  "resetdigital.co", "indazn.com", "sng.link", "uuidksinc.net", "mediaplex.com",
+  "testmy.net", "msftauthimages.net", "alidns.com", "redbubble.com", "syndicatedsearch.goog",
+  "4wps.net", "wallapop.com", "mtgglobals.com", "cloudbackup.management", "google.ch",
+  "myclientip.com", "cpx.to", "lifeaiot.com", "edgecdn.ru", "mintegral.net",
+  "nuget.org", "deepernetworks.org", "schwab.com", "google.com.co", "shopifycdn.com",
+  "superbet.bet.br", "tokopedia.com", "nba.com", "outboundproxy.com", "ticketmaster.com",
+  "nextdns.io", "qwps.cn", "anonymised.io", "cookiebot.com", "microsoftonline.com",
+  "mfadsrvr.com", "ueiwsp.com", "sohu.com", "wistia.com", "volcvod.com",
+  "xml-redirect.online", "zscalerthree.net", "aniview.com", "google.as", "gmail.com",
+  "addtoany.com", "yotpoapi.com", "demonware.net", "idexx.com", "selcdn.net",
+  "travel-assets.com", "qiyukf.com", "gtld-servers.net", "appbaqend.com", "booking.com",
+  "mediavine.com", "aliyun.com", "izatcloud.net", "nocookie.net", "channelcom.tech",
+  "google.la", "vkvideo.ru", "google.com.ai", "onkakao.net", "vonedge.com",
+  "zing.vn", "apkpure.net", "siteimproveanalytics.io", "powerschool.com", "doppiocdn.com",
+  "coupert.com", "tiktokcdn.com", "mgtv.com", "hpsmart.com", "mopub.com",
+  "devicetrust.com", "ndcpp-os.com", "drom.ru", "givefreely.com", "qustodio.com",
+  "speedtestcustom.com", "hsforms.net", "sina.com.cn", "serving-sys.ru", "opt360.net",
+  "bytepluscdn.com", "webengage.com", "prebid-server.com", "paytm.com", "spribegaming.com",
+  "dutils.com", "newsbreak.com", "ad-delivery.net", "opentrackr.org", "honeygain.com",
+  "remote-service-pf.com", "wpengine.com", "p-cdn.us", "netlify.com", "tapad.com",
+  "poly-ai.chat", "kinescopecdn.net", "google.co.ug", "wego.com", "iotcplatform.com",
+  "futbin.com", "tubemogul.com", "linkplay.com", "santander.com.br", "appboy.com",
+  "zippypongbee.com", "wordwall.net", "revjet.com", "bytefcdn.com", "octo25.me",
+  "ebay.com", "sonarr.tv", "npttech.com", "tribunnews.com", "dotomi.com",
+  "bytelb.com", "azure-dns.net", "dramaverses.com", "safedk.com", "bloomreach.co",
+  "bluestacks.com", "make.com", "smile.io", "rtbwise.com", "cnzz.com",
+  "samokat.ru", "capcutcdn-us.com", "semanticscholar.org", "opentracker.io", "pdst.fm",
+  "tinypass.com", "grammarly.net", "trvdp.com", "geniex.com", "popcash.net",
+  "configcat.com", "keplr.app", "nypost.com", "fhgte.com", "fastly-insights.com",
+  "cloudflareok.com", "shopee.vn", "adapty.io", "nordpass.com", "hsadspixel.net",
+  "v2z.ru", "r7ops.com", "phonefactor.net", "yandex.ru", "onrender.com",
+  "google.bs", "kayzen.io", "susercontent.com", "wixmp.com", "hulustream.com",
+  "ospserver.net", "delta.com", "apnews.com", "usepylon.com", "sanity.io",
+  "navdmp.com", "heytapimage.com", "webshare.io", "eqtv.io", "qualtrics.com",
+  "media-amazon.com", "mercadolibre.com", "ifood.com.br", "aiv-cdn.net", "eu-1-id5-sync.com",
+  "postrelease.com", "google.lv", "alibaba-inc.com", "f-sos.net", "pvvstream.pro",
+  "ccgateway.net", "appiersig.com", "intsmarthub.com", "kameleoon.eu", "adroll.com",
+  "8slp.net", "acrobat.com", "tencentmusic.com", "dotnxdomain.net", "sicoob.com.br",
+  "trustedstack.com", "packetsdk.io", "disney.co.jp", "onefootball.com", "sourshaped.com",
+  "prodregistryv2.org", "bancointer.com.br", "kslawin.com", "roeyecdn.com", "e-msedge.net",
+  "txlivecdn.com", "deviantart.net", "minecraft-services.net", "google.nu", "weatherbug.net",
+  "storagejsstrategiesfabulous.com", "anuytzc.xyz", "galaxy-cdn.com", "feishu.cn", "wwsga.me",
+  "brevo.com", "quad9.net", "google.com.br", "artstation.com", "dnsv1.com",
+  "mktoresp.com", "sm.cn", "ipip.net", "system-monitor.com", "qidi3dprinter.com",
+  "wetransfer.net", "salesforceliveagent.com", "fontawesome.com", "superproxy.io", "apicgate.com",
+  "go-mpulse.net", "adsbynimbus.com", "browsiprod.com", "bugsnag.com", "glassdoor.com",
+  "mypikpak.com", "localytics.com", "adspower.net", "lge.com", "cdninstagram.com",
+  "google.com.sv", "redbubble.net", "aliapp.org", "pubmnet.com", "ac.kr",
+  "saawsedge.com", "gonet-ads.com", "mxptint.net", "getgrass.io", "nextersglobal.com",
+  "jsmsat.com", "akahost.net", "cisco.com", "eeroup.com", "amazonsilk.com",
+  "pixiv.net", "mega.nz", "nest.com", "tenjin.com", "amzn.eu",
+  "jito.wtf", "lookout.com", "highspeedinternet.com", "elastic.co", "mi.com",
+  "dnse0.com", "1drv.com", "aliyuncs.com", "google.com.ar", "banco.bradesco",
+  "hik-connect.com", "gcdn.co", "unioneeu.com", "volcmcdn3.com", "logitech.com",
+  "bytegle.site", "best61.com", "best82.com", "fluidplayer.com", "cloudscdn.net",
+  "aidemsrv.com", "stnvideo.com", "nhs.uk", "vercel.app", "xdrtc.com",
+  "signalr.net", "queue-it.net", "thinkingdata.cn", "hereapi.com", "google.com.et",
+  "airtable.com", "windy.com", "tenable.com", "apptracer.ru", "tesla.services",
+  "samsungcloud.com", "aliyuncsslbintl.com", "google.com.vn", "gameanalytics.com", "linke.ai",
+  "sspnet.tech", "dtscout.com", "isharing-gps.com", "crowdstrike.com", "ably.io",
+  "plista.com", "flickr.com", "webflow.com", "axs.com", "jd.com",
+  "redhat.com", "edgedns-tm.info", "tradplusad.com", "mobile.de", "geoipcheck.com",
+  "megaphone.fm", "t-ru.org", "libsyn.com", "ruckuswireless.com", "voodoo-tech.io",
+  "fpjs.io", "otto.de", "nabu.casa", "bdydns.com", "fuseplatform.net",
+  "atidevs.com", "tru.am", "roku.com", "squarespace.com", "bumlam.com",
+  "chimpstatic.com", "x.ai", "xhtotal.com", "streamrail.com", "mathworks.com",
+  "mi-fds.com", "blogspot.com", "airbrake.io", "quantcount.com", "alipayobjects.com",
+  "jiveip.net", "goo.gl", "bringads.ru", "kunlunsl.com", "garena.com",
+  "samsunghealth.com", "douyinpic.com", "navercorp.com", "vidazoo.services", "gouv.fr",
+  "samba.tv", "google.co.kr", "thecatmachine.com", "alarmnet.com", "affec.tv",
+  "instana.io", "vesync.com", "pushd.com", "erne.co", "bidmatic.io",
+  "olxcdn.com", "sap.com", "google.co.nz", "boomplaymusic.com", "gtranslate.net",
+  "rs-online.com", "bytetcdn.com", "google.mk", "opensea.io", "pbbl.co",
+  "zmaticoo.com", "wb.ru", "mediarithmics.com", "s-onetag.com", "volcfcdndvs.com",
+  "hcaptcha.com", "hath.network", "e5.sk", "f2pool.com", "google.mn",
+  "tbcache.com", "bb.com.br", "dramaboxdb.com", "sc-static.net", "lsapp.eu",
+  "quicksetcloud.com", "paloaltonetworks.com", "b-msedge.net", "demdex.net", "vsco.co",
+  "binance.org", "minecraft.net", "socdm.com", "livesport.services", "android.com",
+  "worldoftanks.eu", "scene7.com", "admixer.net", "concursolutions.com", "google.co.zw",
+  "acobt.tech", "celtra.com", "holadns.com", "ip-api.com", "ovrc.com",
+  "primis.tech", "zeotap.com", "nflximg.com", "pstatp.com", "veeam.com",
+  "biz.id", "nexon.com", "google.az", "bezeqint.net", "qianxun.com",
+  "otclick-adv.ru", "ml314.com", "judge.me", "mercadoclics.com", "netlify.app",
+  "midasplayer.net", "lgthinq.com", "muscache.com", "seek.com.au", "smilewanted.com",
+  "decibelinsight.net", "captioncall.com", "fc2.com", "totalbattle.com", "edgesuite.net",
+  "google.com.gh", "msftstatic.com", "clarip.com", "ttdns3.com", "pokeapi.co",
+  "google.gp", "media6degrees.com", "bytedance.com", "youtu.be", "nextlgsdp.com",
+  "jwplatform.com", "kargo.com", "dbankcloud.eu", "bluetrafficstream.com", "porsche.com",
+  "tsyndicate.com", "libero.it", "ipv6-test.com", "bdstatic.com", "monday.com",
+  "srmdata-us.com", "aqara.com", "nearme.com.cn", "bilivideo.com", "ripe.net",
+  "nflxso.net", "app-measurement.com", "wp.pl", "apptentive.com", "p-n.io",
+  "xbox-dns.ru", "overwolf.com", "autonavi.com", "dmv.org", "kwaicdn.com",
+  "powerplatform.com", "falconnet.app", "permutive.com", "azurerms.com", "clean.gg",
+  "aylanetworks.com", "gaijin.net", "hubspot.com", "hot.net.il", "glotgrx.com",
+  "presage.io", "okx.com", "csfloat.com", "pipopay.com", "google.vg",
+  "rockylinux.org", "rollbar.com", "dual-s-dc-msedge.net", "uservoice.com", "liveperson.net",
+  "pinduoduo.com", "tile-api.com", "allegrostatic.com", "cloudinary.com", "avada.io",
+  "jfrog.io", "yclients.com", "lnkdns.net", "zoho.in", "sfx.ms",
+  "gstatic.com", "ipinfo.io", "acrobits.cz", "azure-dns.com", "xerox.com",
+  "op.gg", "zhihu.com", "infinitepay.io", "blastapi.io", "zyxel.com",
+  "tribalfusion.com", "coinall.ltd", "avito.st", "amspbs.com", "nih.gov",
+  "fizzopic.org", "instagram.com", "spbycdn.com", "ietf.org", "comodoca.com",
+  "sgmbocast.com", "dtignite.com", "office.com", "xwz.ovh", "cudaops.com",
 ];
 
 const $o = (sel, root = document) => root.querySelector(sel);
@@ -115,13 +308,18 @@ function isPrivateIp(ip) {
 async function probeTrace(domain, timeoutMs, signal) {
   const url = `https://${domain}/cdn-cgi/trace`;
   const start = performance.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || PROBE_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort);
+  }
   try {
-    const timeoutId = setTimeout(() => signal?.abort ? null : null, 0);
-    const resp = await fetch(url, { signal, cache: "no-store" });
+    const resp = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
     const ttfb = performance.now() - start;
     const text = await resp.text();
     const total = performance.now() - start;
-    // 解析 colo / loc / ip
     let colo = "", loc = "", ip = "";
     for (const line of text.split("\n")) {
       if (line.startsWith("colo=")) colo = line.slice(5).trim().toUpperCase();
@@ -132,6 +330,9 @@ async function probeTrace(domain, timeoutMs, signal) {
   } catch (e) {
     const total = performance.now() - start;
     return { ok: false, domain, ttfb: -1, total, colo: "", loc: "", ip: "", error: e.name || "error" };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -140,14 +341,24 @@ async function probeTrace(domain, timeoutMs, signal) {
 /* ------------------------------------------------------------------ */
 async function resolveEdgeIp(domain, signal) {
   const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort);
+  }
   try {
-    const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal });
+    const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal });
     if (!resp.ok) return "";
     const data = await resp.json();
     const a = (data.Answer || []).filter((x) => x.type === 1).map((x) => x.data);
     return a[0] || "";
   } catch (_e) {
     return "";
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -157,16 +368,26 @@ async function resolveEdgeIp(domain, signal) {
 async function probeDownload(signal) {
   const url = `https://speed.cloudflare.com/__down?bytes=${DOWNLOAD_BYTES}`;
   const start = performance.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  const onAbort = () => ctrl.abort();
+  if (signal) {
+    if (signal.aborted) ctrl.abort();
+    else signal.addEventListener("abort", onAbort);
+  }
   try {
-    const resp = await fetch(url, { signal, cache: "no-store" });
+    const resp = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
     if (!resp.ok) return { ok: false, mbps: 0, bytes: 0 };
     const buf = await resp.arrayBuffer();
     const ms = performance.now() - start;
     const bytes = buf.byteLength;
-    const mbps = ms > 0 ? (bytes * 8) / (ms * 1000) : 0; // 字节*8/毫秒/1000 = Mbps
+    const mbps = ms > 0 ? (bytes * 8) / (ms * 1000) : 0;
     return { ok: true, mbps, bytes, ms };
   } catch (_e) {
     return { ok: false, mbps: 0, bytes: 0 };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -253,10 +474,11 @@ async function optimizerStart() {
       toast("未获取到候选域名，请检查网络后重试。", true);
       return;
     }
+    const total = OptimizerState.domains.length;
 
     // 1) 出口 IP 基线 + VPN 启发式检测
     setProgress(4, "检测网络环境…");
-    const baseline = await probeTrace("speed.cloudflare.com", PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
+    const baseline = await probeTrace(BASELINE_DOMAIN, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
     OptimizerState.egressIp = baseline.ip || "";
     const localIps = await detectLocalIps();
     const publicLocal = localIps.filter((ip) => !isPrivateIp(ip));
@@ -267,22 +489,54 @@ async function optimizerStart() {
       showVpnBanner();
     }
 
-    // 2) 并发测速：每域名多轮 trace + DoH 解析 Edge IP
-    const domains = OptimizerState.domains;
-    const total = domains.length;
-    let done = 0;
-    const perDomain = {};
+    // 2) 第一阶段：小流量快速筛选（全部候选域名 × 1 轮）
+    setProgress(8, `第一阶段 · 快速筛选 0/${total} 域名…`);
+    const micro = {}; // domain -> { ttfb, colo }
+    await runConcurrent(OptimizerState.domains, MICRO_CONCURRENCY, async (domain) => {
+      const res = await probeTrace(domain, MICRO_TIMEOUT_MS, OptimizerState.controller.signal);
+      if (res.ok && res.ttfb >= 0) {
+        micro[domain] = { ttfb: res.ttfb, colo: res.colo };
+      }
+      if (res.ok && res.ip && OptimizerState.egressIp && res.ip !== OptimizerState.egressIp) {
+        OptimizerState.egressChanged = true;
+      }
+    }, (n) => {
+      setProgress(8 + Math.floor((n / total) * 47), `第一阶段 · 快速筛选 ${n}/${total} 域名…`);
+    });
 
-    setProgress(8, `并发测速 0/${total} 域名…`);
-    await runConcurrent(domains, CONCURRENCY, async (domain) => {
-      // DoH 实时解析该域名当前命中的 CF Edge IP（浏览器本地发起）
+    if (OptimizerState.aborted) {
+      setProgress(100, "已停止");
+      toast("测速已停止。");
+      return;
+    }
+
+    // 3) 精选决赛域名（TTFB 最快 top FINAL_DOMAINS，含基准域名）
+    setProgress(56, "精选决赛域名…");
+    const microList = Object.entries(micro)
+      .sort((a, b) => a[1].ttfb - b[1].ttfb)
+      .map(([d]) => d);
+    const finalists = [];
+    if (micro[BASELINE_DOMAIN]) finalists.push(BASELINE_DOMAIN);
+    for (const d of microList) {
+      if (finalists.length >= FINAL_DOMAINS) break;
+      if (!finalists.includes(d)) finalists.push(d);
+    }
+    if (!finalists.length) {
+      setProgress(100, "筛选阶段无有效结果");
+      toast("快速筛选未获取到有效结果，请检查网络后重试。", true);
+      return;
+    }
+
+    // 4) 第二阶段：决赛域名精确测速（多轮 + DoH 解析 Edge IP）
+    const perDomain = {};
+    setProgress(60, `第二阶段 · 精确测速 0/${finalists.length} 域名…`);
+    await runConcurrent(finalists, CONCURRENCY, async (domain) => {
       const edgeIp = await resolveEdgeIp(domain, OptimizerState.controller.signal);
       const rounds = [];
       for (let r = 0; r < OptimizerState.rounds; r++) {
         if (OptimizerState.aborted) break;
         const res = await probeTrace(domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
         rounds.push(res);
-        // 出口变化检测
         if (res.ok && res.ip && OptimizerState.egressIp && res.ip !== OptimizerState.egressIp) {
           OptimizerState.egressChanged = true;
         }
@@ -301,8 +555,7 @@ async function optimizerStart() {
         rounds: rounds.length,
       };
     }, (n) => {
-      done = n;
-      setProgress(8 + Math.floor((n / total) * 60), `并发测速 ${n}/${total} 域名…`);
+      setProgress(60 + Math.floor((n / finalists.length) * 20), `第二阶段 · 精确测速 ${n}/${finalists.length} 域名…`);
     });
 
     if (OptimizerState.aborted) {
@@ -311,12 +564,12 @@ async function optimizerStart() {
       return;
     }
 
-    // 3) 下载吞吐（整体参考）
-    setProgress(72, "测试下载吞吐…");
+    // 5) 下载吞吐（整体参考）
+    setProgress(82, "测试下载吞吐…");
     const dl = await probeDownload(OptimizerState.controller.signal);
 
-    // 4) 计算 Edge Score + 排序
-    setProgress(82, "计算 Edge Score…");
+    // 6) 计算 Edge Score + 排序
+    setProgress(88, "计算 Edge Score…");
     OptimizerState.results = Object.values(perDomain)
       .filter((m) => m.rounds > 0)
       .map((m) => {
@@ -325,9 +578,9 @@ async function optimizerStart() {
       })
       .sort((a, b) => b.edgeScore - a.edgeScore);
 
-    // 5) 渲染 + 保存
+    // 7) 渲染 + 保存
     renderBest(OptimizerState.results[0], dl);
-    renderResults(OptimizerState.results, dl);
+    renderResults(OptimizerState.results, dl, total, finalists.length);
     saveLocal(OptimizerState.results[0], dl);
     setProgress(100, "完成");
 
@@ -407,10 +660,10 @@ function renderBest(best, dl) {
     </div>`;
 }
 
-function renderResults(results, dl) {
+function renderResults(results, dl, totalDomains, finalistCount) {
   const wrap = $o("#optimizer-results");
   wrap.classList.remove("hidden");
-  const tbody = results.slice(0, 15).map((m, i) => {
+  const tbody = results.slice(0, FINAL_DOMAINS).map((m, i) => {
     const ip = m.ips && m.ips[0] ? m.ips[0] : "—";
     const ttfb = m.medianTtfb >= 0 ? `${m.medianTtfb.toFixed(0)} ms` : "—";
     const sr = `${(m.successRate * 100).toFixed(0)}%`;
@@ -425,9 +678,10 @@ function renderResults(results, dl) {
       <td>${cv}</td>
     </tr>`;
   }).join("");
+  const scope = `从 ${totalDomains} 个候选域名中筛选 ${finalistCount} 个决赛域名精确测速`;
   wrap.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>候选域名排名（按 Edge Score）</h3></div><small>下载参考：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>决赛域名排名（按 Edge Score）</h3><p>${escapeHtmlO(scope)}</p></div><small>下载参考：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
       <div class="table-scroll"><table class="data-table">
         <thead><tr><th>#</th><th>域名</th><th>Edge IP</th><th>POP</th><th>TTFB</th><th>成功率</th><th>波动</th></tr></thead>
         <tbody>${tbody || '<tr><td colspan="7">无有效结果</td></tr>'}</tbody>
@@ -496,7 +750,8 @@ function optimizerOnEnter() {
   renderHistory();
   const box = $o("#optimizer-traffic-hint");
   if (box) {
-    box.innerHTML = `本次测速约消耗 <b>${(DOWNLOAD_BYTES / 1024 / 1024).toFixed(0)} MB</b> 下载流量（${OptimizerState.rounds} 轮 × ${OptimizerState.domains.length || OPTIMIZER_DOMAINS.length} 个域名 trace + 一次下载测速），全程在浏览器本地完成，服务器不参与测速、不上传任何数据。`;
+    const pool = OptimizerState.domains.length || OPTIMIZER_DOMAINS.length;
+    box.innerHTML = `测速分两阶段：先对 <b>${pool} 个候选域名</b>做 1 轮快速筛选，再对 <b>${FINAL_DOMAINS} 个决赛域名</b>做 ${OptimizerState.rounds} 轮精确测速 + 一次约 ${(DOWNLOAD_BYTES / 1024 / 1024).toFixed(0)} MB 下载测速。全程在浏览器本地完成，服务器不参与测速、不上传任何数据。`;
   }
 }
 
