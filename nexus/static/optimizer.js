@@ -514,7 +514,7 @@ function readSelect(sel, fallback) {
   return (el && el.value) ? el.value : fallback;
 }
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function optSleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // Edge 复用稳定性：连续短间隔 trace（串行，100ms 间隔，复用 TCP/TLS 连接）
 // 关键：不能并发，必须串行，否则浏览器会创建多个连接、无法观察连接复用效果。
@@ -525,7 +525,7 @@ async function probeEdgeStability(domain, rounds, signal) {
     if (OptimizerState.aborted) break;
     const res = await probeTrace(domain, PROBE_TIMEOUT_MS, signal);
     if (res.ok && res.ttfb >= 0) { success++; ttfbs.push(res.ttfb); }
-    if (i < rounds - 1) await sleep(100);
+    if (i < rounds - 1) await optSleep(100);
   }
   const successRate = rounds ? success / rounds : 0;
   const avgTTFB = ttfbs.length ? ttfbs.reduce((a, b) => a + b, 0) / ttfbs.length : -1;
