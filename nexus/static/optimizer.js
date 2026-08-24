@@ -27,7 +27,13 @@ const OptimizerState = {
   egressChanged: false,  // 测速过程中出口 IP 是否变化
   vpnDetected: false,    // 是否检测到 VPN/代理特征
   networkType: "",       // WiFi / Mobile / ...
-  operator: "",          // 运营商（IP 反查，失败为"未知"）
+  operator: "",          // 运营商（IP 反查或手动指定）
+  operatorManual: "",    // 手动运营商（"auto"=自动检测）
+  protocol: "dual",      // ipv4 / ipv6 / dual
+  use: "proxy",          // web 网页 / proxy 代理 / download 下载
+  mode: "balanced",      // balanced 均衡 / asia_hunt 亚洲入口狩猎
+  ipv4Results: [],       // 双栈：IPv4 候选榜（独立排名）
+  ipv6Results: [],       // 双栈：IPv6 候选榜（独立排名）
   popCount: {},          // 实时 POP 统计 {HKG: n, LAX: n, ...}
 };
 
@@ -51,13 +57,54 @@ const FINAL_COUNT = 20;           // Stage 3 深度测试数量
 const CONCURRENCY = 8;            // Stage 2/3 并发
 const PROBE_TIMEOUT_MS = 8000;    // Stage 3 深度测试超时
 const ROUNDS = 3;                 // Stage 3 每域名累计轮数
+const EDGE_STABILITY_ROUNDS = 5;  // Edge 复用稳定性连续 trace 轮数（仅 proxy 模式）
 const DOWNLOAD_BYTES = 2 * 1024 * 1024;
 const STORAGE_KEY = "rr_edge_optimizer";
 const BLACKLIST_KEY = "rr_edge_optimizer_blacklist";
 const CUSTOM_DOMAINS_KEY = "rr_edge_optimizer_custom_domains";
-// 综合评分权重（五哥确认版）
-// 可用性 40 / 速度 30（域名自身资源响应速度）/ 稳定 15 / 延迟 10 / DNS 5
-const SCORE_W = { availability: 40, speed: 30, stability: 15, latency: 10, dns: 5 };
+// 用途评分权重（五哥确认版，按用途动态切换，不改变基础测试流程只改权重）
+// web 网页访问：可用性40 / TTFB30 / 稳定20 / DNS10
+// proxy 代理节点：可用性35 / 真实响应性能25 / 稳定性25 / 延迟15（默认，RR-vps 主用途）
+// download 下载：可用性30 / 吞吐40 / 稳定20 / 延迟10
+// 用途评分权重（五哥最终确认版，模块化：加用途只需加一个 key，不改评分引擎）
+// web 网页访问：可用性40 / TTFB30 / 稳定20 / DNS10
+// proxy 代理节点（默认）：可用性35 / Edge复用稳定性25 / CF吞吐25 / 延迟10 / DNS5
+// download 下载：可用性30 / 吞吐40 / 稳定20 / 延迟10
+const SCORE_PRESETS = {
+  web:      { availability: 40, ttfb: 30, stability: 20, dns: 10 },
+  proxy:    { availability: 35, edgeStability: 25, cfThroughput: 25, latency: 10, dns: 5 },
+  download: { availability: 30, throughput: 40, stability: 20, latency: 10 },
+};
+const USE_LABELS = { web: "网页访问", proxy: "代理节点", download: "大流量下载" };
+const USE_WEIGHT_TEXT = {
+  web: "可用性40% · TTFB30% · 稳定20% · DNS10%",
+  proxy: "可用性35% · Edge复用稳定性25% · CF吞吐25% · 延迟10% · DNS5%",
+  download: "可用性30% · 吞吐40% · 稳定20% · 延迟10%",
+};
+
+// 评分维度计算器（纯函数，返回 0-1 归一化值；加维度只需加一个 key）
+const SCORE_DIMENSIONS = {
+  // 可用性：多轮 trace 成功率
+  availability: (m) => m.successRate,
+  // TTFB（网页访问）：中位首字节，50ms 满分，800ms 归零
+  ttfb: (m) => (m.medianTtfb >= 0 ? Math.max(0, 1 - m.medianTtfb / 800) : 0),
+  // 延迟（代理/下载）：同 TTFB，语义为连接延迟
+  latency: (m) => (m.medianTtfb >= 0 ? Math.max(0, 1 - m.medianTtfb / 800) : 0),
+  // 稳定/波动：多轮 TTFB 的 CV（波动小=稳定）
+  stability: (m) => (1 - Math.min(1, m.cv)),
+  // DNS：DoH 解析耗时，2000ms 归零
+  dns: (m) => (m.dnsMs >= 0 ? Math.max(0, 1 - m.dnsMs / 2000) : 0.5),
+  // Edge 复用稳定性：连续 trace 复用连接，连续成功率 70% + TTFB 波动 30%
+  edgeStability: (m) => {
+    const es = m.edgeStability;
+    if (!es || !es.samples) return 0;
+    return es.successRate * 0.7 + (1 - Math.min(1, es.ttfbCV)) * 0.3;
+  },
+  // CF 出口吞吐：speed.cloudflare.com/__down（共享基准值，一次测速）
+  cfThroughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 100) : 0),
+  // 吞吐（下载）：同 CF 出口吞吐
+  throughput: (m, ctx) => (ctx && ctx.dl && ctx.dl.ok ? Math.min(1, ctx.dl.mbps / 100) : 0),
+};
 
 // 候选 CF 域名池（内嵌在工具文件中，服务器仅静态托管此文件，域名池随之分发）
 const OPTIMIZER_DOMAINS = [
@@ -352,8 +399,9 @@ async function probeTrace(domain, timeoutMs, signal) {
 /* ------------------------------------------------------------------ */
 /* DNS-over-HTTPS 解析域名的 Edge IP（浏览器本地发起，服务器不参与）      */
 /* ------------------------------------------------------------------ */
-async function resolveEdgeIp(domain, signal) {
-  const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`;
+// DoH 解析：按协议查 A(IPv4) / AAAA(IPv6) / 双栈
+async function resolveEdgeIps(domain, protocol, signal) {
+  const types = protocol === "ipv6" ? ["AAAA"] : (protocol === "dual" ? ["A", "AAAA"] : ["A"]);
   const start = performance.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -362,15 +410,22 @@ async function resolveEdgeIp(domain, signal) {
     if (signal.aborted) ctrl.abort();
     else signal.addEventListener("abort", onAbort);
   }
+  const result = { ipv4: "", ipv6: "", ip: "", dnsMs: -1 };
   try {
-    const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal });
-    const dnsMs = performance.now() - start;
-    if (!resp.ok) return { ip: "", dnsMs: -1 };
-    const data = await resp.json();
-    const a = (data.Answer || []).filter((x) => x.type === 1).map((x) => x.data);
-    return { ip: a[0] || "", dnsMs };
+    for (const t of types) {
+      const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${t}`;
+      const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      const recs = (data.Answer || []).filter((x) => (t === "A" ? x.type === 1 : x.type === 28)).map((x) => x.data);
+      if (t === "A" && recs.length) result.ipv4 = recs[0];
+      if (t === "AAAA" && recs.length) result.ipv6 = recs[0];
+    }
+    result.dnsMs = performance.now() - start;
+    result.ip = result.ipv4 || result.ipv6;
+    return result;
   } catch (_e) {
-    return { ip: "", dnsMs: -1 };
+    return { ipv4: "", ipv6: "", ip: "", dnsMs: -1 };
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -441,29 +496,45 @@ function coefficientOfVariation(values) {
   return sd / avg;
 }
 
-// 综合评分（0-100 加权和）：可用性 40 + 速度 30 + 稳定 15 + 延迟 10 + DNS 5
+// 综合评分（0-100 加权和）：模块化引擎，按用途(mode)查权重，逐维度计算。
 // 核心思想（迁移安卓 2.7.1）：稳定高速 > 低延迟但晚上炸；延迟不是唯一指标。
-// 速度 = 该域名自身资源响应速度（total 总响应时间），不依赖 speed.cloudflare.com 公共测速。
-function computeScore(metrics, dl) {
-  // 可用性 40：多轮 trace 成功率（最高权重）
-  const availability = metrics.successRate * SCORE_W.availability;
+function computeScore(result, mode, ctx) {
+  const w = SCORE_PRESETS[mode] || SCORE_PRESETS.proxy;
+  let score = 0;
+  for (const dim of Object.keys(w)) {
+    const calc = SCORE_DIMENSIONS[dim];
+    if (calc) score += calc(result, ctx) * w[dim];
+  }
+  return score;
+}
 
-  // 速度 30：该域名自身资源响应速度（total 越小越快，200ms 满分，3000ms 归零）
-  const speed = metrics.medianTotal >= 0
-    ? Math.max(0, 1 - metrics.medianTotal / 3000) * SCORE_W.speed : 0;
+// 读取选择器值（带默认值兜底）
+function readSelect(sel, fallback) {
+  const el = $o(sel);
+  return (el && el.value) ? el.value : fallback;
+}
 
-  // 稳定 15：多轮 TTFB 的 CV（波动小=稳定，晚上不炸）
-  const stability = (1 - Math.min(1, metrics.cv)) * SCORE_W.stability;
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-  // 延迟 10：中位数 TTFB（50ms 满分，800ms 归零，权重最低）
-  const latency = metrics.medianTtfb >= 0
-    ? Math.max(0, 1 - metrics.medianTtfb / 800) * SCORE_W.latency : 0;
-
-  // DNS 5：DoH 解析耗时（2000ms 归零）
-  const dns = metrics.dnsMs >= 0
-    ? Math.max(0, 1 - metrics.dnsMs / 2000) * SCORE_W.dns : SCORE_W.dns / 2;
-
-  return availability + speed + stability + latency + dns;
+// Edge 复用稳定性：连续短间隔 trace（串行，100ms 间隔，复用 TCP/TLS 连接）
+// 关键：不能并发，必须串行，否则浏览器会创建多个连接、无法观察连接复用效果。
+async function probeEdgeStability(domain, rounds, signal) {
+  const ttfbs = [];
+  let success = 0;
+  for (let i = 0; i < rounds; i++) {
+    if (OptimizerState.aborted) break;
+    const res = await probeTrace(domain, PROBE_TIMEOUT_MS, signal);
+    if (res.ok && res.ttfb >= 0) { success++; ttfbs.push(res.ttfb); }
+    if (i < rounds - 1) await sleep(100);
+  }
+  const successRate = rounds ? success / rounds : 0;
+  const avgTTFB = ttfbs.length ? ttfbs.reduce((a, b) => a + b, 0) / ttfbs.length : -1;
+  return {
+    successRate,
+    avgTTFB,
+    ttfbCV: coefficientOfVariation(ttfbs),
+    samples: ttfbs.length,
+  };
 }
 
 // 运营商 POP 优先级（隐藏辅助因子，仅同分 tiebreak，不覆盖测速结果）
@@ -524,6 +595,8 @@ function buildMetrics(domain, roundsData, dnsRes, source) {
     loc,
     source,
     ips: ip ? [ip] : [],
+    ipv4: dnsRes ? (dnsRes.ipv4 || "") : "",
+    ipv6: dnsRes ? (dnsRes.ipv6 || "") : "",
     roundsData,
     rounds: roundsData.length,
     medianTtfb: median(ttfbs),
@@ -554,10 +627,22 @@ async function optimizerStart() {
   OptimizerState.controller = new AbortController();
   OptimizerState.results = [];
   OptimizerState.asiaResults = [];
+  OptimizerState.ipv4Results = [];
+  OptimizerState.ipv6Results = [];
   OptimizerState.egressChanged = false;
   OptimizerState.vpnDetected = false;
   OptimizerState.networkType = detectNetworkType();
   OptimizerState.popCount = {};
+
+  // 读用户选择：用途 / 协议 / 测速模式 / 运营商
+  const mode = readSelect("#optimizer-use", "proxy");
+  const protocol = readSelect("#optimizer-protocol", "dual");
+  const huntMode = readSelect("#optimizer-mode", "balanced");
+  const operatorManual = readSelect("#optimizer-operator", "auto");
+  OptimizerState.use = mode;
+  OptimizerState.protocol = protocol;
+  OptimizerState.mode = huntMode;
+  OptimizerState.operatorManual = operatorManual;
 
   const startBtn = $o("#optimizer-start");
   const stopBtn = $o("#optimizer-stop");
@@ -572,7 +657,7 @@ async function optimizerStart() {
   setProgress(0, "准备中…");
 
   try {
-    // 0) 候选域名 = 内置 1000 域名池 + 用户扩展池（自定义）
+    // 0) 候选域名 = 内置 1000 域名池 + 用户扩展池
     setProgress(4, "读取候选域名池…");
     const custom = loadCustomDomains();
     const allDomains = [];
@@ -588,17 +673,24 @@ async function optimizerStart() {
     }
     const total = candidates.length;
 
-    // 1) 出口 IP 基线 + 运营商检测 + VPN 启发式检测
+    // 1) 出口 IP 基线 + 运营商（自动或手动）+ VPN 启发式检测
     setProgress(6, "检测网络环境…");
     const baseline = await probeTrace(candidates[0].domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
     OptimizerState.egressIp = baseline.ip || "";
-    OptimizerState.operator = await detectOperator();
+    OptimizerState.operator = operatorManual === "auto" ? await detectOperator() : operatorManual;
     const localIps = await detectLocalIps();
     const publicLocal = localIps.filter((ip) => !isPrivateIp(ip));
     if (publicLocal.length && baseline.ip && !publicLocal.includes(baseline.ip)) {
       OptimizerState.vpnDetected = true;
     }
     if (OptimizerState.vpnDetected) showVpnBanner();
+
+    // 1.5) CF 出口吞吐基准：一次测速，所有候选共享（proxy/download 需要，避免 1000 域名×下载耗流量）
+    let dl = { ok: false, mbps: 0, bytes: 0 };
+    if (mode === "proxy" || mode === "download") {
+      setProgress(7, "测试 CF 出口吞吐（基准）…");
+      dl = await probeDownload(OptimizerState.controller.signal);
+    }
 
     // 2) Stage 1：轻量探测（batch 50/批，/cdn-cgi/trace 短超时，过滤失败）
     setProgress(8, `Stage 1 轻量探测 0/${total}…`);
@@ -626,12 +718,12 @@ async function optimizerStart() {
     stage1.sort((a, b) => a.ttfb - b.ttfb);
     const stage2List = stage1.slice(0, STAGE2_COUNT);
 
-    // 3) Stage 2：小流量测速（每域名自身资源多次请求 + DoH 解析 Edge IP）
+    // 3) Stage 2：小流量测速（每域名自身资源多次请求 + DoH 按协议解析 IPv4/IPv6）
     const perDomain = {};
     setProgress(46, `Stage 2 小流量测速 0/${stage2List.length}…`);
     await runConcurrent(stage2List, CONCURRENCY, async (item) => {
       const domain = item.domain;
-      const dnsRes = await resolveEdgeIp(domain, OptimizerState.controller.signal);
+      const dnsRes = await resolveEdgeIps(domain, protocol, OptimizerState.controller.signal);
       const roundsData = [item]; // Stage 1 结果作为第 1 轮
       for (let r = 1; r < 2; r++) { // 再测 1 次，共 2 次
         if (OptimizerState.aborted) break;
@@ -648,7 +740,7 @@ async function optimizerStart() {
     // Stage 2 粗评分 → TOP FINAL_COUNT
     const stage2Scored = Object.values(perDomain)
       .filter((m) => m.rounds > 0)
-      .map((m) => { m.score = computeScore(m, null); return m; })
+      .map((m) => { m.score = computeScore(m, mode, { dl }); return m; })
       .sort((a, b) => b.score - a.score);
     const finalists = stage2Scored.slice(0, FINAL_COUNT);
     if (!finalists.length) {
@@ -657,7 +749,7 @@ async function optimizerStart() {
       return;
     }
 
-    // 4) Stage 3：深度测试（TOP 20 补测到 ROUNDS 次，精确成功率/速度/波动/TTFB）
+    // 4) Stage 3：深度测试（TOP 20 补测到 ROUNDS 次；仅 proxy 模式额外做 Edge 稳定性）
     setProgress(68, `Stage 3 深度测试 0/${finalists.length}…`);
     await runConcurrent(finalists, CONCURRENCY, async (m) => {
       while (m.rounds < ROUNDS) {
@@ -669,21 +761,23 @@ async function optimizerStart() {
           OptimizerState.egressChanged = true;
         }
       }
-      const rebuilt = buildMetrics(m.domain, m.roundsData, { ip: m.ips[0] || "", dnsMs: m.dnsMs }, m.source);
+      // proxy 模式：Edge 复用稳定性（连续串行 trace，不复用 roundsData，避免覆盖原 trace）
+      if (mode === "proxy") {
+        m.edgeStability = await probeEdgeStability(m.domain, EDGE_STABILITY_ROUNDS, OptimizerState.controller.signal);
+      }
+      const es = m.edgeStability;
+      const rebuilt = buildMetrics(m.domain, m.roundsData, { ip: m.ips[0] || "", ipv4: m.ipv4, ipv6: m.ipv6, dnsMs: m.dnsMs }, m.source);
       Object.assign(m, rebuilt);
+      m.edgeStability = es;
     }, (n) => {
       setProgress(68 + Math.floor((n / finalists.length) * 14), `Stage 3 深度测试 ${n}/${finalists.length}…`);
     });
 
     if (OptimizerState.aborted) { setProgress(100, "已停止"); toast("测速已停止。"); return; }
 
-    // 5) 整体下载吞吐（仅作参考展示，不参与单域名评分）
-    setProgress(84, "测试整体下载吞吐（参考）…");
-    const dl = await probeDownload(OptimizerState.controller.signal);
-
-    // 6) 最终评分 + 失败惩罚 + tiebreak 排序
+    // 5) 最终评分 + 失败惩罚 + tiebreak 排序
     setProgress(90, "计算综合评分…");
-    const results = finalists.map((m) => { m.score = computeScore(m, dl); return m; });
+    const results = finalists.map((m) => { m.score = computeScore(m, mode, { dl }); return m; });
     const blist = loadBlacklist();
     results.forEach((m) => {
       if (m.successRate === 0 && !blist.includes(m.domain)) blist.push(m.domain);
@@ -696,14 +790,17 @@ async function optimizerStart() {
       return popRank(b.colo) - popRank(a.colo);
     });
     OptimizerState.results = results;
+    // 双栈：按 DNS 记录分类，IPv4/IPv6 各自独立排名，互不覆盖
+    OptimizerState.ipv4Results = results.filter((m) => m.ipv4);
+    OptimizerState.ipv6Results = results.filter((m) => m.ipv6);
     OptimizerState.asiaResults = results.filter((m) => isAsiaTarget(m.colo));
 
-    // 7) 渲染 + 推荐理由 + 保存
-    renderBest(OptimizerState.results[0], dl);
-    renderRecommendation(OptimizerState.results[0], dl);
+    // 6) 渲染 + 推荐理由 + 保存
+    renderBest(results[0], dl);
+    renderRecommendation(results[0], dl);
     renderAsiaHunt(OptimizerState.asiaResults);
-    renderResults(OptimizerState.results, dl, total, stage1.length, stage2List.length);
-    saveLocal(OptimizerState.results[0], dl);
+    renderResults(results, dl, total, stage1.length, stage2List.length);
+    saveLocal(results[0], dl);
     setProgress(100, "完成");
 
     if (OptimizerState.egressChanged) {
@@ -761,33 +858,58 @@ function showVpnBanner() {
   if (btn) btn.addEventListener("click", () => optimizerStart());
 }
 
+// 渲染单个候选卡（IPv4 / IPv6）
+function renderCandidateCard(label, m) {
+  if (!m) return `<div class="opt-candidate-empty">${label}：无可用候选（DNS 无对应记录）</div>`;
+  const ip = label === "IPv6" ? (m.ipv6 || "—") : (m.ipv4 || "—");
+  const ttfb = m.medianTtfb >= 0 ? `${m.medianTtfb.toFixed(0)} ms` : "—";
+  const stability = m.cv >= 0 ? `${(100 - Math.min(100, m.cv * 100)).toFixed(0)}%` : "—";
+  const score = m.score != null ? `${m.score.toFixed(1)}` : "—";
+  const availability = `${(m.successRate * 100).toFixed(0)}%`;
+  const operator = OptimizerState.operator || "未知";
+  const sourceLabel = m.source === "custom" ? "扩展池" : "内置池";
+  const useLabel = USE_LABELS[OptimizerState.use] || "代理节点";
+  return `
+    <div class="opt-candidate">
+      <div class="opt-candidate-head"><span class="eyebrow">BEST ${label} CANDIDATE</span></div>
+      <div class="opt-best-grid">
+        <div class="opt-best-main"><label>入口域名</label><strong>${escapeHtmlO(m.domain)}</strong></div>
+        <div class="opt-best-main"><label>综合评分</label><strong class="opt-score">${score}<small class="opt-score-max">/100</small></strong></div>
+        <div class="opt-best-item"><label>${label} 地址</label><strong class="opt-mono opt-ip">${escapeHtmlO(ip)}</strong></div>
+        <div class="opt-best-item"><label>POP</label><strong>${escapeHtmlO(m.colo || "—")}</strong></div>
+        <div class="opt-best-item"><label>用途</label><strong>${useLabel}</strong></div>
+        <div class="opt-best-item"><label>运营商</label><strong>${escapeHtmlO(operator)}</strong></div>
+        <div class="opt-best-item"><label>来源</label><strong>${sourceLabel}</strong></div>
+        <div class="opt-best-item"><label>TTFB</label><strong>${ttfb}</strong></div>
+        <div class="opt-best-item"><label>成功率</label><strong>${availability}</strong></div>
+        <div class="opt-best-item"><label>稳定性</label><strong>${stability}</strong></div>
+      </div>
+    </div>`;
+}
+
 function renderBest(best, dl) {
   if (!best) return;
   const box = $o("#optimizer-best");
   box.classList.remove("hidden");
-  const bestIp = best.ips && best.ips[0] ? best.ips[0] : "—";
-  const ttfb = best.medianTtfb >= 0 ? `${best.medianTtfb.toFixed(0)} ms` : "—";
-  const speed = best.medianTotal >= 0 ? `${best.medianTotal.toFixed(0)} ms` : "—";
-  const stability = best.cv >= 0 ? `${(100 - Math.min(100, best.cv * 100)).toFixed(0)}%` : "—";
-  const score = best.score != null ? `${best.score.toFixed(1)}` : "—";
-  const availability = `${(best.successRate * 100).toFixed(0)}%`;
-  const operator = OptimizerState.operator || "未知";
-  const sourceLabel = best.source === "custom" ? "扩展池" : "内置池";
+  const protocol = OptimizerState.protocol;
   const unstable = OptimizerState.egressChanged ? " · 网络不稳定" : "";
-  box.innerHTML = `
-    <div class="opt-best-head"><span class="eyebrow">BEST CLOUDFLARE EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
-    <div class="opt-best-grid">
-      <div class="opt-best-main"><label>入口域名</label><strong>${escapeHtmlO(best.domain)}</strong></div>
-      <div class="opt-best-main"><label>综合评分</label><strong class="opt-score">${score}<small class="opt-score-max">/100</small></strong></div>
-      <div class="opt-best-item"><label>解析 Edge</label><strong class="opt-mono opt-ip">${escapeHtmlO(bestIp)}</strong></div>
-      <div class="opt-best-item"><label>POP</label><strong>${escapeHtmlO(best.colo || "—")}</strong></div>
-      <div class="opt-best-item"><label>运营商</label><strong>${escapeHtmlO(operator)}</strong></div>
-      <div class="opt-best-item"><label>来源</label><strong>${sourceLabel}</strong></div>
-      <div class="opt-best-item"><label>TTFB</label><strong>${ttfb}</strong></div>
-      <div class="opt-best-item"><label>响应速度</label><strong>${speed}</strong></div>
-      <div class="opt-best-item"><label>成功率</label><strong>${availability}</strong></div>
-      <div class="opt-best-item"><label>稳定性</label><strong>${stability}</strong></div>
-    </div>`;
+  if (protocol === "dual") {
+    const ipv4Best = OptimizerState.ipv4Results[0];
+    const ipv6Best = OptimizerState.ipv6Results[0];
+    box.innerHTML = `
+      <div class="opt-best-head"><span class="eyebrow">BEST CLOUDFLARE EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
+      <p class="opt-dual-hint">按 DNS 记录分类，评分来自当前浏览器实际出口；IPv4 与 IPv6 各自独立排名，互不覆盖。</p>
+      <div class="opt-dual-grid">
+        ${renderCandidateCard("IPv4", ipv4Best)}
+        ${renderCandidateCard("IPv6", ipv6Best)}
+      </div>`;
+  } else {
+    const label = protocol === "ipv6" ? "IPv6" : "IPv4";
+    const m = protocol === "ipv6" ? (OptimizerState.ipv6Results[0] || best) : (OptimizerState.ipv4Results[0] || best);
+    box.innerHTML = `
+      <div class="opt-best-head"><span class="eyebrow">BEST CLOUDFLARE EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
+      ${renderCandidateCard(label, m)}`;
+  }
 }
 
 function renderRecommendation(best, dl) {
@@ -795,6 +917,7 @@ function renderRecommendation(best, dl) {
   const box = $o("#optimizer-recommendation");
   if (!box) return;
   box.classList.remove("hidden");
+  const mode = OptimizerState.use;
   const ttfb = best.medianTtfb >= 0 ? `${best.medianTtfb.toFixed(0)} ms` : "—";
   const successN = Math.round(best.successRate * (best.rounds || ROUNDS));
   const reasons = [];
@@ -802,7 +925,17 @@ function renderRecommendation(best, dl) {
     if (popPriority(best.colo) > 0) reasons.push(`${best.colo} 亚洲入口（${OptimizerState.operator || "默认"}优先级高）`);
     else reasons.push(`${best.colo} 入口`);
   }
-  if (best.medianTtfb >= 0 && best.medianTtfb < 300) reasons.push(`低 TTFB ${ttfb}`);
+  if (mode === "proxy") {
+    const es = best.edgeStability;
+    if (es && es.samples) {
+      reasons.push(`Edge 复用稳定性 ${(es.successRate * 100).toFixed(0)}%（连续 ${es.samples} 次复用连接）`);
+      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（复用连接稳定）");
+      else reasons.push("TTFB 波动较大（连接可能频繁重建）");
+    }
+    if (dl && dl.ok) reasons.push(`CF 出口吞吐 ${dl.mbps.toFixed(1)} Mbps（共享基准）`);
+  } else {
+    if (best.medianTtfb >= 0 && best.medianTtfb < 300) reasons.push(`低 TTFB ${ttfb}`);
+  }
   reasons.push(`连续测试 ${successN}/${best.rounds || ROUNDS} 成功`);
   if (best.cv >= 0) {
     if (best.cv < 0.3) reasons.push("速度稳定（波动小）");
@@ -810,7 +943,7 @@ function renderRecommendation(best, dl) {
   }
   box.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">WHY</span><h3>推荐理由</h3><p>为什么推荐这个入口</p></div></div>
+      <div class="panel-head"><div><span class="eyebrow">WHY</span><h3>推荐理由</h3><p>用途：${USE_LABELS[mode] || "代理节点"}</p></div></div>
       <div class="opt-reason-list">
         ${reasons.map((r) => `<div class="opt-reason-item">${escapeHtmlO(r)}</div>`).join("")}
       </div>
@@ -839,10 +972,11 @@ function renderResults(results, dl, totalDomains, aliveCount, stage2Count) {
       <td><strong>${sc}</strong></td>
     </tr>`;
   }).join("");
-  const scope = `${totalDomains} 个候选 → Stage 1 存活 ${aliveCount} → Stage 2 精选 ${stage2Count} → TOP ${results.length}（可用性 40% · 速度 30% · 稳定 15% · 延迟 10% · DNS 5%）`;
+  const wtxt = USE_WEIGHT_TEXT[OptimizerState.use] || USE_WEIGHT_TEXT.proxy;
+  const scope = `${totalDomains} 个候选 → Stage 1 存活 ${aliveCount} → Stage 2 精选 ${stage2Count} → TOP ${results.length}（${wtxt}）`;
   wrap.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>CF Edge 入口排名</h3><p>${escapeHtmlO(scope)}</p></div><small>整体下载参考：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>CF Edge 入口排名</h3><p>${escapeHtmlO(scope)}</p></div><small>CF 出口吞吐：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
       <div class="table-scroll"><table class="data-table">
         <thead><tr><th>#</th><th>入口域名</th><th>来源</th><th>POP</th><th>解析 Edge</th><th>TTFB</th><th>响应速度</th><th>成功率</th><th>评分</th></tr></thead>
         <tbody>${tbody || '<tr><td colspan="9">无有效结果</td></tr>'}</tbody>

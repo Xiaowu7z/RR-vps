@@ -208,3 +208,77 @@
 @media (max-width: 760px) {
   .opt-best-grid, .opt-hist-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* ---- 用途模式层：选择器面板 + 双栈候选卡 ---- */
+.optimizer-selectors {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  padding: 16px;
+  margin: 12px 0;
+}
+.opt-field label {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+  letter-spacing: .04em;
+}
+.opt-field select {
+  width: 100%;
+  padding: 9px 12px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.16);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b93a7' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+.opt-field select:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(90,230,255,.12);
+}
+.optimizer-disclaimer {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 4px 0 12px;
+  line-height: 1.6;
+}
+.opt-dual-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.opt-dual-hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 8px 0 12px;
+  line-height: 1.6;
+}
+.opt-candidate {
+  border: 1px solid rgba(255,255,255,.16);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255,255,255,.02);
+}
+.opt-candidate-head {
+  margin-bottom: 10px;
+}
+.opt-candidate-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  border: 1px dashed rgba(255,255,255,.16);
+  border-radius: 12px;
+}
+@media (max-width: 640px) {
+  .opt-dual-grid { grid-template-columns: 1fr; }
+}

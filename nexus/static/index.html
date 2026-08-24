@@ -118,6 +118,41 @@
         </div>
         <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
         <p id="optimizer-traffic-hint" class="optimizer-hint"></p>
+        <div class="optimizer-selectors glass">
+          <div class="opt-field">
+            <label>用途模式</label>
+            <select id="optimizer-use">
+              <option value="web">网页访问</option>
+              <option value="proxy" selected>代理节点</option>
+              <option value="download">大流量下载</option>
+            </select>
+          </div>
+          <div class="opt-field">
+            <label>协议</label>
+            <select id="optimizer-protocol">
+              <option value="ipv4">IPv4</option>
+              <option value="ipv6">IPv6</option>
+              <option value="dual" selected>双栈</option>
+            </select>
+          </div>
+          <div class="opt-field">
+            <label>测速模式</label>
+            <select id="optimizer-mode">
+              <option value="balanced" selected>均衡</option>
+              <option value="asia_hunt">亚洲入口狩猎</option>
+            </select>
+          </div>
+          <div class="opt-field">
+            <label>运营商</label>
+            <select id="optimizer-operator">
+              <option value="auto" selected>自动</option>
+              <option value="中国移动">移动</option>
+              <option value="中国电信">电信</option>
+              <option value="中国联通">联通</option>
+            </select>
+          </div>
+        </div>
+        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP 测速。本工具优化的是「当前网络环境下 Cloudflare Edge 入口域名」的表现，而非强制指定 IP。</p>
         <div id="optimizer-custom-wrap" class="optimizer-custom-wrap">
           <label>用户扩展池（可选，一行一个，不影响默认域名池）</label>
           <textarea id="optimizer-custom-input" class="optimizer-custom-input" rows="2" placeholder="例如：&#10;aaa.trycloudflare.com&#10;bbb.example.com"></textarea>
