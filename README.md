@@ -6,7 +6,13 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.0.1** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.0.2** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.0.2 新功能：RR 面板 Edge 候选初筛
+
+RR Nexus 新增浏览器本地 Cloudflare Edge 候选初筛，面向暂时没有 Android 测试环境的用户：浏览器从内置 1000 域名池分层筛出 TOP 20，移动网络以 `openai.com` 为质量基准，Wi-Fi / 宽带使用 `openai.com`、`deepl.com`、`cloudflare.com` 三项参考，并提供亚洲入口狩猎、成功率、TTFB、波动和本机历史记录。
+
+**面板优选质量不能只看排名。** 浏览器受 DNS、SNI、TLS、连接复用和 CORS 限制，排名只是候选顺序，不代表真实代理质量，也不保证第一名或前三名就是实际最快入口。用户必须把 TOP 20 放进真实客户端逐个测试，最终以实际速度、稳定性和晚高峰表现为准。有 Android 环境时，优先推荐下方的 **CF 域名优选 2.7.1** 做最终测试；没有 Android 环境时，再使用面板完成初筛。
 
 ## 一键安装
 
@@ -60,7 +66,7 @@ rr --version
 
 ## 配套工具：CF 域名优选（Android）
 
-Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudflare IP + 域名入口组合。原生 Kotlin，权限最小化（仅联网与网络状态），无广告。
+Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudflare IP + 域名入口组合。原生 Kotlin，权限最小化（仅联网与网络状态），无广告。**这是经过实际测试、当前最好用且优先推荐的最终优选工具，适合中国移动、中国电信、中国联通三网优选，测试结果可直接用于实际配置。** RR 面板浏览器版仅用于没有 Android 测试环境时的候选初筛。
 
 - 最新版 **2.7.1** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.7.1.apk](assets/cf-optimizer/CF-Optimizer-2.7.1.apk)（2.6.0 / 2.5.0 继续保留存档）
 - 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + Gradle/CLI 构建文件 + **1000 域名候选池**）
@@ -68,6 +74,8 @@ Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudfla
 - 功能：IPv4/IPv6/双栈独立管线、Cloudflare IP/POP/Prefix 发现、Nexus 基准守擂、Final Address Floor、TTFB/成功率/波动、50 条历史记录
 - 2.7.1：修复主页无法向下滚动导致“历史测试”入口不可达
 - 详情见 [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
+
+> 后续计划：电脑端优选工具将沿用 Android 2.7.1 的原生探测与分层筛选原理，避免浏览器无法固定 IP / SNI 等限制。
 
 ## 主要功能
 
@@ -85,13 +93,14 @@ Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudfla
 - Sing-box 配置校验、健康检查和异常自动重启
 - 节点、通用订阅、Base64 订阅、Sing-box 客户端配置和 Clash Meta 订阅同步刷新
 - 主动心跳模式：客户端保活参数注入订阅，锁屏/挂起后秒级恢复网络通道（4 档 + 自定义 1~3600 秒）
-- 选项 8 模块化热更新：bundle 完整性校验、SHA256 校验、语法检查、防旧包降级、运行迁移、失败自动回滚、升级后服务自动恢复
+- 选项 8 模块化热更新：GitHub Raw / 官方 API / IPv4 CDN 多源回退、bundle 完整性校验、SHA256 校验、语法检查、防旧包降级、运行迁移、失败自动回滚、升级后服务自动恢复
 - Vmess/Argo 本地源站端口不再强制占用 `443`
 - 可选安装的 RR Nexus（星枢）Web 管理界面
 - 每台设备独立凭据、独立协议链接、二维码、启停和到期时间
 - 面板「服务器实时状态」页：每秒刷新 CPU / 内存 / 磁盘 / 网络，零依赖 `/proc` 采样
 - 面板「防火墙」设置页：端口开关、IPv4/IPv6 进出站分流、SSH 端口保护与权限教程
 - 面板「流媒体解锁检测」：Netflix / Disney+ / YouTube Premium 等平台解锁状态与地区
+- 面板「Edge 候选初筛」：浏览器本地将 1000 域名缩小到 TOP 20；排名不代表真实代理质量，必须使用 Android 2.7.1 或真实客户端逐个复测
 - 面板登录防爆破：IP + 账号双维锁定、30 分钟 5 次失败、指数退避、状态持久化；重置入口在脚本菜单 14 → 2
 - 设备订阅三种格式（通用链接 / Sing-box 完整配置 / Clash Meta YAML）、自动优选副节点同步、Argo 实时域名展示
 

@@ -1,7 +1,7 @@
 "use strict";
 
 /*
- * RR Edge Optimizer — Browser Local CF Edge 优选（浏览器本地测速引擎）
+ * RR Edge Optimizer — Browser Local CF Edge 候选初筛（浏览器本地测速引擎）
  *
  * 原则：
  *   1. 所有测速运行在用户浏览器本地；服务器只静态托管工具与候选域名池，不参与任何计算。
@@ -9,10 +9,12 @@
  *   3. 结果仅存 localStorage（用户自己设备上）。
  *   4. 测速对象是 CF 域名（间接测其命中的 Cloudflare Edge IP 段），
  *      不宣称"浏览器绑定指定 IP 测速"。Edge IP 由浏览器通过 DNS-over-HTTPS 实时解析。
+ *   5. 排名只用于把 1000 个域名缩小到 TOP 20，不代表真实代理质量；
+ *      用户必须在 Android 工具或实际客户端中逐个复测。
  *
  * 与 Android 版 CF Optimizer 的关系（对齐其分层测速思想）：
  *   Android = IP 精准探测版（FixedDns + 指定 IP）
- *   Web     = 浏览器本地 CF Edge 优选版（真实用户网络环境测试）
+ *   Web     = 浏览器本地 CF Edge 初筛版（没有 Android 环境时生成候选清单）
  *   分层策略对齐 Pipeline.kt：候选池（1000 域名）→ 小流量筛选 → 决赛名单 → 完整测速。
  */
 
@@ -21,7 +23,7 @@ const OptimizerState = {
   aborted: false,
   controller: null,
   domains: [],           // 候选 CF 域名列表（内嵌，无需请求服务器）
-  results: [],           // 全局排名结果
+  results: [],           // 浏览器候选顺序（不等于真实代理质量排名）
   asiaResults: [],       // 亚洲入口狩猎榜结果
   egressIp: "",          // 首次 trace 检测到的出口 IP
   egressChanged: false,  // 测速过程中出口 IP 是否变化
@@ -1047,7 +1049,7 @@ function renderCandidateCard(label, m) {
   const useLabel = USE_LABELS[OptimizerState.use] || "代理节点";
   return `
     <div class="opt-candidate">
-      <div class="opt-candidate-head"><span class="eyebrow">BEST ${label} CANDIDATE</span></div>
+      <div class="opt-candidate-head"><span class="eyebrow">TOP ${label} BROWSER CANDIDATE</span></div>
       <div class="opt-best-grid">
         <div class="opt-best-main"><label>入口域名</label><strong>${escapeHtmlO(m.domain)}</strong></div>
         <div class="opt-best-main"><label>综合评分</label><strong class="opt-score">${score}<small class="opt-score-max">/100</small></strong></div>
@@ -1070,7 +1072,7 @@ function renderBest(best, dl, gateAllowed) {
   const protocol = OptimizerState.protocol;
   const unstable = OptimizerState.egressChanged ? " · 网络不稳定" : "";
   const referenceOnly = OptimizerState.use === "proxy" && gateAllowed === false;
-  const bestLabel = referenceOnly ? "REFERENCE ONLY · 未通过基准门禁" : "BEST CLOUDFLARE EDGE";
+  const bestLabel = referenceOnly ? "REFERENCE ONLY · 未通过基准门禁" : "TOP BROWSER CANDIDATE · 仍需客户端复测";
   if (protocol === "dual") {
     const ipv4Best = OptimizerState.ipv4Results[0];
     const ipv6Best = OptimizerState.ipv6Results[0];
@@ -1106,7 +1108,7 @@ function renderBenchmarkCompare(best, benchmarks, benchmarkMedian, gateAllowed) 
     return `<tr><td>${escapeHtmlO(bm.domain)}</td><td>${escapeHtmlO(bm.colo || "—")}</td><td>${sr}</td><td>${core}</td></tr>`;
   }).join("");
   const gateHtml = gateAllowed
-    ? `<div class="opt-gate opt-gate-pass">✓ 候选入口核心稳定性达到${profile.label}，可作为代理入口</div>`
+    ? `<div class="opt-gate opt-gate-pass">✓ 候选入口核心稳定性达到${profile.label}，已进入复测清单；是否可用请以真实客户端测试为准</div>`
     : (benchmarkMedian >= 0
       ? `<div class="opt-gate opt-gate-fail">✗ 候选入口核心稳定性低于${profile.label}（${(benchmarkMedian * 100).toFixed(0)}%），当前网络下不建议作为代理入口</div>`
       : `<div class="opt-gate opt-gate-fail">✗ ${profile.label}不可用，无法确认候选入口质量；本次结果仅供参考且不会保存</div>`);
@@ -1160,7 +1162,7 @@ function renderRecommendation(best, dl, gateAllowed) {
     : "";
   box.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">WHY</span><h3>推荐理由</h3><p>用途：${USE_LABELS[mode] || "代理节点"}</p></div></div>
+      <div class="panel-head"><div><span class="eyebrow">WHY SHORTLISTED</span><h3>入围理由</h3><p>用途：${USE_LABELS[mode] || "代理节点"} · 排名不代表真实代理质量</p></div></div>
       ${gateWarn}
       <div class="opt-reason-list">
         ${reasons.map((r) => `<div class="opt-reason-item">${escapeHtmlO(r)}</div>`).join("")}
@@ -1194,7 +1196,7 @@ function renderResults(results, dl, totalDomains, aliveCount, stage2Count) {
   const scope = `${totalDomains} 个候选 → Stage 1 存活 ${aliveCount} → Stage 2 精选 ${stage2Count} → TOP ${results.length}（${wtxt}）`;
   wrap.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>CF Edge 入口排名</h3><p>${escapeHtmlO(scope)}</p></div><small>CF 出口吞吐：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">BROWSER SHORTLIST</span><h3>CF Edge 候选顺序（TOP 20）</h3><p>${escapeHtmlO(scope)} · 请在真实客户端逐个测试，不要只看名次</p></div><small>CF 出口吞吐：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
       <div class="table-scroll"><table class="data-table">
         <thead><tr><th>#</th><th>入口域名</th><th>来源</th><th>POP</th><th>解析 Edge</th><th>TTFB</th><th>响应速度</th><th>成功率</th><th>评分</th></tr></thead>
         <tbody>${tbody || '<tr><td colspan="9">无有效结果</td></tr>'}</tbody>
@@ -1279,7 +1281,7 @@ function renderHistory(record) {
   if (!box) return;
   const rec = record || loadLocal();
   if (!rec) {
-    box.innerHTML = '<p class="form-hint">暂无历史优选结果，点击「开始本地测速」生成第一个记录。</p>';
+    box.innerHTML = '<p class="form-hint">暂无历史初筛结果，点击「开始候选初筛」生成第一个记录。</p>';
     return;
   }
   const when = (rec.last_success || rec.timestamp) ? new Date(rec.last_success || rec.timestamp).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -1288,7 +1290,7 @@ function renderHistory(record) {
   const sc = rec.score >= 0 ? `${rec.score}` : "—";
   box.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">LAST RESULT</span><h3>历史最佳入口（本机保存）</h3></div><small>${escapeHtmlO(when)}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">LAST SHORTLIST</span><h3>上次首位候选（本机保存）</h3><p>仅代表浏览器初筛顺序，仍需真实客户端复测</p></div><small>${escapeHtmlO(when)}</small></div>
       <div class="opt-hist-grid">
         <div class="opt-hist-item"><label>Best Domain</label><strong>${escapeHtmlO(rec.best_domain || "—")}</strong></div>
         <div class="opt-hist-item"><label>综合评分</label><strong class="opt-score">${sc}</strong></div>

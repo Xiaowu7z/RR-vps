@@ -16,7 +16,7 @@ RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
-SCRIPT_VERSION="7.0.1"
+SCRIPT_VERSION="7.0.2"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"  # 干净URL+?t=防CDN旧缓存(2026-08)
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LOCAL_MANIFEST="${RR_LIB_DIR}/manifest.sha256"

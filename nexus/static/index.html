@@ -40,7 +40,7 @@
         <button class="nav-item" data-view="firewall"><span class="nav-icon">⛨</span><span>防火墙</span></button>
         <button class="nav-item" data-view="devices"><span class="nav-icon">◇</span><span>设备与用户</span></button>
         <button class="nav-item" data-view="remote"><span class="nav-icon">⛁</span><span>多服务器</span></button>
-        <button class="nav-item" data-view="optimizer"><span class="nav-icon">⚡</span><span>Edge 优选</span></button>
+        <button class="nav-item" data-view="optimizer"><span class="nav-icon">⚡</span><span>Edge 初筛</span></button>
         <button class="nav-item" data-view="security"><span class="nav-icon">◈</span><span>访问与安全</span></button>
         <button class="nav-item" data-view="audit"><span class="nav-icon">≋</span><span>审计日志</span></button>
       </nav>
@@ -113,8 +113,8 @@
 
       <section id="view-optimizer" class="view">
         <div class="section-toolbar">
-          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最适合作为<strong>代理入口</strong>的 CF Edge 域名。移动网络严格以 <strong>openai.com</strong> 为标准；Wi-Fi / 宽带使用 openai.com、deepl.com、cloudflare.com 三项参考门禁。测速全部由当前浏览器发起，RR-vps 服务器不参与计算，也不接收测速结果。</p></div>
-          <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始本地测速</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
+          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 候选初筛</h2><p>为没有 Android 测试环境的用户，把 Cloudflare 1000 域名池缩小到 TOP 20 候选。移动网络严格以 <strong>openai.com</strong> 为标准；Wi-Fi / 宽带使用 openai.com、deepl.com、cloudflare.com 三项参考。测速全部由当前浏览器发起，RR-vps 服务器不参与计算，也不接收测速结果。</p></div>
+          <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始候选初筛</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
         </div>
         <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
         <p id="optimizer-traffic-hint" class="optimizer-hint"></p>
@@ -160,7 +160,9 @@
             </select>
           </div>
         </div>
-        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP、强制 IPv4 / IPv6 或逐候选执行真实下载。本工具评估的是当前浏览器实际路径下的连接稳定性（连续 trace + 成功率 + POP 质量），以 speed.cloudflare.com 作为环境吞吐参考。自动识别不可靠时请手动选择网络环境；测试会直接访问候选域名、Cloudflare DoH / Speed 和运营商识别服务，但 RR-vps 不收集这些请求或结果。</p>
+        <p class="optimizer-disclaimer"><strong>推荐优先使用 Android CF 域名优选 2.7.1：</strong>已经实际测试，适合移动、电信、联通三网优选，测试结果可直接用于实际配置。<a href="https://github.com/Xiaowu7z/RR-vps/tree/main/assets/cf-optimizer" target="_blank" rel="noopener">查看安卓工具</a></p>
+        <p class="optimizer-disclaimer"><strong>面板优选质量不能只看排名：</strong>浏览器排名只是候选顺序，不代表真实代理质量，也不保证第一名或前三名最快。请把 TOP 20 放进真实客户端逐个测试，最终以实际速度、稳定性和晚高峰表现为准。浏览器无法固定 IP、强制 IPv4 / IPv6 或逐候选执行真实下载；自动识别不可靠时请手动选择网络环境。</p>
+        <p class="optimizer-disclaimer">隐私说明：测试会直接访问候选域名、Cloudflare DoH / Speed 和运营商识别服务，但 RR-vps 不收集这些请求或结果。</p>
         <div id="optimizer-custom-wrap" class="optimizer-custom-wrap">
           <label>用户扩展池（可选，一行一个，不影响默认域名池）</label>
           <textarea id="optimizer-custom-input" class="optimizer-custom-input" rows="2" placeholder="例如：&#10;aaa.trycloudflare.com&#10;bbb.example.com"></textarea>
@@ -338,7 +340,7 @@
 
   <div id="toast" class="toast" role="status"></div>
   <script src="/app.js?v=19" defer></script>
-  <script src="/optimizer.js?v=9" defer></script>
+  <script src="/optimizer.js?v=10" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
     <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>

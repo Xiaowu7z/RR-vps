@@ -470,6 +470,10 @@ grep -Eq 'id="login-form"' nexus/static/index.html
 grep -Eq 'id="device-grid"' nexus/static/index.html
 grep -Eq 'id="traffic-chart"' nexus/static/index.html
 grep -Eq 'id="ssh-command"' nexus/static/index.html
+grep -Fq '面板优选质量不能只看排名' nexus/static/index.html
+grep -Fq '适合移动、电信、联通三网优选' nexus/static/index.html
+grep -Fq '请把 TOP 20 放进真实客户端逐个测试' nexus/static/index.html
+grep -Fq '/optimizer.js?v=10' nexus/static/index.html
 grep -Eq '/api/devices' nexus/static/app.js
 grep -Eq '/api/traffic' nexus/static/app.js
 grep -Fq 'UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L' nexus/static/app.js

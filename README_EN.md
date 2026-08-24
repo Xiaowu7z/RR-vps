@@ -6,7 +6,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.0.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.0.2** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### New in 7.0.2: browser-based Edge candidate screening
+
+RR Nexus now provides a local browser-based Cloudflare Edge screener for users without an Android test environment. It narrows the built-in 1,000-domain pool to a TOP 20 shortlist. Mobile networks use `openai.com` as the quality baseline, while Wi-Fi/broadband uses `openai.com`, `deepl.com`, and `cloudflare.com`.
+
+**Do not judge optimization quality by the panel ranking alone.** Browser DNS, SNI, TLS, connection reuse, and CORS limitations mean that the ranking is only a candidate order, not real proxy quality. Users must test the TOP 20 one by one in the actual client and decide by real speed, stability, and peak-hour performance. The Android **CF Domain Optimizer 2.7.1** remains the recommended final test.
 
 ## One-command installation
 
@@ -60,12 +66,14 @@ Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to rem
 
 ## Companion tool: CF Domain Optimizer (Android)
 
-An Android tool that scans Cloudflare edge IPs and domains to find the fastest combination for your node subscriptions. Native Kotlin, minimal permissions (network only), no ads.
+An Android tool that scans Cloudflare edge IPs and domains to find the fastest combination for your node subscriptions. Native Kotlin, minimal permissions (network only), no ads. **It has been field-tested, is the preferred final optimizer, supports China Mobile, China Telecom, and China Unicom, and produces results ready for real configuration.** The browser panel is only a shortlist fallback for users without Android testing access.
 
-- Latest **2.6.0** APK: [assets/cf-optimizer/CF-Optimizer-2.6.0-debug.apk] (2.5.0 archive: [assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk](assets/cf-optimizer/CF-Optimizer-2.5.0-debug.apk)
-- Full source: [assets/cf-optimizer/](assets/cf-optimizer/) (`app/` project + `test/` suite + `build.sh` + 134-domain pool)
-- Features: preferred-IP probing, triple-metric throughput, IPv4/IPv6 pipelines, baseline champion comparison, 50-entry history
+- Latest **2.7.1** APK: [assets/cf-optimizer/CF-Optimizer-2.7.1.apk](assets/cf-optimizer/CF-Optimizer-2.7.1.apk)
+- Full source: [assets/cf-optimizer/](assets/cf-optimizer/) (`app/` project + `test/` suite + Gradle/CLI build files + 1,000-domain pool)
+- Features: IPv4/IPv6/dual-stack pipelines, Cloudflare IP/POP/prefix discovery, Asia Hunt, Nexus benchmark defense, success rate/TTFB/variation ranking, and 50-entry history
 - Details: [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
+
+> Roadmap: the desktop optimizer will reuse Android 2.7.1's native probing and layered screening model, avoiding browser limitations such as the inability to pin IP/SNI paths.
 
 ## Features
 
@@ -82,13 +90,14 @@ An Android tool that scans Cloudflare edge IPs and domains to find the fastest c
 - Public subscription-port mapping for NAT/LXD VPS instances
 - Sing-box validation, health checks, and guarded automatic restart
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Transactional modular updates with SHA256 verification, Bash syntax checks, migration, and rollback
+- Transactional modular updates with GitHub Raw/API/IPv4-CDN fallback, SHA256 verification, Bash syntax checks, migration, and rollback
 - No forced reservation of local port 443 for Argo
 - Optional RR Nexus web console with local-only or public HTTPS access
 - Per-device credentials, protocol links, QR codes, enable/disable state, and expiry
 - Panel live server status page: per-second CPU / memory / disk / network, zero-dependency `/proc` sampling
 - Panel firewall settings page: port toggles, IPv4/IPv6 inbound/outbound split, SSH port protection, and a permission tutorial
 - Panel streaming unlock checker: unlock status and region for Netflix / Disney+ / YouTube Premium and more
+- Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be tested individually with Android 2.7.1 or the actual client
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
 - Device subscriptions in three formats (universal link / Sing-box full config / Clash Meta YAML), automatic alternate-node optimization sync, live Argo domain display
