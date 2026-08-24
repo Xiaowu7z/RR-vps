@@ -113,7 +113,7 @@
 
       <section id="view-optimizer" class="view">
         <div class="section-toolbar">
-          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最适合作为<strong>代理入口</strong>的 CF Edge 域名（优先连接稳定性，并以 openai.com / deepl.com / cloudflare.com 黄金参考做基准门禁）。测速全部在浏览器本地完成，服务器只静态托管工具、不参与测速、不上传任何数据。</p></div>
+          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最适合作为<strong>代理入口</strong>的 CF Edge 域名。移动网络严格以 <strong>openai.com</strong> 为标准；Wi-Fi / 宽带使用 openai.com、deepl.com、cloudflare.com 三项参考门禁。测速全部由当前浏览器发起，RR-vps 服务器不参与计算，也不接收测速结果。</p></div>
           <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始本地测速</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
         </div>
         <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
@@ -143,6 +143,14 @@
             </select>
           </div>
           <div class="opt-field">
+            <label>网络环境</label>
+            <select id="optimizer-network">
+              <option value="auto" selected>自动识别</option>
+              <option value="mobile">移动网络 · OpenAI 基准</option>
+              <option value="broadband">Wi-Fi / 宽带</option>
+            </select>
+          </div>
+          <div class="opt-field">
             <label>运营商</label>
             <select id="optimizer-operator">
               <option value="auto" selected>自动</option>
@@ -152,7 +160,7 @@
             </select>
           </div>
         </div>
-        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP 测速，也无法逐个候选下载 5MB 真实吞吐。本工具优化的是「当前网络环境下 CF Edge 代理入口的连接稳定性」（连续 trace 复用 + 成功率 + POP 质量），以 speed.cloudflare.com 实测吞吐作为环境参考，并用 openai.com / deepl.com / cloudflare.com 黄金参考做基准门禁。</p>
+        <p class="optimizer-disclaimer">⚠ 浏览器无法固定 IP、强制 IPv4 / IPv6 或逐候选执行真实下载。本工具评估的是当前浏览器实际路径下的连接稳定性（连续 trace + 成功率 + POP 质量），以 speed.cloudflare.com 作为环境吞吐参考。自动识别不可靠时请手动选择网络环境；测试会直接访问候选域名、Cloudflare DoH / Speed 和运营商识别服务，但 RR-vps 不收集这些请求或结果。</p>
         <div id="optimizer-custom-wrap" class="optimizer-custom-wrap">
           <label>用户扩展池（可选，一行一个，不影响默认域名池）</label>
           <textarea id="optimizer-custom-input" class="optimizer-custom-input" rows="2" placeholder="例如：&#10;aaa.trycloudflare.com&#10;bbb.example.com"></textarea>
@@ -330,7 +338,7 @@
 
   <div id="toast" class="toast" role="status"></div>
   <script src="/app.js?v=19" defer></script>
-  <script src="/optimizer.js?v=8" defer></script>
+  <script src="/optimizer.js?v=9" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
     <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>

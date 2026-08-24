@@ -27,6 +27,8 @@ const OptimizerState = {
   egressChanged: false,  // 测速过程中出口 IP 是否变化
   vpnDetected: false,    // 是否检测到 VPN/代理特征
   networkType: "",       // WiFi / Mobile / ...
+  networkMode: "auto",   // auto / mobile / broadband（用于基准选择）
+  benchmarkProfile: "default",
   operator: "",          // 运营商（IP 反查或手动指定）
   operatorManual: "",    // 手动运营商（"auto"=自动检测）
   protocol: "dual",      // ipv4 / ipv6 / dual
@@ -62,11 +64,16 @@ const DOWNLOAD_BYTES = 2 * 1024 * 1024;
 const STORAGE_KEY = "rr_edge_optimizer";
 const BLACKLIST_KEY = "rr_edge_optimizer_blacklist";
 const CUSTOM_DOMAINS_KEY = "rr_edge_optimizer_custom_domains";
-const HISTORY_KEY = "rr_edge_optimizer_history";   // 每域名历史测速记录（供「历史表现」维度 + 时间衰减）
+const HISTORY_KEY = "rr_edge_optimizer_history_v2"; // 按网络/运营商/协议隔离的历史记录
 const HISTORY_N = 7;                               // 历史表现：最近 7 次滑动平均
 const HISTORY_HALFLIFE_MS = 7 * 24 * 3600 * 1000;  // 时间衰减半衰期 7 天
-const BENCHMARK_DOMAINS = ["openai.com", "deepl.com", "cloudflare.com"];  // 黄金参考（不参与排名）
+const BENCHMARK_PROFILES = {
+  // 移动网络按负责人实测口径：只以 openai.com 作为标准，避免多基准中位数稀释移动线路特征。
+  mobile: { label: "移动网络标准", domains: ["openai.com"] },
+  default: { label: "黄金参考", domains: ["openai.com", "deepl.com", "cloudflare.com"] },
+};
 const BENCHMARK_GATE = 0.7;                        // 门禁：candidateCore < benchmarkMedian × 0.7 禁止推荐
+const ASIA_FINAL_QUOTAS = { HKG: 8, NRT: 3, SIN: 3, ICN: 2, TPE: 2 };
 // 用途评分权重（v4 最终确认版，按用途动态切换，模块化：加用途只需加一个 key）
 // web 网页访问：可用性40 / TTFB30 / 稳定20 / DNS10
 // proxy 代理节点（默认，v4 重定位 = 代理入口稳定性，非网页速度）：
@@ -339,6 +346,22 @@ function detectNetworkType() {
   return "未知";
 }
 
+function resolveNetworkProfile(manualMode, detectedType) {
+  if (manualMode === "mobile") {
+    return { mode: "mobile", label: "移动网络（手动）", benchmarkProfile: "mobile" };
+  }
+  if (manualMode === "broadband") {
+    return { mode: "broadband", label: "Wi-Fi / 宽带（手动）", benchmarkProfile: "default" };
+  }
+  // 只有浏览器明确报告 cellular 时才自动套用移动基准；effectiveType=4g 在 Wi-Fi 下也可能出现。
+  const mobile = detectedType === "Mobile";
+  return { mode: "auto", label: detectedType || "未知", benchmarkProfile: mobile ? "mobile" : "default" };
+}
+
+function activeBenchmarkProfile() {
+  return BENCHMARK_PROFILES[OptimizerState.benchmarkProfile] || BENCHMARK_PROFILES.default;
+}
+
 /* ------------------------------------------------------------------ */
 /* 工具：WebRTC 本地 IP 探测（用于 VPN/代理启发式检测）                   */
 /* ------------------------------------------------------------------ */
@@ -476,12 +499,14 @@ async function probeDownload(signal) {
 /* ------------------------------------------------------------------ */
 async function runConcurrent(items, concurrency, fn, onProgress) {
   let idx = 0;
+  let completed = 0;
   const workers = Array.from({ length: Math.min(concurrency, items.length || 1) }, async () => {
     while (idx < items.length) {
       if (OptimizerState.aborted) break;
       const i = idx++;
       await fn(items[i], i);
-      if (onProgress) onProgress(idx);
+      completed++;
+      if (onProgress) onProgress(completed);
     }
   });
   await Promise.all(workers);
@@ -526,9 +551,17 @@ function popQualityScore(pop) {
   return 0.2;  // 非亚洲 POP（LAX 等）：0.2
 }
 
-// 历史表现（方案B）：最近 7 次滑动平均 + 时间衰减（7 天半衰期）；无历史 = 0.5 中性
+function historyScopeKey() {
+  const network = OptimizerState.benchmarkProfile || "default";
+  const operator = OptimizerState.operator || "未知";
+  const protocol = OptimizerState.protocol || "dual";
+  return `${network}|${operator}|${protocol}`;
+}
+
+// 历史表现（方案B）：同一网络画像最近 7 次滑动平均 + 时间衰减；无历史 = 0.5 中性
 function historyScore(domain) {
-  const arr = loadHistory()[domain] || [];
+  const bucket = loadHistory()[historyScopeKey()] || {};
+  const arr = bucket[domain] || [];
   if (!arr.length) return 0.5;
   const now = Date.now();
   const recent = arr.slice(-HISTORY_N);
@@ -549,12 +582,15 @@ function loadHistory() {
 function saveHistoryScores(results) {
   if (!results || !results.length) return;
   const hist = loadHistory();
+  const scope = historyScopeKey();
+  if (!hist[scope] || Array.isArray(hist[scope])) hist[scope] = {};
+  const bucket = hist[scope];
   const now = Date.now();
   for (const m of results) {
     if (!m || !m.domain) continue;
-    if (!hist[m.domain]) hist[m.domain] = [];
-    hist[m.domain].push({ s: m.score != null ? m.score : 0, t: now });
-    if (hist[m.domain].length > 20) hist[m.domain] = hist[m.domain].slice(-20);
+    if (!bucket[m.domain]) bucket[m.domain] = [];
+    bucket[m.domain].push({ s: m.score != null ? m.score : 0, t: now });
+    if (bucket[m.domain].length > 20) bucket[m.domain] = bucket[m.domain].slice(-20);
   }
   try { localStorage.setItem(HISTORY_KEY, JSON.stringify(hist)); } catch (_e) {}
 }
@@ -564,10 +600,10 @@ function benchmarkCore(bm) {
   return (SCORE_DIMENSIONS.connStability(bm) * 35 + SCORE_DIMENSIONS.successRate(bm) * 20) / 55;
 }
 
-// Benchmark 测速：测 3 个黄金参考（openai/deepl/cloudflare）的连通性 + 稳定连接（不参与候选排名）
-async function probeBenchmark(signal) {
+// Benchmark 测速：移动网络只测 openai.com；其他网络测三黄金参考（均不参与候选排名）
+async function probeBenchmark(signal, domains) {
   const list = [];
-  for (const domain of BENCHMARK_DOMAINS) {
+  for (const domain of domains || activeBenchmarkProfile().domains) {
     if (OptimizerState.aborted) break;
     const rounds = [];
     for (let r = 0; r < ROUNDS; r++) {
@@ -620,6 +656,33 @@ function popRank(pop) {
     if (idx >= 0) return order.length - idx;
   }
   return popPriority(pop);
+}
+
+function selectFinalists(scored, huntMode, limit) {
+  const max = Math.max(0, limit || FINAL_COUNT);
+  if (huntMode !== "asia_hunt") return scored.slice(0, max);
+  const selected = [];
+  const seen = new Set();
+  for (const [pop, quota] of Object.entries(ASIA_FINAL_QUOTAS)) {
+    for (const item of scored.filter((m) => m.colo === pop).slice(0, quota)) {
+      if (!seen.has(item.domain)) { selected.push(item); seen.add(item.domain); }
+    }
+  }
+  for (const item of scored) {
+    if (selected.length >= max) break;
+    if (!seen.has(item.domain)) { selected.push(item); seen.add(item.domain); }
+  }
+  return selected.slice(0, max);
+}
+
+function compareRankedResults(a, b, huntMode) {
+  if (huntMode === "asia_hunt") {
+    const asiaDiff = popPriority(b.colo) - popPriority(a.colo);
+    if (asiaDiff) return asiaDiff;
+  }
+  const scoreDiff = b.score - a.score;
+  if (Math.abs(scoreDiff) > 0.01) return scoreDiff;
+  return popRank(b.colo) - popRank(a.colo);
 }
 
 /* ------------------------------------------------------------------ */
@@ -676,7 +739,8 @@ function buildMetrics(domain, roundsData, dnsRes, source) {
     rounds: roundsData.length,
     medianTtfb: median(ttfbs),
     medianTotal: median(totals),
-    cv: coefficientOfVariation(ttfbs),
+    // 对齐 Android 2.7.1：失败轮次按 0 进入波动统计，不能把失败过滤后伪装成稳定。
+    cv: coefficientOfVariation(roundsData.map((r) => (r.ok && r.ttfb >= 0 ? r.ttfb : 0))),
     successRate: roundsData.length ? okRounds.length / roundsData.length : 0,
     dnsMs: dnsRes ? dnsRes.dnsMs : -1,
   };
@@ -706,17 +770,21 @@ async function optimizerStart() {
   OptimizerState.ipv6Results = [];
   OptimizerState.egressChanged = false;
   OptimizerState.vpnDetected = false;
-  OptimizerState.networkType = detectNetworkType();
   OptimizerState.popCount = {};
 
-  // 读用户选择：用途 / 协议 / 测速模式 / 运营商
+  // 读用户选择：用途 / 协议 / 测速模式 / 网络环境 / 运营商
   const mode = readSelect("#optimizer-use", "proxy");
   const protocol = readSelect("#optimizer-protocol", "dual");
   const huntMode = readSelect("#optimizer-mode", "balanced");
+  const networkManual = readSelect("#optimizer-network", "auto");
   const operatorManual = readSelect("#optimizer-operator", "auto");
+  const network = resolveNetworkProfile(networkManual, detectNetworkType());
   OptimizerState.use = mode;
   OptimizerState.protocol = protocol;
   OptimizerState.mode = huntMode;
+  OptimizerState.networkMode = network.mode;
+  OptimizerState.networkType = network.label;
+  OptimizerState.benchmarkProfile = network.benchmarkProfile;
   OptimizerState.operatorManual = operatorManual;
 
   const startBtn = $o("#optimizer-start");
@@ -751,7 +819,9 @@ async function optimizerStart() {
 
     // 1) 出口 IP 基线 + 运营商（自动或手动）+ VPN 启发式检测
     setProgress(6, "检测网络环境…");
-    const baseline = await probeTrace(candidates[0].domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
+    const benchmarkProfile = activeBenchmarkProfile();
+    const baselineDomain = benchmarkProfile.domains[0];
+    const baseline = await probeTrace(baselineDomain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
     OptimizerState.egressIp = baseline.ip || "";
     OptimizerState.operator = operatorManual === "auto" ? await detectOperator() : operatorManual;
     const localIps = await detectLocalIps();
@@ -759,7 +829,12 @@ async function optimizerStart() {
     if (publicLocal.length && baseline.ip && !publicLocal.includes(baseline.ip)) {
       OptimizerState.vpnDetected = true;
     }
-    if (OptimizerState.vpnDetected) showVpnBanner();
+    if (OptimizerState.vpnDetected) {
+      showVpnBanner();
+      setProgress(100, "检测到 VPN / 代理，已停止");
+      toast("检测到 VPN 或代理环境，请关闭后重新检测；本次不会开始测速或保存结果。", true);
+      return;
+    }
 
     // 1.5) CF 环境吞吐基准：一次测速，所有候选共享（proxy/download 需要，避免 1000 域名×下载耗流量）
     let dl = { ok: false, mbps: 0, bytes: 0 };
@@ -770,8 +845,8 @@ async function optimizerStart() {
     // 1.6) Benchmark 黄金参考（仅 proxy 模式，用于门禁对比，不参与候选排名）
     let benchmarks = [];
     if (mode === "proxy") {
-      setProgress(7, "测试黄金参考 openai/deepl/cloudflare…");
-      benchmarks = await probeBenchmark(OptimizerState.controller.signal);
+      setProgress(7, `测试${benchmarkProfile.label} ${benchmarkProfile.domains.join("/")}…`);
+      benchmarks = await probeBenchmark(OptimizerState.controller.signal, benchmarkProfile.domains);
     }
 
     // 2) Stage 1：轻量探测（batch 50/批，/cdn-cgi/trace 短超时，过滤失败）
@@ -780,7 +855,8 @@ async function optimizerStart() {
     await runBatches(candidates, BATCH_SIZE, async (cand) => {
       const res = await probeTrace(cand.domain, STAGE1_TIMEOUT_MS, OptimizerState.controller.signal);
       if (res.ok && res.ttfb >= 0) {
-        stage1.push({ domain: cand.domain, source: cand.source, ttfb: res.ttfb, total: res.total, colo: res.colo, loc: res.loc, ip: res.ip });
+        // 保留 ok=true；否则 Stage 2 会把这次成功误算成失败，三轮全成功也只能得到 67% 成功率。
+        stage1.push({ ok: true, domain: cand.domain, source: cand.source, ttfb: res.ttfb, total: res.total, colo: res.colo, loc: res.loc, ip: res.ip });
         const pop = res.colo || "OTHER";
         OptimizerState.popCount[pop] = (OptimizerState.popCount[pop] || 0) + 1;
       }
@@ -824,7 +900,7 @@ async function optimizerStart() {
       .filter((m) => m.rounds > 0)
       .map((m) => { m.score = computeScore(m, mode, { dl }); return m; })
       .sort((a, b) => b.score - a.score);
-    const finalists = stage2Scored.slice(0, FINAL_COUNT);
+    const finalists = selectFinalists(stage2Scored, huntMode, FINAL_COUNT);
     if (!finalists.length) {
       setProgress(100, "Stage 2 无有效结果");
       toast("Stage 2 未筛选出有效域名。", true);
@@ -865,38 +941,42 @@ async function optimizerStart() {
       if (m.successRate === 0 && !blist.includes(m.domain)) blist.push(m.domain);
     });
     saveBlacklist(blist);
-    // 主评分排序；同分时按运营商 POP 优先级 tiebreak（隐藏辅助因子，不覆盖测速结果）
-    results.sort((a, b) => {
-      const diff = b.score - a.score;
-      if (Math.abs(diff) > 0.01) return diff;
-      return popRank(b.colo) - popRank(a.colo);
-    });
+    // 均衡模式按主评分；亚洲狩猎模式先按 HKG>NRT>SIN>ICN>TPE，再按主评分。
+    results.sort((a, b) => compareRankedResults(a, b, huntMode));
     OptimizerState.results = results;
-    // 双栈：按 DNS 记录分类，IPv4/IPv6 各自独立排名，互不覆盖
+    // 双栈：按 DNS 记录分类并分组排序；实际连接路径仍由浏览器与系统网络栈决定
     OptimizerState.ipv4Results = results.filter((m) => m.ipv4);
     OptimizerState.ipv6Results = results.filter((m) => m.ipv6);
-    OptimizerState.asiaResults = results.filter((m) => isAsiaTarget(m.colo));
+    OptimizerState.asiaResults = results
+      .filter((m) => isAsiaTarget(m.colo))
+      .sort((a, b) => popPriority(b.colo) - popPriority(a.colo) || b.score - a.score);
 
     // 5.5) Benchmark 门禁：推荐核心 vs 黄金参考中位数（仅 proxy 模式）
     let benchmarkMedian = -1;
-    let gateAllowed = true;
+    let gateAllowed = mode !== "proxy";
     if (mode === "proxy" && benchmarks.length) {
-      const cores = benchmarks.map((bm) => bm.benchmarkCore).filter((c) => Number.isFinite(c) && c >= 0);
+      const cores = benchmarks
+        .filter((bm) => bm.successRate > 0 && bm.edgeStability && bm.edgeStability.samples > 0)
+        .map((bm) => bm.benchmarkCore)
+        .filter((c) => Number.isFinite(c) && c > 0);
       if (cores.length) {
         benchmarkMedian = median(cores);
         const candidateCore = benchmarkCore(results[0]);
-        gateAllowed = benchmarkMedian < 0 || candidateCore >= benchmarkMedian * BENCHMARK_GATE;
+        gateAllowed = candidateCore >= benchmarkMedian * BENCHMARK_GATE;
       }
     }
 
     // 6) 渲染 + 推荐理由 + 保存
-    renderBest(results[0], dl);
+    renderBest(results[0], dl, gateAllowed);
     renderBenchmarkCompare(results[0], benchmarks, benchmarkMedian, gateAllowed);
     renderRecommendation(results[0], dl, gateAllowed);
     renderAsiaHunt(OptimizerState.asiaResults);
     renderResults(results, dl, total, stage1.length, stage2List.length);
-    saveLocal(results[0], dl);
-    saveHistoryScores(results);
+    const reliable = !OptimizerState.egressChanged && (mode !== "proxy" || gateAllowed);
+    if (reliable) {
+      saveLocal(results[0], dl);
+      saveHistoryScores(results);
+    }
     setProgress(100, "完成");
 
     if (OptimizerState.egressChanged) {
@@ -978,23 +1058,25 @@ function renderCandidateCard(label, m) {
         <div class="opt-best-item"><label>来源</label><strong>${sourceLabel}</strong></div>
         <div class="opt-best-item"><label>TTFB</label><strong>${ttfb}</strong></div>
         <div class="opt-best-item"><label>成功率</label><strong>${availability}</strong></div>
-        <div class="opt-best-item"><label>稳定性</label><strong>${stability}</strong></div>
+        <div class="opt-best-item"><label>轮次稳定性</label><strong>${stability}</strong></div>
       </div>
     </div>`;
 }
 
-function renderBest(best, dl) {
+function renderBest(best, dl, gateAllowed) {
   if (!best) return;
   const box = $o("#optimizer-best");
   box.classList.remove("hidden");
   const protocol = OptimizerState.protocol;
   const unstable = OptimizerState.egressChanged ? " · 网络不稳定" : "";
+  const referenceOnly = OptimizerState.use === "proxy" && gateAllowed === false;
+  const bestLabel = referenceOnly ? "REFERENCE ONLY · 未通过基准门禁" : "BEST CLOUDFLARE EDGE";
   if (protocol === "dual") {
     const ipv4Best = OptimizerState.ipv4Results[0];
     const ipv6Best = OptimizerState.ipv6Results[0];
     box.innerHTML = `
-      <div class="opt-best-head"><span class="eyebrow">BEST CLOUDFLARE EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
-      <p class="opt-dual-hint">按 DNS 记录分类，评分来自当前浏览器实际出口；IPv4 与 IPv6 各自独立排名，互不覆盖。</p>
+      <div class="opt-best-head"><span class="eyebrow">${bestLabel}</span><span class="opt-best-unstable">${unstable}</span></div>
+      <p class="opt-dual-hint">按 DNS 记录分组展示；评分来自浏览器实际连接路径。受浏览器限制，无法强制 IPv4 / IPv6 分别建连，因此两组不是底层独立测速。</p>
       <div class="opt-dual-grid">
         ${renderCandidateCard("IPv4", ipv4Best)}
         ${renderCandidateCard("IPv6", ipv6Best)}
@@ -1003,7 +1085,7 @@ function renderBest(best, dl) {
     const label = protocol === "ipv6" ? "IPv6" : "IPv4";
     const m = protocol === "ipv6" ? (OptimizerState.ipv6Results[0] || best) : (OptimizerState.ipv4Results[0] || best);
     box.innerHTML = `
-      <div class="opt-best-head"><span class="eyebrow">BEST CLOUDFLARE EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
+      <div class="opt-best-head"><span class="eyebrow">${bestLabel}</span><span class="opt-best-unstable">${unstable}</span></div>
       ${renderCandidateCard(label, m)}`;
   }
 }
@@ -1015,6 +1097,8 @@ function renderBenchmarkCompare(best, benchmarks, benchmarkMedian, gateAllowed) 
   if (OptimizerState.use !== "proxy") { box.classList.add("hidden"); return; }
   box.classList.remove("hidden");
   const candidateCore = benchmarkCore(best);
+  const profile = activeBenchmarkProfile();
+  const domainText = profile.domains.join(" / ");
   const ratio = benchmarkMedian > 0 ? Math.round((candidateCore / benchmarkMedian) * 100) : -1;
   const rows = benchmarks.map((bm) => {
     const core = bm.benchmarkCore != null ? `${(bm.benchmarkCore * 100).toFixed(0)}%` : "—";
@@ -1022,18 +1106,20 @@ function renderBenchmarkCompare(best, benchmarks, benchmarkMedian, gateAllowed) 
     return `<tr><td>${escapeHtmlO(bm.domain)}</td><td>${escapeHtmlO(bm.colo || "—")}</td><td>${sr}</td><td>${core}</td></tr>`;
   }).join("");
   const gateHtml = gateAllowed
-    ? `<div class="opt-gate opt-gate-pass">✓ 推荐入口核心稳定性达到黄金参考基准，可作为代理入口</div>`
-    : `<div class="opt-gate opt-gate-fail">✗ 推荐入口核心稳定性低于黄金参考基准（${(benchmarkMedian * 100).toFixed(0)}%），当前网络下不建议作为代理入口</div>`;
+    ? `<div class="opt-gate opt-gate-pass">✓ 候选入口核心稳定性达到${profile.label}，可作为代理入口</div>`
+    : (benchmarkMedian >= 0
+      ? `<div class="opt-gate opt-gate-fail">✗ 候选入口核心稳定性低于${profile.label}（${(benchmarkMedian * 100).toFixed(0)}%），当前网络下不建议作为代理入口</div>`
+      : `<div class="opt-gate opt-gate-fail">✗ ${profile.label}不可用，无法确认候选入口质量；本次结果仅供参考且不会保存</div>`);
   box.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">BENCHMARK</span><h3>黄金参考对比</h3><p>推荐入口 vs openai.com / deepl.com / cloudflare.com 稳定性基准（核心 = 稳定连接 + 成功率）</p></div></div>
+      <div class="panel-head"><div><span class="eyebrow">BENCHMARK</span><h3>${profile.label}对比</h3><p>候选入口 vs ${escapeHtmlO(domainText)} 稳定性基准（核心 = 稳定连接 + 成功率）</p></div></div>
       <div class="table-scroll"><table class="data-table">
         <thead><tr><th>参考域名</th><th>POP</th><th>成功率</th><th>核心稳定性</th></tr></thead>
         <tbody>${rows || '<tr><td colspan="4">无黄金参考数据</td></tr>'}</tbody>
       </table></div>
       <div class="opt-bench-summary">
-        <div class="opt-bench-item"><label>推荐入口核心</label><strong>${(candidateCore * 100).toFixed(0)}%</strong></div>
-        <div class="opt-bench-item"><label>黄金基准中位数</label><strong>${benchmarkMedian >= 0 ? (benchmarkMedian * 100).toFixed(0) + "%" : "—"}</strong></div>
+        <div class="opt-bench-item"><label>候选入口核心</label><strong>${(candidateCore * 100).toFixed(0)}%</strong></div>
+        <div class="opt-bench-item"><label>${profile.label}</label><strong>${benchmarkMedian >= 0 ? (benchmarkMedian * 100).toFixed(0) + "%" : "—"}</strong></div>
         <div class="opt-bench-item"><label>性能比</label><strong>${ratio >= 0 ? ratio + "%" : "—"}</strong></div>
       </div>
       ${gateHtml}
@@ -1057,8 +1143,8 @@ function renderRecommendation(best, dl, gateAllowed) {
     const es = best.edgeStability;
     if (es && es.samples) {
       reasons.push(`稳定连接 ${(es.successRate * 100).toFixed(0)}%（连续 ${es.samples} 次复用连接）`);
-      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（连接稳定）");
-      else reasons.push("TTFB 波动较大（连接可能频繁重建）");
+      if (es.ttfbCV < 0.3) reasons.push("复用连接 TTFB 波动小");
+      else reasons.push("复用连接 TTFB 波动较大（连接可能频繁重建）");
     }
     if (dl && dl.ok) reasons.push(`CF 环境吞吐 ${dl.mbps.toFixed(1)} Mbps（参考）`);
   } else {
@@ -1066,11 +1152,11 @@ function renderRecommendation(best, dl, gateAllowed) {
   }
   reasons.push(`连续测试 ${successN}/${best.rounds || ROUNDS} 成功`);
   if (best.cv >= 0) {
-    if (best.cv < 0.3) reasons.push("速度稳定（波动小）");
-    else reasons.push("波动较大，晚间可能不稳定");
+    if (best.cv < 0.3) reasons.push("深度轮次波动小，晚间更稳");
+    else reasons.push("深度轮次波动较大，晚间可能不稳定");
   }
   const gateWarn = (mode === "proxy" && gateAllowed === false)
-    ? `<div class="opt-gate opt-gate-fail">⚠ 该入口核心稳定性低于黄金参考基准，当前网络下不建议作为代理入口（详见「黄金参考对比」）。</div>`
+    ? `<div class="opt-gate opt-gate-fail">⚠ 该入口未通过当前网络基准门禁，不作为正式推荐，也不会写入历史最佳（详见「基准对比」）。</div>`
     : "";
   box.innerHTML = `
     <article class="panel glass">
@@ -1222,7 +1308,7 @@ function optimizerOnEnter() {
   renderHistory();
   const box = $o("#optimizer-traffic-hint");
   if (box) {
-    box.innerHTML = `三级筛选：<b>Stage 1</b> 对约 ${OPTIMIZER_DOMAINS.length} 个内置 CF 域名做轻量探测（${BATCH_SIZE}/批并发），<b>Stage 2</b> 对存活域名测自身资源响应速度，<b>Stage 3</b> 对 TOP ${FINAL_COUNT} 连续深度测试。全程在浏览器本地完成，服务器不参与测速、不上传任何数据。`;
+    box.innerHTML = `三级筛选：<b>Stage 1</b> 对约 ${OPTIMIZER_DOMAINS.length} 个内置 CF 域名做轻量探测（${BATCH_SIZE}/批并发），<b>Stage 2</b> 对存活域名复测并解析 Edge，<b>Stage 3</b> 对 TOP ${FINAL_COUNT} 连续深度测试。移动网络只以 <b>openai.com</b> 为基准；RR-vps 服务器不参与测速、不接收或保存测速结果。`;
   }
   const input = $o("#optimizer-custom-input");
   if (input) {
