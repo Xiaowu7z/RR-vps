@@ -1,6 +1,8 @@
 # RR-vps
 
-[中文](README.md) · [English](README_EN.md) · [RR-vps 官方交流频道](https://t.me/GMgP4NG7lncwZGE1)
+> 📢 **[进入 RR-vps 官方交流频道](https://t.me/GMgP4NG7lncwZGE1)**
+
+[中文](README.md) · [English](README_EN.md)
 
 RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保留一个简单的 `rr` 管理入口，同时把程序、协议模块、用户配置、运行配置和订阅数据分开保存，便于热更新、回滚和开源维护。
 
@@ -12,7 +14,7 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 RR Nexus 新增浏览器本地 Cloudflare Edge 候选初筛，面向暂时没有 Android 测试环境的用户：浏览器从内置 1000 域名池分层筛出 TOP 20，移动网络以 `openai.com` 为质量基准，Wi-Fi / 宽带使用 `openai.com`、`deepl.com`、`cloudflare.com` 三项参考，并提供亚洲入口狩猎、成功率、TTFB、波动和本机历史记录。
 
-**面板优选质量不能只看排名。** 浏览器受 DNS、SNI、TLS、连接复用和 CORS 限制，排名只是候选顺序，不代表真实代理质量，也不保证第一名或前三名就是实际最快入口。用户必须把 TOP 20 放进真实客户端逐个测试，最终以实际速度、稳定性和晚高峰表现为准。有 Android 环境时，优先推荐下方的 **CF 域名优选 2.7.1** 做最终测试；没有 Android 环境时，再使用面板完成初筛。
+**面板优选质量不能只看排名。** 浏览器受 DNS、SNI、TLS、连接复用和 CORS 限制，排名只是候选顺序，不代表真实代理质量，也不保证第一名或前三名就是实际最快入口。用户必须把 TOP 20 放进真实客户端逐个测试，最终以实际速度、稳定性和晚高峰表现为准。优先推荐独立项目 [**RR Edge Atlas 多端域名优选**](https://github.com/Xiaowu7z/RR-Edge-Atlas) 做最终测试；没有电脑或 Android 原生测试环境时，再使用面板完成初筛。
 
 ## 一键安装
 
@@ -64,18 +66,16 @@ rr --version
 
 更新请选择主菜单 `8`；卸载请选择主菜单 `6`，再输入 `UNINSTALL` 二次确认。卸载完成后终端会再次显示项目地址和重新安装命令。
 
-## 配套工具：CF 域名优选（Android）
+## 配套工具：RR Edge Atlas 多端域名优选
 
-Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudflare IP + 域名入口组合。原生 Kotlin，权限最小化（仅联网与网络状态），无广告。**这是经过实际测试、当前最好用且优先推荐的最终优选工具，适合中国移动、中国电信、中国联通三网优选，测试结果可直接用于实际配置。** RR 面板浏览器版仅用于没有 Android 测试环境时的候选初筛。
+[RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) 已作为独立开源项目发布，同时提供电脑端正式版 **1.0** 与 Android **2.7.1**。两端都使用原生固定 IP、SNI 与证书校验及分层筛选思路，适合中国移动、中国电信、中国联通三网测试；RR 面板浏览器版继续作为没有原生测试环境时的候选初筛。
 
-- 最新版 **2.7.1** APK 下载：[assets/cf-optimizer/CF-Optimizer-2.7.1.apk](assets/cf-optimizer/CF-Optimizer-2.7.1.apk)（2.6.0 / 2.5.0 继续保留存档）
-- 完整源码：[assets/cf-optimizer/](assets/cf-optimizer/)（`app/` 工程源码 + `test/` 测试 + Gradle/CLI 构建文件 + **1000 域名候选池**）
+- 项目主页与完整源码：[Xiaowu7z/RR-Edge-Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas)
+- 电脑端 **1.0**（Windows / macOS / Linux）：[下载正式版](https://github.com/Xiaowu7z/RR-Edge-Atlas/releases/tag/v1.0)
+- Android **2.7.1** APK：[直接下载](https://github.com/Xiaowu7z/RR-Edge-Atlas/releases/download/v1.0/CF-Optimizer-2.7.1.apk)
+- Android 版已经实际测试，适合移动、电信、联通三网优选，结果可直接用于实际配置
 - 模式：均衡测速 + **亚洲入口狩猎**；亚洲入口优先 HKG > NRT > SIN > ICN > TPE，并在 Full 阶段复验 POP 漂移
-- 功能：IPv4/IPv6/双栈独立管线、Cloudflare IP/POP/Prefix 发现、Nexus 基准守擂、Final Address Floor、TTFB/成功率/波动、50 条历史记录
-- 2.7.1：修复主页无法向下滚动导致“历史测试”入口不可达
-- 详情见 [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
-
-> 后续计划：电脑端优选工具将沿用 Android 2.7.1 的原生探测与分层筛选原理，避免浏览器无法固定 IP / SNI 等限制。
+- 功能：IPv4/IPv6/双栈独立管线、POP/Prefix 发现、Final Address Floor、TTFB/成功率/波动与本机历史记录
 
 ## 主要功能
 
@@ -100,7 +100,7 @@ Cloudflare IP 优选 Android 工具，为节点订阅挑选更合适的 Cloudfla
 - 面板「服务器实时状态」页：每秒刷新 CPU / 内存 / 磁盘 / 网络，零依赖 `/proc` 采样
 - 面板「防火墙」设置页：端口开关、IPv4/IPv6 进出站分流、SSH 端口保护与权限教程
 - 面板「流媒体解锁检测」：Netflix / Disney+ / YouTube Premium 等平台解锁状态与地区
-- 面板「Edge 候选初筛」：浏览器本地将 1000 域名缩小到 TOP 20；排名不代表真实代理质量，必须使用 Android 2.7.1 或真实客户端逐个复测
+- 面板「Edge 候选初筛」：浏览器本地将 1000 域名缩小到 TOP 20；排名不代表真实代理质量，必须使用 RR Edge Atlas 电脑端 1.0、Android 2.7.1 或真实客户端逐个复测
 - 面板登录防爆破：IP + 账号双维锁定、30 分钟 5 次失败、指数退避、状态持久化；重置入口在脚本菜单 14 → 2
 - 设备订阅三种格式（通用链接 / Sing-box 完整配置 / Clash Meta YAML）、自动优选副节点同步、Argo 实时域名展示
 
@@ -290,3 +290,4 @@ OpenVZ、受限容器或廉价 NAT VPS 可能禁止 BBR、sysctl、iptables 或 
 提交 Issue 时请提供：系统版本、CPU 架构、虚拟化类型、所选协议、报错文本和脱敏后的状态信息。**不要粘贴 UUID、私钥、Tunnel Token、完整订阅链接或服务器登录凭据。**
 
 安全信息请阅读 [SECURITY.md](SECURITY.md)，版本变化请阅读 [CHANGELOG.md](CHANGELOG.md)。
+
