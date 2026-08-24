@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>RR Nexus · 星枢</title>
   <link rel="stylesheet" href="/app.css?v=3">
+  <link rel="stylesheet" href="/optimizer.css?v=1">
 </head>
 <body>
   <div class="ambient ambient-one"></div>
@@ -39,6 +40,7 @@
         <button class="nav-item" data-view="firewall"><span class="nav-icon">⛨</span><span>防火墙</span></button>
         <button class="nav-item" data-view="devices"><span class="nav-icon">◇</span><span>设备与用户</span></button>
         <button class="nav-item" data-view="remote"><span class="nav-icon">⛁</span><span>多服务器</span></button>
+        <button class="nav-item" data-view="optimizer"><span class="nav-icon">⚡</span><span>Edge 优选</span></button>
         <button class="nav-item" data-view="security"><span class="nav-icon">◈</span><span>访问与安全</span></button>
         <button class="nav-item" data-view="audit"><span class="nav-icon">≋</span><span>审计日志</span></button>
       </nav>
@@ -107,6 +109,22 @@
           <div id="rs-device-grid" class="device-grid"></div>
           <div id="rs-device-empty" class="empty-state glass hidden"><span>◇</span><h3>该服务器还没有设备</h3><p>点击上方「添加设备」远程创建。</p></div>
         </div>
+      </section>
+
+      <section id="view-optimizer" class="view">
+        <div class="section-toolbar">
+          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，一键测出当前最快的 Cloudflare 边缘入口。测速全部在浏览器本地完成，服务器只提供候选域名与预解析 IP、不参与测速、不上传任何数据。</p></div>
+          <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始本地测速</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
+        </div>
+        <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
+        <p id="optimizer-traffic-hint" class="optimizer-hint"></p>
+        <div id="optimizer-progress-wrap" class="optimizer-progress-wrap hidden">
+          <div class="optimizer-progress-bar"><div id="optimizer-progress-fill" class="optimizer-progress-fill"></div></div>
+          <div id="optimizer-progress-text" class="optimizer-progress-text"></div>
+        </div>
+        <div id="optimizer-best" class="optimizer-best hidden"></div>
+        <div id="optimizer-results" class="optimizer-results hidden"></div>
+        <div id="optimizer-history" class="optimizer-history"></div>
       </section>
 
       <section id="view-security" class="view">
@@ -267,7 +285,8 @@
   </form></dialog>
 
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=18" defer></script>
+  <script src="/app.js?v=19" defer></script>
+  <script src="/optimizer.js?v=1" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
     <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>

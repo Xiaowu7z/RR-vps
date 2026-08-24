@@ -25,6 +25,8 @@ MANIFEST_FILES = (
         "nexus/static/index.html",
         "nexus/static/app.js",
         "nexus/static/app.css",
+        "nexus/static/optimizer.js",
+        "nexus/static/optimizer.css",
     ]
 )
 BUNDLE_MEMBERS = MANIFEST_FILES + [

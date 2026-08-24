@@ -1321,7 +1321,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         self.send_header("Cache-Control", "no-store")
         if STATE.config.mode == "public":
@@ -2806,7 +2806,7 @@ class Handler(BaseHTTPRequestHandler):
     def serve_static(self, path: str) -> None:
         if path in {"", "/"}:
             file_path = STATIC_ROOT / "index.html"
-        elif path in {"/app.css", "/app.js", "/i18n.js"}:
+        elif path in {"/app.css", "/app.js", "/i18n.js", "/optimizer.js", "/optimizer.css"}:
             file_path = STATIC_ROOT / path.removeprefix("/")
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})

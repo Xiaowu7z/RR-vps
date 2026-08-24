@@ -1,0 +1,127 @@
+/* RR Edge Optimizer — 浏览器本地 CF Edge 优选（独立样式，复用 RR Nexus 设计变量） */
+
+/* 停止按钮（红色警示） */
+.button.danger { color: var(--red); border: 1px solid rgba(255, 116, 132, .35); background: rgba(255, 116, 132, .08); }
+
+/* VPN / 代理检测横幅 */
+.optimizer-banner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  border-radius: 14px;
+  padding: 15px 17px;
+  margin: 14px 0;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, .025);
+}
+.optimizer-banner.warning {
+  border-color: rgba(245, 200, 108, .4);
+  background: rgba(245, 200, 108, .08);
+}
+.optimizer-banner .bf-icon { font-size: 18px; margin-top: 1px; }
+.optimizer-banner b { display: block; font-size: 13px; color: var(--amber); }
+.optimizer-banner p { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 6px 0 10px; }
+
+/* 流量预估提示 */
+.optimizer-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0 0 14px;
+  padding: 12px 15px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .02);
+}
+.optimizer-hint b { color: var(--cyan); }
+
+/* 进度条 */
+.optimizer-progress-wrap { margin: 14px 0; }
+.optimizer-progress-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .06);
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.optimizer-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #6ce6ce, #5aa7ff, #967cff);
+  transition: width .18s ease-out;
+}
+.optimizer-progress-text {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/* Best Edge 结果卡 */
+.optimizer-best { margin: 14px 0; }
+.opt-best-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.opt-best-unstable { color: var(--amber); font-size: 11px; }
+.opt-best-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.opt-best-main {
+  grid-column: span 1;
+  border-radius: 14px;
+  padding: 16px;
+  border: 1px solid var(--line-strong);
+  background: linear-gradient(145deg, rgba(150, 124, 255, .12), rgba(150, 124, 255, .03));
+}
+.opt-best-main label, .opt-best-item label, .opt-hist-item label {
+  display: block;
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+.opt-best-main strong {
+  display: block;
+  font-size: 19px;
+  letter-spacing: -.02em;
+  word-break: break-all;
+}
+.opt-best-item {
+  border-radius: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, .02);
+}
+.opt-best-item strong { display: block; font-size: 17px; letter-spacing: -.02em; }
+
+.opt-ip { color: var(--cyan); }
+.opt-mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+/* 排名结果容器 */
+.optimizer-results { margin-top: 14px; }
+
+/* 历史结果 */
+.optimizer-history { margin-top: 14px; }
+.opt-hist-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.opt-hist-item {
+  border-radius: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, .02);
+}
+.opt-hist-item strong { display: block; font-size: 14px; word-break: break-all; }
+
+@media (max-width: 760px) {
+  .opt-best-grid, .opt-hist-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

@@ -148,6 +148,7 @@ function setView(name) {
     overview: ["运行总览", "OVERVIEW"], traffic: ["实时流量", "TRAFFIC"],
     devices: ["设备与用户", "DEVICES"], security: ["访问与安全", "SECURITY"], audit: ["审计日志", "AUDIT"],
     server: ["服务器状态", "SERVER"], firewall: ["防火墙", "FIREWALL"], remote: ["多服务器", "MULTI-SERVER"],
+    optimizer: ["Edge 优选", "CF EDGE OPTIMIZER"],
   };
   state.activeView = name;
   $$(".nav-item[data-view]").forEach(item => item.classList.toggle("active", item.dataset.view === name));
@@ -159,6 +160,8 @@ function setView(name) {
   if (name === "server") { startServerStats(); loadMediaUnlock(); } else { stopServerStats(); }
   if (name === "firewall") loadFirewall();
   if (name === "remote" && state.remoteActive === null) loadRemoteServers();
+  if (name === "optimizer") { if (window.OptimizerModule) OptimizerModule.enter(); }
+  else if (window.OptimizerModule) OptimizerModule.leave();
   requestAnimationFrame(renderCharts);
 }
 
