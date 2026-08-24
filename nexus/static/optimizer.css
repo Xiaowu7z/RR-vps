@@ -1,4 +1,4 @@
-/* RR Edge Optimizer — 浏览器本地 CF Edge 优选（独立样式，复用 RR Nexus 设计变量） */
+/* RR ARGO Domain Optimizer — 浏览器本地 ARGO 入口优选（独立样式，复用 RR Nexus 设计变量） */
 
 /* 停止按钮（红色警示） */
 .button.danger { color: var(--red); border: 1px solid rgba(255, 116, 132, .35); background: rgba(255, 116, 132, .08); }
@@ -139,6 +139,63 @@
   background: rgba(255, 255, 255, .02);
 }
 .opt-hist-item strong { display: block; font-size: 14px; word-break: break-all; }
+
+/* 自定义候选域名输入 */
+.optimizer-custom-wrap {
+  margin: 14px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .02);
+}
+.optimizer-custom-wrap label {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.optimizer-custom-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .2);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+.optimizer-custom-input:focus { outline: none; border-color: var(--cyan); }
+
+/* 推荐理由 */
+.optimizer-recommendation { margin-top: 14px; }
+.opt-reason-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.opt-reason-item {
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(108, 230, 206, .05);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.opt-reason-item::before {
+  content: "✓ ";
+  color: var(--cyan);
+  font-weight: 700;
+}
+
+/* 综合评分 */
+.opt-score { color: #6ce6ce; }
+.opt-score-max { font-size: 11px; color: var(--muted); font-weight: 400; margin-left: 2px; }
 
 @media (max-width: 760px) {
   .opt-best-grid, .opt-hist-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

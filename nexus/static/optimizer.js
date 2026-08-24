@@ -32,224 +32,23 @@ const OptimizerState = {
 
 // 亚洲入口狩猎：亚洲 POP 优先级（对齐 Android Pipeline.popPriority）
 const ASIA_POP_PRIORITY = { HKG: 5, NRT: 4, SIN: 3, ICN: 2, TPE: 1 };
-const ASIA_QUOTAS = { HKG: 8, NRT: 3, SIN: 3, ICN: 2, TPE: 2 }; // 决赛配额
-const ASIA_CONTRAST = 2; // 非亚洲最快对照数
 function popPriority(pop) { return ASIA_POP_PRIORITY[pop] || 0; }
 function isAsiaTarget(pop) { return popPriority(pop) > 0; }
 
-// 分层测速常量（对齐 Android Pipeline.kt 的 micro → full）
-const BASELINE_DOMAIN = "www.nexusmods.com"; // 基准域名（必进决赛）
-const FINAL_DOMAINS = 20;      // 决赛域名数（对齐 Android finalDomains 慢档）
-const MICRO_CONCURRENCY = 25;  // 筛选阶段并发
-const MICRO_TIMEOUT_MS = 3500; // 筛选阶段短超时（快速淘汰慢域名）
-const CONCURRENCY = 8;         // 精确测速阶段并发
-const PROBE_TIMEOUT_MS = 8000; // 精确测速超时
-const DOWNLOAD_BYTES = 2 * 1024 * 1024; // 下载测速 2MB
-const STORAGE_KEY = "rr_edge_optimizer";
+// 候选 ARGO 入口域名：预设公共域名池（对齐 RR-vps 安装向导同款预设 CDN）
+const PRESET_DOMAINS = ["cloudflare-ech.com", "www.visa.com.sg", "www.wto.org", "www.web.com"];
 
-// 候选 CF 域名池（内嵌在工具文件中，服务器仅静态托管此文件，域名池随之分发）
-const OPTIMIZER_DOMAINS = [
-  "www.nexusmods.com", "nexusmods.com", "www.cloudflare.com", "cloudflare.com", "blog.cloudflare.com",
-  "developers.cloudflare.com", "speed.cloudflare.com", "radar.cloudflare.com", "community.cloudflare.com", "dash.cloudflare.com",
-  "pages.cloudflare.com", "workers.cloudflare.com", "www.cloudflarestatus.com", "cloudflarestatus.com", "cloudflare-dns.com",
-  "www.cloudflare-dns.com", "one.one.one.one", "1dot1dot1dot1.cloudflare-dns.com", "www.trycloudflare.com", "trycloudflare.com",
-  "pages.dev", "workers.dev", "warp.dev", "cloudflareclient.com", "www.cloudflareclient.com",
-  "cloudflareinsights.com", "www.cloudflareinsights.com", "www.4chan.org", "4chan.org", "www.canva.com",
-  "canva.com", "www.fiverr.com", "fiverr.com", "www.indeed.com", "indeed.com",
-  "www.pexels.com", "pexels.com", "www.shopify.com", "shopify.com", "www.chess.com",
-  "chess.com", "www.itch.io", "itch.io", "www.codepen.io", "codepen.io",
-  "www.dribbble.com", "dribbble.com", "www.deepl.com", "deepl.com", "www.sentry.io",
-  "sentry.io", "www.bitly.com", "bitly.com", "www.ngrok.com", "ngrok.com",
-  "www.digitalocean.com", "digitalocean.com", "www.vultr.com", "vultr.com", "www.linode.com",
-  "linode.com", "www.docker.com", "docker.com", "www.gitlab.com", "gitlab.com",
-  "www.medium.com", "medium.com", "www.genius.com", "genius.com", "www.tawk.to",
-  "tawk.to", "www.namecheap.com", "namecheap.com", "www.cloudflare.net", "cloudflare.net",
-  "www.discourse.org", "discourse.org", "www.letterboxd.com", "letterboxd.com", "www.producthunt.com",
-  "producthunt.com", "www.behance.net", "behance.net", "www.unsplash.com", "unsplash.com",
-  "www.imgur.com", "imgur.com", "www.fandom.com", "fandom.com", "www.archiveofourown.org",
-  "archiveofourown.org", "www.curseforge.com", "curseforge.com", "www.speedtest.net", "speedtest.net",
-  "www.mozilla.org", "mozilla.org", "www.python.org", "python.org", "www.rust-lang.org",
-  "rust-lang.org", "www.npmjs.com", "npmjs.com", "www.npmjs.org", "npmjs.org",
-  "www.jsdelivr.com", "jsdelivr.com", "www.stackshare.io", "stackshare.io", "www.cloudflare-ipfs.com",
-  "cf-ipfs.com", "discord.com", "www.discord.com", "www.patreon.com", "patreon.com",
-  "www.quora.com", "quora.com", "www.coinmarketcap.com", "coinmarketcap.com", "www.grammarly.com",
-  "grammarly.com", "www.notion.so", "notion.so", "www.openai.com", "openai.com",
-  "www.reddit.com", "reddit.com", "www.twitch.tv", "twitch.tv", "www.udemy.com",
-  "udemy.com", "www.coursera.org", "coursera.org", "www.khanacademy.org", "khanacademy.org",
-  "wbinsights.com", "yuanshen.com", "goodreads.com", "rt.ru", "l-err.biz",
-  "sky.com", "b2clogin.com", "vk.com", "goodsync.com", "nuancemobility.net",
-  "myip.com", "razorpay.com", "impact-ad.jp", "google.com.mx", "rambler.ru",
-  "gotolstoy.com", "discogs.com", "360.cn", "amap.com", "awswaf.com",
-  "sndcdn.com", "krisp.ai", "disquscdn.com", "xero.com", "pendo.io",
-  "189.cn", "me.com", "exponea.com", "brightcove.net", "bidswitch.net",
-  "atmtd.com", "tq-tungsten.com", "gdms.cloud", "drdrab.com", "conversionsapigateway.com",
-  "zdbb.net", "pop-convert.com", "force.com", "google.ge", "gnezdo.ru",
-  "ruckus.cloud", "securly.com", "fireoscaptiveportal.com", "tnt-ea.com", "mgslb.com",
-  "redditspace.com", "ubnt.com", "latamairlines.com", "dmrtb.com", "snarutox.com",
-  "google.kz", "mjedge.net", "wps.com", "wondershare.cc", "mmechocaptiveportal.com",
-  "dattobackup.com", "packetstream.io", "nintendo.com", "kumulos.com", "t-static.ru",
-  "warnermediacdn.com", "yandex.fi", "qianwen.com", "litatom.com", "reson8.com",
-  "blockchain.info", "infocyte.com", "myfitnesspal.com", "google.org", "haplat.net",
-  "belkin.com", "google.at", "ns1p.net", "parastorage.com", "nytimes.com",
-  "appnexusgslb.com", "online-metrix.net", "comfylink.com", "gcore.com", "hepsiburada.com",
-  "byte008.com", "docusign.com", "adsensecustomsearchads.com", "usgovcloudapi.net", "depositphotos.com",
-  "yeastar.com", "ldmnq.com", "aviasales.com", "ttvnw.net", "365scores.com",
-  "ixigua.com", "solaredge.com", "calendly.com", "refinery89.com", "7tv.io",
-  "amplitude.com", "opera-api.com", "cdn-fileserver.com", "bcbd123.com", "lunalabs.io",
-  "hola.org", "languagetoolplus.com", "nflxext.com", "adpushup.com", "bol.com",
-  "wfcdn.com", "adobeccstatic.com", "omnisendlink.com", "mercadolibre.com.mx", "apibay.org",
-  "ghost.io", "soundcloud.com", "elasticbeanstalk.com", "huobi.pro", "loox.io",
-  "appdome.com", "colnsedge.com", "mist.com", "opera.technology", "emc.com",
-  "crpt.ru", "cars.com", "tdatamaster.com", "fedoraproject.org", "live-video.net",
-  "bricks-co.com", "oracleinfinity.io", "coolzcloud.com", "sleepnumber.com", "cloud.globo",
-  "digitalaudience.io", "ladesk.com", "aidata.io", "mdpi.com", "tpmn.io",
-  "ebayimg.com", "corel.com", "ask.com", "cloudflare-gateway.com", "adstk.io",
-  "indriverapp.com", "shallspark.com", "mediav.com", "kwai-pay.com", "toast.com",
-  "voltaxservices.io", "clover.com", "cbssports.com", "conviva.com", "zg-api.com",
-  "docker.io", "vps-vids.com", "lgtvcommon.com", "1905.com", "homeconnecthca.com",
-  "clarocdn.com.br", "yandex.com.tr", "lenovomm.com", "adp.com", "casasbahia.com.br",
-  "tildacdn.com", "grofers.com", "railway.app", "netgear.com", "okx.cab",
-  "verkada.com", "tdnsstic1.cn", "sendbird.com", "google.bt", "changeip.com",
-  "adobestats.io", "douyinstatic.com", "activision.com", "dialmyapp.com", "apkpure.com",
-  "a-b-c-8.com", "noaa.gov", "zaloapp.com", "adobeprimetime.com", "ele.me",
-  "web.id", "outlook.com", "everesttech.net", "ebaydesc.com", "itbakit.com",
-  "rbstsystems.live", "fandango.com", "puicdn.com", "tubi.video", "gotomeeting.com",
-  "quillbot.com", "pb.com", "weglot.com", "dalyfeds.com", "printercloud.com",
-  "zillowstatic.com", "scribd.com", "zscloud.net", "sweatco.in", "idealmedia.io",
-  "gototraining.com", "iubenda.com", "jumpcloud.com", "nexthink.cloud", "google.com.py",
-  "instabug.com", "assets-yammer.com", "sportradarserving.com", "oaiusercontent.com", "salesforce-scrt.com",
-  "google.com.jm", "country.is", "onetag-sys.com", "chewy.com", "cloudsink.net",
-  "priceline.com", "mygaru.com", "ca.gov", "eufylife.com", "tiktokw.eu",
-  "espncricinfo.com", "marriott.com", "typeform.com", "google.hr", "google.al",
-  "esportesdasorte.bet.br", "pastebin.com", "zeronaught.com", "alfabank.ru", "mova-tech.com",
-  "genieesspv.jp", "affirm.com", "myip.link", "etahub.com", "google.cg",
-  "ivi.ru", "zscaler.net", "deviantart.com", "metricswpsh.com", "qantas.com",
-  "wareztv.io", "olx.com.br", "accuweather.com", "bradesco.com.br", "ttdns2.com",
-  "quago.io", "pinterest.com", "hexagon-analytics.com", "disney-plus.net", "openxcdn.net",
-  "protonmail.ch", "fbsbx.com", "googleapis.cn", "wwstat.com", "ipleak.net",
-  "bilibili.com", "codedish.co", "centrastage.net", "bcebos.com", "usercentrics.eu",
-  "tivo.com", "dreame.tech", "ac.in", "intsig.net", "go.com",
-  "lenovo.com", "signal.org", "google.sr", "samsungcloudsolution.net", "zohopublic.com",
-  "im-apps.net", "biahosted.com", "skinnycrawlinglax.com", "windows.com", "netcoresmartech.com",
-  "google.lk", "mcas.ms", "dzeninfra.ru", "ttwstatic.com", "vorwerk-digital.com",
-  "kinopoisk.ru", "urban-vpn.com", "unmsapp.com", "volcgtm.com", "cambaddies.com",
-  "like-video.com", "wandera.com", "tatum.io", "bromium-online.com", "archlinux.org",
-  "samsung.com", "viafoura.co", "listdl.com", "tailscale.io", "richaudience.com",
-  "cpanel.net", "pcloud.com", "eyeota.net", "adx.ws", "sophosupd.com",
-  "loom.com", "glance.com", "gofastchat.com", "samsungosp.com", "monitoring360.io",
-  "nereserv.com", "saygames.io", "ad4m.at", "zdn.vn", "intelbrasp2p.com.br",
-  "oracle.com", "apollo.io", "amazon.pl", "joinwebinar.com", "sgsnssdk.com",
-  "imgsmail.ru", "discord.gg", "optimizely.com", "scw.cloud", "nbc.com",
-  "freepik.com", "opera.software", "zzpxy.top", "kwaipros.com", "advertising.com",
-  "ampproject.org", "flirtify.com", "wiley.com", "octobrowser.net", "kontur.ru",
-  "tpmn.co.kr", "zoom.us", "zencdn.net", "tianwenca.com", "fbcdn.net",
-  "youngle.tech", "ecobee.com", "certum.pl", "weathercn.com", "google.com.tw",
-  "apitd.net", "jetbrains.com", "myfoscam.com", "intercom.io", "pbs.org",
-  "doppiocdn.net", "smartthings.com", "usercontent.goog", "capitaloneshopping.com", "allawnos.com",
-  "resetdigital.co", "indazn.com", "sng.link", "uuidksinc.net", "mediaplex.com",
-  "testmy.net", "msftauthimages.net", "alidns.com", "redbubble.com", "syndicatedsearch.goog",
-  "4wps.net", "wallapop.com", "mtgglobals.com", "cloudbackup.management", "google.ch",
-  "myclientip.com", "cpx.to", "lifeaiot.com", "edgecdn.ru", "mintegral.net",
-  "nuget.org", "deepernetworks.org", "schwab.com", "google.com.co", "shopifycdn.com",
-  "superbet.bet.br", "tokopedia.com", "nba.com", "outboundproxy.com", "ticketmaster.com",
-  "nextdns.io", "qwps.cn", "anonymised.io", "cookiebot.com", "microsoftonline.com",
-  "mfadsrvr.com", "ueiwsp.com", "sohu.com", "wistia.com", "volcvod.com",
-  "xml-redirect.online", "zscalerthree.net", "aniview.com", "google.as", "gmail.com",
-  "addtoany.com", "yotpoapi.com", "demonware.net", "idexx.com", "selcdn.net",
-  "travel-assets.com", "qiyukf.com", "gtld-servers.net", "appbaqend.com", "booking.com",
-  "mediavine.com", "aliyun.com", "izatcloud.net", "nocookie.net", "channelcom.tech",
-  "google.la", "vkvideo.ru", "google.com.ai", "onkakao.net", "vonedge.com",
-  "zing.vn", "apkpure.net", "siteimproveanalytics.io", "powerschool.com", "doppiocdn.com",
-  "coupert.com", "tiktokcdn.com", "mgtv.com", "hpsmart.com", "mopub.com",
-  "devicetrust.com", "ndcpp-os.com", "drom.ru", "givefreely.com", "qustodio.com",
-  "speedtestcustom.com", "hsforms.net", "sina.com.cn", "serving-sys.ru", "opt360.net",
-  "bytepluscdn.com", "webengage.com", "prebid-server.com", "paytm.com", "spribegaming.com",
-  "dutils.com", "newsbreak.com", "ad-delivery.net", "opentrackr.org", "honeygain.com",
-  "remote-service-pf.com", "wpengine.com", "p-cdn.us", "netlify.com", "tapad.com",
-  "poly-ai.chat", "kinescopecdn.net", "google.co.ug", "wego.com", "iotcplatform.com",
-  "futbin.com", "tubemogul.com", "linkplay.com", "santander.com.br", "appboy.com",
-  "zippypongbee.com", "wordwall.net", "revjet.com", "bytefcdn.com", "octo25.me",
-  "ebay.com", "sonarr.tv", "npttech.com", "tribunnews.com", "dotomi.com",
-  "bytelb.com", "azure-dns.net", "dramaverses.com", "safedk.com", "bloomreach.co",
-  "bluestacks.com", "make.com", "smile.io", "rtbwise.com", "cnzz.com",
-  "samokat.ru", "capcutcdn-us.com", "semanticscholar.org", "opentracker.io", "pdst.fm",
-  "tinypass.com", "grammarly.net", "trvdp.com", "geniex.com", "popcash.net",
-  "configcat.com", "keplr.app", "nypost.com", "fhgte.com", "fastly-insights.com",
-  "cloudflareok.com", "shopee.vn", "adapty.io", "nordpass.com", "hsadspixel.net",
-  "v2z.ru", "r7ops.com", "phonefactor.net", "yandex.ru", "onrender.com",
-  "google.bs", "kayzen.io", "susercontent.com", "wixmp.com", "hulustream.com",
-  "ospserver.net", "delta.com", "apnews.com", "usepylon.com", "sanity.io",
-  "navdmp.com", "heytapimage.com", "webshare.io", "eqtv.io", "qualtrics.com",
-  "media-amazon.com", "mercadolibre.com", "ifood.com.br", "aiv-cdn.net", "eu-1-id5-sync.com",
-  "postrelease.com", "google.lv", "alibaba-inc.com", "f-sos.net", "pvvstream.pro",
-  "ccgateway.net", "appiersig.com", "intsmarthub.com", "kameleoon.eu", "adroll.com",
-  "8slp.net", "acrobat.com", "tencentmusic.com", "dotnxdomain.net", "sicoob.com.br",
-  "trustedstack.com", "packetsdk.io", "disney.co.jp", "onefootball.com", "sourshaped.com",
-  "prodregistryv2.org", "bancointer.com.br", "kslawin.com", "roeyecdn.com", "e-msedge.net",
-  "txlivecdn.com", "deviantart.net", "minecraft-services.net", "google.nu", "weatherbug.net",
-  "storagejsstrategiesfabulous.com", "anuytzc.xyz", "galaxy-cdn.com", "feishu.cn", "wwsga.me",
-  "brevo.com", "quad9.net", "google.com.br", "artstation.com", "dnsv1.com",
-  "mktoresp.com", "sm.cn", "ipip.net", "system-monitor.com", "qidi3dprinter.com",
-  "wetransfer.net", "salesforceliveagent.com", "fontawesome.com", "superproxy.io", "apicgate.com",
-  "go-mpulse.net", "adsbynimbus.com", "browsiprod.com", "bugsnag.com", "glassdoor.com",
-  "mypikpak.com", "localytics.com", "adspower.net", "lge.com", "cdninstagram.com",
-  "google.com.sv", "redbubble.net", "aliapp.org", "pubmnet.com", "ac.kr",
-  "saawsedge.com", "gonet-ads.com", "mxptint.net", "getgrass.io", "nextersglobal.com",
-  "jsmsat.com", "akahost.net", "cisco.com", "eeroup.com", "amazonsilk.com",
-  "pixiv.net", "mega.nz", "nest.com", "tenjin.com", "amzn.eu",
-  "jito.wtf", "lookout.com", "highspeedinternet.com", "elastic.co", "mi.com",
-  "dnse0.com", "1drv.com", "aliyuncs.com", "google.com.ar", "banco.bradesco",
-  "hik-connect.com", "gcdn.co", "unioneeu.com", "volcmcdn3.com", "logitech.com",
-  "bytegle.site", "best61.com", "best82.com", "fluidplayer.com", "cloudscdn.net",
-  "aidemsrv.com", "stnvideo.com", "nhs.uk", "vercel.app", "xdrtc.com",
-  "signalr.net", "queue-it.net", "thinkingdata.cn", "hereapi.com", "google.com.et",
-  "airtable.com", "windy.com", "tenable.com", "apptracer.ru", "tesla.services",
-  "samsungcloud.com", "aliyuncsslbintl.com", "google.com.vn", "gameanalytics.com", "linke.ai",
-  "sspnet.tech", "dtscout.com", "isharing-gps.com", "crowdstrike.com", "ably.io",
-  "plista.com", "flickr.com", "webflow.com", "axs.com", "jd.com",
-  "redhat.com", "edgedns-tm.info", "tradplusad.com", "mobile.de", "geoipcheck.com",
-  "megaphone.fm", "t-ru.org", "libsyn.com", "ruckuswireless.com", "voodoo-tech.io",
-  "fpjs.io", "otto.de", "nabu.casa", "bdydns.com", "fuseplatform.net",
-  "atidevs.com", "tru.am", "roku.com", "squarespace.com", "bumlam.com",
-  "chimpstatic.com", "x.ai", "xhtotal.com", "streamrail.com", "mathworks.com",
-  "mi-fds.com", "blogspot.com", "airbrake.io", "quantcount.com", "alipayobjects.com",
-  "jiveip.net", "goo.gl", "bringads.ru", "kunlunsl.com", "garena.com",
-  "samsunghealth.com", "douyinpic.com", "navercorp.com", "vidazoo.services", "gouv.fr",
-  "samba.tv", "google.co.kr", "thecatmachine.com", "alarmnet.com", "affec.tv",
-  "instana.io", "vesync.com", "pushd.com", "erne.co", "bidmatic.io",
-  "olxcdn.com", "sap.com", "google.co.nz", "boomplaymusic.com", "gtranslate.net",
-  "rs-online.com", "bytetcdn.com", "google.mk", "opensea.io", "pbbl.co",
-  "zmaticoo.com", "wb.ru", "mediarithmics.com", "s-onetag.com", "volcfcdndvs.com",
-  "hcaptcha.com", "hath.network", "e5.sk", "f2pool.com", "google.mn",
-  "tbcache.com", "bb.com.br", "dramaboxdb.com", "sc-static.net", "lsapp.eu",
-  "quicksetcloud.com", "paloaltonetworks.com", "b-msedge.net", "demdex.net", "vsco.co",
-  "binance.org", "minecraft.net", "socdm.com", "livesport.services", "android.com",
-  "worldoftanks.eu", "scene7.com", "admixer.net", "concursolutions.com", "google.co.zw",
-  "acobt.tech", "celtra.com", "holadns.com", "ip-api.com", "ovrc.com",
-  "primis.tech", "zeotap.com", "nflximg.com", "pstatp.com", "veeam.com",
-  "biz.id", "nexon.com", "google.az", "bezeqint.net", "qianxun.com",
-  "otclick-adv.ru", "ml314.com", "judge.me", "mercadoclics.com", "netlify.app",
-  "midasplayer.net", "lgthinq.com", "muscache.com", "seek.com.au", "smilewanted.com",
-  "decibelinsight.net", "captioncall.com", "fc2.com", "totalbattle.com", "edgesuite.net",
-  "google.com.gh", "msftstatic.com", "clarip.com", "ttdns3.com", "pokeapi.co",
-  "google.gp", "media6degrees.com", "bytedance.com", "youtu.be", "nextlgsdp.com",
-  "jwplatform.com", "kargo.com", "dbankcloud.eu", "bluetrafficstream.com", "porsche.com",
-  "tsyndicate.com", "libero.it", "ipv6-test.com", "bdstatic.com", "monday.com",
-  "srmdata-us.com", "aqara.com", "nearme.com.cn", "bilivideo.com", "ripe.net",
-  "nflxso.net", "app-measurement.com", "wp.pl", "apptentive.com", "p-n.io",
-  "xbox-dns.ru", "overwolf.com", "autonavi.com", "dmv.org", "kwaicdn.com",
-  "powerplatform.com", "falconnet.app", "permutive.com", "azurerms.com", "clean.gg",
-  "aylanetworks.com", "gaijin.net", "hubspot.com", "hot.net.il", "glotgrx.com",
-  "presage.io", "okx.com", "csfloat.com", "pipopay.com", "google.vg",
-  "rockylinux.org", "rollbar.com", "dual-s-dc-msedge.net", "uservoice.com", "liveperson.net",
-  "pinduoduo.com", "tile-api.com", "allegrostatic.com", "cloudinary.com", "avada.io",
-  "jfrog.io", "yclients.com", "lnkdns.net", "zoho.in", "sfx.ms",
-  "gstatic.com", "ipinfo.io", "acrobits.cz", "azure-dns.com", "xerox.com",
-  "op.gg", "zhihu.com", "infinitepay.io", "blastapi.io", "zyxel.com",
-  "tribalfusion.com", "coinall.ltd", "avito.st", "amspbs.com", "nih.gov",
-  "fizzopic.org", "instagram.com", "spbycdn.com", "ietf.org", "comodoca.com",
-  "sgmbocast.com", "dtignite.com", "office.com", "xwz.ovh", "cudaops.com",
-];
+const CONCURRENCY = 6;           // 候选域名并发
+const PROBE_TIMEOUT_MS = 8000;   // trace 超时
+const WS_TIMEOUT_MS = 6000;      // WebSocket 握手超时
+const DOWNLOAD_BYTES = 2 * 1024 * 1024; // 下载测速 2MB
+const ROUNDS = 3;                // 每个候选域名多轮测试
+const STORAGE_KEY = "rr_edge_optimizer";
+const BLACKLIST_KEY = "rr_edge_optimizer_blacklist";
+const CUSTOM_DOMAINS_KEY = "rr_edge_optimizer_custom_domains";
+// 综合评分权重（五哥最终确认版）
+// 成功率 40 / 真实 ARGO 连通 30 / 稳定传输 20 / 延迟 10
+const SCORE_W = { success: 40, argo: 30, stability: 20, latency: 10 };
 
 const $o = (sel, root = document) => root.querySelector(sel);
 
@@ -342,6 +141,7 @@ async function probeTrace(domain, timeoutMs, signal) {
 /* ------------------------------------------------------------------ */
 async function resolveEdgeIp(domain, signal) {
   const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`;
+  const start = performance.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
   const onAbort = () => ctrl.abort();
@@ -351,12 +151,13 @@ async function resolveEdgeIp(domain, signal) {
   }
   try {
     const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal });
-    if (!resp.ok) return "";
+    const dnsMs = performance.now() - start;
+    if (!resp.ok) return { ip: "", dnsMs: -1 };
     const data = await resp.json();
     const a = (data.Answer || []).filter((x) => x.type === 1).map((x) => x.data);
-    return a[0] || "";
+    return { ip: a[0] || "", dnsMs };
   } catch (_e) {
-    return "";
+    return { ip: "", dnsMs: -1 };
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -427,31 +228,105 @@ function coefficientOfVariation(values) {
   return sd / avg;
 }
 
-// 全局 Edge Score = Speed × Stability × Success Rate（纯速度，不含 POP 偏好）
-function computeEdgeScore(metrics) {
-  const ttfb = metrics.medianTtfb;
-  const speedScore = ttfb < 0 ? 0.05 : Math.max(0.05, Math.min(1, 1 - ttfb / 800));
-  const stabilityScore = Math.max(0.05, Math.min(1, 1 - metrics.cv));
-  const successRate = Math.max(0.05, metrics.successRate);
-  return speedScore * stabilityScore * successRate;
+// 综合评分（0-100 加权和）：可用性 40 + 下载 30 + 稳定 15 + 延迟 10 + DNS 5
+// 核心思想（迁移安卓 2.7.1）：稳定高速 > 低延迟但晚上炸；延迟不是唯一指标。
+function computeScore(metrics, dl) {
+  // 成功率 40：trace 成功轮次 / 总轮次（可用性，最高权重）
+  const success = metrics.successRate * SCORE_W.success;
+
+  // 真实 ARGO 连通 30：ws 真实路径（/UUID-vm）成功=满分，仅根路径=降权，均失败=0
+  let argo = 0;
+  const wsRealOk = metrics.wsReal && metrics.wsReal.ok;
+  const wsRootOk = metrics.wsRoot && metrics.wsRoot.ok;
+  if (wsRealOk) argo = SCORE_W.argo;
+  else if (wsRootOk) argo = SCORE_W.argo * 0.4;
+
+  // 稳定传输 20：下载速度 10 + 波动稳定 10（波动小=稳定，晚上不炸）
+  const dlMbps = dl && dl.ok ? dl.mbps : 0;
+  const speedPart = Math.min(1, dlMbps / 100) * 10;
+  const stabilityPart = (1 - Math.min(1, metrics.cv)) * 10;
+
+  // 延迟 10：TTFB（50ms 满分，800ms 归零，权重最低）
+  const latency = metrics.medianTtfb >= 0
+    ? Math.max(0, 1 - metrics.medianTtfb / 800) * SCORE_W.latency : 0;
+
+  return success + argo + speedPart + stabilityPart + latency;
 }
 
-// 亚洲入口价值 = POP 优先级 × Speed × Stability × Success Rate
-function computeAsiaScore(metrics) {
-  const pop = popPriority(metrics.colo); // HKG=5...非亚洲=0
-  const speedScore = metrics.medianTtfb < 0 ? 0.05 : Math.max(0.05, Math.min(1, 1 - metrics.medianTtfb / 800));
-  const stabilityScore = Math.max(0.05, Math.min(1, 1 - metrics.cv));
-  const successRate = Math.max(0.05, metrics.successRate);
-  const popWeight = pop > 0 ? pop : 0.5; // 亚洲 POP 加权放大，非亚洲基准 0.5
-  return popWeight * speedScore * stabilityScore * successRate;
+// 亚洲入口价值：综合评分 × 亚洲 POP 加权（HKG/NRT/SIN/ICN/TPE 放大，非亚洲减半）
+function computeAsiaScore(metrics, dl) {
+  const base = computeScore(metrics, dl);
+  const pop = popPriority(metrics.colo);
+  const popWeight = pop > 0 ? (1 + pop * 0.1) : 0.5;
+  return base * popWeight;
 }
 
 /* ------------------------------------------------------------------ */
 /* 主流程                                                               */
 /* ------------------------------------------------------------------ */
-function loadDomains() {
-  OptimizerState.domains = OPTIMIZER_DOMAINS.slice();
-  return OptimizerState.domains;
+function loadCustomDomains() {
+  try { return JSON.parse(localStorage.getItem(CUSTOM_DOMAINS_KEY) || "[]"); } catch (_e) { return []; }
+}
+function saveCustomDomains(list) {
+  try { localStorage.setItem(CUSTOM_DOMAINS_KEY, JSON.stringify(list)); } catch (_e) {}
+}
+
+// 读取 RR-vps 当前节点 ARGO 隧道配置（域名/端口/ws 路径）
+async function fetchArgoConfig() {
+  try {
+    const resp = await fetch("/api/argo/config", { cache: "no-store" });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch (_e) { return null; }
+}
+
+// 收集候选 ARGO 域名：用户节点 ARGO 域名（API）> 预设域名池 > 用户自定义
+async function collectCandidates() {
+  const list = [];
+  const seen = new Set();
+  const cfg = await fetchArgoConfig();
+  if (cfg && cfg.domain) {
+    OptimizerState.argoConfig = cfg;
+    if (!seen.has(cfg.domain)) { list.push({ domain: cfg.domain, source: "argo", config: cfg }); seen.add(cfg.domain); }
+  }
+  PRESET_DOMAINS.forEach((d) => {
+    if (!seen.has(d)) { list.push({ domain: d, source: "preset" }); seen.add(d); }
+  });
+  loadCustomDomains().forEach((d) => {
+    if (d && !seen.has(d)) { list.push({ domain: d, source: "custom" }); seen.add(d); }
+  });
+  return list;
+}
+
+// WebSocket 握手检测（真实 ARGO 业务承载）：onopen = Upgrade: websocket 成功
+function probeWebSocket(domain, path, timeoutMs, signal) {
+  return new Promise((resolve) => {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    let ws;
+    try {
+      ws = new WebSocket(`${scheme}://${domain}${path}`);
+    } catch (_e) {
+      resolve({ ok: false, upgraded: false, error: "构造失败" });
+      return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => finish(false, false, "timeout"), timeoutMs || WS_TIMEOUT_MS);
+    const finish = (ok, upgraded, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      try { ws.close(); } catch (_e) {}
+      resolve({ ok, upgraded, error });
+    };
+    const onAbort = () => finish(false, false, "aborted");
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener("abort", onAbort);
+    }
+    ws.onopen = () => finish(true, true, "");
+    ws.onerror = () => finish(false, false, "ws_error");
+  });
 }
 
 async function optimizerStart() {
@@ -477,20 +352,21 @@ async function optimizerStart() {
   setProgress(0, "准备中…");
 
   try {
-    // 0) 加载候选域名池（内嵌，无需请求服务器）
-    if (!OptimizerState.domains.length) {
-      loadDomains();
-    }
-    if (!OptimizerState.domains.length) {
+    // 1) 收集候选 ARGO 域名（用户节点 ARGO 域名 + 预设域名池 + 自定义）
+    setProgress(6, "读取候选 ARGO 域名…");
+    const allCandidates = await collectCandidates();
+    const blacklist = new Set(loadBlacklist());
+    const candidates = allCandidates.filter((c) => !blacklist.has(c.domain));
+    if (!candidates.length) {
       setProgress(100, "无可用候选域名");
-      toast("未获取到候选域名，请检查网络后重试。", true);
+      toast("未获取到候选 ARGO 域名，请检查节点配置或手动添加。", true);
       return;
     }
-    const total = OptimizerState.domains.length;
+    const total = candidates.length;
 
-    // 1) 出口 IP 基线 + VPN 启发式检测
-    setProgress(4, "检测网络环境…");
-    const baseline = await probeTrace(BASELINE_DOMAIN, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
+    // 2) 出口 IP 基线 + VPN 启发式检测
+    setProgress(10, "检测网络环境…");
+    const baseline = await probeTrace(candidates[0].domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
     OptimizerState.egressIp = baseline.ip || "";
     const localIps = await detectLocalIps();
     const publicLocal = localIps.filter((ip) => !isPrivateIp(ip));
@@ -501,66 +377,16 @@ async function optimizerStart() {
       showVpnBanner();
     }
 
-    // 2) 第一阶段：小流量快速筛选（全部候选域名 × 1 轮）
-    setProgress(8, `第一阶段 · 快速筛选 0/${total} 域名…`);
-    const micro = {}; // domain -> { ttfb, colo }
-    await runConcurrent(OptimizerState.domains, MICRO_CONCURRENCY, async (domain) => {
-      const res = await probeTrace(domain, MICRO_TIMEOUT_MS, OptimizerState.controller.signal);
-      if (res.ok && res.ttfb >= 0) {
-        micro[domain] = { ttfb: res.ttfb, colo: res.colo };
-      }
-      if (res.ok && res.ip && OptimizerState.egressIp && res.ip !== OptimizerState.egressIp) {
-        OptimizerState.egressChanged = true;
-      }
-    }, (n) => {
-      setProgress(8 + Math.floor((n / total) * 47), `第一阶段 · 快速筛选 ${n}/${total} 域名…`);
-    });
-
-    if (OptimizerState.aborted) {
-      setProgress(100, "已停止");
-      toast("测速已停止。");
-      return;
-    }
-
-    // 3) 精选决赛域名（亚洲入口狩猎：POP 配额制，含基准域名）
-    setProgress(56, "精选决赛域名（亚洲入口狩猎）…");
-    const microList = Object.entries(micro).sort((a, b) => a[1].ttfb - b[1].ttfb);
-    const byPop = {};
-    for (const [d, m] of microList) {
-      const pop = m.colo || "OTHER";
-      (byPop[pop] = byPop[pop] || []).push(d);
-    }
-    const finalists = [];
-    // 亚洲 POP 配额：HKG 8 / NRT 3 / SIN 3 / ICN 2 / TPE 2
-    for (const [pop, quota] of Object.entries(ASIA_QUOTAS)) {
-      (byPop[pop] || []).slice(0, quota).forEach((d) => finalists.push(d));
-    }
-    // 非亚洲最快对照（最多 ASIA_CONTRAST 个）
-    Object.entries(byPop)
-      .filter(([pop]) => !isAsiaTarget(pop))
-      .flatMap(([, list]) => list)
-      .slice(0, ASIA_CONTRAST)
-      .forEach((d) => finalists.push(d));
-    // 基准域名兜底
-    if (micro[BASELINE_DOMAIN] && !finalists.includes(BASELINE_DOMAIN)) finalists.unshift(BASELINE_DOMAIN);
-    // 补足到 FINAL_DOMAINS
-    for (const [d] of microList) {
-      if (finalists.length >= FINAL_DOMAINS) break;
-      if (!finalists.includes(d)) finalists.push(d);
-    }
-    if (!finalists.length) {
-      setProgress(100, "筛选阶段无有效结果");
-      toast("快速筛选未获取到有效结果，请检查网络后重试。", true);
-      return;
-    }
-
-    // 4) 第二阶段：决赛域名精确测速（多轮 + DoH 解析 Edge IP）
+    // 3) 对每个候选域名：多轮 trace + DoH + WebSocket 握手（真实 ARGO 业务）
     const perDomain = {};
-    setProgress(60, `第二阶段 · 精确测速 0/${finalists.length} 域名…`);
-    await runConcurrent(finalists, CONCURRENCY, async (domain) => {
-      const edgeIp = await resolveEdgeIp(domain, OptimizerState.controller.signal);
+    setProgress(15, `测速 0/${total} 候选域名…`);
+    await runConcurrent(candidates, CONCURRENCY, async (cand) => {
+      const domain = cand.domain;
+      const dnsRes = await resolveEdgeIp(domain, OptimizerState.controller.signal);
+      const edgeIp = dnsRes.ip || "";
+      const dnsMs = dnsRes.dnsMs;
       const rounds = [];
-      for (let r = 0; r < OptimizerState.rounds; r++) {
+      for (let r = 0; r < ROUNDS; r++) {
         if (OptimizerState.aborted) break;
         const res = await probeTrace(domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
         rounds.push(res);
@@ -568,21 +394,33 @@ async function optimizerStart() {
           OptimizerState.egressChanged = true;
         }
       }
+      // WebSocket 握手：A 根路径（快速筛选）+ B 真实路径 /UUID-vm（100% 模拟 RR-vps）
+      const wsRoot = await probeWebSocket(domain, "/", WS_TIMEOUT_MS, OptimizerState.controller.signal);
+      let wsReal = null;
+      if (OptimizerState.argoConfig && OptimizerState.argoConfig.path) {
+        wsReal = await probeWebSocket(domain, OptimizerState.argoConfig.path, WS_TIMEOUT_MS, OptimizerState.controller.signal);
+      }
       const okRounds = rounds.filter((r) => r.ok);
       const ttfbs = okRounds.map((r) => r.ttfb);
       const colo = okRounds.find((r) => r.colo)?.colo || "";
+      const loc = okRounds.find((r) => r.loc)?.loc || "";
       const successRate = rounds.length ? okRounds.length / rounds.length : 0;
       perDomain[domain] = {
         domain,
         colo,
+        loc,
+        source: cand.source,
         ips: edgeIp ? [edgeIp] : [],
         medianTtfb: median(ttfbs),
         cv: coefficientOfVariation(ttfbs),
         successRate,
         rounds: rounds.length,
+        dnsMs,
+        wsRoot,
+        wsReal,
       };
     }, (n) => {
-      setProgress(60 + Math.floor((n / finalists.length) * 20), `第二阶段 · 精确测速 ${n}/${finalists.length} 域名…`);
+      setProgress(15 + Math.floor((n / total) * 55), `测速 ${n}/${total} 候选域名…`);
     });
 
     if (OptimizerState.aborted) {
@@ -591,28 +429,36 @@ async function optimizerStart() {
       return;
     }
 
-    // 5) 下载吞吐（整体参考）
-    setProgress(82, "测试下载吞吐…");
+    // 4) 下载吞吐（整体参考，稳定传输的一部分）
+    setProgress(72, "测试下载吞吐…");
     const dl = await probeDownload(OptimizerState.controller.signal);
 
-    // 6) 计算 Edge Score + 亚洲入口价值 + 双榜排序
-    setProgress(88, "计算 Edge Score…");
+    // 5) 综合评分（成功率40 + 真实ARGO连通30 + 稳定传输20 + 延迟10）+ 失败惩罚 + 双榜排序
+    setProgress(80, "计算综合评分…");
     const metrics = Object.values(perDomain)
       .filter((m) => m.rounds > 0)
       .map((m) => {
-        m.edgeScore = computeEdgeScore(m);
-        m.asiaScore = computeAsiaScore(m);
+        m.score = computeScore(m, dl);
+        m.asiaScore = computeAsiaScore(m, dl);
         return m;
       });
-    OptimizerState.results = metrics.slice().sort((a, b) => b.edgeScore - a.edgeScore);
+    // 失败惩罚：trace 全失败 且 ws 均失败 → 加入黑名单，下次跳过
+    const blist = loadBlacklist();
+    metrics.forEach((m) => {
+      const wsDead = !(m.wsReal && m.wsReal.ok) && !(m.wsRoot && m.wsRoot.ok);
+      if (m.successRate === 0 && wsDead && !blist.includes(m.domain)) blist.push(m.domain);
+    });
+    saveBlacklist(blist);
+    OptimizerState.results = metrics.slice().sort((a, b) => b.score - a.score);
     OptimizerState.asiaResults = metrics
       .filter((m) => isAsiaTarget(m.colo))
       .sort((a, b) => b.asiaScore - a.asiaScore);
 
-    // 7) 渲染 + 保存
+    // 6) 渲染 + 推荐理由 + 保存
     renderBest(OptimizerState.results[0], dl);
+    renderRecommendation(OptimizerState.results[0], dl);
     renderAsiaHunt(OptimizerState.asiaResults);
-    renderResults(OptimizerState.results, dl, total, finalists.length);
+    renderResults(OptimizerState.results, dl, total);
     saveLocal(OptimizerState.results[0], dl);
     setProgress(100, "完成");
 
@@ -679,12 +525,22 @@ function renderBest(best, dl) {
   const ttfb = best.medianTtfb >= 0 ? `${best.medianTtfb.toFixed(0)} ms` : "—";
   const speed = dl && dl.ok ? `${dl.mbps.toFixed(1)} Mbps` : "—";
   const stability = best.cv >= 0 ? `${(100 - Math.min(100, best.cv * 100)).toFixed(0)}%` : "—";
+  const score = best.score != null ? `${best.score.toFixed(1)}` : "—";
+  const availability = `${(best.successRate * 100).toFixed(0)}%`;
+  const wsRealOk = best.wsReal && best.wsReal.ok;
+  const wsRootOk = best.wsRoot && best.wsRoot.ok;
+  const wsLabel = wsRealOk ? "真实路径 ✓" : (wsRootOk ? "根路径 ✓" : "✗");
+  const sourceLabel = best.source === "argo" ? "你的节点" : (best.source === "preset" ? "预设" : "自定义");
   const unstable = OptimizerState.egressChanged ? " · 网络不稳定" : "";
   box.innerHTML = `
-    <div class="opt-best-head"><span class="eyebrow">BEST EDGE</span><span class="opt-best-unstable">${unstable}</span></div>
+    <div class="opt-best-head"><span class="eyebrow">BEST ARGO ENTRY</span><span class="opt-best-unstable">${unstable}</span></div>
     <div class="opt-best-grid">
-      <div class="opt-best-main"><label>Best Domain</label><strong>${escapeHtmlO(best.domain)}</strong></div>
-      <div class="opt-best-main"><label>Best Edge IP</label><strong class="opt-ip">${escapeHtmlO(bestIp)}</strong></div>
+      <div class="opt-best-main"><label>最佳入口域名</label><strong>${escapeHtmlO(best.domain)}</strong></div>
+      <div class="opt-best-main"><label>综合评分</label><strong class="opt-score">${score}<small class="opt-score-max">/100</small></strong></div>
+      <div class="opt-best-item"><label>来源</label><strong>${sourceLabel}</strong></div>
+      <div class="opt-best-item"><label>WebSocket</label><strong>${wsLabel}</strong></div>
+      <div class="opt-best-item"><label>Edge IP</label><strong class="opt-mono opt-ip">${escapeHtmlO(bestIp)}</strong></div>
+      <div class="opt-best-item"><label>成功率</label><strong>${availability}</strong></div>
       <div class="opt-best-item"><label>POP</label><strong>${escapeHtmlO(best.colo || "—")}</strong></div>
       <div class="opt-best-item"><label>TTFB</label><strong>${ttfb}</strong></div>
       <div class="opt-best-item"><label>Speed</label><strong>${speed}</strong></div>
@@ -692,31 +548,60 @@ function renderBest(best, dl) {
     </div>`;
 }
 
-function renderResults(results, dl, totalDomains, finalistCount) {
+function renderRecommendation(best, dl) {
+  if (!best) return;
+  const box = $o("#optimizer-recommendation");
+  if (!box) return;
+  box.classList.remove("hidden");
+  const wsRealOk = best.wsReal && best.wsReal.ok;
+  const wsRootOk = best.wsRoot && best.wsRoot.ok;
+  const wsDesc = wsRealOk ? "WebSocket 真实路径握手成功（100% 模拟 RR-vps 节点）" : (wsRootOk ? "WebSocket 根路径握手成功（快速筛选通过）" : "WebSocket 握手失败，建议谨慎使用");
+  const ttfb = best.medianTtfb >= 0 ? `${best.medianTtfb.toFixed(0)} ms` : "—";
+  const successN = Math.round(best.successRate * (best.rounds || ROUNDS));
+  const reasons = [
+    wsDesc,
+    `TTFB ${ttfb}`,
+  ];
+  if (dl && dl.ok) reasons.push(`下载速度 ${dl.mbps.toFixed(1)} Mbps`);
+  reasons.push(`连续测试 ${successN}/${best.rounds || ROUNDS} 成功`);
+  box.innerHTML = `
+    <article class="panel glass">
+      <div class="panel-head"><div><span class="eyebrow">WHY</span><h3>推荐理由</h3><p>为什么推荐这个入口</p></div></div>
+      <div class="opt-reason-list">
+        ${reasons.map((r) => `<div class="opt-reason-item">${escapeHtmlO(r)}</div>`).join("")}
+      </div>
+    </article>`;
+}
+
+function renderResults(results, dl, totalDomains) {
   const wrap = $o("#optimizer-results");
   wrap.classList.remove("hidden");
-  const tbody = results.slice(0, FINAL_DOMAINS).map((m, i) => {
+  const tbody = results.map((m, i) => {
     const ip = m.ips && m.ips[0] ? m.ips[0] : "—";
     const ttfb = m.medianTtfb >= 0 ? `${m.medianTtfb.toFixed(0)} ms` : "—";
     const sr = `${(m.successRate * 100).toFixed(0)}%`;
-    const cv = `${(Math.min(100, m.cv * 100)).toFixed(0)}%`;
+    const ws = (m.wsReal && m.wsReal.ok) ? "真实✓" : ((m.wsRoot && m.wsRoot.ok) ? "根✓" : "✗");
+    const sc = m.score != null ? m.score.toFixed(1) : "—";
+    const src = m.source === "argo" ? "节点" : (m.source === "preset" ? "预设" : "自定义");
     return `<tr>
       <td>${i + 1}</td>
       <td>${escapeHtmlO(m.domain)}</td>
+      <td>${src}</td>
+      <td>${ws}</td>
       <td class="opt-mono">${escapeHtmlO(ip)}</td>
       <td>${escapeHtmlO(m.colo || "—")}</td>
       <td>${ttfb}</td>
       <td>${sr}</td>
-      <td>${cv}</td>
+      <td><strong>${sc}</strong></td>
     </tr>`;
   }).join("");
-  const scope = `从 ${totalDomains} 个候选域名中筛选 ${finalistCount} 个决赛域名精确测速`;
+  const scope = `共 ${totalDomains} 个候选 ARGO 入口域名，按综合评分排序（成功率 40% · 真实 ARGO 连通 30% · 稳定传输 20% · 延迟 10%）`;
   wrap.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>决赛域名排名（按 Edge Score）</h3><p>${escapeHtmlO(scope)}</p></div><small>下载参考：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">RANKING</span><h3>ARGO 入口域名排名</h3><p>${escapeHtmlO(scope)}</p></div><small>下载参考：${dl && dl.ok ? dl.mbps.toFixed(1) + " Mbps" : "—"}</small></div>
       <div class="table-scroll"><table class="data-table">
-        <thead><tr><th>#</th><th>域名</th><th>Edge IP</th><th>POP</th><th>TTFB</th><th>成功率</th><th>波动</th></tr></thead>
-        <tbody>${tbody || '<tr><td colspan="7">无有效结果</td></tr>'}</tbody>
+        <thead><tr><th>#</th><th>域名</th><th>来源</th><th>WS</th><th>Edge IP</th><th>POP</th><th>TTFB</th><th>成功率</th><th>评分</th></tr></thead>
+        <tbody>${tbody || '<tr><td colspan="9">无有效结果</td></tr>'}</tbody>
       </table></div>
     </article>`;
 }
@@ -756,6 +641,16 @@ function renderAsiaHunt(asia) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 失败惩罚 + 黑名单                                                    */
+/* ------------------------------------------------------------------ */
+function loadBlacklist() {
+  try { return JSON.parse(localStorage.getItem(BLACKLIST_KEY) || "[]"); } catch (_e) { return []; }
+}
+function saveBlacklist(list) {
+  try { localStorage.setItem(BLACKLIST_KEY, JSON.stringify(list)); } catch (_e) {}
+}
+
+/* ------------------------------------------------------------------ */
 /* localStorage                                                        */
 /* ------------------------------------------------------------------ */
 function saveLocal(best, dl) {
@@ -764,9 +659,11 @@ function saveLocal(best, dl) {
     best_domain: best.domain,
     best_ip: best.ips && best.ips[0] ? best.ips[0] : "",
     pop: best.colo || "",
+    loc: best.loc || "",
+    score: best.score != null ? Math.round(best.score * 10) / 10 : -1,
     latency: best.medianTtfb >= 0 ? Math.round(best.medianTtfb) : -1,
     speed: dl && dl.ok ? Math.round(dl.mbps * 10) / 10 : -1,
-    timestamp: new Date().toISOString(),
+    last_success: new Date().toISOString(),
     network: OptimizerState.networkType,
     vpn_detected: !!OptimizerState.vpnDetected,
     unstable: !!OptimizerState.egressChanged,
@@ -792,16 +689,18 @@ function renderHistory(record) {
     box.innerHTML = '<p class="form-hint">暂无历史优选结果，点击「开始本地测速」生成第一个记录。</p>';
     return;
   }
-  const when = rec.timestamp ? new Date(rec.timestamp).toLocaleString("zh-CN", { hour12: false }) : "—";
+  const when = (rec.last_success || rec.timestamp) ? new Date(rec.last_success || rec.timestamp).toLocaleString("zh-CN", { hour12: false }) : "—";
   const lat = rec.latency >= 0 ? `${rec.latency} ms` : "—";
   const spd = rec.speed >= 0 ? `${rec.speed} Mbps` : "—";
+  const sc = rec.score >= 0 ? `${rec.score}` : "—";
   box.innerHTML = `
     <article class="panel glass">
-      <div class="panel-head"><div><span class="eyebrow">LAST RESULT</span><h3>上次优选结果（本机保存）</h3></div><small>${escapeHtmlO(when)}</small></div>
+      <div class="panel-head"><div><span class="eyebrow">LAST RESULT</span><h3>历史最佳入口（本机保存）</h3></div><small>${escapeHtmlO(when)}</small></div>
       <div class="opt-hist-grid">
         <div class="opt-hist-item"><label>Best Domain</label><strong>${escapeHtmlO(rec.best_domain || "—")}</strong></div>
+        <div class="opt-hist-item"><label>综合评分</label><strong class="opt-score">${sc}</strong></div>
         <div class="opt-hist-item"><label>Best Edge IP</label><strong class="opt-mono">${escapeHtmlO(rec.best_ip || "—")}</strong></div>
-        <div class="opt-hist-item"><label>POP</label><strong>${escapeHtmlO(rec.pop || "—")}</strong></div>
+        <div class="opt-hist-item"><label>POP / 地区</label><strong>${escapeHtmlO(rec.pop || "—")}${rec.loc ? " · " + escapeHtmlO(rec.loc) : ""}</strong></div>
         <div class="opt-hist-item"><label>TTFB</label><strong>${lat}</strong></div>
         <div class="opt-hist-item"><label>Speed</label><strong>${spd}</strong></div>
         <div class="opt-hist-item"><label>网络</label><strong>${escapeHtmlO(rec.network || "—")}${rec.vpn_detected ? " · VPN" : ""}${rec.unstable ? " · 不稳定" : ""}</strong></div>
@@ -816,8 +715,11 @@ function optimizerOnEnter() {
   renderHistory();
   const box = $o("#optimizer-traffic-hint");
   if (box) {
-    const pool = OptimizerState.domains.length || OPTIMIZER_DOMAINS.length;
-    box.innerHTML = `测速分两阶段：先对 <b>${pool} 个候选域名</b>做 1 轮快速筛选，再对 <b>${FINAL_DOMAINS} 个决赛域名</b>做 ${OptimizerState.rounds} 轮精确测速 + 一次约 ${(DOWNLOAD_BYTES / 1024 / 1024).toFixed(0)} MB 下载测速。全程在浏览器本地完成，服务器不参与测速、不上传任何数据。`;
+    box.innerHTML = `测速会优先读取你节点当前的 <b>ARGO 域名</b>，再补充预设域名和自定义域名，对每个候选域名做多轮 trace + <b>WebSocket 握手</b>（真实 ARGO 业务承载）+ 下载测速。全程在浏览器本地完成，服务器不参与测速、不上传任何数据。`;
+  }
+  const input = $o("#optimizer-custom-input");
+  if (input) {
+    input.value = loadCustomDomains().join("\n");
   }
 }
 
@@ -830,6 +732,16 @@ function optimizerInit() {
   const stopBtn = $o("#optimizer-stop");
   if (startBtn) startBtn.addEventListener("click", optimizerStart);
   if (stopBtn) stopBtn.addEventListener("click", optimizerStop);
+  const saveBtn = $o("#optimizer-custom-save");
+  if (saveBtn) {
+    saveBtn.addEventListener("click", () => {
+      const input = $o("#optimizer-custom-input");
+      if (!input) return;
+      const list = input.value.split("\n").map((s) => s.trim()).filter(Boolean);
+      saveCustomDomains(list);
+      if (typeof toast === "function") toast(`已保存 ${list.length} 个自定义候选域名。`);
+    });
+  }
 }
 
 // 暴露给 app.js 的 setView 调用

@@ -1501,6 +1501,11 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 self.handle_remote_qr(query)
             return
+        if path == "/api/argo/config":
+            session = self.require_session()
+            if session:
+                self.handle_argo_config()
+            return
         if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "links" and DEVICE_ID_RE.fullmatch(segments[2]):
             session = self.require_session()
             if session:
@@ -2646,6 +2651,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def subscription_file(self, device_id: str) -> Path:
         return STATE.config.subscription_root / f"{device_id}.txt"
+
+    def handle_argo_config(self) -> None:
+        """读取当前节点 ARGO 隧道配置（域名/端口/ws 路径），供浏览器本地优选使用。
+
+        安全说明：ws 路径 /UUID-vm 与订阅链接同级别暴露（登录后可见），
+        仅返回测试所需最小字段，不返回 /etc/argo_vmess.conf 其余敏感项。
+        """
+        argo_domain = ""
+        argo_edge_port = ""
+        argo_uuid = ""
+        try:
+            with open("/etc/argo_vmess.conf", "r", encoding="utf-8") as cf:
+                for line in cf:
+                    line = line.strip()
+                    if line.startswith("ARGO_DOMAIN="):
+                        argo_domain = line.split("=", 1)[1]
+                    elif line.startswith("ARGO_EDGE_PORT="):
+                        argo_edge_port = line.split("=", 1)[1]
+                    elif line.startswith("UUID="):
+                        argo_uuid = line.split("=", 1)[1]
+        except OSError:
+            pass
+        path = f"/{argo_uuid}-vm" if argo_uuid else ""
+        self.send_json(HTTPStatus.OK, {
+            "domain": argo_domain,
+            "edge_port": argo_edge_port,
+            "path": path,
+            "transport": "ws",
+        })
 
     def handle_device_links(self, device_id: str) -> None:
         device = self.device_record(device_id)
