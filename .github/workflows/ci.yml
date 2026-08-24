@@ -20,3 +20,5 @@ jobs:
         run: |
           awk 'NF!=2||length($1)!=64{print"BAD:"$0;e=1}END{exit e}' manifest.sha256
           sha256sum -c manifest.sha256
+      - name: Repository regression suite
+        run: bash scripts/validate.sh
