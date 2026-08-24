@@ -1,6 +1,8 @@
 # RR-vps
 
-[中文](README.md) · [English](README_EN.md) · [RR-vps Official Channel](https://t.me/GMgP4NG7lncwZGE1)
+> 📢 **[Join the official RR-vps community channel](https://t.me/GMgP4NG7lncwZGE1)**
+
+[中文](README.md) · [English](README_EN.md)
 
 RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS instances. Users keep one simple `rr` command, while program modules, persistent settings, runtime configuration, and subscriptions are stored separately for safer updates and rollback.
 
@@ -12,7 +14,7 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 RR Nexus now provides a local browser-based Cloudflare Edge screener for users without an Android test environment. It narrows the built-in 1,000-domain pool to a TOP 20 shortlist. Mobile networks use `openai.com` as the quality baseline, while Wi-Fi/broadband uses `openai.com`, `deepl.com`, and `cloudflare.com`.
 
-**Do not judge optimization quality by the panel ranking alone.** Browser DNS, SNI, TLS, connection reuse, and CORS limitations mean that the ranking is only a candidate order, not real proxy quality. Users must test the TOP 20 one by one in the actual client and decide by real speed, stability, and peak-hour performance. The Android **CF Domain Optimizer 2.7.1** remains the recommended final test.
+**Do not judge optimization quality by the panel ranking alone.** Browser DNS, SNI, TLS, connection reuse, and CORS limitations mean that the ranking is only a candidate order, not real proxy quality. Users must test the TOP 20 one by one in the actual client and decide by real speed, stability, and peak-hour performance. The standalone [**RR Edge Atlas multi-platform optimizer**](https://github.com/Xiaowu7z/RR-Edge-Atlas) is the recommended final test.
 
 ## One-command installation
 
@@ -64,16 +66,14 @@ rr --version
 
 Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to remove RR-vps. The uninstall result prints the project URL and reinstall command for future use.
 
-## Companion tool: CF Domain Optimizer (Android)
+## Companion tool: RR Edge Atlas
 
-An Android tool that scans Cloudflare edge IPs and domains to find the fastest combination for your node subscriptions. Native Kotlin, minimal permissions (network only), no ads. **It has been field-tested, is the preferred final optimizer, supports China Mobile, China Telecom, and China Unicom, and produces results ready for real configuration.** The browser panel is only a shortlist fallback for users without Android testing access.
+[RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) is now a standalone open-source multi-platform project with desktop **1.0** and Android **2.7.1** editions. Both use native fixed-IP probing, SNI and certificate validation, and layered screening. The Android edition has been field-tested across China Mobile, China Telecom, and China Unicom; the browser panel remains a shortlist fallback when no native test environment is available.
 
-- Latest **2.7.1** APK: [assets/cf-optimizer/CF-Optimizer-2.7.1.apk](assets/cf-optimizer/CF-Optimizer-2.7.1.apk)
-- Full source: [assets/cf-optimizer/](assets/cf-optimizer/) (`app/` project + `test/` suite + Gradle/CLI build files + 1,000-domain pool)
-- Features: IPv4/IPv6/dual-stack pipelines, Cloudflare IP/POP/prefix discovery, Asia Hunt, Nexus benchmark defense, success rate/TTFB/variation ranking, and 50-entry history
-- Details: [assets/cf-optimizer/README.md](assets/cf-optimizer/README.md)
-
-> Roadmap: the desktop optimizer will reuse Android 2.7.1's native probing and layered screening model, avoiding browser limitations such as the inability to pin IP/SNI paths.
+- Project and full source: [Xiaowu7z/RR-Edge-Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas)
+- Desktop **1.0** for Windows, macOS, and Linux: [release downloads](https://github.com/Xiaowu7z/RR-Edge-Atlas/releases/tag/v1.0)
+- Android **2.7.1** APK: [direct download](https://github.com/Xiaowu7z/RR-Edge-Atlas/releases/download/v1.0/CF-Optimizer-2.7.1.apk)
+- Features: IPv4/IPv6/dual-stack pipelines, POP/prefix discovery, Asia Hunt, Final Address Floor, TTFB/success/variation ranking, and local history
 
 ## Features
 
@@ -97,7 +97,7 @@ An Android tool that scans Cloudflare edge IPs and domains to find the fastest c
 - Panel live server status page: per-second CPU / memory / disk / network, zero-dependency `/proc` sampling
 - Panel firewall settings page: port toggles, IPv4/IPv6 inbound/outbound split, SSH port protection, and a permission tutorial
 - Panel streaming unlock checker: unlock status and region for Netflix / Disney+ / YouTube Premium and more
-- Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be tested individually with Android 2.7.1 or the actual client
+- Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be retested with RR Edge Atlas desktop 1.0, Android 2.7.1, or the actual client
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
 - Device subscriptions in three formats (universal link / Sing-box full config / Clash Meta YAML), automatic alternate-node optimization sync, live Argo domain display
@@ -232,3 +232,4 @@ Option 8 replaces program modules without resetting persistent settings. Updates
 - Prefer a named Cloudflare Tunnel for long-lived use and keep one direct protocol as a fallback.
 
 When opening an Issue, include the OS version, CPU architecture, virtualization type, selected protocol, error text, and redacted status output. Read [SECURITY.md](SECURITY.md) before sharing logs, and see [CHANGELOG.md](CHANGELOG.md) for release changes.
+
