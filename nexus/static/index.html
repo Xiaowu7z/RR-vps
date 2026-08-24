@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>RR Nexus · 星枢</title>
   <link rel="stylesheet" href="/app.css?v=3">
-  <link rel="stylesheet" href="/optimizer.css?v=2">
+  <link rel="stylesheet" href="/optimizer.css?v=3">
 </head>
 <body>
   <div class="ambient ambient-one"></div>
@@ -113,19 +113,20 @@
 
       <section id="view-optimizer" class="view">
         <div class="section-toolbar">
-          <div><span class="eyebrow">ARGO DOMAIN OPTIMIZER</span><h2>ARGO 入口优选</h2><p>在你的真实网络环境下，从候选 ARGO 入口域名中选出连接成功率最高、最稳定、速度最快的入口。测速全部在浏览器本地完成，服务器只静态托管工具、不参与测速、不上传任何数据。</p></div>
+          <div><span class="eyebrow">BROWSER LOCAL CF EDGE</span><h2>Cloudflare Edge 优选</h2><p>在你的真实网络环境下，从 Cloudflare 候选入口域名池中，自动筛选当前网络最佳的 CF Edge 入口。测速全部在浏览器本地完成，服务器只静态托管工具、不参与测速、不上传任何数据。</p></div>
           <div class="toolbar-actions"><button id="optimizer-start" class="button primary">▶ 开始本地测速</button><button id="optimizer-stop" class="button danger ghost hidden">■ 停止</button></div>
         </div>
         <div id="optimizer-net-banner" class="optimizer-banner hidden"></div>
         <p id="optimizer-traffic-hint" class="optimizer-hint"></p>
         <div id="optimizer-custom-wrap" class="optimizer-custom-wrap">
-          <label>自定义候选域名（可选，一行一个）</label>
+          <label>用户扩展池（可选，一行一个，不影响默认域名池）</label>
           <textarea id="optimizer-custom-input" class="optimizer-custom-input" rows="2" placeholder="例如：&#10;aaa.trycloudflare.com&#10;bbb.example.com"></textarea>
           <button id="optimizer-custom-save" class="button ghost small">保存自定义域名</button>
         </div>
         <div id="optimizer-progress-wrap" class="optimizer-progress-wrap hidden">
           <div class="optimizer-progress-bar"><div id="optimizer-progress-fill" class="optimizer-progress-fill"></div></div>
           <div id="optimizer-progress-text" class="optimizer-progress-text"></div>
+          <div id="optimizer-pop-live" class="optimizer-pop-live"></div>
         </div>
         <div id="optimizer-best" class="optimizer-best hidden"></div>
         <div id="optimizer-recommendation" class="optimizer-recommendation hidden"></div>
@@ -293,7 +294,7 @@
 
   <div id="toast" class="toast" role="status"></div>
   <script src="/app.js?v=19" defer></script>
-  <script src="/optimizer.js?v=4" defer></script>
+  <script src="/optimizer.js?v=5" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
     <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>

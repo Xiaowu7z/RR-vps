@@ -57,6 +57,14 @@
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+.optimizer-pop-live {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--cyan);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  letter-spacing: .02em;
+  line-height: 1.6;
+}
 
 /* Best Edge 结果卡 */
 .optimizer-best { margin: 14px 0; }
