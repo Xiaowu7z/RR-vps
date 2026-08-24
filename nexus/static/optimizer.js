@@ -929,7 +929,7 @@ function renderRecommendation(best, dl) {
     const es = best.edgeStability;
     if (es && es.samples) {
       reasons.push(`Edge 复用稳定性 ${(es.successRate * 100).toFixed(0)}%（连续 ${es.samples} 次复用连接）`);
-      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（复用连接稳定）");
+      if (es.ttfbCV < 0.3) reasons.push("TTFB 波动小（Edge 复用稳定）");
       else reasons.push("TTFB 波动较大（连接可能频繁重建）");
     }
     if (dl && dl.ok) reasons.push(`CF 出口吞吐 ${dl.mbps.toFixed(1)} Mbps（共享基准）`);
