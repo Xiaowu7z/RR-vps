@@ -21,7 +21,8 @@ const OptimizerState = {
   aborted: false,
   controller: null,
   domains: [],           // 候选 CF 域名列表（内嵌，无需请求服务器）
-  results: [],           // 决赛域名聚合结果
+  results: [],           // 全局排名结果
+  asiaResults: [],       // 亚洲入口狩猎榜结果
   egressIp: "",          // 首次 trace 检测到的出口 IP
   egressChanged: false,  // 测速过程中出口 IP 是否变化
   vpnDetected: false,    // 是否检测到 VPN/代理特征
@@ -29,12 +30,12 @@ const OptimizerState = {
   rounds: 3,             // 决赛域名精确测速轮次
 };
 
-// POP 权重：亚洲入口偏好，仅作软偏好，最终由实际测速结果主导。
-const POP_WEIGHT = {
-  HKG: 1.00, NRT: 0.95, SIN: 0.95, ICN: 0.90, TPE: 0.88,
-  KIX: 0.85, NGO: 0.85, FUK: 0.85, SEA: 0.75, LAX: 0.70, SJC: 0.70,
-};
-const POP_WEIGHT_DEFAULT = 0.65;
+// 亚洲入口狩猎：亚洲 POP 优先级（对齐 Android Pipeline.popPriority）
+const ASIA_POP_PRIORITY = { HKG: 5, NRT: 4, SIN: 3, ICN: 2, TPE: 1 };
+const ASIA_QUOTAS = { HKG: 8, NRT: 3, SIN: 3, ICN: 2, TPE: 2 }; // 决赛配额
+const ASIA_CONTRAST = 2; // 非亚洲最快对照数
+function popPriority(pop) { return ASIA_POP_PRIORITY[pop] || 0; }
+function isAsiaTarget(pop) { return popPriority(pop) > 0; }
 
 // 分层测速常量（对齐 Android Pipeline.kt 的 micro → full）
 const BASELINE_DOMAIN = "www.nexusmods.com"; // 基准域名（必进决赛）
@@ -426,14 +427,23 @@ function coefficientOfVariation(values) {
   return sd / avg;
 }
 
-// Edge Score = Speed × Stability × Success Rate × POP Weight
+// 全局 Edge Score = Speed × Stability × Success Rate（纯速度，不含 POP 偏好）
 function computeEdgeScore(metrics) {
   const ttfb = metrics.medianTtfb;
   const speedScore = ttfb < 0 ? 0.05 : Math.max(0.05, Math.min(1, 1 - ttfb / 800));
   const stabilityScore = Math.max(0.05, Math.min(1, 1 - metrics.cv));
   const successRate = Math.max(0.05, metrics.successRate);
-  const popWeight = metrics.colo ? (POP_WEIGHT[metrics.colo] || POP_WEIGHT_DEFAULT) : POP_WEIGHT_DEFAULT;
-  return speedScore * stabilityScore * successRate * popWeight;
+  return speedScore * stabilityScore * successRate;
+}
+
+// 亚洲入口价值 = POP 优先级 × Speed × Stability × Success Rate
+function computeAsiaScore(metrics) {
+  const pop = popPriority(metrics.colo); // HKG=5...非亚洲=0
+  const speedScore = metrics.medianTtfb < 0 ? 0.05 : Math.max(0.05, Math.min(1, 1 - metrics.medianTtfb / 800));
+  const stabilityScore = Math.max(0.05, Math.min(1, 1 - metrics.cv));
+  const successRate = Math.max(0.05, metrics.successRate);
+  const popWeight = pop > 0 ? pop : 0.5; // 亚洲 POP 加权放大，非亚洲基准 0.5
+  return popWeight * speedScore * stabilityScore * successRate;
 }
 
 /* ------------------------------------------------------------------ */
@@ -450,6 +460,7 @@ async function optimizerStart() {
   OptimizerState.aborted = false;
   OptimizerState.controller = new AbortController();
   OptimizerState.results = [];
+  OptimizerState.asiaResults = [];
   OptimizerState.egressChanged = false;
   OptimizerState.vpnDetected = false;
   OptimizerState.networkType = detectNetworkType();
@@ -459,6 +470,7 @@ async function optimizerStart() {
   startBtn.disabled = true;
   stopBtn.classList.remove("hidden");
   hideEl("#optimizer-best");
+  hideEl("#optimizer-asia");
   hideEl("#optimizer-results");
   showEl("#optimizer-progress-wrap");
   $o("#optimizer-net-banner").classList.add("hidden");
@@ -510,14 +522,29 @@ async function optimizerStart() {
       return;
     }
 
-    // 3) 精选决赛域名（TTFB 最快 top FINAL_DOMAINS，含基准域名）
-    setProgress(56, "精选决赛域名…");
-    const microList = Object.entries(micro)
-      .sort((a, b) => a[1].ttfb - b[1].ttfb)
-      .map(([d]) => d);
+    // 3) 精选决赛域名（亚洲入口狩猎：POP 配额制，含基准域名）
+    setProgress(56, "精选决赛域名（亚洲入口狩猎）…");
+    const microList = Object.entries(micro).sort((a, b) => a[1].ttfb - b[1].ttfb);
+    const byPop = {};
+    for (const [d, m] of microList) {
+      const pop = m.colo || "OTHER";
+      (byPop[pop] = byPop[pop] || []).push(d);
+    }
     const finalists = [];
-    if (micro[BASELINE_DOMAIN]) finalists.push(BASELINE_DOMAIN);
-    for (const d of microList) {
+    // 亚洲 POP 配额：HKG 8 / NRT 3 / SIN 3 / ICN 2 / TPE 2
+    for (const [pop, quota] of Object.entries(ASIA_QUOTAS)) {
+      (byPop[pop] || []).slice(0, quota).forEach((d) => finalists.push(d));
+    }
+    // 非亚洲最快对照（最多 ASIA_CONTRAST 个）
+    Object.entries(byPop)
+      .filter(([pop]) => !isAsiaTarget(pop))
+      .flatMap(([, list]) => list)
+      .slice(0, ASIA_CONTRAST)
+      .forEach((d) => finalists.push(d));
+    // 基准域名兜底
+    if (micro[BASELINE_DOMAIN] && !finalists.includes(BASELINE_DOMAIN)) finalists.unshift(BASELINE_DOMAIN);
+    // 补足到 FINAL_DOMAINS
+    for (const [d] of microList) {
       if (finalists.length >= FINAL_DOMAINS) break;
       if (!finalists.includes(d)) finalists.push(d);
     }
@@ -568,18 +595,23 @@ async function optimizerStart() {
     setProgress(82, "测试下载吞吐…");
     const dl = await probeDownload(OptimizerState.controller.signal);
 
-    // 6) 计算 Edge Score + 排序
+    // 6) 计算 Edge Score + 亚洲入口价值 + 双榜排序
     setProgress(88, "计算 Edge Score…");
-    OptimizerState.results = Object.values(perDomain)
+    const metrics = Object.values(perDomain)
       .filter((m) => m.rounds > 0)
       .map((m) => {
         m.edgeScore = computeEdgeScore(m);
+        m.asiaScore = computeAsiaScore(m);
         return m;
-      })
-      .sort((a, b) => b.edgeScore - a.edgeScore);
+      });
+    OptimizerState.results = metrics.slice().sort((a, b) => b.edgeScore - a.edgeScore);
+    OptimizerState.asiaResults = metrics
+      .filter((m) => isAsiaTarget(m.colo))
+      .sort((a, b) => b.asiaScore - a.asiaScore);
 
     // 7) 渲染 + 保存
     renderBest(OptimizerState.results[0], dl);
+    renderAsiaHunt(OptimizerState.asiaResults);
     renderResults(OptimizerState.results, dl, total, finalists.length);
     saveLocal(OptimizerState.results[0], dl);
     setProgress(100, "完成");
@@ -685,6 +717,40 @@ function renderResults(results, dl, totalDomains, finalistCount) {
       <div class="table-scroll"><table class="data-table">
         <thead><tr><th>#</th><th>域名</th><th>Edge IP</th><th>POP</th><th>TTFB</th><th>成功率</th><th>波动</th></tr></thead>
         <tbody>${tbody || '<tr><td colspan="7">无有效结果</td></tr>'}</tbody>
+      </table></div>
+    </article>`;
+}
+
+/* ------------------------------------------------------------------ */
+/* 亚洲入口狩猎榜                                                       */
+/* ------------------------------------------------------------------ */
+function renderAsiaHunt(asia) {
+  const box = $o("#optimizer-asia");
+  if (!box) return;
+  box.classList.remove("hidden");
+  if (!asia.length) {
+    box.innerHTML = '<article class="panel glass"><div class="panel-head"><div><span class="eyebrow">ASIA HUNT</span><h3>亚洲入口狩猎</h3></div></div><p class="form-hint">本次未发现命中亚洲入口（HKG/NRT/SIN/ICN/TPE）的候选域名，可能是当前网络环境未就近接入亚洲 Cloudflare 边缘。</p></article>';
+    return;
+  }
+  const rows = asia.slice(0, 12).map((m, i) => {
+    const ip = m.ips && m.ips[0] ? m.ips[0] : "—";
+    const ttfb = m.medianTtfb >= 0 ? `${m.medianTtfb.toFixed(0)} ms` : "—";
+    const pri = popPriority(m.colo);
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><span class="opt-pop opt-pop-${pri}">${escapeHtmlO(m.colo || "—")}</span></td>
+      <td>${escapeHtmlO(m.domain)}</td>
+      <td class="opt-mono">${escapeHtmlO(ip)}</td>
+      <td>${ttfb}</td>
+      <td>${(m.successRate * 100).toFixed(0)}%</td>
+    </tr>`;
+  }).join("");
+  box.innerHTML = `
+    <article class="panel glass">
+      <div class="panel-head"><div><span class="eyebrow">ASIA HUNT</span><h3>亚洲入口狩猎（HKG·NRT·SIN·ICN·TPE）</h3><p>按亚洲入口价值排序，专为亚洲网络环境优选低延迟 Cloudflare 边缘入口</p></div></div>
+      <div class="table-scroll"><table class="data-table">
+        <thead><tr><th>#</th><th>POP</th><th>域名</th><th>Edge IP</th><th>TTFB</th><th>成功率</th></tr></thead>
+        <tbody>${rows}</tbody>
       </table></div>
     </article>`;
 }

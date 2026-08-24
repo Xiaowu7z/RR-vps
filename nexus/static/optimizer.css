@@ -107,6 +107,24 @@
 /* 排名结果容器 */
 .optimizer-results { margin-top: 14px; }
 
+/* 亚洲入口狩猎容器 */
+.optimizer-asia { margin-top: 14px; }
+.opt-pop {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.opt-pop-5 { color: #2bffc6; background: rgba(43, 255, 198, .12); border: 1px solid rgba(43, 255, 198, .3); } /* HKG 香港 */
+.opt-pop-4 { color: #5ae6ff; background: rgba(90, 230, 255, .12); border: 1px solid rgba(90, 230, 255, .3); } /* NRT 东京 */
+.opt-pop-3 { color: #967cff; background: rgba(150, 124, 255, .12); border: 1px solid rgba(150, 124, 255, .3); } /* SIN 新加坡 */
+.opt-pop-2 { color: #ff9d5c; background: rgba(255, 157, 92, .12); border: 1px solid rgba(255, 157, 92, .3); } /* ICN 首尔 */
+.opt-pop-1 { color: #ffd166; background: rgba(255, 209, 102, .12); border: 1px solid rgba(255, 209, 102, .3); } /* TPE 台北 */
+.opt-pop-0 { color: var(--muted); background: rgba(255, 255, 255, .05); border: 1px solid var(--line); } /* 非亚洲 */
+
 /* 历史结果 */
 .optimizer-history { margin-top: 14px; }
 .opt-hist-grid {
