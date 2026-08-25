@@ -21,6 +21,7 @@ OLD_RUNTIME=""
 NEW_LAUNCHER=""
 RUNTIME_REPLACED=false
 TRANSACTION_ACTIVE=false
+ROLLBACK_FAILED=false
 
 rr_error() {
     echo "[RR-vps] $*" >&2
@@ -90,13 +91,48 @@ rr_manifest_is_valid() {
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
-        $2 == "install.sh" { next }
         { exit 1 }
         END {
             if (!launcher || modules < 2) exit 1
             if (!nexus_app || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
+}
+
+rr_bundle_archive_is_safe() {
+    local archive_file="$1"
+    [ -s "$archive_file" ] || return 1
+    # The runtime payload is normally below 1 MiB. Refuse unexpectedly large
+    # downloads and any archive member outside the exact release namespace.
+    [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
+    tar -tzf "$archive_file" 2>/dev/null | awk '
+        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/rr_nexus\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
+        seen[$0]++ { exit 1 }
+        END { if (NR < 2) exit 1 }
+    '
+}
+
+rr_bundle_tree_is_valid() {
+    local bundle_root="$1"
+    local manifest_file="$bundle_root/manifest.sha256"
+    local expected_count=0
+    local actual_count=0
+    local shell_file=""
+
+    rr_manifest_is_valid "$manifest_file" || return 1
+    if find "$bundle_root" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
+        return 1
+    fi
+    expected_count=$(( $(awk 'END { print NR + 0 }' "$manifest_file") + 1 ))
+    actual_count=$(find "$bundle_root" -type f | wc -l)
+    [ "$actual_count" -eq "$expected_count" ] || return 1
+    (cd "$bundle_root" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || return 1
+    bash -n "$bundle_root/rr" || return 1
+    for shell_file in "$bundle_root"/modules/*.sh; do
+        [ -f "$shell_file" ] || return 1
+        bash -n "$shell_file" || return 1
+    done
+    python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
 }
 
 rr_check_system() {
@@ -140,12 +176,16 @@ rr_check_system() {
             ;;
     esac
 
-    for required_command in bash awk sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 jq curl; do
+    for required_command in bash awk sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 tar find stat cmp pgrep pkill; do
         command -v "$required_command" >/dev/null 2>&1 || {
             rr_error "系统缺少必要命令：${required_command}"
             return 1
         }
     done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        rr_error "系统缺少 curl/wget，无法下载 RR-vps。"
+        return 1
+    fi
 }
 
 rr_backup_file() {
@@ -164,6 +204,29 @@ rr_backup_dir() {
         cp -a "$source_dir" "$BACKUP_DIR/$backup_name" || return 1
         : > "$BACKUP_DIR/had_${backup_name}"
     fi
+}
+
+rr_backup_sqlite() {
+    local source_db="$1"
+    local backup_name="$2"
+    [ -e "$source_db" ] || return 0
+    if ! python3 - "$source_db" "$BACKUP_DIR/$backup_name" <<'PY'
+import sqlite3
+import sys
+
+source = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=10)
+target = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(target)
+finally:
+    target.close()
+    source.close()
+PY
+    then
+        rm -f "$BACKUP_DIR/$backup_name"
+        return 1
+    fi
+    : > "$BACKUP_DIR/had_${backup_name}"
 }
 
 rr_restore_file() {
@@ -185,19 +248,33 @@ rr_restore_file() {
             return 0
         fi
         rr_error "警告：恢复 ${target_file} 失败（可能被运行中的进程占用），已跳过并继续回滚。"
+        return 1
     else
-        rm -f "$target_file"
+        rm -f "$target_file" || return 1
     fi
+    return 0
 }
 
 rr_restore_dir() {
     local backup_name="$1"
     local target_dir="$2"
-    rm -rf "$target_dir"
+    rm -rf "$target_dir" || return 1
     if [ -f "$BACKUP_DIR/had_${backup_name}" ]; then
-        mkdir -p "$(dirname "$target_dir")"
-        cp -a "$BACKUP_DIR/$backup_name" "$target_dir"
+        mkdir -p "$(dirname "$target_dir")" || return 1
+        cp -a "$BACKUP_DIR/$backup_name" "$target_dir" || return 1
     fi
+    return 0
+}
+
+rr_restore_sqlite() {
+    local backup_name="$1"
+    local target_db="$2"
+    rm -f "$target_db" "${target_db}-wal" "${target_db}-shm" || return 1
+    if [ -f "$BACKUP_DIR/had_${backup_name}" ]; then
+        mkdir -p "$(dirname "$target_db")" || return 1
+        install -m 600 "$BACKUP_DIR/$backup_name" "$target_db" || return 1
+    fi
+    return 0
 }
 
 rr_snapshot_runtime() {
@@ -212,10 +289,15 @@ rr_snapshot_runtime() {
     rr_backup_file /etc/systemd/system/argo-rr-health.service health.service || return 1
     rr_backup_file /etc/systemd/system/argo-rr-health.timer health.timer || return 1
     rr_backup_file /usr/local/bin/auto_update_sub.py auto_update_sub.py || return 1
+    rr_backup_file /etc/rr-nexus/nexus.json nexus.json || return 1
+    rr_backup_file /etc/systemd/system/rr-nexus.service nexus.service || return 1
+    rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db || return 1
     rr_backup_dir /tmp/sub_server sub_server || return 1
 
     systemctl is-active --quiet sing-box 2>/dev/null && : > "$BACKUP_DIR/singbox_was_running"
     systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$BACKUP_DIR/nexus_was_running"
+    pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && \
+        : > "$BACKUP_DIR/subscription_was_running"
     systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
         : > "$BACKUP_DIR/health_timer_was_enabled"
 
@@ -228,28 +310,38 @@ rr_snapshot_runtime() {
 rr_rollback() {
     [ "$TRANSACTION_ACTIVE" = true ] || return 0
     TRANSACTION_ACTIVE=false
+    local rollback_failed=false
     rr_error "新版本校验失败，正在恢复升级前状态……"
+
+    systemctl stop sing-box rr-nexus >/dev/null 2>&1 || true
+    pkill -f 'subscription_server\.py' >/dev/null 2>&1 || true
 
     if [ "$RUNTIME_REPLACED" = true ]; then
         if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
             rm -rf "$RR_LIB_DIR"
-            mv "$OLD_RUNTIME" "$RR_LIB_DIR"
-            OLD_RUNTIME=""
+            if mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
+                OLD_RUNTIME=""
+            else
+                rollback_failed=true
+            fi
         else
-            rm -rf "$RR_LIB_DIR"
+            rm -rf "$RR_LIB_DIR" || rollback_failed=true
         fi
         RUNTIME_REPLACED=false
     fi
 
-    rr_restore_file rr_launcher "$RR_LAUNCHER"
-    rr_restore_file argo_vmess.conf /etc/argo_vmess.conf
-    rr_restore_file singbox_config.json /etc/sing-box/config.json
-    rr_restore_file singbox_binary /usr/local/bin/sing-box
-    rr_restore_file singbox.service /etc/systemd/system/sing-box.service
-    rr_restore_file health.service /etc/systemd/system/argo-rr-health.service
-    rr_restore_file health.timer /etc/systemd/system/argo-rr-health.timer
-    rr_restore_file auto_update_sub.py /usr/local/bin/auto_update_sub.py
-    rr_restore_dir sub_server /tmp/sub_server
+    rr_restore_file rr_launcher "$RR_LAUNCHER" || rollback_failed=true
+    rr_restore_file argo_vmess.conf /etc/argo_vmess.conf || rollback_failed=true
+    rr_restore_file singbox_config.json /etc/sing-box/config.json || rollback_failed=true
+    rr_restore_file singbox_binary /usr/local/bin/sing-box || rollback_failed=true
+    rr_restore_file singbox.service /etc/systemd/system/sing-box.service || rollback_failed=true
+    rr_restore_file health.service /etc/systemd/system/argo-rr-health.service || rollback_failed=true
+    rr_restore_file health.timer /etc/systemd/system/argo-rr-health.timer || rollback_failed=true
+    rr_restore_file auto_update_sub.py /usr/local/bin/auto_update_sub.py || rollback_failed=true
+    rr_restore_file nexus.json /etc/rr-nexus/nexus.json || rollback_failed=true
+    rr_restore_file nexus.service /etc/systemd/system/rr-nexus.service || rollback_failed=true
+    rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db || rollback_failed=true
+    rr_restore_dir sub_server /tmp/sub_server || rollback_failed=true
 
     systemctl daemon-reload >/dev/null 2>&1 || true
     if [ -f "$BACKUP_DIR/health_timer_was_enabled" ] && \
@@ -267,20 +359,35 @@ rr_rollback() {
     if [ -f "$BACKUP_DIR/nexus_was_running" ] && \
        [ -f /etc/systemd/system/rr-nexus.service ]; then
         systemctl restart rr-nexus >/dev/null 2>&1 || true
+    else
+        systemctl stop rr-nexus >/dev/null 2>&1 || true
     fi
-    rr_error "回滚完成：原 rr、配置、内核和订阅已恢复。"
+    if [ -f "$BACKUP_DIR/subscription_was_running" ] && [ -x "$RR_LAUNCHER" ]; then
+        "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || \
+            rr_error "警告：旧版订阅服务未能自动恢复，请执行 rr 重试。"
+    fi
+    if [ "$rollback_failed" = true ]; then
+        ROLLBACK_FAILED=true
+        rr_error "严重：回滚未完整完成；现场备份将保留在 ${BACKUP_DIR}，请勿删除。"
+        [ -n "$OLD_RUNTIME" ] && rr_error "旧运行目录仍保留在 ${OLD_RUNTIME}。"
+        return 1
+    fi
+    rr_error "回滚完成：原 rr、配置、内核、Nexus 数据库和订阅已恢复。"
+    return 0
 }
 
 rr_cleanup() {
     local result=$?
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
-        rr_rollback
+        rr_rollback || result=1
     fi
     [ -n "$STAGE_ROOT" ] && rm -rf "$STAGE_ROOT"
     [ -n "$NEW_RUNTIME" ] && [ -e "$NEW_RUNTIME" ] && rm -rf "$NEW_RUNTIME"
     [ -n "$NEW_LAUNCHER" ] && [ -e "$NEW_LAUNCHER" ] && rm -f "$NEW_LAUNCHER"
-    [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
-    [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
+    if [ "$ROLLBACK_FAILED" != true ]; then
+        [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
+        [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
+    fi
     return "$result"
 }
 
@@ -290,17 +397,32 @@ rr_fetch_release() {
     mkdir -p "$PAYLOAD_DIR/modules"
 
     echo "[RR-vps] 正在下载发布清单……"
-rr_download "${RR_RAW_BASE}/rr-bundle.tar.gz" "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null && \
-actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}') && \
-[ "$actual" = "0b36979baad848271bb0419a4436dc3e22e81c1fa9b68e11c1e0c7c7c94b4a39" ] && \
-tar -xzf "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" --strip-components=1 2>/dev/null && \
-cp "$PAYLOAD_DIR/manifest.sha256" "$STAGE_ROOT/manifest.sha256" && \
-rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" && \
-echo "[RR-vps] ✓ 高速模式加载完成" && \
-cp "$PAYLOAD_DIR/install.sh" "$STAGE_ROOT/install.sh" 2>/dev/null && \
-return 0
+    local actual=""
+    local bundle_ready=false
+    if [ -n "${RR_BUNDLE_FILE:-}" ] && [ -r "$RR_BUNDLE_FILE" ]; then
+        cp -p -- "$RR_BUNDLE_FILE" "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null && \
+            bundle_ready=true
+    elif rr_download "${RR_RAW_BASE}/rr-bundle.tar.gz" \
+        "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null; then
+        bundle_ready=true
+    fi
+    if [ "$bundle_ready" = true ]; then
+        actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
+        if [ "$actual" = "540db7e2c96634f2849ef5584ab58905f56aabaff92fbda3c471d5835558108d" ] && \
+           rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
+           tar --no-same-owner --no-same-permissions -xzf \
+               "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
+               --strip-components=1 2>/dev/null && \
+           rr_bundle_tree_is_valid "$PAYLOAD_DIR"; then
+            cp "$PAYLOAD_DIR/manifest.sha256" "$STAGE_ROOT/manifest.sha256" || return 1
+            echo "[RR-vps] ✓ 高速模式加载完成（外层与内部 SHA256 均已校验）"
+            return 0
+        fi
+    fi
 
-echo "[RR-vps] ⚡ 高速模式未命中，切换逐文件下载……"
+    echo "[RR-vps] ⚡ 高速模式未命中，切换逐文件下载……"
+    rm -rf "$PAYLOAD_DIR"
+    mkdir -p "$PAYLOAD_DIR/modules"
     rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
     rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || {
         rr_error "远程发布清单格式无效。"
@@ -428,18 +550,13 @@ esac
 trap rr_cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-#skip || exit 1
+rr_check_system || exit 1
 rr_fetch_release || exit 1
 rr_install_release || exit 1
 
 if [ "$RR_MODE" = "--upgrade" ]; then
-    # 升级后必须把服务拉起来：旧实现 stop 后直接 exit，节点断连
-    # 直到健康定时器兜底（1-5 分钟）。restart 对未运行服务报错也安全。
-    echo "[RR-vps] 正在重启节点与面板服务……"
-    systemctl restart sing-box 2>/dev/null || true
-    systemctl restart rr-subscription 2>/dev/null || true
-    systemctl restart rr-nexus 2>/dev/null || true
-    sleep 1
+    # --post-update 已完成迁移与服务恢复；这里不得再用 || true 掩盖失败，
+    # 也不得把用户原本停用的服务无条件拉起。
     echo "[RR-vps] 模块化热更新完成。"
     exit 0
 fi

@@ -124,6 +124,35 @@ nexus_collect_traffic_once() {
     RR_NEXUS_CONFIG="$NEXUS_CONFIG_FILE" python3 "$NEXUS_APP" --collect-traffic
 }
 
+nexus_traffic_core_version() {
+    local work_dir=""
+    local release_json=""
+    local build_info=""
+    local info_url=""
+    local version=""
+    work_dir=$(mktemp -d /tmp/rr-nexus-version.XXXXXX) || return 1
+    release_json="$work_dir/release.json"
+    build_info="$work_dir/BUILD_INFO"
+    if ! curl -fsSL --retry 2 --connect-timeout 8 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
+        -o "$release_json" "$NEXUS_CORE_RELEASE_API"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
+        "$release_json" | head -n 1)
+    if [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
+       ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
+           -o "$build_info" "$info_url"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
+    rm -rf "$work_dir"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
 nexus_download_traffic_core() {
     local work_dir="$1"
     local release_json="$work_dir/release.json"
@@ -141,29 +170,26 @@ nexus_download_traffic_core() {
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
         -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
         -o "$release_json" "$NEXUS_CORE_RELEASE_API" || return 1
-    archive_name=$(jq -r --arg arch "$SYS_ARCH" \
-        '.assets[] | select(.name | test("^rr-sing-box-[0-9]+\\.[0-9]+\\.[0-9]+[^/]*-linux-" + $arch + "\\.tar\\.gz$")) | .name' \
-        "$release_json" | head -n 1)
-    archive_url=$(jq -r --arg name "$archive_name" \
-        '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
     checksum_url=$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url' \
         "$release_json" | head -n 1)
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
-    if [[ ! "$archive_name" =~ ^rr-sing-box-[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.-]*-linux-${SYS_ARCH}\.tar\.gz$ ]] || \
-       [[ ! "$archive_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
-       [[ ! "$checksum_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
+    if [[ ! "$checksum_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
        [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]]; then
         return 1
     fi
-    curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "$work_dir/$archive_name" "$archive_url" || return 1
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$checksums" "$checksum_url" || return 1
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$build_info" "$info_url" || return 1
+    version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
+    archive_url=$(jq -r --arg name "$archive_name" \
+        '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
+    [[ "$archive_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || return 1
+    curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "$work_dir/$archive_name" "$archive_url" || return 1
     expected=$(awk -v name="$archive_name" '$2 == name {print $1; exit}' "$checksums")
     actual=$(sha256sum "$work_dir/$archive_name" | awk '{print $1}')
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] || return 1
-    version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
     extracted="sing-box-${version}-linux-${SYS_ARCH}/sing-box"
     tar -tzf "$work_dir/$archive_name" "$extracted" >/dev/null 2>&1 || return 1
     tar --no-same-owner -xzf "$work_dir/$archive_name" -C "$work_dir" "$extracted" 2>/dev/null || return 1
@@ -745,7 +771,6 @@ nexus_port_available() {
 nexus_choose_port() {
     local port=""
     local preferred_port="${1:-}"
-    local tries=0
     # 推荐端口（域名模式传 443）；否则随机高位端口作为默认
     local random_port=""
     if [ -n "$preferred_port" ]; then
@@ -769,21 +794,8 @@ nexus_choose_port() {
             printf '%s\n' "$port"
             return 0
         fi
-        local pid
-        pid=$(ss -tlnp 2>/dev/null | awk -v p="$port" '$0 ~ ":"p" " {print $NF}' | grep -oP 'pid=\K[0-9]+' | head -1)
         # 提示文字必须走 stderr：本函数 stdout 只允许输出端口号（调用方 $(...) 捕获）
-        echo -e "${YELLOW}端口 ${port} 已被占用，正在释放……${RESET}" >&2
-        systemctl stop nginx 2>/dev/null || true
-        fuser -k "${port}/tcp" 2>/dev/null || true
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-        sleep 1
-        if nexus_port_available "$port"; then
-            printf '%s\n' "$port"
-            return 0
-        fi
-        tries=$((tries + 1))
-        [ "$tries" -lt 3 ] && echo -e "${RED}释放失败，请更换端口。${RESET}" >&2
-        [ "$tries" -ge 3 ] && { echo -e "${RED}多次释放失败，请手动处理端口冲突后重试。${RESET}" >&2; return 1; }
+        echo -e "${RED}端口 ${port} 已被占用。为避免误杀 SSH、节点或其他服务，请选择其他端口。${RESET}" >&2
     done
 }
 
@@ -1004,14 +1016,14 @@ nexus_start_service() {
                 return 1
             fi
         else
-            fuser -k ${listen_port}/tcp 2>/dev/null || true
-            sleep 1
+            echo -e "${RED}拒绝强制终止占用进程；请先释放端口 ${listen_port} 后重试。${RESET}"
+            return 1
         fi
     fi
 
     nexus_write_service || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable rr-nexus >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    systemctl enable rr-nexus >/dev/null 2>&1 || return 1
 
     # 停止 Nginx 释放端口（如果有冲突）
     systemctl is-active --quiet nginx 2>/dev/null && { nginx_was_running=true; systemctl stop nginx 2>/dev/null || true; sleep 1; }

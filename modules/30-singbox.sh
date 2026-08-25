@@ -22,6 +22,9 @@ install_singbox() {
     local installed_version=""
     local was_running=false
     local validate_current_config=false
+    local rr_core_dir=""
+    local rr_core_version=""
+    local rr_core_ok=false
 
     # A fresh install writes an INSTALL_COMPLETE=false candidate before the
     # core is downloaded.  It deliberately has empty certificate/Reality
@@ -62,45 +65,47 @@ install_singbox() {
     asset_url=$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
     expected_digest=$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json" | head -n 1)
     expected_digest="${expected_digest#sha256:}"
-    # 优先 RR-vps 自建带统计构建（官方构建不含 with_v2ray_api，面板流量统计依赖它）
-    # 自建构建由仓库 Actions 按官方源码编译（.github/workflows/singbox-stats.yml），
-    # 无 GitHub digest 元数据，安装后以版本号 + Tags 校验代替。
-    local rr_asset_url="https://github.com/Xiaowu7z/RR-vps/releases/download/sing-box-${sb_version}/${asset_name}"
-    local rr_asset_ok=false
-    if curl -fLsI --retry 1 --connect-timeout 8 --max-time 20 -o /dev/null "$rr_asset_url" 2>/dev/null; then
-        rr_asset_ok=true
+    # 优先使用 rr-nexus-core 固定 release：它同时提供 SHA256SUMS 与
+    # BUILD_INFO，避免旧的版本化自建资产只能靠版本字符串进行弱校验。
+    rr_core_dir="$sb_tmp_dir/rr-core"
+    mkdir -p "$rr_core_dir"
+    if declare -F nexus_download_traffic_core >/dev/null 2>&1 && \
+       nexus_download_traffic_core "$rr_core_dir" >/dev/null 2>&1; then
+        rr_core_version=$(get_singbox_version "$rr_core_dir/sing-box" 2>/dev/null || true)
+        if [ "$rr_core_version" = "$sb_version" ]; then
+            mv "$rr_core_dir/sing-box" "$sb_tmp_dir/sing-box"
+            rr_core_ok=true
+        fi
     fi
-    if [ "$rr_asset_ok" = true ]; then
-        asset_url="$rr_asset_url"
-        expected_digest=""
-    else
+    candidate="$sb_tmp_dir/sing-box"
+    if [ "$rr_core_ok" != true ]; then
         echo -e "${YELLOW}[提示] 官方构建不含流量统计标签（with_v2ray_api），面板流量统计不可用。${RESET}"
         if [[ ! "$expected_digest" =~ ^[0-9a-fA-F]{64}$ ]] || [[ ! "$asset_url" =~ ^https://github\.com/SagerNet/sing-box/releases/download/ ]]; then
             echo -e "${RED}[失败] 正式版安装包缺少可信 SHA256 元数据，现有内核未改动。${RESET}"
             rm -rf "$sb_tmp_dir"
             return 1
         fi
+        extracted="sing-box-${sb_version}-linux-${SYS_ARCH}/sing-box"
+        if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$archive" "$asset_url"; then
+            echo -e "${RED}[失败] Sing-box 下载失败，现有内核未改动。${RESET}"
+            rm -rf "$sb_tmp_dir"
+            return 1
+        fi
+        actual_digest=$(sha256sum "$archive" | awk '{print $1}')
+        if [ "${actual_digest,,}" != "${expected_digest,,}" ]; then
+            echo -e "${RED}[失败] Sing-box 安装包 SHA256 校验不一致，现有内核未改动。${RESET}"
+            rm -rf "$sb_tmp_dir"
+            return 1
+        fi
+        if ! tar -tzf "$archive" "$extracted" >/dev/null 2>&1 || \
+           ! tar --no-same-owner --no-same-permissions -xzf \
+               "$archive" -C "$sb_tmp_dir" "$extracted" 2>/dev/null; then
+            echo -e "${RED}[失败] Sing-box 压缩包不完整，现有内核未改动。${RESET}"
+            rm -rf "$sb_tmp_dir"
+            return 1
+        fi
+        mv "$sb_tmp_dir/$extracted" "$candidate"
     fi
-    extracted="sing-box-${sb_version}-linux-${SYS_ARCH}/sing-box"
-    candidate="$sb_tmp_dir/sing-box"
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 -o "$archive" "$asset_url"; then
-        echo -e "${RED}[失败] Sing-box 下载失败，现有内核未改动。${RESET}"
-        rm -rf "$sb_tmp_dir"
-        return 1
-    fi
-    actual_digest=$(sha256sum "$archive" | awk '{print $1}')
-    if [ -n "$expected_digest" ] && [ "${actual_digest,,}" != "${expected_digest,,}" ]; then
-        echo -e "${RED}[失败] Sing-box 安装包 SHA256 校验不一致，现有内核未改动。${RESET}"
-        rm -rf "$sb_tmp_dir"
-        return 1
-    fi
-    if ! tar -tzf "$archive" "$extracted" >/dev/null 2>&1 || \
-       ! tar --no-same-owner -xzf "$archive" -C "$sb_tmp_dir" "$extracted" 2>/dev/null; then
-        echo -e "${RED}[失败] Sing-box 压缩包不完整，现有内核未改动。${RESET}"
-        rm -rf "$sb_tmp_dir"
-        return 1
-    fi
-    mv "$sb_tmp_dir/$extracted" "$candidate"
     chmod 755 "$candidate"
     if [ "$(get_singbox_version "$candidate")" != "$sb_version" ]; then
         echo -e "${RED}[失败] Sing-box 内核版本校验失败，现有内核未改动。${RESET}"
@@ -108,7 +113,7 @@ install_singbox() {
         return 1
     fi
     # 自建构建必须带流量统计标签，否则回退官方构建同样缺统计
-    if [ "$rr_asset_ok" = true ] && ! "$candidate" version 2>/dev/null | grep -qw 'with_v2ray_api'; then
+    if [ "$rr_core_ok" = true ] && ! "$candidate" version 2>/dev/null | grep -qw 'with_v2ray_api'; then
         echo -e "${RED}[失败] 自建内核缺少 with_v2ray_api 标签，现有内核未改动。${RESET}"
         rm -rf "$sb_tmp_dir"
         return 1
@@ -187,8 +192,11 @@ ensure_singbox_core() {
     # 版本已达标但内核缺流量统计标签（官方 1.12+ 构建不含 with_v2ray_api）
     # 且仓库已有同版本自建构建时，无损替换为带统计内核。
     if ! "$SINGBOX_BIN" version 2>/dev/null | grep -qw 'with_v2ray_api'; then
-        local rr_stats_url="https://github.com/Xiaowu7z/RR-vps/releases/download/sing-box-${current_version}/sing-box-${current_version}-linux-${SYS_ARCH}.tar.gz"
-        if curl -fLsI --retry 1 --connect-timeout 8 --max-time 20 -o /dev/null "$rr_stats_url" 2>/dev/null; then
+        local available_core_version=""
+        if declare -F nexus_traffic_core_version >/dev/null 2>&1; then
+            available_core_version=$(nexus_traffic_core_version 2>/dev/null || true)
+        fi
+        if [ "$available_core_version" = "$current_version" ]; then
             echo -e "${YELLOW}[内核] 官方构建缺少流量统计标签，升级为自建带统计构建。${RESET}"
             install_singbox
             return $?
@@ -813,6 +821,7 @@ restore_config_transaction_snapshot() {
     local old_uuid="$2"
     local was_running="$3"
     local restart_required="$4"
+    local restore_failed=false
 
     cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE" || return 1
     if [ -f "$tx_dir/had_runtime_config" ]; then
@@ -836,12 +845,14 @@ restore_config_transaction_snapshot() {
 
     load_config_with_defaults || return 1
     if [ "$restart_required" = true ] && [ "$was_running" = true ]; then
-        restart_singbox >/dev/null 2>&1 || true
+        restart_singbox >/dev/null 2>&1 || restore_failed=true
     fi
     # 只恢复事务开始前确实在运行的订阅服务，不擅自启动用户原本已停止的监听。
     if [ -f "$tx_dir/sub_was_running" ]; then
         if select_entry_ip >/dev/null 2>&1; then
-            start_subscription_server >/dev/null 2>&1 || true
+            start_subscription_server >/dev/null 2>&1 || restore_failed=true
+        else
+            restore_failed=true
         fi
     else
         local current_sub_pid=""
@@ -851,6 +862,7 @@ restore_config_transaction_snapshot() {
         fi
         rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE"
     fi
+    [ "$restore_failed" = false ]
 }
 
 apply_config_transaction() {
@@ -894,21 +906,30 @@ apply_config_transaction() {
         value="$2"
         shift 2
         if ! safe_sed "$key" "$value"; then
-            cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE"
-            rm -rf "$tx_dir"
+            if cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE"; then
+                rm -rf "$tx_dir"
+            else
+                echo -e "${RED}[严重] 配置回滚失败，备份保留在 ${tx_dir}。${RESET}" >&2
+            fi
             return 1
         fi
     done
     if ! load_config_with_defaults; then
-        restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" false >/dev/null 2>&1 || true
-        rm -rf "$tx_dir"
+        if restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" false >/dev/null 2>&1; then
+            rm -rf "$tx_dir"
+        else
+            echo -e "${RED}[严重] 配置回滚不完整，备份保留在 ${tx_dir}。${RESET}" >&2
+        fi
         return 1
     fi
 
     if ! build_singbox_config; then
-        restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" false >/dev/null 2>&1 || true
-        rm -rf "$tx_dir"
-        echo -e "${RED}[失败] ${description}未通过内核配置校验，原配置和节点均未改动。${RESET}"
+        if restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" false >/dev/null 2>&1; then
+            rm -rf "$tx_dir"
+            echo -e "${RED}[失败] ${description}未通过内核配置校验，原配置和节点均未改动。${RESET}"
+        else
+            echo -e "${RED}[严重] ${description}失败且回滚不完整，备份保留在 ${tx_dir}。${RESET}" >&2
+        fi
         return 1
     fi
     [ "$SINGBOX_CONFIG_CHANGED" = true ] && config_changed=true
@@ -916,9 +937,12 @@ apply_config_transaction() {
     if [ "$config_changed" = true ] && [ "$was_running" = true ]; then
         if any_node_protocol_enabled; then
             if ! restart_singbox; then
-                restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" true >/dev/null 2>&1 || true
-                rm -rf "$tx_dir"
-                echo -e "${RED}[失败] ${description}启动失败，已恢复原节点并重新拉起。${RESET}"
+                if restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" true >/dev/null 2>&1; then
+                    rm -rf "$tx_dir"
+                    echo -e "${RED}[失败] ${description}启动失败，已恢复原节点并重新拉起。${RESET}"
+                else
+                    echo -e "${RED}[严重] ${description}启动失败且回滚不完整，备份保留在 ${tx_dir}。${RESET}" >&2
+                fi
                 return 1
             fi
         else
@@ -928,16 +952,22 @@ apply_config_transaction() {
 
     if crontab -l 2>/dev/null | grep -q 'auto_update_sub.py'; then
         if ! write_auto_update_worker; then
-            restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" "$config_changed" >/dev/null 2>&1 || true
-            rm -rf "$tx_dir"
-            echo -e "${RED}[失败] 自动订阅程序刷新失败，${description}已完整回滚。${RESET}"
+            if restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" "$config_changed" >/dev/null 2>&1; then
+                rm -rf "$tx_dir"
+                echo -e "${RED}[失败] 自动订阅程序刷新失败，${description}已完整回滚。${RESET}"
+            else
+                echo -e "${RED}[严重] 自动订阅刷新失败且回滚不完整，备份保留在 ${tx_dir}。${RESET}" >&2
+            fi
             return 1
         fi
     fi
     if ! generate_node_and_sub; then
-        restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" "$config_changed" >/dev/null 2>&1 || true
-        rm -rf "$tx_dir"
-        echo -e "${RED}[失败] ${description}的订阅刷新失败，已完整回滚。${RESET}"
+        if restore_config_transaction_snapshot "$tx_dir" "$old_uuid" "$was_running" "$config_changed" >/dev/null 2>&1; then
+            rm -rf "$tx_dir"
+            echo -e "${RED}[失败] ${description}的订阅刷新失败，已完整回滚。${RESET}"
+        else
+            echo -e "${RED}[严重] ${description}订阅刷新失败且回滚不完整，备份保留在 ${tx_dir}。${RESET}" >&2
+        fi
         return 1
     fi
 

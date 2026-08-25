@@ -73,6 +73,7 @@ TRAFFIC_POLL_SECONDS = 5
 # 额度用尽后自动删除等待时间（秒）。15 天 = 1296000（真机验证通过后的正式值）
 QUOTA_AUTO_DELETE_SECONDS = 15 * 86400
 TRAFFIC_BUCKET_SECONDS = 5 * 60
+MAX_JSON_BODY_BYTES = 1024 * 1024
 V2RAY_QUERY_METHOD = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 
 # ---- 多服务器远程管理（6.6.0）----
@@ -86,9 +87,8 @@ REMOTE_MAX_SERVERS = 500              # 主面板可管理的服务器上限（�
 REMOTE_CRED_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 
 # 远程升级任务（副面板侧，6.6.3）：任务状态文件 + 异步执行升级。
-# 升级命令与本地版本无关：直接下载最新 install.sh 执行 --upgrade（bootstrap 全量升级，
-# 内含事务替换 + post_update_migrate + 自动重启 sing-box/订阅/面板），
-# 旧版脚本（无 rr --update-now 入口）的副面板也能远程升级。
+# 统一调用 rr --update-now：复用模块内 GitHub Raw/API/CDN 回退、bundle 双层校验、
+# 安装器事务替换与 post_update_migrate。避免面板另维护一套只有 Raw 的下载逻辑。
 # 关键：必须用 systemd-run 隔离——install.sh --upgrade 中途会 stop rr-nexus，
 # 若升级进程在面板 cgroup 内会连同面板一起被杀，死在 stop/restart 之间。
 UPDATE_JOB_PATH = Path("/var/lib/rr-nexus/update-job.json")
@@ -102,16 +102,10 @@ UPDATE_CMD = [
     "systemd-run", "--unit=rr-remote-upgrade", "--collect", "--wait",
     "/bin/bash", "-c",
     'exec > /var/lib/rr-nexus/update.log 2>&1; '
-    'tmp=$(mktemp /tmp/rr-upgrade.XXXXXX) && '
-    'echo "[1/4] 下载最新安装程序..."; '
-    'curl -fsSL --connect-timeout 10 --max-time 120 '
-    '"https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)" -o "$tmp" && '
-    'echo "[2/4] 校验安装程序完整性..."; '
-    'bash -n "$tmp" && grep -q "Xiaowu7z/RR-vps" "$tmp" && chmod 700 "$tmp" && '
-    'echo "[3/4] 事务替换升级（自动重启节点与面板）..."; '
-    'bash "$tmp" --upgrade; '
-    'rc=$?; rm -f "$tmp"; '
-    'echo "[4/4] 完成（退出码 $rc）"; exit $rc',
+    'echo "[1/2] 启动统一更新事务..."; '
+    '/usr/local/bin/rr --update-now; '
+    'rc=$?; '
+    'echo "[2/2] 完成（退出码 $rc）"; exit $rc',
 ]
 
 
@@ -1330,6 +1324,8 @@ class Handler(BaseHTTPRequestHandler):
     def read_json_body(self) -> dict:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
+            if content_length < 0 or content_length > MAX_JSON_BODY_BYTES:
+                return {}
             raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
             return json.loads(raw.decode("utf-8"))
         except Exception:

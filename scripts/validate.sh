@@ -20,12 +20,12 @@ load_modules_for_tests() {
     done
 }
 
-echo "[1/11] Bash and Python syntax"
+echo "[1/12] Bash and Python syntax"
 bash -n install.sh rr modules/*.sh
 python3 -c 'compile(open("nexus/rr_nexus.py", encoding="utf-8").read(), "nexus/rr_nexus.py", "exec")'
 if command -v node >/dev/null 2>&1; then node --check nexus/static/app.js; fi
 
-echo "[2/11] Combined module loading"
+echo "[2/12] Combined module loading"
 bash -c '
     for module_file in modules/*.sh; do
         [ "$module_file" = "modules/00-runtime.sh" ] && continue
@@ -42,7 +42,7 @@ bash -c '
     done
 '
 
-echo "[3/11] Fresh-install port selection regression"
+echo "[3/12] Fresh-install port selection regression"
 (
     load_modules_for_tests
     PORT=0
@@ -75,7 +75,7 @@ echo "[3/11] Fresh-install port selection regression"
     is_valid_port "$selected_port"
 )
 
-echo "[4/11] Fresh-install snapshot regression"
+echo "[4/12] Fresh-install snapshot regression"
 snapshot_function=$(awk '
     /^rr_snapshot_runtime\(\) \{/ { capture = 1 }
     capture { print }
@@ -87,7 +87,9 @@ snapshot_function=$(awk '
     RR_LAUNCHER="/nonexistent/rr"
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
+    rr_backup_sqlite() { return 0; }
     systemctl() { return 1; }
+    pgrep() { return 1; }
 
     rr_snapshot_runtime
     [ -d "$BACKUP_DIR" ]
@@ -102,7 +104,9 @@ snapshot_function=$(awk '
     RR_LAUNCHER="/nonexistent/rr"
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
+    rr_backup_sqlite() { return 0; }
     systemctl() { return 0; }
+    pgrep() { return 0; }
 
     rr_snapshot_runtime
     [ -e "$BACKUP_DIR/singbox_was_running" ]
@@ -116,7 +120,9 @@ snapshot_function=$(awk '
     RR_LAUNCHER="/nonexistent/rr"
     rr_backup_file() { return 1; }
     rr_backup_dir() { return 0; }
+    rr_backup_sqlite() { return 0; }
     systemctl() { return 1; }
+    pgrep() { return 1; }
 
     if rr_snapshot_runtime; then
         echo "Snapshot unexpectedly ignored a real backup failure." >&2
@@ -125,7 +131,7 @@ snapshot_function=$(awk '
     rm -rf "$BACKUP_DIR"
 )
 
-echo "[5/11] Fresh-install crypto material regression"
+echo "[5/12] Fresh-install crypto material regression"
 (
     load_modules_for_tests
     CONFIG_FILE="/tmp/rr-validate-config"
@@ -251,17 +257,30 @@ post_update_function=$(awk '
 (
     eval "$post_update_function"
     CONFIG_FILE="/tmp/rr-incomplete-config"
+    : > "$CONFIG_FILE"
     check_supported_os() { return 0; }
     migrate_config_schema() { return 0; }
     load_config_with_defaults() { INSTALL_COMPLETE=false; return 0; }
-    any_node_protocol_enabled() {
-        echo "Incomplete install reached runtime migration." >&2
-        return 0
+    any_node_protocol_enabled() { return 1; }
+    systemctl() { return 0; }
+    pkill() { return 0; }
+    sleep() { :; }
+    post_update_migrate
+    rm -f "$CONFIG_FILE"
+)
+(
+    eval "$post_update_function"
+    CONFIG_FILE="/tmp/rr-missing-config"
+    rm -f "$CONFIG_FILE"
+    check_supported_os() { return 0; }
+    systemctl() {
+        echo "Missing RR config triggered a service operation." >&2
+        return 1
     }
     post_update_migrate
 )
 
-echo "[6/11] Subscription URL control-character regression"
+echo "[6/12] Subscription URL control-character regression"
 (
     load_modules_for_tests
     test_uuid="e219c8c7-b669-4c75-b33b-a9e5227a8a24"
@@ -303,7 +322,7 @@ echo "[6/11] Subscription URL control-character regression"
     fi
 )
 
-echo "[7/11] Ubuntu 22.04 Python and Argon2 compatibility"
+echo "[7/12] Ubuntu 22.04 Python and Argon2 compatibility"
 if grep -En 'from datetime import.*\bUTC\b|datetime\.now\(UTC\)' nexus/rr_nexus.py; then
     echo "Python 3.11-only datetime.UTC usage was found." >&2
     exit 1
@@ -405,7 +424,7 @@ assert config.ssh_host == "服务器IP"
 PY
 rm -rf "$argon2_stub"
 
-echo "[8/11] RR Nexus per-device traffic helpers"
+echo "[8/12] RR Nexus per-device traffic helpers"
 (
     load_modules_for_tests
     nexus_tmp=$(mktemp -d)
@@ -450,7 +469,7 @@ PY
     rm -rf "$nexus_tmp"
 )
 
-echo "[9/11] Release manifest coverage"
+echo "[9/12] Release manifest coverage"
 expected_paths=$(mktemp)
 manifest_paths=$(mktemp)
 trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
@@ -462,10 +481,22 @@ trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
 awk 'NF == 2 {print $2}' manifest.sha256 | LC_ALL=C sort > "$manifest_paths"
 diff -u "$expected_paths" "$manifest_paths"
 
-echo "[10/11] Release hashes"
+echo "[10/12] Release hashes"
 sha256sum -c manifest.sha256
 
-echo "[11/11] RR Nexus static asset contract"
+echo "[11/12] Deterministic release bundle"
+python3 scripts/rebuild-bundle.py --check
+bundle_paths=$(mktemp)
+expected_bundle_paths=$(mktemp)
+tar -tzf rr-bundle.tar.gz | LC_ALL=C sort > "$bundle_paths"
+{
+    sed 's#^#rr-bundle/#' "$manifest_paths"
+    echo rr-bundle/manifest.sha256
+} | LC_ALL=C sort > "$expected_bundle_paths"
+diff -u "$expected_bundle_paths" "$bundle_paths"
+rm -f "$bundle_paths" "$expected_bundle_paths"
+
+echo "[12/12] RR Nexus static asset and update contract"
 grep -Eq 'id="login-form"' nexus/static/index.html
 grep -Eq 'id="device-grid"' nexus/static/index.html
 grep -Eq 'id="traffic-chart"' nexus/static/index.html
@@ -496,6 +527,28 @@ grep -Fq 'RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}
 grep -Fq 'Accept: application/vnd.github.raw+json' modules/60-update.sh install.sh
 grep -Fq 'rr_download_file "$bundle_url" "$bundle_tmp" 10' modules/60-update.sh
 grep -Fq 'UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"' modules/60-update.sh
+grep -Fq 'rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"' modules/60-update.sh
+grep -Fq 'RR_BUNDLE_FILE="$bundle_tmp" bash "$bootstrap_tmp" --upgrade' modules/60-update.sh
+grep -Fq 'rr_bundle_tree_is_valid "$PAYLOAD_DIR"' install.sh
+grep -Fxq 'rr_check_system || exit 1' install.sh
+grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh
+grep -Fq 'rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db' install.sh
+grep -Fq 'ROLLBACK_FAILED=true' install.sh
+grep -Fq 'command -v timeout >/dev/null 2>&1' modules/60-update.sh
+grep -Fq 'declare -F sync_nexus_devices >/dev/null 2>&1' modules/60-update.sh
+grep -Fq 'nexus_download_traffic_core "$rr_core_dir"' modules/30-singbox.sh
+grep -Fq 'archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"' modules/85-nexus.sh
+grep -Fq '/usr/local/bin/rr --update-now' nexus/rr_nexus.py
+grep -Fq 'MAX_JSON_BODY_BYTES = 1024 * 1024' nexus/rr_nexus.py
+if grep -Eq 'fuser[[:space:]]+-k|gh release delete[[:space:]]+rr-nexus-core|#skip[[:space:]]*\|\|' \
+    modules/85-nexus.sh .github/workflows/build-nexus-core.yml install.sh; then
+    echo "A destructive port/release action or skipped installer gate remains." >&2
+    exit 1
+fi
+if grep -Fq 'post_update_migrate >/dev/null 2>&1 || true' modules/60-update.sh; then
+    echo "Update migration failure is still being ignored." >&2
+    exit 1
+fi
 # 新安装必须按 manifest 复制全部 Nexus 静态资源，不能只固定复制 app 三件套。
 grep -Fq 'nexus/static/*.html|nexus/static/*.css|nexus/static/*.js)' install.sh
 grep -Fq '"$NEW_RUNTIME/$relative_path" || return 1' install.sh

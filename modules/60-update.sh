@@ -76,6 +76,49 @@ rr_manifest_is_valid() {
     ' "$manifest_file"
 }
 
+rr_bundle_archive_is_safe() {
+    local archive_file="$1"
+    [ -s "$archive_file" ] || return 1
+    [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
+    tar -tzf "$archive_file" 2>/dev/null | awk '
+        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/rr_nexus\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
+        seen[$0]++ { exit 1 }
+        END { if (NR < 2) exit 1 }
+    '
+}
+
+rr_bundle_tree_is_valid() {
+    local bundle_root="$1"
+    local manifest_file="$bundle_root/manifest.sha256"
+    local expected_count=0
+    local actual_count=0
+    local shell_file=""
+
+    rr_manifest_is_valid "$manifest_file" || return 1
+    if find "$bundle_root" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
+        return 1
+    fi
+    expected_count=$(( $(awk 'END { print NR + 0 }' "$manifest_file") + 1 ))
+    actual_count=$(find "$bundle_root" -type f | wc -l)
+    [ "$actual_count" -eq "$expected_count" ] || return 1
+    (cd "$bundle_root" && sha256sum -c manifest.sha256 >/dev/null 2>&1) || return 1
+    bash -n "$bundle_root/rr" || return 1
+    for shell_file in "$bundle_root"/modules/*.sh; do
+        [ -f "$shell_file" ] || return 1
+        bash -n "$shell_file" || return 1
+    done
+    python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
+}
+
+rr_prepare_bootstrap() {
+    local target_file="$1"
+    rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 && \
+        [ -s "$target_file" ] && \
+        bash -n "$target_file" 2>/dev/null && \
+        grep -q '^RR_BOOTSTRAP_VERSION=' "$target_file" && \
+        grep -q 'Xiaowu7z/RR-vps' "$target_file"
+}
+
 # H16/T12：健康自愈失败不得静默——写 /var/log/rr-health.log + syslog（logger）。
 # 供 ensure_runtime_health 在内核重装失败、孤立进程发现等场景记录，面板同步提示。
 RR_HEALTH_LOG="/var/log/rr-health.log"
@@ -123,16 +166,17 @@ rr_health_log() {
 }
 
 post_update_migrate() {
+    check_supported_os >/dev/null 2>&1 || return 1
+    # A machine without RR-vps configuration has no managed runtime to stop or
+    # migrate. Returning before service operations avoids touching an unrelated
+    # system sing-box installation during a fresh bootstrap.
+    [ -f "$CONFIG_FILE" ] || return 0
     # 热更新前置：停止旧服务避免端口冲突
-    local nexus_was_running=false
-    systemctl is-active --quiet rr-nexus && nexus_was_running=true
     systemctl stop sing-box 2>/dev/null || true
     systemctl stop rr-subscription 2>/dev/null || true
     systemctl stop rr-nexus 2>/dev/null || true
     pkill -f "subscription_server.py" 2>/dev/null || true
     sleep 1
-    check_supported_os >/dev/null 2>&1 || return 1
-    [ -f "$CONFIG_FILE" ] || return 0
     migrate_config_schema || return 1
     load_config_with_defaults || return 1
 
@@ -260,9 +304,10 @@ ensure_runtime_health() {
 
     # 设备到期和额度状态可能在无人操作时变化；定时同步只会在用户列表
     # 实际变化时重启 Sing-box，平时不会打断在线节点。
-    if declare -F timeout 15 sync_nexus_devices 2>/dev/null || true >/dev/null 2>&1 && \
+    if command -v timeout >/dev/null 2>&1 && \
+       declare -F sync_nexus_devices >/dev/null 2>&1 && \
        [ -f "${NEXUS_DB_FILE:-/nonexistent}" ]; then
-        timeout 15 sync_nexus_devices 2>/dev/null || true >/dev/null 2>&1 || true
+        timeout 15 sync_nexus_devices >/dev/null 2>&1 || true
     fi
 
     local sub_pid=""
@@ -285,87 +330,68 @@ do_update() {
 
     # ============================================================
     # 第一步：bundle 高速直更（绕过 CDN manifest 缓存）
-    # 先解压到临时目录做完整校验，全部通过才交换进正式目录。
+    # 先解压到临时目录做完整校验，再交给安装器的统一事务执行升级。
     # ============================================================
     local bundle_url="${RR_RAW_BASE}/rr-bundle.tar.gz"
     local bundle_tmp=""
     bundle_tmp=$(mktemp /tmp/rr-bundle-update.XXXXXX) || true
     local bundle_stage=""
     bundle_stage=$(mktemp -d /tmp/rr-bundle-stage.XXXXXX) || true
-    local bundle_backup=""
-    local member_count=0
     local remote_ver=""
     local local_ver="${SCRIPT_VERSION:-0}"
+    local bootstrap_tmp=""
+    local bundle_changed=false
 
     if [ -n "$bundle_tmp" ] && [ -n "$bundle_stage" ] && \
        rr_download_file "$bundle_url" "$bundle_tmp" 10 && \
        [ -s "$bundle_tmp" ] && \
-       tar -xzf "$bundle_tmp" -C "$bundle_stage" 2>/dev/null; then
-        # --- 完整性校验：成员数 + 关键文件 + 语法 + 版本合法 ---
-        member_count=$(find "$bundle_stage" -type f | wc -l)
+       rr_bundle_archive_is_safe "$bundle_tmp" && \
+       tar --no-same-owner --no-same-permissions -xzf \
+           "$bundle_tmp" -C "$bundle_stage" 2>/dev/null && \
+       rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"; then
         remote_ver=$(grep -o '^SCRIPT_VERSION="[0-9][0-9.]*"' \
             "$bundle_stage/rr-bundle/modules/00-runtime.sh" 2>/dev/null | head -1 | cut -d'"' -f2)
-        if [ "$member_count" -ge 22 ] && \
-           [ -s "$bundle_stage/rr-bundle/rr" ] && \
-           [ -s "$bundle_stage/rr-bundle/install.sh" ] && \
-           [ -s "$bundle_stage/rr-bundle/manifest.sha256" ] && \
-           [ -s "$bundle_stage/rr-bundle/modules/00-runtime.sh" ] && \
-           bash -n "$bundle_stage/rr-bundle/rr" 2>/dev/null && \
-           [ -n "$remote_ver" ] && \
-           { [ "$local_ver" = "0" ] || { [ "$remote_ver" != "$local_ver" ] && version_ge "$remote_ver" "$local_ver"; }; }; then
-            # --- 原子交换 + 回滚保护 ---
-            # rr 有双份：$RR_LIB_DIR/rr（模块目录内）与 $RR_LAUNCHER（入口脚本），两处同步更新。
-            bundle_backup=$(mktemp -d /tmp/rr-backup.XXXXXX) || true
-            if [ -n "$bundle_backup" ] && \
-               cp -a "$RR_LAUNCHER" "$bundle_backup/rr-launcher" 2>/dev/null && \
-               mv "$RR_LIB_DIR" "$bundle_backup/rr-old" 2>/dev/null && \
-               cp -a "$bundle_stage/rr-bundle" "$RR_LIB_DIR" 2>/dev/null && \
-               cp -a "$bundle_stage/rr-bundle/rr" "$RR_LAUNCHER" 2>/dev/null && \
-               chmod 755 "$RR_LIB_DIR/rr" "$RR_LAUNCHER" 2>/dev/null && \
-               bash -n "$RR_LIB_DIR/rr" 2>/dev/null && \
-               bash -n "$RR_LAUNCHER" 2>/dev/null && \
-               migrate_config_schema; then
-                # 运行时尽力刷新（失败只警告，不回滚——文件已成功落地）：
-                # 1) 订阅文件重新生成（热更后立即拉订阅就能拿到新配置）
-                # 2) 自动订阅 worker 更新（若用户已开启自动优选订阅）
-                if ! generate_node_and_sub >/dev/null 2>&1; then
-                    echo -e "${YELLOW}[提示] 订阅文件刷新失败，重新执行 rr 后会自动重试。${RESET}"
-                fi
-                if crontab -l 2>/dev/null | grep -q 'auto_update_sub.py'; then
-                    write_auto_update_worker >/dev/null 2>&1 || true
-                    python3 /usr/local/bin/auto_update_sub.py >/dev/null 2>&1 || true
-                fi
-                echo -e "${GREEN}[成功] 高速热更完成（已校验 bundle 完整性并迁移配置）。${RESET}"
-                # 拉起新版本运行组件：守护/校验 sing-box、重启新版面板（rr-nexus），
-                # 使远程升级后无需任何人工操作即进入新版本。
-                post_update_migrate >/dev/null 2>&1 || true
-                echo -e "${CYAN}服务已自动恢复，面板已切换至新版本。${RESET}"
-                rm -f "$bundle_tmp" && rm -rf "$bundle_stage" "$bundle_backup"
-                # 不能依赖 read 的返回值决定是否退出：非交互环境下 read 失败会
-                # fall-through 到下方回滚块，把刚更新好的文件删光。
+        if [ -s "$RR_LOCAL_MANIFEST" ] && \
+           cmp -s "$bundle_stage/rr-bundle/manifest.sha256" "$RR_LOCAL_MANIFEST"; then
+            bundle_changed=false
+        else
+            bundle_changed=true
+        fi
+        if [ -n "$remote_ver" ] && [ "$bundle_changed" = true ] && \
+           { [ "$local_ver" = "0" ] || version_ge "$remote_ver" "$local_ver"; }; then
+            bootstrap_tmp=$(mktemp /tmp/rr-bootstrap-update.XXXXXX) || return 1
+            if ! rr_prepare_bootstrap "$bootstrap_tmp"; then
+                rm -f "$bootstrap_tmp" "$bundle_tmp"
+                rm -rf "$bundle_stage"
+                echo -e "${RED}[失败] 更新程序下载或完整性检查失败，当前节点未改动。${RESET}"
+                read -rp "按回车键返回..." || true
+                return 1
+            fi
+            chmod 700 "$bootstrap_tmp"
+            echo -e "${YELLOW}发现发布内容更新，正在执行带完整回滚保护的高速热更新...${RESET}"
+            if RR_BUNDLE_FILE="$bundle_tmp" bash "$bootstrap_tmp" --upgrade; then
+                rm -f "$bootstrap_tmp" "$bundle_tmp"
+                rm -rf "$bundle_stage"
+                echo -e "${GREEN}[成功] RR-vps 已完成高速热更新，服务迁移校验通过。${RESET}"
                 read -rp "按回车键退出..." || true
                 exit 0
             fi
-            # 回滚：新目录/新 launcher 校验失败时恢复原文件（双份都恢复）
-            rm -rf "$RR_LIB_DIR" 2>/dev/null
-            if [ -d "$bundle_backup/rr-old" ] && mv "$bundle_backup/rr-old" "$RR_LIB_DIR" 2>/dev/null && \
-               [ -s "$bundle_backup/rr-launcher" ] && mv "$bundle_backup/rr-launcher" "$RR_LAUNCHER" 2>/dev/null; then
-                echo -e "${YELLOW}[警告] bundle 校验失败，已回滚原模块。${RESET}"
-            else
-                echo -e "${RED}[严重] 热更失败且回滚异常，建议重新安装。${RESET}"
-                rm -rf "$bundle_tmp" "$bundle_stage" "$bundle_backup" 2>/dev/null
-                read -p "按回车键返回..."
-                return 1
-            fi
+            rm -f "$bootstrap_tmp" "$bundle_tmp"
+            rm -rf "$bundle_stage"
+            echo -e "${RED}[失败] 高速热更新未完成，安装程序已回滚运行文件与数据。${RESET}"
+            read -rp "按回车键返回..." || true
+            return 1
         fi
     fi
     rm -f "$bundle_tmp" 2>/dev/null
-    rm -rf "$bundle_stage" "$bundle_backup" 2>/dev/null
+    rm -rf "$bundle_stage" 2>/dev/null
 
     # H3：远程 bundle 版本低于本地时显式提示降级已被拦截（此前静默跳过）。
     if [ -n "$remote_ver" ] && [ "$local_ver" != "0" ] && [ "$remote_ver" != "$local_ver" ] && \
        ! version_ge "$remote_ver" "$local_ver"; then
         echo -e "${YELLOW}[提示] 已阻止降级：远程版本 ${remote_ver} 低于本地版本 ${local_ver}。${RESET}"
+        read -rp "按回车键返回..." || true
+        return 1
     fi
 
     # ============================================================
@@ -383,16 +409,9 @@ do_update() {
         return 0
     fi
 
-    local bootstrap_tmp=""
     # 直接下载最新安装器（带时间戳绕过 CDN 缓存）。
-    # 旧实现优先提取 payload 里的 install.sh，但 bundle 内 install.sh 的
-    # bundle hash 行必然差一版（自引用），会导致高速模式永远不命中。
     bootstrap_tmp=$(mktemp /tmp/rr-bootstrap-update.XXXXXX) || return 1
-    if ! rr_download_file "$RR_BOOTSTRAP_URL" "$bootstrap_tmp" 10 || \
-       [ ! -s "$bootstrap_tmp" ] || \
-       ! bash -n "$bootstrap_tmp" 2>/dev/null || \
-       ! grep -q '^RR_BOOTSTRAP_VERSION=' "$bootstrap_tmp" || \
-       ! grep -q 'Xiaowu7z/RR-vps' "$bootstrap_tmp"; then
+    if ! rr_prepare_bootstrap "$bootstrap_tmp"; then
         rm -f "$bootstrap_tmp"
         echo -e "${RED}[失败] 更新程序下载或完整性检查失败，当前节点未改动。${RESET}"
         read -p "按回车键返回..." || true
