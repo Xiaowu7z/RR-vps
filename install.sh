@@ -292,7 +292,7 @@ rr_fetch_release() {
     echo "[RR-vps] 正在下载发布清单……"
 rr_download "${RR_RAW_BASE}/rr-bundle.tar.gz" "$STAGE_ROOT/rr-bundle.tar.gz" 2>/dev/null && \
 actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}') && \
-[ "$actual" = "b665522e9bd375e8f3832d3d52a1aaad1aca50f9a39bbcacf42afb32bae3a2f7" ] && \
+[ "$actual" = "0b36979baad848271bb0419a4436dc3e22e81c1fa9b68e11c1e0c7c7c94b4a39" ] && \
 tar -xzf "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" --strip-components=1 2>/dev/null && \
 cp "$PAYLOAD_DIR/manifest.sha256" "$STAGE_ROOT/manifest.sha256" && \
 rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" && \
@@ -376,9 +376,18 @@ rr_install_release() {
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
         install -d -m 755 "$NEW_RUNTIME/nexus/static" || return 1
         install -m 755 "$PAYLOAD_DIR/nexus/rr_nexus.py" "$NEW_RUNTIME/nexus/rr_nexus.py" || return 1
-        install -m 644 "$PAYLOAD_DIR/nexus/static/index.html" "$NEW_RUNTIME/nexus/static/index.html" || return 1
-        install -m 644 "$PAYLOAD_DIR/nexus/static/app.css" "$NEW_RUNTIME/nexus/static/app.css" || return 1
-        install -m 644 "$PAYLOAD_DIR/nexus/static/app.js" "$NEW_RUNTIME/nexus/static/app.js" || return 1
+        # 静态资源以已校验的 manifest 为唯一来源，避免新增 optimizer/i18n
+        # 等文件后仍被固定三文件复制逻辑漏装。
+        local relative_path=""
+        while read -r _ relative_path; do
+            case "$relative_path" in
+                nexus/static/*.html|nexus/static/*.css|nexus/static/*.js)
+                    [ -f "$PAYLOAD_DIR/$relative_path" ] || return 1
+                    install -m 644 "$PAYLOAD_DIR/$relative_path" \
+                        "$NEW_RUNTIME/$relative_path" || return 1
+                    ;;
+            esac
+        done < "$STAGE_ROOT/manifest.sha256"
     fi
     NEW_LAUNCHER=$(mktemp /usr/local/bin/.rr.new.XXXXXX) || return 1
     install -m 755 "$PAYLOAD_DIR/rr" "$NEW_LAUNCHER" || return 1

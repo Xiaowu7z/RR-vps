@@ -496,6 +496,9 @@ grep -Fq 'RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}
 grep -Fq 'Accept: application/vnd.github.raw+json' modules/60-update.sh install.sh
 grep -Fq 'rr_download_file "$bundle_url" "$bundle_tmp" 10' modules/60-update.sh
 grep -Fq 'UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"' modules/60-update.sh
+# 新安装必须按 manifest 复制全部 Nexus 静态资源，不能只固定复制 app 三件套。
+grep -Fq 'nexus/static/*.html|nexus/static/*.css|nexus/static/*.js)' install.sh
+grep -Fq '"$NEW_RUNTIME/$relative_path" || return 1' install.sh
 # D10：孤儿清理必须覆盖按客户端拆分的订阅文件（-vl/-v2rayn/-v2rayng/-sr/-nekobox）
 grep -Fq -- '${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt"' modules/85-nexus.sh
 grep -Fq -- '${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt"' modules/85-nexus.sh
