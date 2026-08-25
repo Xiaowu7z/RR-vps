@@ -49,7 +49,7 @@ jobs:
             current_version=""
             if [[ "$info_url" == https://github.com/${GITHUB_REPOSITORY}/releases/download/rr-nexus-core/* ]]; then
               current_version=$(curl -fsSL --retry 2 "$info_url" 2>/dev/null | \
-                awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}')
+                awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' || true)
             fi
             for asset in \
               "rr-sing-box-${version}-linux-amd64.tar.gz" \

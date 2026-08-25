@@ -76,6 +76,20 @@ echo "[3/12] Fresh-install port selection regression"
 )
 
 echo "[4/12] Fresh-install snapshot regression"
+version_function=$(awk '
+    /^rr_version_ge\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^}$/ { exit }
+' install.sh)
+(
+    eval "$version_function"
+    rr_version_ge 7.0.2 7.0.2
+    rr_version_ge 7.0.3 7.0.2
+    if rr_version_ge 7.0.1 7.0.2; then
+        echo "Bootstrap downgrade comparison accepted an older version." >&2
+        exit 1
+    fi
+)
 snapshot_function=$(awk '
     /^rr_snapshot_runtime\(\) \{/ { capture = 1 }
     capture { print }
@@ -534,6 +548,7 @@ grep -Fxq 'rr_check_system || exit 1' install.sh
 grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh
 grep -Fq 'rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db' install.sh
 grep -Fq 'ROLLBACK_FAILED=true' install.sh
+grep -Fq 'rr_version_ge "$release_version" "$installed_version"' install.sh
 grep -Fq 'command -v timeout >/dev/null 2>&1' modules/60-update.sh
 grep -Fq 'declare -F sync_nexus_devices >/dev/null 2>&1' modules/60-update.sh
 grep -Fq 'nexus_download_traffic_core "$rr_core_dir"' modules/30-singbox.sh

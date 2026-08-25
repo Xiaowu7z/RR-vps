@@ -135,6 +135,11 @@ rr_bundle_tree_is_valid() {
     python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
 }
 
+rr_version_ge() {
+    [ "$1" = "$2" ] || \
+        [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n 1)" = "$1" ]
+}
+
 rr_check_system() {
     [ "${EUID:-$(id -u)}" -eq 0 ] || {
         rr_error "请使用 root 用户运行安装命令。"
@@ -176,7 +181,7 @@ rr_check_system() {
             ;;
     esac
 
-    for required_command in bash awk sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 tar find stat cmp pgrep pkill; do
+    for required_command in bash awk sed grep wc head sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 tar find stat cmp pgrep pkill sort tail; do
         command -v "$required_command" >/dev/null 2>&1 || {
             rr_error "系统缺少必要命令：${required_command}"
             return 1
@@ -284,6 +289,8 @@ rr_snapshot_runtime() {
     rr_backup_file "$RR_LAUNCHER" rr_launcher || return 1
     rr_backup_file /etc/argo_vmess.conf argo_vmess.conf || return 1
     rr_backup_file /etc/sing-box/config.json singbox_config.json || return 1
+    rr_backup_file /etc/sing-box/cert.pem singbox_cert.pem || return 1
+    rr_backup_file /etc/sing-box/private.key singbox_private.key || return 1
     rr_backup_file /usr/local/bin/sing-box singbox_binary || return 1
     rr_backup_file /etc/systemd/system/sing-box.service singbox.service || return 1
     rr_backup_file /etc/systemd/system/argo-rr-health.service health.service || return 1
@@ -333,6 +340,8 @@ rr_rollback() {
     rr_restore_file rr_launcher "$RR_LAUNCHER" || rollback_failed=true
     rr_restore_file argo_vmess.conf /etc/argo_vmess.conf || rollback_failed=true
     rr_restore_file singbox_config.json /etc/sing-box/config.json || rollback_failed=true
+    rr_restore_file singbox_cert.pem /etc/sing-box/cert.pem || rollback_failed=true
+    rr_restore_file singbox_private.key /etc/sing-box/private.key || rollback_failed=true
     rr_restore_file singbox_binary /usr/local/bin/sing-box || rollback_failed=true
     rr_restore_file singbox.service /etc/systemd/system/sing-box.service || rollback_failed=true
     rr_restore_file health.service /etc/systemd/system/argo-rr-health.service || rollback_failed=true
@@ -483,6 +492,25 @@ rr_fetch_release() {
 }
 
 rr_install_release() {
+    local release_version=""
+    local installed_version=""
+    release_version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' \
+        "$PAYLOAD_DIR/modules/00-runtime.sh" | head -n 1)
+    [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        rr_error "发布包版本号无效，拒绝安装。"
+        return 1
+    }
+    if [ "$RR_MODE" = "--upgrade" ] && \
+       [ -r "$RR_LIB_DIR/modules/00-runtime.sh" ]; then
+        installed_version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' \
+            "$RR_LIB_DIR/modules/00-runtime.sh" | head -n 1)
+        if [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+           ! rr_version_ge "$release_version" "$installed_version"; then
+            rr_error "已阻止降级：发布包 ${release_version} 低于已安装版本 ${installed_version}。"
+            return 1
+        fi
+    fi
+
     rr_snapshot_runtime || {
         rr_error "无法完整备份当前安装，已取消更新。"
         return 1
