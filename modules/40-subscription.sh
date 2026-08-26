@@ -160,7 +160,9 @@ generate_node_and_sub() {
 
     # Tuic5
     if [ "$TU5_ENABLED" = "true" ] && [ -n "$TU5_PORT" ] && [ "$TU5_PORT" != "0" ]; then
-        local tu5_link="tuic://${UUID}:${UUID}@${SERVER_IP}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&zero_rtt_handshake=true#TU5-${HOSTNAME:-node}"
+        # NekoBox 的 TUIC URI 解析器使用 allow_insecure；同时保留 insecure
+        # 兼容其他客户端。两者并存时，各客户端会忽略不认识的参数。
+        local tu5_link="tuic://${UUID}:${UUID}@${SERVER_IP}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&allow_insecure=1&zero_rtt_handshake=true#TU5-${HOSTNAME:-node}"
         if [ -z "$all_links" ]; then
             all_links="$tu5_link"
         else
@@ -225,7 +227,9 @@ generate_node_and_sub() {
     fi
     # Nexus 面板设备订阅同步刷新（未安装面板或未加载模块时跳过）
     if command -v generate_nexus_device_subscriptions >/dev/null 2>&1; then
-        generate_nexus_device_subscriptions 2>/dev/null || true
+        # 已安装 Nexus 时个人订阅属于本次刷新事务的一部分；失败必须向上
+        # 返回，让配置变更/热更新回滚，不能留下节点已更新而二维码仍指向旧内容。
+        generate_nexus_device_subscriptions || return 1
     fi
     return 0
 }
@@ -735,6 +739,8 @@ EOF
         fi
         cat >> "$yaml_file" <<EOF
     password: "$uuid_val"
+    obfs: salamander
+    obfs-password: "$UUID"
     sni: www.bing.com
     skip-cert-verify: true
     alpn:

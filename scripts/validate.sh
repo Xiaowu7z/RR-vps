@@ -20,12 +20,12 @@ load_modules_for_tests() {
     done
 }
 
-echo "[1/12] Bash and Python syntax"
+echo "[1/13] Bash and Python syntax"
 bash -n install.sh rr modules/*.sh
 python3 -c 'compile(open("nexus/rr_nexus.py", encoding="utf-8").read(), "nexus/rr_nexus.py", "exec")'
 if command -v node >/dev/null 2>&1; then node --check nexus/static/app.js; fi
 
-echo "[2/12] Combined module loading"
+echo "[2/13] Combined module loading"
 bash -c '
     for module_file in modules/*.sh; do
         [ "$module_file" = "modules/00-runtime.sh" ] && continue
@@ -42,7 +42,7 @@ bash -c '
     done
 '
 
-echo "[3/12] Fresh-install port selection regression"
+echo "[3/13] Fresh-install port selection regression"
 (
     load_modules_for_tests
     PORT=0
@@ -75,7 +75,7 @@ echo "[3/12] Fresh-install port selection regression"
     is_valid_port "$selected_port"
 )
 
-echo "[4/12] Fresh-install snapshot regression"
+echo "[4/13] Fresh-install snapshot regression"
 version_function=$(awk '
     /^rr_version_ge\(\) \{/ { capture = 1 }
     capture { print }
@@ -145,7 +145,7 @@ snapshot_function=$(awk '
     rm -rf "$BACKUP_DIR"
 )
 
-echo "[5/12] Fresh-install crypto material regression"
+echo "[5/13] Fresh-install crypto material regression"
 (
     load_modules_for_tests
     CONFIG_FILE="/tmp/rr-validate-config"
@@ -294,7 +294,7 @@ post_update_function=$(awk '
     post_update_migrate
 )
 
-echo "[6/12] Subscription URL control-character regression"
+echo "[6/13] Subscription URL control-character regression"
 (
     load_modules_for_tests
     test_uuid="e219c8c7-b669-4c75-b33b-a9e5227a8a24"
@@ -344,7 +344,7 @@ echo "[6/12] Subscription URL control-character regression"
     render_terminal_qr "$qr_payload" "VLESS Reality 节点" >/dev/null
 )
 
-echo "[7/12] Ubuntu 22.04 Python and Argon2 compatibility"
+echo "[7/13] Ubuntu 22.04 Python and Argon2 compatibility"
 if grep -En 'from datetime import.*\bUTC\b|datetime\.now\(UTC\)' nexus/rr_nexus.py; then
     echo "Python 3.11-only datetime.UTC usage was found." >&2
     exit 1
@@ -456,6 +456,7 @@ base_config = {
     "port": 7900,
     "database": sys.argv[1],
     "subscription_root": str(config_path.parent / "subscriptions"),
+    "published_subscription_root": str(config_path.parent / "published" / "nexus"),
     "stats_port": 39091,
     "public_port": 9443,
     "sub_port": 39291,
@@ -471,9 +472,12 @@ device = {
 handler = object.__new__(module.Handler)
 artifact_root = config_path.parent / "subscriptions"
 artifact_root.mkdir(parents=True, exist_ok=True)
+published_root = config_path.parent / "published" / "nexus"
+published_root.mkdir(parents=True, exist_ok=True)
 artifact_suffixes = ["-vl.json", ".yaml", "-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt", ".txt", ".json"]
 for suffix in artifact_suffixes:
     (artifact_root / f"{device['id']}{suffix}").write_text("test", encoding="utf-8")
+    (published_root / f"{device['subscription_token']}{suffix}").write_text("test", encoding="utf-8")
 
 def write_config(**values):
     payload = dict(base_config)
@@ -487,14 +491,47 @@ assert local_primary == "http://[2001:db8::99]:39291/nexus/test_subscription_tok
 assert len(local_urls) == 8
 assert all(item["url"].startswith("http://[2001:db8::99]:39291/nexus/") for item in local_urls)
 # 不存在的格式不能继续显示一个注定 404 的二维码。
-(artifact_root / f"{device['id']}-vl.json").unlink()
+(published_root / f"{device['subscription_token']}-vl.json").unlink()
 assert all(item["format"] != "Sing-box 官方" for item in handler._device_subscription_urls(device)[1])
-(artifact_root / f"{device['id']}-vl.json").write_text("test", encoding="utf-8")
+(published_root / f"{device['subscription_token']}-vl.json").write_text("test", encoding="utf-8")
 
 write_config(mode="public", domain="45.192.205.71", ssh_host="45.192.205.71")
 ip_primary, ip_urls = handler._device_subscription_urls(device)
 assert ip_primary == "http://45.192.205.71:39291/nexus/test_subscription_token_123456.txt"
 assert all(":9443/sub/" not in item["url"] for item in ip_urls)
+
+# 公网 IP/本地模式的地址必须能被真实的静态订阅服务逐一下载，且内容
+# 与刚发布的文件完全一致（覆盖 NekoBox 的 Base64 地址）。
+import functools
+import http.server
+import threading
+import urllib.request
+
+quiet_handler = type(
+    "QuietSubscriptionHandler",
+    (http.server.SimpleHTTPRequestHandler,),
+    {"log_message": lambda self, *args: None},
+)
+static_handler = functools.partial(quiet_handler, directory=str(published_root.parent))
+static_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), static_handler)
+static_thread = threading.Thread(target=static_server.serve_forever, daemon=True)
+static_thread.start()
+try:
+    write_config(
+        mode="public",
+        domain="127.0.0.1",
+        ssh_host="127.0.0.1",
+        sub_port=static_server.server_port,
+    )
+    live_ip_primary, live_ip_urls = handler._device_subscription_urls(device)
+    assert live_ip_primary.startswith(f"http://127.0.0.1:{static_server.server_port}/nexus/")
+    for item in live_ip_urls:
+        with urllib.request.urlopen(item["url"], timeout=2) as response:
+            assert response.status == 200 and response.read() == b"test"
+finally:
+    static_server.shutdown()
+    static_server.server_close()
+    static_thread.join(timeout=2)
 
 write_config(mode="public", domain="panel.example.com", ssh_host="45.192.205.71", public_port=443)
 domain_primary, domain_urls = handler._device_subscription_urls(device)
@@ -532,10 +569,16 @@ try:
         assert argv[argv.index("-l") + 1] == "M"
         assert argv[argv.index("-m") + 1] == "4"
         assert kwargs["timeout"] == 5
-    for item in domain_urls:
-        status, _ = handler._qr_png_bytes(device["id"], {"raw": [item["url"]]})
-        assert status == module.HTTPStatus.OK
-        assert captured[-1][0][-1] == item["url"]
+    for config_values, mode_urls in (
+        ({"mode": "local", "domain": "", "ssh_host": "2001:db8::99"}, local_urls),
+        ({"mode": "public", "domain": "45.192.205.71", "ssh_host": "45.192.205.71"}, ip_urls),
+        ({"mode": "public", "domain": "panel.example.com", "ssh_host": "45.192.205.71", "public_port": 443}, domain_urls),
+    ):
+        write_config(**config_values)
+        for item in mode_urls:
+            status, _ = handler._qr_png_bytes(device["id"], {"raw": [item["url"]]})
+            assert status == module.HTTPStatus.OK
+            assert captured[-1][0][-1] == item["url"]
     assert handler._qr_png_bytes(device["id"], {"raw": ["https://invalid.example/sub"]})[0] == module.HTTPStatus.BAD_REQUEST
     assert handler._qr_png_bytes(device["id"], {"index": ["-1"]})[0] == module.HTTPStatus.BAD_REQUEST
 finally:
@@ -578,7 +621,7 @@ assert sent and sent[0][0] == module.HTTPStatus.NOT_FOUND
 PY
 rm -rf "$argon2_stub"
 
-echo "[8/12] RR Nexus per-device traffic helpers"
+echo "[8/13] RR Nexus per-device traffic helpers"
 (
     load_modules_for_tests
     nexus_tmp=$(mktemp -d)
@@ -620,10 +663,152 @@ PY
     nexus_migrate_runtime_config
     [ "$(jq -r '.stats_port' "$NEXUS_CONFIG_FILE")" = "39091" ]
     [ "$(jq -r '.ssh_host' "$NEXUS_CONFIG_FILE")" = "45.192.205.71" ]
+    [ "$(jq -r '.published_subscription_root' "$NEXUS_CONFIG_FILE")" = "/tmp/sub_server/nexus" ]
     rm -rf "$nexus_tmp"
 )
 
-echo "[9/12] Release manifest coverage"
+echo "[9/13] RR Nexus personal subscription compatibility"
+(
+    load_modules_for_tests
+    sub_tmp=$(mktemp -d)
+    trap 'rm -rf "$sub_tmp"' EXIT
+    NEXUS_DB_FILE="$sub_tmp/nexus.db"
+    NEXUS_CONFIG_FILE="$sub_tmp/nexus.json"
+    NEXUS_DATA_DIR="$sub_tmp/nexus-data"
+    NEXUS_SUB_ROOT="$NEXUS_DATA_DIR/subscriptions"
+    SUB_ROOT="$sub_tmp/published"
+    mkdir -p "$SUB_ROOT"
+
+    UUID="e219c8c7-b669-4c75-b33b-a9e5227a8a24"
+    device_credential="01234567-89ab-4cde-8fab-0123456789ab"
+    device_id="dev_012345abcdef"
+    sub_token="test_subscription_token_123456"
+    PORT=20443
+    VL_PORT=20444
+    HY2_PORT=20445
+    TU5_PORT=20446
+    AN_PORT=20447
+    NAIVE_PORT=20448
+    VM_ENABLED=true
+    VM_TLS_ENABLED=true
+    VL_ENABLED=true
+    HY2_ENABLED=true
+    TU5_ENABLED=true
+    AN_ENABLED=true
+    NAIVE_ENABLED=true
+    NAIVE_USER=rr-naive
+    NAIVE_PASS=server-naive-password
+    NAIVE_DOMAIN=naive.example.com
+    PUBLIC_KEY=test-reality-public-key
+    SHORT_ID=0123456789abcdef
+    CERT_SHA256=$(printf 'a%.0s' {1..64})
+    HY2_HOP_INTERVAL=30s
+    HB_ENABLED=false
+    CLASH_ENABLED=true
+    CDN_IP=www.bing.com
+    ARGO_DOMAIN=argo.example.com
+    ARGO_EDGE_PORT=443
+
+    python3 - "$NEXUS_DB_FILE" "$device_id" "$device_credential" "$sub_token" <<'PY'
+import sqlite3
+import sys
+
+database, device_id, credential, token = sys.argv[1:]
+with sqlite3.connect(database) as connection:
+    connection.executescript("""
+        CREATE TABLE devices (
+          id TEXT PRIMARY KEY, credential TEXT NOT NULL, name TEXT NOT NULL,
+          subscription_token TEXT NOT NULL, enabled INTEGER NOT NULL,
+          expires_at TEXT, quota_bytes INTEGER NOT NULL, used_bytes INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        );
+    """)
+    connection.execute(
+        "INSERT INTO devices VALUES (?,?,?,?,1,NULL,0,0,'2026-01-01')",
+        (device_id, credential, "NekoBox 测试", token),
+    )
+PY
+    printf '{"mode":"public"}\n' > "$NEXUS_CONFIG_FILE"
+
+    load_config_with_defaults() { return 0; }
+    validate_subscription_crypto_material() { return 0; }
+    select_entry_ip() {
+        ENTRY_IP_RAW="45.192.205.71"
+        ENTRY_IP_URI="45.192.205.71"
+        SUB_URL_PORT=39291
+        return 0
+    }
+    nexus_sync_subscription_endpoint() { return 0; }
+    get_hop_ports() { printf '%s\n' '21000:21010'; }
+
+    generate_nexus_device_subscriptions
+
+    raw_file="$NEXUS_SUB_ROOT/${device_id}.txt"
+    neko_file="$NEXUS_SUB_ROOT/${device_id}-nekobox.txt"
+    [ -s "$raw_file" ] && [ -s "$neko_file" ]
+    base64 -d "$neko_file" > "$sub_tmp/nekobox-decoded.txt"
+    cmp -s "$raw_file" "$sub_tmp/nekobox-decoded.txt"
+    [ "$(wc -l < "$raw_file")" -eq 6 ]
+    grep -Eq '^hysteria2://.*obfs=salamander&obfs-password=e219c8c7-b669-4c75-b33b-a9e5227a8a24' "$raw_file"
+    grep -Eq '^tuic://.*insecure=1&allow_insecure=1' "$raw_file"
+    jq -e --arg credential "$device_credential" '.outbounds[] | select(.type == "vless") | .uuid == $credential' \
+        "$NEXUS_SUB_ROOT/${device_id}-vl.json" >/dev/null
+    grep -Fq 'obfs: salamander' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    grep -Fq 'obfs-password: "e219c8c7-b669-4c75-b33b-a9e5227a8a24"' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+
+    python3 - "$raw_file" "$neko_file" "$device_credential" "$UUID" <<'PY'
+import base64
+import json
+import sys
+import urllib.parse
+
+raw_path, encoded_path, credential, server_password = sys.argv[1:]
+raw = open(raw_path, encoding="utf-8").read()
+encoded = open(encoded_path, encoding="utf-8").read()
+assert base64.b64decode(encoded).decode() == raw
+links = {line.split(":", 1)[0]: line for line in raw.splitlines()}
+assert set(links) == {"vmess", "vless", "hysteria2", "tuic", "anytls", "naive+https"}
+
+vmess = json.loads(base64.b64decode(links["vmess"].removeprefix("vmess://")))
+assert vmess["id"] == credential and vmess["allowInsecure"] == "1"
+
+def parsed(name):
+    return urllib.parse.urlsplit(links[name].replace(f"{name}://", "https://", 1))
+
+vless = parsed("vless")
+assert vless.username == credential and urllib.parse.parse_qs(vless.query)["security"] == ["reality"]
+hy2 = parsed("hysteria2")
+hy2_query = urllib.parse.parse_qs(hy2.query)
+assert hy2.username == credential
+assert hy2_query["insecure"] == ["1"]
+assert hy2_query["obfs-password"] == [server_password]
+tuic = parsed("tuic")
+assert tuic.username == credential and tuic.password == credential
+assert urllib.parse.parse_qs(tuic.query)["allow_insecure"] == ["1"]
+anytls = parsed("anytls")
+assert anytls.username == credential and urllib.parse.parse_qs(anytls.query)["insecure"] == ["1"]
+naive = urllib.parse.urlsplit(links["naive+https"].replace("naive+https://", "https://", 1))
+assert naive.username.startswith("dev_") and naive.password
+PY
+
+    for suffix in .txt .json .yaml -vl.json -v2rayn.txt -v2rayng.txt -sr.txt -nekobox.txt; do
+        cmp -s "$NEXUS_SUB_ROOT/${device_id}${suffix}" "$SUB_ROOT/nexus/${sub_token}${suffix}"
+    done
+
+    # NekoBox/Base64 订阅不能依赖 Sing-box/Clash 格式是否生成成功；失败的
+    # 格式应从源目录与发布目录同步移除，不能继续暴露旧文件二维码。
+    generate_client_json() { return 1; }
+    generate_clash_yaml() { return 1; }
+    generate_nexus_device_subscriptions
+    [ -s "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" ]
+    cmp -s "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" "$SUB_ROOT/nexus/${sub_token}-nekobox.txt"
+    for suffix in .json .yaml -vl.json; do
+        [ ! -e "$NEXUS_SUB_ROOT/${device_id}${suffix}" ]
+        [ ! -e "$SUB_ROOT/nexus/${sub_token}${suffix}" ]
+    done
+)
+
+echo "[10/13] Release manifest coverage"
 expected_paths=$(mktemp)
 manifest_paths=$(mktemp)
 trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
@@ -635,10 +820,10 @@ trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
 awk 'NF == 2 {print $2}' manifest.sha256 | LC_ALL=C sort > "$manifest_paths"
 diff -u "$expected_paths" "$manifest_paths"
 
-echo "[10/12] Release hashes"
+echo "[11/13] Release hashes"
 sha256sum -c manifest.sha256
 
-echo "[11/12] Deterministic release bundle"
+echo "[12/13] Deterministic release bundle"
 python3 scripts/rebuild-bundle.py --check
 bundle_paths=$(mktemp)
 expected_bundle_paths=$(mktemp)
@@ -650,7 +835,7 @@ tar -tzf rr-bundle.tar.gz | LC_ALL=C sort > "$bundle_paths"
 diff -u "$expected_bundle_paths" "$bundle_paths"
 rm -f "$bundle_paths" "$expected_bundle_paths"
 
-echo "[12/12] RR Nexus static asset and update contract"
+echo "[13/13] RR Nexus static asset and update contract"
 grep -Eq 'id="login-form"' nexus/static/index.html
 grep -Eq 'id="device-grid"' nexus/static/index.html
 grep -Eq 'id="traffic-chart"' nexus/static/index.html
@@ -666,6 +851,14 @@ grep -Fq 'UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L' module
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/40-subscription.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/85-nexus.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/90-auto-update.sh
+grep -Eq 'hysteria2://.*obfs=salamander.*obfs-password=' modules/40-subscription.sh
+grep -Eq 'hysteria2://.*obfs=salamander.*obfs-password=' modules/85-nexus.sh
+grep -Eq 'hysteria2://.*obfs=salamander.*obfs-password=' modules/90-auto-update.sh
+grep -Eq 'tuic://.*allow_insecure=1' modules/40-subscription.sh
+grep -Eq 'tuic://.*allow_insecure=1' modules/85-nexus.sh
+grep -Eq 'tuic://.*allow_insecure=1' modules/90-auto-update.sh
+grep -Fq 'generate_nexus_device_subscriptions || return 1' modules/40-subscription.sh
+grep -Fq '"client-nekobox.txt"' modules/90-auto-update.sh
 # D4：/nexus/ 目录枚举防护——发布目录必须生成空白 index.html
 grep -Fq 'nexus/index.html' modules/85-nexus.sh
 # D9：面板设备订阅文案必须标注全协议（曾误写「仅 VMess」）

@@ -93,6 +93,21 @@ nexus_device_naive_password() {
     printf '%s' "${NAIVE_PASS}:${device_id}" | sha256sum | cut -c1-24
 }
 
+nexus_atomic_copy() {
+    # 订阅客户端可能恰好在刷新过程中拉取文件；始终先写同目录临时文件，
+    # 再原子替换，避免返回截断的 Base64/JSON/YAML。
+    local source_path="$1"
+    local target_path="$2"
+    local target_tmp=""
+    [ -f "$source_path" ] || return 1
+    target_tmp=$(mktemp "${target_path}.XXXXXX") || return 1
+    if ! cp -f "$source_path" "$target_tmp" || ! chmod 600 "$target_tmp"; then
+        rm -f "$target_tmp"
+        return 1
+    fi
+    mv -f "$target_tmp" "$target_path"
+}
+
 nexus_traffic_user_names() {
     if [ ! -f "$NEXUS_DB_FILE" ]; then
         printf '%s\n' '[]'
@@ -400,11 +415,13 @@ $link"
             local hy2_extra=""
             hy2_hop=$(get_hop_ports "$HY2_PORT")
             [ -n "$hy2_hop" ] && hy2_extra="&mport=$(printf '%s' "$hy2_hop" | tr ':' '-')"
-            link="hysteria2://${credential}@${server_uri}:${HY2_PORT}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256=${CERT_SHA256}${hy2_extra}#HY2-${display_name}"
+            # 服务端启用了 Salamander 混淆；个人 URI 必须携带同一混淆密码，
+            # 否则 NekoBox 等客户端虽能导入，却无法建立连接。
+            link="hysteria2://${credential}@${server_uri}:${HY2_PORT}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256=${CERT_SHA256}&obfs=salamander&obfs-password=${UUID}${hy2_extra}#HY2-${display_name}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
         if [ "$TU5_ENABLED" = "true" ] && [ "$TU5_PORT" != "0" ]; then
-            link="tuic://${credential}:${credential}@${server_uri}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1#TUIC-${display_name}"
+            link="tuic://${credential}:${credential}@${server_uri}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&allow_insecure=1#TUIC-${display_name}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
         if [ "$AN_ENABLED" = "true" ] && [ "$AN_PORT" != "0" ]; then
@@ -433,27 +450,39 @@ $link"
             ndev_op=$(nexus_device_naive_password "$device_id") || ndev_op="$NAIVE_PASS"
             if RR_CLIENT_UUID_OVERRIDE="$credential" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
                 generate_client_json "$server_raw" 2>/dev/null; then
-                cp -f "$device_sub_dir/client.json" "$NEXUS_SUB_ROOT/${device_id}.json" 2>/dev/null || true
+                nexus_atomic_copy "$device_sub_dir/client.json" "$NEXUS_SUB_ROOT/${device_id}.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
                 # sing-box 官方客户端：单独 VL Reality（五哥指定，最大保活）
-                RR_CLIENT_UUID_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
-                    generate_client_json "$server_raw" vless 2>/dev/null || true
-                cp -f "$device_sub_dir/client-vl.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json" 2>/dev/null || true
-                chmod 600 "$NEXUS_SUB_ROOT/${device_id}-vl.json" 2>/dev/null || true
-                # 其他软件：一个软件一条订阅（五哥定：全部全协议，base64 格式）
-                local _dev_txt="$NEXUS_SUB_ROOT/${device_id}.txt"
-                if [ -s "$_dev_txt" ]; then
-                    base64 -w0 < "$_dev_txt" > "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" 2>/dev/null
-                    cp -f "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" 2>/dev/null
-                    cp -f "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-sr.txt" 2>/dev/null
-                    cp -f "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" 2>/dev/null
-                    chmod 600 "$NEXUS_SUB_ROOT"/${device_id}-v2rayn.txt "$NEXUS_SUB_ROOT"/${device_id}-v2rayng.txt "$NEXUS_SUB_ROOT"/${device_id}-sr.txt "$NEXUS_SUB_ROOT"/${device_id}-nekobox.txt 2>/dev/null || true
+                if RR_CLIENT_UUID_OVERRIDE="$credential" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
+                    generate_client_json "$server_raw" vless 2>/dev/null; then
+                    nexus_atomic_copy "$device_sub_dir/client-vl.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                else
+                    rm -f "$NEXUS_SUB_ROOT/${device_id}-vl.json"
                 fi
-                chmod 600 "$NEXUS_SUB_ROOT/${device_id}.json" 2>/dev/null || true
+            else
+                rm -f "$NEXUS_SUB_ROOT/${device_id}.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json"
+            fi
+            # URI/Base64 订阅只依赖上面已经生成的原始链接，不能被 Sing-box
+            # JSON 的生成结果连带跳过；这保证 NekoBox 等地址始终同步刷新。
+            local _dev_txt="$NEXUS_SUB_ROOT/${device_id}.txt"
+            if [ -s "$_dev_txt" ]; then
+                local _encoded_tmp=""
+                _encoded_tmp=$(mktemp "$NEXUS_SUB_ROOT/.${device_id}-encoded.XXXXXX") || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                if ! base64 -w0 < "$_dev_txt" > "$_encoded_tmp" || ! chmod 600 "$_encoded_tmp"; then
+                    rm -f "$_encoded_tmp"
+                    rm -rf "$device_sub_dir"
+                    rm -f "$rows_file"
+                    return 1
+                fi
+                mv -f "$_encoded_tmp" "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt"
+                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-sr.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
             fi
             if RR_CLIENT_UUID_OVERRIDE="$credential" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
                 generate_clash_yaml "$server_raw" 2>/dev/null; then
-                cp -f "$device_sub_dir/clash_meta.yaml" "$NEXUS_SUB_ROOT/${device_id}.yaml" 2>/dev/null || true
-                chmod 600 "$NEXUS_SUB_ROOT/${device_id}.yaml" 2>/dev/null || true
+                nexus_atomic_copy "$device_sub_dir/clash_meta.yaml" "$NEXUS_SUB_ROOT/${device_id}.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+            else
+                rm -f "$NEXUS_SUB_ROOT/${device_id}.yaml"
             fi
             rm -rf "$device_sub_dir"
         fi
@@ -461,22 +490,15 @@ $link"
         if [ -n "$sub_token" ] && [ -d "$SUB_ROOT" ]; then
             local nexus_pub_dir="${SUB_ROOT}/nexus"
             install -d -m 700 "$nexus_pub_dir"
-            cp -f "$NEXUS_SUB_ROOT/${device_id}.txt" "$nexus_pub_dir/${sub_token}.txt"
-            chmod 600 "$nexus_pub_dir/${sub_token}.txt"
-            if [ -f "$NEXUS_SUB_ROOT/${device_id}.json" ]; then
-                cp -f "$NEXUS_SUB_ROOT/${device_id}.json" "$nexus_pub_dir/${sub_token}.json"
-                chmod 600 "$nexus_pub_dir/${sub_token}.json"
-            fi
-            if [ -f "$NEXUS_SUB_ROOT/${device_id}.yaml" ]; then
-                cp -f "$NEXUS_SUB_ROOT/${device_id}.yaml" "$nexus_pub_dir/${sub_token}.yaml"
-                chmod 600 "$nexus_pub_dir/${sub_token}.yaml"
-            fi
-            # 按客户端拆分的订阅同步到发布目录
+            nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}.txt" "$nexus_pub_dir/${sub_token}.txt" || { rm -f "$rows_file"; return 1; }
+            # 逐格式同步；新一轮未生成的格式必须同时删除旧发布副本，避免
+            # 个人地址/二维码继续返回上一次配置的陈旧内容。
             local _split_sfx=""
-            for _split_sfx in "-vl.json" "-v2rayn.txt" "-v2rayng.txt" "-sr.txt" "-nekobox.txt"; do
+            for _split_sfx in ".json" ".yaml" "-vl.json" "-v2rayn.txt" "-v2rayng.txt" "-sr.txt" "-nekobox.txt"; do
                 if [ -f "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" ]; then
-                    cp -f "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" "$nexus_pub_dir/${sub_token}${_split_sfx}"
-                    chmod 600 "$nexus_pub_dir/${sub_token}${_split_sfx}"
+                    nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" "$nexus_pub_dir/${sub_token}${_split_sfx}" || { rm -f "$rows_file"; return 1; }
+                else
+                    rm -f "$nexus_pub_dir/${sub_token}${_split_sfx}"
                 fi
             done
             active_tokens="${active_tokens}${sub_token}|"
@@ -624,6 +646,7 @@ nexus_write_config() {
   "domain": "__DOMAIN__",
   "database": "/var/lib/rr-nexus/nexus.db",
   "subscription_root": "/var/lib/rr-nexus/subscriptions",
+  "published_subscription_root": "__PUBLISHED_SUB_ROOT__",
   "stats_port": __STATS_PORT__,
   "ssh_host": "__SSH_HOST__",
   "public_port": __USER_PORT__,
@@ -633,6 +656,7 @@ nexus_write_config() {
     cfg="${cfg//__MODE__/$mode}"
     cfg="${cfg//__BACKEND_PORT__/$backend_port}"
     cfg="${cfg//__DOMAIN__/$domain}"
+    cfg="${cfg//__PUBLISHED_SUB_ROOT__/${SUB_ROOT}\/nexus}"
     cfg="${cfg//__STATS_PORT__/$stats_port}"
     cfg="${cfg//__SSH_HOST__/$ssh_host}"
     cfg="${cfg//__USER_PORT__/$user_port}"
@@ -701,7 +725,8 @@ nexus_migrate_runtime_config() {
     fi
     tmp=$(mktemp /tmp/rr-nexus-migrate.XXXXXX) || return 1
     if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" --argjson sub_port "$sub_url_port" \
-        '.stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+        --arg published_subscription_root "${SUB_ROOT}/nexus" \
+        '.stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port | .published_subscription_root=$published_subscription_root' "$NEXUS_CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi

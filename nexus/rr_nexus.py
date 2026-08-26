@@ -326,6 +326,7 @@ class NexusConfig:
     domain: str
     database: Path
     subscription_root: Path
+    published_subscription_root: Path
     stats_port: int
 
     @property
@@ -351,6 +352,9 @@ class NexusConfig:
         domain = str(raw.get("domain", ""))
         database = Path(str(raw.get("database", "/var/lib/rr-nexus/nexus.db")))
         subscription_root = Path(str(raw.get("subscription_root", "/var/lib/rr-nexus/subscriptions")))
+        published_subscription_root = Path(
+            str(raw.get("published_subscription_root", "/tmp/sub_server/nexus"))
+        )
         public_port = int(raw.get("public_port", 7900))
         stats_port = int(raw.get("stats_port", 39091))
         ssh_host = str(raw.get("ssh_host", "服务器IP")).strip()
@@ -369,18 +373,19 @@ class NexusConfig:
         ):
             raise ValueError("invalid RR Nexus config")
         return cls(
-            mode,
-            listen,
-            port,
-            domain,
-            database,
-            subscription_root,
-            stats_port,
-            ssh_host,
-            mode == "public",
-            "both",
-            public_port,
-            sub_port,
+            mode=mode,
+            listen=listen,
+            port=port,
+            domain=domain,
+            database=database,
+            subscription_root=subscription_root,
+            published_subscription_root=published_subscription_root,
+            stats_port=stats_port,
+            ssh_host=ssh_host,
+            secure_cookie=mode == "public",
+            traffic_mode="both",
+            public_port=public_port,
+            sub_port=sub_port,
         )
 
     @property
@@ -2690,7 +2695,9 @@ class Handler(BaseHTTPRequestHandler):
             ("Sing-box 完整", "Sing-box 完整多协议配置", "json", ".json"),
         ]
 
-        def artifact_exists(suffix: str) -> bool:
+        def artifact_exists(suffix: str, *, published: bool = False) -> bool:
+            if published:
+                return (config.published_subscription_root / f"{token}{suffix}").is_file()
             return (config.subscription_root / f"{device_id}{suffix}").is_file()
 
         if (
@@ -2719,11 +2726,11 @@ class Handler(BaseHTTPRequestHandler):
         if not sub_port or not host:
             return "", []
         base = "http://{}:{}/nexus/{}".format(_url_host(host), sub_port, token)
-        subscription_url = f"{base}.txt" if artifact_exists(".txt") else ""
+        subscription_url = f"{base}.txt" if artifact_exists(".txt", published=True) else ""
         urls = [
             {"format": fmt, "name": name, "url": f"{base}{suffix}"}
             for fmt, name, _route, suffix in specs
-            if artifact_exists(suffix)
+            if artifact_exists(suffix, published=True)
         ]
         return subscription_url, urls
 

@@ -188,11 +188,11 @@ def make_hy2(ps, port, hop_ports=""):
     hop_extra = ""
     if hop_ports:
         hop_extra = "&mport=" + hop_ports.replace(":", "-")
-    return f"hysteria2://{uuid}@{server_ip_uri}:{port}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256={cert_sha256}{hop_extra}#{ps}"
+    return f"hysteria2://{uuid}@{server_ip_uri}:{port}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256={cert_sha256}&obfs=salamander&obfs-password={uuid}{hop_extra}#{ps}"
 
 
 def make_tuic5(ps, port):
-    return f"tuic://{uuid}:{uuid}@{server_ip_uri}:{port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1#{ps}"
+    return f"tuic://{uuid}:{uuid}@{server_ip_uri}:{port}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&allow_insecure=1#{ps}"
 
 
 def make_anytls(ps, port):
@@ -318,6 +318,16 @@ for filename, content in (("jhsub.txt", sub_content), ("jhsub_encoded.txt", fina
     final_path = os.path.join(target_dir, filename)
     with open(temp_path, "w", encoding="utf-8") as output_file:
         output_file.write(content)
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, final_path)
+
+# 客户端拆分地址与通用订阅使用同一份刚更新的 URI；自动优选刷新后不能
+# 只更新 jhsub 而留下旧的 NekoBox/v2rayN/Shadowrocket 内容。
+for filename in ("client-v2rayn.txt", "client-v2rayng.txt", "client-sr.txt", "client-nekobox.txt"):
+    temp_path = os.path.join(target_dir, f".{filename}.{os.getpid()}.tmp")
+    final_path = os.path.join(target_dir, filename)
+    with open(temp_path, "w", encoding="utf-8") as output_file:
+        output_file.write(final_b64)
     os.chmod(temp_path, 0o600)
     os.replace(temp_path, final_path)
 
