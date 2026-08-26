@@ -37,13 +37,13 @@ sudo -i
 Install with curl (recommended):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
 ```
 
 Or use wget:
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh)
+bash <(wget -qO- "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
 ```
 
 Open the control panel:

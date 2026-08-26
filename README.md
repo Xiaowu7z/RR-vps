@@ -37,13 +37,13 @@ sudo -i
 使用 curl 安装（推荐）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
 ```
 
 没有 curl 时使用 wget：
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh)
+bash <(wget -qO- "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
 ```
 
 安装后打开管理面板：
