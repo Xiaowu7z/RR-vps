@@ -235,7 +235,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "6886993e37854c3d53336012ed0747925e46be86d0cfcc3410fe2d7f7ae95464" ]
+# [ "$actual" = "0b566e90b5ab3294e8399dbe3c41685d27ba76fd6e393f77bf061918cdd04fdc" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

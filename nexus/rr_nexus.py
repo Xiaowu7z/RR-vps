@@ -250,6 +250,172 @@ def expiry_epoch(value: str | None) -> int:
     return int(end.timestamp()) - 1
 
 
+PERSONAL_BASE64_SUFFIXES = (
+    "-v2rayn.txt",
+    "-v2rayng.txt",
+    "-sr.txt",
+    "-nekobox.txt",
+)
+PERSONAL_PROXY_TYPES = {
+    "vmess",
+    "vless",
+    "hysteria2",
+    "tuic",
+    "anytls",
+    "naive",
+    "trojan",
+    "shadowsocks",
+}
+
+
+def _subscription_value(device: Any, key: str, default: Any = None) -> Any:
+    try:
+        value = device[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _compact_bytes(value: int) -> str:
+    amount = max(0, int(value or 0))
+    for unit, divisor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2)):
+        if amount >= divisor:
+            number = amount / divisor
+            rendered = f"{number:.2f}".rstrip("0").rstrip(".")
+            return f"{rendered}{unit}"
+    return f"{amount / 1024:.1f}KB" if amount >= 1024 else f"{amount}B"
+
+
+def subscription_usage_name(device: Any) -> str:
+    """Compact live quota text used as the first, still-connectable proxy alias."""
+    used = max(0, int(_subscription_value(device, "used_bytes", 0) or 0))
+    quota = max(0, int(_subscription_value(device, "quota_bytes", 0) or 0))
+    remaining = _compact_bytes(max(0, quota - used)) if quota else "不限"
+    expiry = str(_subscription_value(device, "expires_at", "") or "长期有效")
+    return f"流量｜已用{_compact_bytes(used)}｜剩余{remaining}｜到期{expiry}"
+
+
+def _clone_uri_with_name(uri: str, name: str) -> str | None:
+    value = uri.strip()
+    if value.startswith("vmess://"):
+        try:
+            payload = value.removeprefix("vmess://")
+            decoded = base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_")
+            item = json.loads(decoded.decode("utf-8"))
+            if not isinstance(item, dict):
+                return None
+            item["ps"] = name
+            encoded = base64.b64encode(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            return "vmess://" + encoded
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {
+        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "trojan", "ss"
+    } or not parsed.netloc:
+        return None
+    return urllib.parse.urlunsplit(parsed._replace(fragment=urllib.parse.quote(name, safe="")))
+
+
+def _enrich_uri_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        info_uri = _clone_uri_with_name(line, name)
+        if info_uri:
+            return (info_uri + "\n" + "\n".join(lines) + "\n").encode("utf-8")
+    return raw
+
+
+def _enrich_base64_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        payload = b"".join(raw.split())
+        decoded = base64.b64decode(payload + b"=" * (-len(payload) % 4), altchars=b"-_")
+    except (ValueError, TypeError):
+        return raw
+    enriched = _enrich_uri_subscription(decoded, name)
+    if enriched == decoded:
+        return raw
+    return base64.b64encode(enriched)
+
+
+def _enrich_singbox_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    outbounds = payload.get("outbounds") if isinstance(payload, dict) else None
+    if not isinstance(outbounds, list):
+        return raw
+    source = next(
+        (
+            item for item in outbounds
+            if isinstance(item, dict) and str(item.get("type", "")) in PERSONAL_PROXY_TYPES
+        ),
+        None,
+    )
+    if source is None:
+        return raw
+    info = json.loads(json.dumps(source, ensure_ascii=False))
+    info["tag"] = name
+    outbounds.insert(0, info)
+    for item in outbounds:
+        if not isinstance(item, dict) or item.get("type") != "selector" or item.get("tag") != "proxy":
+            continue
+        choices = item.get("outbounds")
+        if isinstance(choices, list) and name not in choices:
+            choices.insert(0, name)
+    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _enrich_clash_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    header = re.search(r"(?m)^proxies:\s*$", text)
+    if not header:
+        return raw
+    first = re.search(
+        r"(?ms)^  - name:.*?(?=^  - name:|^proxy-groups:)",
+        text[header.end():],
+    )
+    if not first:
+        return raw
+    start = header.end() + first.start()
+    end = header.end() + first.end()
+    quoted = json.dumps(name, ensure_ascii=False)
+    clone = re.sub(r"(?m)^  - name:.*$", f"  - name: {quoted}", text[start:end], count=1)
+    enriched = text[:start] + clone + text[start:]
+    group = re.search(r"(?ms)^(proxy-groups:\n.*?^    proxies:\n)", enriched)
+    if group:
+        enriched = enriched[:group.end()] + f"      - {quoted}\n" + enriched[group.end():]
+    return enriched.encode("utf-8")
+
+
+def enrich_subscription_content(raw: bytes, filename: str, device: Any) -> bytes:
+    """Add a live, connectable first entry without modifying stored subscription files."""
+    lower = filename.lower()
+    name = subscription_usage_name(device)
+    if lower.endswith(PERSONAL_BASE64_SUFFIXES):
+        return _enrich_base64_subscription(raw, name)
+    if lower.endswith(".json"):
+        return _enrich_singbox_subscription(raw, name)
+    if lower.endswith(".yaml") or lower.endswith(".yml"):
+        return _enrich_clash_subscription(raw, name)
+    if lower.endswith(".txt"):
+        return _enrich_uri_subscription(raw, name)
+    return raw
+
+
 def json_compact(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -2712,8 +2878,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         mode = str(payload.get("count_mode", "both") or "both")
         interface = str(payload.get("interface_name", "") or "").strip()
+        calibrate_usage = "current_used_gb" in payload
+        current_used_gb = 0.0
+        if calibrate_usage:
+            try:
+                current_used_gb = float(payload.get("current_used_gb"))
+            except (TypeError, ValueError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_current_usage"})
+                return
         if quota_gb < 0 or quota_gb > MAX_SERVER_TRAFFIC_GB:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_server_quota"})
+            return
+        if calibrate_usage and (current_used_gb < 0 or current_used_gb > MAX_SERVER_TRAFFIC_GB):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_current_usage"})
             return
         if mode not in SERVER_TRAFFIC_MODES:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_traffic_mode"})
@@ -2721,6 +2898,9 @@ class Handler(BaseHTTPRequestHandler):
         if interface and interface not in network_interfaces():
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_network_interface"})
             return
+        # 先收齐保存前的最后一段网卡差值。若管理员校准当前已用量，随后
+        # 会以输入值重新立基线，避免把面板安装前的运营商用量漏掉或重复累加。
+        STATE.traffic.collect_server_traffic()
         quota_bytes = int(quota_gb * 1024**3)
         with STATE.store.connect() as db:
             old = db.execute(
@@ -2740,8 +2920,17 @@ class Handler(BaseHTTPRequestHandler):
                     utc_now(),
                 ),
             )
+            if calibrate_usage:
+                db.execute(
+                    "UPDATE server_traffic_policy SET received_bytes=0,transmitted_bytes=0,"
+                    "initial_used_bytes=?,last_interface='',last_rx_counter=NULL,last_tx_counter=NULL,"
+                    "updated_at=? WHERE id=1",
+                    (int(current_used_gb * 1024**3), utc_now()),
+                )
         STATE.traffic.collect_server_traffic()
         detail = f"quota_gb={quota_gb};mode={mode};interface={interface or 'auto'}"
+        if calibrate_usage:
+            detail += f";current_used_gb={current_used_gb}"
         STATE.store.audit(session["username"], "server_traffic_policy", "server", self.remote_ip, detail)
         self.send_json(HTTPStatus.OK, {"ok": True, "policy": server_traffic_snapshot(STATE.store)})
 
@@ -3259,7 +3448,11 @@ class Handler(BaseHTTPRequestHandler):
         if not inactive and not path.is_file():
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "subscription_not_found"})
             return
-        encoded = b"" if inactive else path.read_bytes()
+        encoded = (
+            b""
+            if inactive
+            else enrich_subscription_content(path.read_bytes(), path.name, device)
+        )
         alias = "RR-{}".format(device_id.removeprefix("dev_")[:8].upper())
         headers = {
             "Subscription-Userinfo": "upload={}; download={}; total={}; expire={}".format(

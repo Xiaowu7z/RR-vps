@@ -91,10 +91,10 @@
           <div class="panel-head"><div><span class="eyebrow">CARRIER PACKAGE</span><h3>服务器流量套餐</h3><p>直接读取公网网卡计数器，适配不同运营商的单向或双向计费。</p></div><span id="server-plan-state" class="live-badge pending"><i></i>等待采样</span></div>
           <form id="server-traffic-form" class="stack-form" autocomplete="off">
             <div class="form-row"><label>套餐总量（GB，0 为不限）<input id="server-plan-quota" type="number" min="0" max="1048576" step="0.1" value="0"></label><label>计费方式<select id="server-plan-mode"><option value="both">双向：服务器接收 RX + 发送 TX</option><option value="tx">单向：仅服务器发送 TX</option><option value="rx">单向：仅服务器接收 RX</option></select></label></div>
-            <label>统计网卡<select id="server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label>
+            <div class="form-row"><label>统计网卡<select id="server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label><label>校准当前已用（GB）<input id="server-plan-current" type="number" min="0" max="1048576" step="0.001" value="0"></label></div>
             <div class="device-traffic"><div><small>服务器接收 RX</small><b id="server-plan-rx">—</b></div><div><small>服务器发送 TX</small><b id="server-plan-tx">—</b></div><div class="traffic-total"><small>套餐已计费</small><b id="server-plan-used">—</b></div></div>
             <div class="quota-block"><div><small id="server-plan-cycle">计费周期尚未开始</small><span id="server-plan-remaining">未设置额度</span></div><div class="quota-track"><i id="server-plan-progress" data-w="0"></i></div></div>
-            <p class="form-hint">按 Linux 公网网卡实际字节累计，包含代理协议开销、SSH 与服务器自身网络请求，更接近运营商账单。这里只监控并告警，不会自动停掉整台服务器。</p>
+            <p class="form-hint">“校准当前已用”可随时填写运营商面板显示的已用流量；保存后以该数值重新立网卡基线，再继续自动累加。统计包含代理协议开销、SSH 与服务器自身网络请求，只监控告警，不会自动停掉整台服务器。</p>
             <div class="modal-actions"><button type="button" id="server-plan-reset" class="button ghost">开始新计费周期</button><button type="submit" class="button primary">保存套餐设置</button></div>
           </form>
         </article>
@@ -121,7 +121,7 @@
             <div class="panel-head"><div><span class="eyebrow">REMOTE CARRIER PACKAGE</span><h3>副服务器流量套餐</h3></div><span id="rs-server-plan-state" class="live-badge pending"><i></i>等待采样</span></div>
             <form id="rs-server-traffic-form" class="stack-form" autocomplete="off">
               <div class="form-row"><label>套餐总量（GB）<input id="rs-server-plan-quota" type="number" min="0" max="1048576" step="0.1" value="0"></label><label>计费方式<select id="rs-server-plan-mode"><option value="both">双向 RX + TX</option><option value="tx">单向仅 TX</option><option value="rx">单向仅 RX</option></select></label></div>
-              <label>统计网卡<select id="rs-server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label>
+              <div class="form-row"><label>统计网卡<select id="rs-server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label><label>校准当前已用（GB）<input id="rs-server-plan-current" type="number" min="0" max="1048576" step="0.001" value="0"></label></div>
               <div class="device-traffic"><div><small>接收 RX</small><b id="rs-server-plan-rx">—</b></div><div><small>发送 TX</small><b id="rs-server-plan-tx">—</b></div><div class="traffic-total"><small>已计费</small><b id="rs-server-plan-used">—</b></div></div>
               <div class="quota-block"><div><small id="rs-server-plan-cycle">计费周期尚未开始</small><span id="rs-server-plan-remaining">未设置额度</span></div><div class="quota-track"><i id="rs-server-plan-progress" data-w="0"></i></div></div>
               <div class="modal-actions"><button type="button" id="rs-server-plan-reset" class="button ghost">开始新周期</button><button type="submit" class="button primary">远程保存</button></div>
@@ -373,7 +373,7 @@
   </form></dialog>
 
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=21" defer></script>
+  <script src="/app.js?v=22" defer></script>
   <script src="/optimizer.js?v=10" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">

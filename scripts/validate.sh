@@ -396,6 +396,7 @@ init_output=$(printf '%s\n' 'StrongPassword123!' | \
     python3 nexus/rr_nexus.py --init-admin tester)
 [[ "$init_output" == RR_NEXUS_RECOVERY_CODES=* ]]
 PYTHONPATH="$argon2_stub" RR_NEXUS_CONFIG="$argon2_config" python3 - "$argon2_db" <<'PY'
+import base64
 import importlib.util
 import json
 import sqlite3
@@ -568,6 +569,42 @@ try:
                 "upload=123; download=456; total=1000; expire=1896134399"
             )
             assert response.headers["Profile-Update-Interval"] == "1"
+
+    # 有效订阅应在响应时动态插入一个可连接的信息节点，源文件保持不变。
+    # 覆盖 URI、NekoBox Base64、Sing-box JSON 与 mihomo YAML 四种结构，
+    # 其余拆分客户端与这四种结构共用同一转换路径。
+    info_raw = b"vless://id@example.com:443?security=reality#REAL\n"
+    info_json = json.dumps({
+        "outbounds": [
+            {"type": "vless", "tag": "REAL", "server": "example.com", "server_port": 443, "uuid": "id"},
+            {"type": "selector", "tag": "proxy", "default": "REAL", "outbounds": ["REAL"]},
+        ]
+    }).encode()
+    info_yaml = b'''proxies:\n  - name: "REAL"\n    type: vless\n    server: example.com\n    port: 443\n\nproxy-groups:\n  - name: select\n    type: select\n    proxies:\n      - "REAL"\n'''
+    (published_root / f"{device['subscription_token']}.txt").write_bytes(info_raw)
+    (published_root / f"{device['subscription_token']}-nekobox.txt").write_bytes(base64.b64encode(info_raw))
+    (published_root / f"{device['subscription_token']}.json").write_bytes(info_json)
+    (published_root / f"{device['subscription_token']}-mihomo.yaml").write_bytes(info_yaml)
+    url_by_format = {item["format"]: item["url"] for item in live_ip_urls}
+    with urllib.request.urlopen(url_by_format["通用链接"], timeout=2) as response:
+        info_text = response.read().decode()
+        assert info_text.count("vless://") == 2
+        assert "%E6%B5%81%E9%87%8F" in info_text.splitlines()[0]
+    with urllib.request.urlopen(url_by_format["NekoBox"], timeout=2) as response:
+        neko_text = base64.b64decode(response.read()).decode()
+        assert neko_text.count("vless://") == 2
+        assert "%E6%B5%81%E9%87%8F" in neko_text.splitlines()[0]
+    with urllib.request.urlopen(url_by_format["Sing-box 官方"], timeout=2) as response:
+        singbox_info = json.loads(response.read())
+        assert singbox_info["outbounds"][0]["tag"].startswith("流量｜已用")
+        assert singbox_info["outbounds"][0]["server"] == "example.com"
+        assert singbox_info["outbounds"][2]["outbounds"][0].startswith("流量｜已用")
+    with urllib.request.urlopen(url_by_format["mihomo"], timeout=2) as response:
+        clash_info = response.read().decode()
+        assert clash_info.index("流量｜已用") < clash_info.index("REAL")
+        assert clash_info.count("server: example.com") == 2
+    assert (published_root / f"{device['subscription_token']}.txt").read_bytes() == info_raw
+
     # 额度用尽后仍返回空订阅和用量头，让客户端更新剩余流量，同时节点已被撤销。
     with sqlite3.connect(sys.argv[1]) as connection:
         connection.execute("UPDATE devices SET used_bytes=quota_bytes WHERE id=?", (device["id"],))
@@ -797,6 +834,40 @@ with store.connect() as db:
         "SELECT received_bytes,transmitted_bytes FROM server_traffic_policy WHERE id=1"
     ).fetchone()
 assert host["received_bytes"] == 700 and host["transmitted_bytes"] == 1100
+
+# 管理员可在不重开计费周期的情况下校准当前已用量。校准会清零历史网卡
+# 差值并以输入值重立基线，后续采集只累加新流量；本地/远程共用该处理器。
+class PolicyTraffic:
+    def __init__(self):
+        self.calls = 0
+
+    def collect_server_traffic(self):
+        self.calls += 1
+
+policy_traffic = PolicyTraffic()
+module.STATE = SimpleNamespace(config=module.NexusConfig.load(), store=store, traffic=policy_traffic)
+policy_handler = object.__new__(module.Handler)
+policy_handler.client_address = ("127.0.0.1", 12345)
+policy_handler.headers = {}
+policy_handler.read_json = lambda: {
+    "quota_gb": 100,
+    "current_used_gb": 50,
+    "count_mode": "both",
+    "interface_name": "eth0",
+}
+policy_sent = []
+policy_handler.send_json = lambda status, body: policy_sent.append((status, body))
+module.network_interfaces = lambda: ["eth0"]
+try:
+    policy_handler.handle_update_server_traffic_policy({"username": "tester"})
+finally:
+    module.network_interfaces = real_interfaces
+assert policy_sent[-1][0] == module.HTTPStatus.OK
+assert policy_sent[-1][1]["policy"]["used_bytes"] == 50 * 1024**3
+assert policy_sent[-1][1]["policy"]["quota_bytes"] == 100 * 1024**3
+assert policy_sent[-1][1]["policy"]["received_bytes"] == 0
+assert policy_sent[-1][1]["policy"]["transmitted_bytes"] == 0
+assert policy_traffic.calls == 2
 PY
 rm -rf "$argon2_stub"
 
@@ -1053,6 +1124,10 @@ grep -Fq 'Subscription-Userinfo' nexus/rr_nexus.py nexus/sub_server.py
 grep -Fq 'QUOTA_AUTO_DELETE_SECONDS = 35 * 86400' nexus/rr_nexus.py
 grep -Fq 'id="server-traffic-form"' nexus/static/index.html
 grep -Fq 'id="rs-server-traffic-form"' nexus/static/index.html
+grep -Fq 'id="server-plan-current"' nexus/static/index.html
+grep -Fq 'id="rs-server-plan-current"' nexus/static/index.html
+grep -Fq 'current_used_gb' nexus/rr_nexus.py nexus/static/app.js
+grep -Fq 'enrich_subscription_content' nexus/rr_nexus.py nexus/sub_server.py
 grep -Fq 'name="reset_at"' nexus/static/index.html
 grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' nexus/static/app.js
 grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' modules/85-nexus.sh
@@ -1074,7 +1149,7 @@ grep -Fq 'v2rayN（Windows）· 全协议' nexus/rr_nexus.py
 grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
 grep -Fq 'SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive' nexus/rr_nexus.py
 grep -Fq 'id="rename-dialog"' nexus/static/index.html
-grep -Fq '/app.js?v=21' nexus/static/index.html
+grep -Fq '/app.js?v=22' nexus/static/index.html
 grep -Fq 'sync": "not_required"' nexus/rr_nexus.py
 if grep -Eq 'read[[:space:]].*(-t|--timeout)|(^|[[:space:]])TMOUT=' rr modules/99-menus.sh; then
     echo "RR main menu contains an active input timeout and may drop an idle home page." >&2

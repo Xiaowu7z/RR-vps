@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import re
@@ -13,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 
 TOKEN_FILE_RE = re.compile(
@@ -28,6 +30,170 @@ def expiry_epoch(value: str | None) -> int:
         return 0
     end = datetime.combine(parsed + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
     return int(end.timestamp()) - 1
+
+
+PERSONAL_BASE64_SUFFIXES = (
+    "-v2rayn.txt",
+    "-v2rayng.txt",
+    "-sr.txt",
+    "-nekobox.txt",
+)
+PERSONAL_PROXY_TYPES = {
+    "vmess",
+    "vless",
+    "hysteria2",
+    "tuic",
+    "anytls",
+    "naive",
+    "trojan",
+    "shadowsocks",
+}
+
+
+def _subscription_value(device: Any, key: str, default: Any = None) -> Any:
+    try:
+        value = device[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _compact_bytes(value: int) -> str:
+    amount = max(0, int(value or 0))
+    for unit, divisor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2)):
+        if amount >= divisor:
+            number = amount / divisor
+            rendered = f"{number:.2f}".rstrip("0").rstrip(".")
+            return f"{rendered}{unit}"
+    return f"{amount / 1024:.1f}KB" if amount >= 1024 else f"{amount}B"
+
+
+def subscription_usage_name(device: Any) -> str:
+    used = max(0, int(_subscription_value(device, "used_bytes", 0) or 0))
+    quota = max(0, int(_subscription_value(device, "quota_bytes", 0) or 0))
+    remaining = _compact_bytes(max(0, quota - used)) if quota else "不限"
+    expiry = str(_subscription_value(device, "expires_at", "") or "长期有效")
+    return f"流量｜已用{_compact_bytes(used)}｜剩余{remaining}｜到期{expiry}"
+
+
+def _clone_uri_with_name(uri: str, name: str) -> str | None:
+    value = uri.strip()
+    if value.startswith("vmess://"):
+        try:
+            payload = value.removeprefix("vmess://")
+            decoded = base64.b64decode(payload + "=" * (-len(payload) % 4), altchars=b"-_")
+            item = json.loads(decoded.decode("utf-8"))
+            if not isinstance(item, dict):
+                return None
+            item["ps"] = name
+            encoded = base64.b64encode(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            return "vmess://" + encoded
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme not in {
+        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "trojan", "ss"
+    } or not parsed.netloc:
+        return None
+    return urllib.parse.urlunsplit(parsed._replace(fragment=urllib.parse.quote(name, safe="")))
+
+
+def _enrich_uri_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        info_uri = _clone_uri_with_name(line, name)
+        if info_uri:
+            return (info_uri + "\n" + "\n".join(lines) + "\n").encode("utf-8")
+    return raw
+
+
+def _enrich_base64_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        payload = b"".join(raw.split())
+        decoded = base64.b64decode(payload + b"=" * (-len(payload) % 4), altchars=b"-_")
+    except (ValueError, TypeError):
+        return raw
+    enriched = _enrich_uri_subscription(decoded, name)
+    if enriched == decoded:
+        return raw
+    return base64.b64encode(enriched)
+
+
+def _enrich_singbox_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    outbounds = payload.get("outbounds") if isinstance(payload, dict) else None
+    if not isinstance(outbounds, list):
+        return raw
+    source = next(
+        (
+            item for item in outbounds
+            if isinstance(item, dict) and str(item.get("type", "")) in PERSONAL_PROXY_TYPES
+        ),
+        None,
+    )
+    if source is None:
+        return raw
+    info = json.loads(json.dumps(source, ensure_ascii=False))
+    info["tag"] = name
+    outbounds.insert(0, info)
+    for item in outbounds:
+        if not isinstance(item, dict) or item.get("type") != "selector" or item.get("tag") != "proxy":
+            continue
+        choices = item.get("outbounds")
+        if isinstance(choices, list) and name not in choices:
+            choices.insert(0, name)
+    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _enrich_clash_subscription(raw: bytes, name: str) -> bytes:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    header = re.search(r"(?m)^proxies:\s*$", text)
+    if not header:
+        return raw
+    first = re.search(
+        r"(?ms)^  - name:.*?(?=^  - name:|^proxy-groups:)",
+        text[header.end():],
+    )
+    if not first:
+        return raw
+    start = header.end() + first.start()
+    end = header.end() + first.end()
+    quoted = json.dumps(name, ensure_ascii=False)
+    clone = re.sub(r"(?m)^  - name:.*$", f"  - name: {quoted}", text[start:end], count=1)
+    enriched = text[:start] + clone + text[start:]
+    group = re.search(r"(?ms)^(proxy-groups:\n.*?^    proxies:\n)", enriched)
+    if group:
+        enriched = enriched[:group.end()] + f"      - {quoted}\n" + enriched[group.end():]
+    return enriched.encode("utf-8")
+
+
+def enrich_subscription_content(raw: bytes, filename: str, device: Any) -> bytes:
+    lower = filename.lower()
+    name = subscription_usage_name(device)
+    if lower.endswith(PERSONAL_BASE64_SUFFIXES):
+        return _enrich_base64_subscription(raw, name)
+    if lower.endswith(".json"):
+        return _enrich_singbox_subscription(raw, name)
+    if lower.endswith(".yaml") or lower.endswith(".yml"):
+        return _enrich_clash_subscription(raw, name)
+    if lower.endswith(".txt"):
+        return _enrich_uri_subscription(raw, name)
+    return raw
 
 
 def load_database_path(config_path: Path) -> Path | None:
@@ -118,8 +284,20 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             return io.BytesIO(b"")
 
-        self._subscription_headers = headers
-        return super().send_head()
+        file_path = Path(self.translate_path(self.path))
+        try:
+            raw = file_path.read_bytes()
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "subscription not found")
+            return None
+        body = enrich_subscription_content(raw, file_path.name, device)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", self.guess_type(str(file_path)))
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        return io.BytesIO(body)
 
     def end_headers(self) -> None:
         for key, value in getattr(self, "_subscription_headers", {}).items():

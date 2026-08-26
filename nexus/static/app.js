@@ -21,6 +21,7 @@ function errorText(code) {
     invalid_expiry: "到期日期格式不正确。",
     invalid_reset_schedule: "自动重置计划无效：日期不能早于今天，次数应为 1–120。",
     invalid_server_quota: "服务器套餐额度无效。",
+    invalid_current_usage: "服务器当前已用流量无效。",
     invalid_traffic_mode: "服务器流量计费方式无效。",
     invalid_network_interface: "所选网卡不存在，请重新选择。",
     invalid_initial_usage: "运营商当前已用流量无效。",
@@ -292,6 +293,7 @@ function renderServerPlan(plan, prefix = "") {
   const quotaInput = id("server-plan-quota");
   const modeInput = id("server-plan-mode");
   const interfaceInput = id("server-plan-interface");
+  const currentInput = id("server-plan-current");
   const form = id("server-traffic-form");
   const editing = form && form.contains(document.activeElement);
   if (!editing) {
@@ -300,6 +302,9 @@ function renderServerPlan(plan, prefix = "") {
     const selected = plan.interface_name || "";
     interfaceInput.innerHTML = '<option value="">自动识别公网默认网卡</option>' + (plan.interfaces || []).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
     interfaceInput.value = selected;
+    const currentGb = (Number(plan.used_bytes || 0) / 1024 ** 3).toFixed(3);
+    currentInput.value = currentGb;
+    currentInput.dataset.original = currentGb;
   }
   id("server-plan-rx").textContent = formatBytes(plan.received_bytes || 0);
   id("server-plan-tx").textContent = formatBytes(plan.transmitted_bytes || 0);
@@ -319,17 +324,29 @@ function renderServerPlan(plan, prefix = "") {
 async function saveServerPlan(event, remote = false) {
   event.preventDefault();
   const prefix = remote ? "rs-" : "";
+  const currentInput = $(`#${prefix}server-plan-current`);
+  const currentUsed = Number(currentInput.value);
+  if (!Number.isFinite(currentUsed) || currentUsed < 0 || currentUsed > 1048576) {
+    toast("当前已用流量应为有效的 GB 数值。", true);
+    return;
+  }
   const payload = {
     quota_gb: Number($(`#${prefix}server-plan-quota`).value || 0),
     count_mode: $(`#${prefix}server-plan-mode`).value,
     interface_name: $(`#${prefix}server-plan-interface`).value,
   };
+  if (currentInput.value !== (currentInput.dataset.original || "")) payload.current_used_gb = currentUsed;
   try {
     const result = remote
       ? await rsRemoteApi("PATCH", "/api/server/traffic-policy", payload)
       : await api("/api/server/traffic-policy", { method: "PATCH", body: payload });
+    if (Object.prototype.hasOwnProperty.call(payload, "current_used_gb")) {
+      currentInput.dataset.original = currentInput.value;
+    }
     renderServerPlan(result.policy || {}, prefix);
-    toast(remote ? "副服务器套餐设置已保存。" : "服务器套餐设置已保存。");
+    toast(Object.prototype.hasOwnProperty.call(payload, "current_used_gb")
+      ? (remote ? "副服务器套餐及当前已用量已校准。" : "服务器套餐及当前已用量已校准。")
+      : (remote ? "副服务器套餐设置已保存。" : "服务器套餐设置已保存。"));
   } catch (error) { toast(error.message, true); }
 }
 
