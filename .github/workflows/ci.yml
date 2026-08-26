@@ -26,6 +26,38 @@ jobs:
           sudo apt-get install -y shellcheck
           shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh
 
+      - name: Update guard compatibility contract
+        run: |
+          set -euo pipefail
+          bash -n install.sh scripts/install-core.sh scripts/update-guard.sh
+          grep -Fq 'RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"' install.sh
+          grep -Fq 'RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"' install.sh
+          grep -Fq '61-update-guard.sh' install.sh
+          grep -Fq '^RR_UPDATE_GUARD_VERSION=' scripts/update-guard.sh
+          grep -Fq '^check_update() {' scripts/update-guard.sh
+          grep -Fq '^do_update() {' scripts/update-guard.sh
+          grep -Fq 'bash "$bootstrap_tmp" --upgrade' scripts/update-guard.sh
+          if grep -Eq 'rr_manifest_is_valid|rr_bundle_(archive|tree)_is_valid|tar[[:space:]].*rr-bundle' scripts/update-guard.sh; then
+            echo 'Update guard must never parse manifest file types or bundle members.' >&2
+            exit 1
+          fi
+
+          guard_tmp=$(mktemp -d)
+          trap 'rm -rf "$guard_tmp"' EXIT
+          # shellcheck disable=SC1091
+          source scripts/update-guard.sh
+          RR_LOCAL_MANIFEST="$guard_tmp/local.manifest"
+          remote_manifest="$guard_tmp/remote.manifest"
+          printf '%s\n' 'old-format-entry' > "$RR_LOCAL_MANIFEST"
+          cp "$RR_LOCAL_MANIFEST" "$remote_manifest"
+          rr_update_guard_download() { cp "$remote_manifest" "$2"; }
+          check_update
+          [ "$UPDATE_CHECK_STATE" = latest ]
+          printf '%s\n' 'old-format-entry' 'future/new/type/file.xyz' > "$remote_manifest"
+          check_update
+          [ "$UPDATE_CHECK_STATE" = available ]
+          [ "$UPDATE_AVAILABLE" = true ]
+
       - name: Python syntax
         run: |
           python3 -m py_compile nexus/rr_nexus.py scripts/rebuild-bundle.py
