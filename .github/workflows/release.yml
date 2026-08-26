@@ -4,6 +4,9 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,16 +18,24 @@ concurrency:
 jobs:
   publish:
     if: >-
-      github.event.workflow_run.event == 'push' &&
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'success'
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
           fetch-depth: 0
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh
 
       - name: Resolve and verify release
         id: release
@@ -34,9 +45,10 @@ jobs:
           version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' modules/00-runtime.sh)
           [[ -n "$version" ]]
           grep -Fq "## ${version} -" CHANGELOG.md
-          python3 scripts/rebuild-bundle.py --check
+          bash scripts/pre-push-test.sh
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           sha256sum rr-bundle.tar.gz
 
           awk -v prefix="## ${version} " '
@@ -60,6 +72,6 @@ jobs:
           fi
           gh release create "$TAG" rr-bundle.tar.gz \
             --repo "$GITHUB_REPOSITORY" \
-            --target "${{ github.event.workflow_run.head_sha }}" \
+            --target "${{ steps.release.outputs.sha }}" \
             --title "RR-vps ${VERSION} 正式版" \
             --notes-file release-notes.md
