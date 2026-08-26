@@ -47,13 +47,13 @@ jobs:
           # shellcheck disable=SC1091
           source scripts/update-guard.sh
           RR_LOCAL_MANIFEST="$guard_tmp/local.manifest"
-          remote_manifest="$guard_tmp/remote.manifest"
+          remote_fixture="$guard_tmp/remote.fixture"
           printf '%s\n' 'old-format-entry' > "$RR_LOCAL_MANIFEST"
-          cp "$RR_LOCAL_MANIFEST" "$remote_manifest"
-          rr_update_guard_download() { cp "$remote_manifest" "$2"; }
+          cp "$RR_LOCAL_MANIFEST" "$remote_fixture"
+          rr_update_guard_download() { cp "$remote_fixture" "$2"; }
           check_update
           [ "$UPDATE_CHECK_STATE" = latest ]
-          printf '%s\n' 'old-format-entry' 'future/new/type/file.xyz' > "$remote_manifest"
+          printf '%s\n' 'old-format-entry' 'future/new/type/file.xyz' > "$remote_fixture"
           check_update
           [ "$UPDATE_CHECK_STATE" = available ]
           [ "$UPDATE_AVAILABLE" = true ]
