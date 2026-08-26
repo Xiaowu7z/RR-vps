@@ -5,8 +5,6 @@ on:
     workflows: [CI]
     types: [completed]
   workflow_dispatch:
-  issues:
-    types: [opened]
 
 permissions:
   contents: write
@@ -19,8 +17,6 @@ jobs:
   publish:
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issues' &&
-      github.event.issue.title == '[release] RR-vps v7.0.3') ||
       (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.conclusion == 'success')
