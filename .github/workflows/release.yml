@@ -4,8 +4,6 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -18,7 +16,6 @@ concurrency:
 jobs:
   publish:
     if: >-
-      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main' &&
