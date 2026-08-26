@@ -33,9 +33,9 @@ jobs:
           grep -Fq 'RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"' install.sh
           grep -Fq 'RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"' install.sh
           grep -Fq '61-update-guard.sh' install.sh
-          grep -Fq '^RR_UPDATE_GUARD_VERSION=' scripts/update-guard.sh
-          grep -Fq '^check_update() {' scripts/update-guard.sh
-          grep -Fq '^do_update() {' scripts/update-guard.sh
+          grep -q '^RR_UPDATE_GUARD_VERSION=' scripts/update-guard.sh
+          grep -q '^check_update() {' scripts/update-guard.sh
+          grep -q '^do_update() {' scripts/update-guard.sh
           grep -Fq 'bash "$bootstrap_tmp" --upgrade' scripts/update-guard.sh
           if grep -Eq 'rr_manifest_is_valid|rr_bundle_(archive|tree)_is_valid|tar[[:space:]].*rr-bundle' scripts/update-guard.sh; then
             echo 'Update guard must never parse manifest file types or bundle members.' >&2
