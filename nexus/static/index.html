@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>RR Nexus · 星枢</title>
-  <link rel="stylesheet" href="/app.css?v=3">
+  <link rel="stylesheet" href="/app.css?v=4">
   <link rel="stylesheet" href="/optimizer.css?v=5">
 </head>
 <body>
@@ -87,6 +87,17 @@
           <article class="traffic-metric glass download-card"><small>累计下载</small><strong id="traffic-download">—</strong><span id="traffic-download-rate">↓ —/s</span></article>
           <article class="traffic-metric glass total-card"><small>累计总流量</small><strong id="traffic-total">—</strong><span>所有设备合计</span></article>
         </div>
+        <article class="panel glass server-traffic-policy">
+          <div class="panel-head"><div><span class="eyebrow">CARRIER PACKAGE</span><h3>服务器流量套餐</h3><p>直接读取公网网卡计数器，适配不同运营商的单向或双向计费。</p></div><span id="server-plan-state" class="live-badge pending"><i></i>等待采样</span></div>
+          <form id="server-traffic-form" class="stack-form" autocomplete="off">
+            <div class="form-row"><label>套餐总量（GB，0 为不限）<input id="server-plan-quota" type="number" min="0" max="1048576" step="0.1" value="0"></label><label>计费方式<select id="server-plan-mode"><option value="both">双向：服务器接收 RX + 发送 TX</option><option value="tx">单向：仅服务器发送 TX</option><option value="rx">单向：仅服务器接收 RX</option></select></label></div>
+            <label>统计网卡<select id="server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label>
+            <div class="device-traffic"><div><small>服务器接收 RX</small><b id="server-plan-rx">—</b></div><div><small>服务器发送 TX</small><b id="server-plan-tx">—</b></div><div class="traffic-total"><small>套餐已计费</small><b id="server-plan-used">—</b></div></div>
+            <div class="quota-block"><div><small id="server-plan-cycle">计费周期尚未开始</small><span id="server-plan-remaining">未设置额度</span></div><div class="quota-track"><i id="server-plan-progress" data-w="0"></i></div></div>
+            <p class="form-hint">按 Linux 公网网卡实际字节累计，包含代理协议开销、SSH 与服务器自身网络请求，更接近运营商账单。这里只监控并告警，不会自动停掉整台服务器。</p>
+            <div class="modal-actions"><button type="button" id="server-plan-reset" class="button ghost">开始新计费周期</button><button type="submit" class="button primary">保存套餐设置</button></div>
+          </form>
+        </article>
         <article class="panel glass traffic-chart-panel"><div class="panel-head"><div><span class="eyebrow">24-HOUR WINDOW</span><h3>上下行趋势</h3></div><div class="legend"><span class="upload">上传</span><span class="download">下载</span></div></div><div class="chart-wrap large"><canvas id="traffic-chart"></canvas><div id="traffic-chart-empty" class="chart-empty">暂时没有统计样本</div></div></article>
         <article class="panel glass ranking-panel"><div class="panel-head"><div><span class="eyebrow">PER DEVICE</span><h3>设备流量排行</h3></div><small id="ranking-count">0 个设备</small></div><div class="table-scroll"><table class="data-table"><thead><tr><th>设备</th><th>状态</th><th>上传</th><th>下载</th><th>总流量</th><th>额度</th><th>最近统计</th></tr></thead><tbody id="traffic-ranking"></tbody></table></div><div id="traffic-ranking-empty" class="table-empty hidden">创建设备并产生流量后，会在这里逐项显示。</div></article>
       </section>
@@ -106,6 +117,16 @@
         <div id="rs-detail" class="hidden">
           <div class="section-toolbar"><div><span class="eyebrow">REMOTE CONTROL</span><h2 id="rs-detail-title">远程服务器</h2><p id="rs-detail-sub"></p></div><div class="toolbar-actions"><button class="button ghost" id="rs-update-btn" title="检查该服务器脚本版本并远程升级">🔄 检查更新</button><button class="button primary" id="rs-device-add">＋ 添加设备</button><button class="button ghost" id="rs-back">← 返回总览</button></div></div>
           <div id="rs-update-box" class="rs-update-box hidden"></div>
+          <article id="rs-server-plan" class="panel glass server-traffic-policy">
+            <div class="panel-head"><div><span class="eyebrow">REMOTE CARRIER PACKAGE</span><h3>副服务器流量套餐</h3></div><span id="rs-server-plan-state" class="live-badge pending"><i></i>等待采样</span></div>
+            <form id="rs-server-traffic-form" class="stack-form" autocomplete="off">
+              <div class="form-row"><label>套餐总量（GB）<input id="rs-server-plan-quota" type="number" min="0" max="1048576" step="0.1" value="0"></label><label>计费方式<select id="rs-server-plan-mode"><option value="both">双向 RX + TX</option><option value="tx">单向仅 TX</option><option value="rx">单向仅 RX</option></select></label></div>
+              <label>统计网卡<select id="rs-server-plan-interface"><option value="">自动识别公网默认网卡</option></select></label>
+              <div class="device-traffic"><div><small>接收 RX</small><b id="rs-server-plan-rx">—</b></div><div><small>发送 TX</small><b id="rs-server-plan-tx">—</b></div><div class="traffic-total"><small>已计费</small><b id="rs-server-plan-used">—</b></div></div>
+              <div class="quota-block"><div><small id="rs-server-plan-cycle">计费周期尚未开始</small><span id="rs-server-plan-remaining">未设置额度</span></div><div class="quota-track"><i id="rs-server-plan-progress" data-w="0"></i></div></div>
+              <div class="modal-actions"><button type="button" id="rs-server-plan-reset" class="button ghost">开始新周期</button><button type="submit" class="button primary">远程保存</button></div>
+            </form>
+          </article>
           <div id="rs-device-grid" class="device-grid"></div>
           <div id="rs-device-empty" class="empty-state glass hidden"><span>◇</span><h3>该服务器还没有设备</h3><p>点击上方「添加设备」远程创建。</p></div>
         </div>
@@ -192,7 +213,7 @@
           <div id="ssh-guide" class="ssh-guide">
             <div class="guide-title"><span class="step-number">1</span><div><b>在你自己的电脑打开终端</b><small>Windows 打开 PowerShell；macOS / Linux 打开“终端”。不要在 VPS 当前窗口执行。</small></div></div>
             <div class="command-box"><code id="ssh-command">正在生成 SSH 命令…</code><button id="copy-ssh-command" class="copy-button">复制命令</button></div>
-            <div class="guide-steps"><div><span class="step-number">2</span><p><b>粘贴命令并回车</b><small>看到 <code>root@服务器IP's password:</code> 后，输入服务器 root 密码再回车。密码输入时不显示字符是正常的。</small></p></div><div><span class="step-number">3</span><p><b>保持终端窗口不要关闭</b><small>隧道成功后终端通常保持空白。打开 <a id="local-panel-link" href="http://127.0.0.1:7900" target="_blank" rel="noopener">http://127.0.0.1:7900</a>；用完按 Ctrl+C。</small></p></div></div>
+            <div class="guide-steps"><div><span class="step-number">2</span><p><b>粘贴命令并回车</b><small>看到 <code>root@服务器IP's password:</code> 后，输入服务器 root 密码再回车。密码输入时不显示字符是正常的。</small></p></div><div><span class="step-number">3</span><p><b>保持终端窗口不要关闭</b><small>隧道成功后终端通常保持空白。命令每 30 秒发送保活探测，连续 6 次无响应才退出；打开 <a id="local-panel-link" href="http://127.0.0.1:7900" target="_blank" rel="noopener">http://127.0.0.1:7900</a>，用完按 Ctrl+C。</small></p></div></div>
           </div>
           <div id="public-guide" class="public-guide hidden"><b>公网面板地址</b><a id="public-panel-link" href="#" target="_blank" rel="noopener">尚未配置域名</a><small>证书、域名和模式切换请在服务器终端运行 <code>rr</code>，进入 RR Nexus 菜单操作。</small></div>
         </article>
@@ -304,9 +325,20 @@
       <div class="modal-head"><div><span class="eyebrow">NEW IDENTITY</span><h2>添加设备</h2></div><button type="button" class="close-button" data-close-dialog>×</button></div>
       <label>设备备注<input name="name" maxlength="64" placeholder="例如：主力手机" required></label>
       <div class="form-row"><label>额度（GB，0 为不限，支持小数如 0.1 = 100MB）<input name="quota_gb" type="number" min="0" max="10240" step="0.1" value="0"></label><label>到期日期（可选）<input name="expires_at" type="date"></label></div>
-      <p class="form-hint">创建后会生成全新的独立凭据，并同步到所有已启用协议。</p>
+      <div class="form-row"><label>首次自动重置日（可选）<input name="reset_at" type="date"></label><label>每月自动重置次数（0 为关闭）<input name="reset_max" type="number" min="0" max="120" step="1" value="0"></label></div>
+      <p class="form-hint">设置自动重置后，每到对应日期已用流量归零、额度保持不变；次数代表续期月数，系统自动计算最终到期日。未设置时使用上方手动到期日期。</p>
       <p id="device-form-error" class="form-error" role="alert"></p>
       <div class="modal-actions"><button type="button" class="button ghost" data-close-dialog>取消</button><button type="submit" class="button primary">创建并同步</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="rename-dialog" class="modal glass">
+    <form id="rename-form" class="stack-form" autocomplete="off">
+      <div class="modal-head"><div><span class="eyebrow">ADMIN NOTE</span><h2>修改设备备注</h2></div><button type="button" class="close-button" data-close-rename>×</button></div>
+      <label>设备备注<input id="rename-input" name="name" maxlength="64" placeholder="例如：主力手机" required></label>
+      <p class="form-hint">备注只保存在管理面板，方便管理员区分设备；不会写入订阅地址、二维码或客户端节点名称。</p>
+      <p id="rename-form-error" class="form-error" role="alert"></p>
+      <div class="modal-actions"><button type="button" class="button ghost" data-close-rename>取消</button><button type="submit" id="rename-submit" class="button primary">保存备注</button></div>
     </form>
   </dialog>
 
@@ -323,7 +355,9 @@
       <p class="form-hint">设备：<b id="reset-device-name"></b></p>
       <p class="form-hint">当前用量：<b id="reset-current"></b></p>
       <label>新额度（GB，留空保持原额度，0 为不限）<input id="reset-quota-input" name="quota_gb" type="number" min="0" max="10240" step="0.1" placeholder="留空保持原额度"></label>
-      <p class="form-hint">支持小数：0.1 GB = 100 MB。重置后已用流量归零，设备立即恢复访问，自动删除倒计时取消。</p>
+      <div class="form-row"><label>首次/下次自动重置日<input id="reset-at-input" name="reset_at" type="date"></label><label>自动重置总次数<input id="reset-max-input" name="reset_max" type="number" min="0" max="120" step="1" value="0"></label></div>
+      <label>手动到期日（关闭自动重置时使用）<input id="reset-expiry-input" name="expires_at" type="date"></label>
+      <p class="form-hint">重置后已用流量归零并立即恢复访问。自动计划按自然月执行，31 日会自动落到当月最后一天；次数用完后按系统计算的最终日期到期。两项自动计划都留空/0 即关闭计划。</p>
       <p id="reset-form-error" class="form-error" role="alert"></p>
       <div class="modal-actions"><button type="button" class="button ghost" data-close-reset>取消</button><button type="submit" id="reset-submit" class="button primary">重置并同步</button></div>
     </form>
@@ -339,7 +373,7 @@
   </form></dialog>
 
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=19" defer></script>
+  <script src="/app.js?v=21" defer></script>
   <script src="/optimizer.js?v=10" defer></script>
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
@@ -353,4 +387,3 @@
 
 </body>
 </html>
-

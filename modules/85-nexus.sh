@@ -65,7 +65,7 @@ nexus_show_local_tutorial() {
     [[ "$ssh_host" == *:* ]] && ssh_host="[$ssh_host]"
     echo -e "${CYAN}============ 本地模式连接教程（每次打开面板前执行） ============${RESET}"
     echo -e "${YELLOW}1. 在你自己的电脑终端（不是当前 VPS SSH 窗口）执行：${RESET}"
-    echo -e "${GREEN}ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L ${tunnel_port}:127.0.0.1:7900 root@${ssh_host}${RESET}"
+    echo -e "${GREEN}ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${tunnel_port}:127.0.0.1:7900 root@${ssh_host}${RESET}"
     echo -e "${YELLOW}2. 输入服务器 root 密码（屏幕不显示字符是正常的安全行为）。${RESET}"
     echo -e "${YELLOW}3. 保持该终端窗口打开，再用浏览器访问：${RESET}${CYAN}http://127.0.0.1:${tunnel_port}${RESET}"
     echo -e "${YELLOW}4. 用完按 Ctrl+C 关闭隧道；终端一关，面板本地访问也会断开。${RESET}"
@@ -363,6 +363,7 @@ PY
     local device_name=""
     local sub_token=""
     local display_name=""
+    local node_alias=""
     local all_links=""
     local link=""
     local active_ids="|"
@@ -373,17 +374,22 @@ PY
     while IFS=$'\t' read -r device_id credential device_name sub_token; do
         [[ "$device_id" =~ ^dev_[a-f0-9]{12}$ ]] || continue
         is_valid_uuid "$credential" || continue
-        display_name=$(jq -nr --arg value "$device_name" '$value|@uri')
+        # 设备备注只供管理员在面板辨认，绝不进入客户端订阅。设备 ID 本身由
+        # 12 位随机十六进制生成，取前 8 位作为稳定且不可读出备注的节点别名。
+        node_alias="RR-${device_id#dev_}"
+        node_alias="${node_alias:0:11}"
+        node_alias=$(printf '%s' "$node_alias" | tr '[:lower:]' '[:upper:]')
+        display_name=$(jq -nr --arg value "$node_alias" '$value|@uri')
         all_links=""
 
         if [ "$VM_ENABLED" != "false" ]; then
             local vm_json=""
             if [ "$VM_TLS_ENABLED" = "true" ]; then
-                vm_json=$(jq -nc --arg name "VMess · $device_name" --arg add "$server_raw" \
+                vm_json=$(jq -nc --arg name "VMess · $node_alias" --arg add "$server_raw" \
                     --arg port "$PORT" --arg id "$credential" --arg path "/${UUID}-vm" \
                     '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:"www.bing.com",path:$path,tls:"tls",sni:"www.bing.com",fp:"chrome",allowInsecure:"1",insecure:"1"}')
             else
-                vm_json=$(jq -nc --arg name "VMess Argo · $device_name" --arg add "$CDN_IP" \
+                vm_json=$(jq -nc --arg name "VMess Argo · $node_alias" --arg add "$CDN_IP" \
                     --arg port "$ARGO_EDGE_PORT" --arg id "$credential" --arg host "$ARGO_DOMAIN" \
                     --arg path "/${UUID}-vm" \
                     '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}')
@@ -395,7 +401,7 @@ PY
                 local pref_add="" pref_index=1
                 while IFS= read -r pref_add; do
                     [ -n "$pref_add" ] || continue
-                    vm_json=$(jq -nc --arg name "VMess Argo优选${pref_index} · $device_name" --arg add "$pref_add" \
+                    vm_json=$(jq -nc --arg name "VMess Argo优选${pref_index} · $node_alias" --arg add "$pref_add" \
                         --arg port "$ARGO_EDGE_PORT" --arg id "$credential" --arg host "$ARGO_DOMAIN" \
                         --arg path "/${UUID}-vm" \
                         '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}')
@@ -448,11 +454,11 @@ $link"
             local ndev_ou="$device_id"
             local ndev_op=""
             ndev_op=$(nexus_device_naive_password "$device_id") || ndev_op="$NAIVE_PASS"
-            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
+            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
                 generate_client_json "$server_raw" 2>/dev/null; then
                 nexus_atomic_copy "$device_sub_dir/client.json" "$NEXUS_SUB_ROOT/${device_id}.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                # sing-box 官方客户端：单独 VL Reality（五哥指定，最大保活）
-                if RR_CLIENT_UUID_OVERRIDE="$credential" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
+                # 旧版 Reality 单节点地址继续生成，仅用于已有订阅平滑热更。
+                if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
                     generate_client_json "$server_raw" vless 2>/dev/null; then
                     nexus_atomic_copy "$device_sub_dir/client-vl.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
                 else
@@ -478,11 +484,16 @@ $link"
                 nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-sr.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
                 nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
             fi
-            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
-                generate_clash_yaml "$server_raw" 2>/dev/null; then
+            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
+                generate_clash_yaml "$server_raw" 2>/dev/null && \
+                RR_CLIENT_UUID_OVERRIDE="$credential" RR_SUB_OUTPUT_DIR="$device_sub_dir" generate_clash_client_copies 2>/dev/null; then
                 nexus_atomic_copy "$device_sub_dir/clash_meta.yaml" "$NEXUS_SUB_ROOT/${device_id}.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                nexus_atomic_copy "$device_sub_dir/client-mihomo.yaml" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                nexus_atomic_copy "$device_sub_dir/client-clash-verge.yaml" "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
+                nexus_atomic_copy "$device_sub_dir/client-flclash.yaml" "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
             else
-                rm -f "$NEXUS_SUB_ROOT/${device_id}.yaml"
+                rm -f "$NEXUS_SUB_ROOT/${device_id}.yaml" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" \
+                    "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml"
             fi
             rm -rf "$device_sub_dir"
         fi
@@ -494,7 +505,7 @@ $link"
             # 逐格式同步；新一轮未生成的格式必须同时删除旧发布副本，避免
             # 个人地址/二维码继续返回上一次配置的陈旧内容。
             local _split_sfx=""
-            for _split_sfx in ".json" ".yaml" "-vl.json" "-v2rayn.txt" "-v2rayng.txt" "-sr.txt" "-nekobox.txt"; do
+            for _split_sfx in ".json" ".yaml" "-vl.json" "-mihomo.yaml" "-clash-verge.yaml" "-flclash.yaml" "-v2rayn.txt" "-v2rayng.txt" "-sr.txt" "-nekobox.txt"; do
                 if [ -f "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" ]; then
                     nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" "$nexus_pub_dir/${sub_token}${_split_sfx}" || { rm -f "$rows_file"; return 1; }
                 else
@@ -511,7 +522,7 @@ $link"
     for existing_file in "$NEXUS_SUB_ROOT"/dev_*.txt; do
         [ -f "$existing_file" ] || continue
         device_id=$(basename "$existing_file" .txt)
-        # 跳过按客户端拆分的订阅文件（-v2rayn/-v2rayng/-sr/-nekobox）
+        # 跳过按客户端拆分的订阅文件。
         case "$device_id" in
             *-v2rayn|*-v2rayng|*-sr|*-nekobox) continue ;;
         esac
@@ -519,7 +530,8 @@ $link"
             # 同步删除按客户端拆分的订阅文件（-vl/-v2rayn/-v2rayng/-sr/-nekobox），
             # 旧实现只删 .txt/.json/.yaml，已删设备的拆分文件残留（D10）
             rm -f "$existing_file" "$NEXUS_SUB_ROOT/${device_id}.json" "$NEXUS_SUB_ROOT/${device_id}.yaml" \
-                "$NEXUS_SUB_ROOT/${device_id}-vl.json" "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" \
+                "$NEXUS_SUB_ROOT/${device_id}-vl.json" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" \
+                "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml" "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" \
                 "$NEXUS_SUB_ROOT/${device_id}-sr.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt"
         fi
     done
@@ -537,7 +549,8 @@ $link"
             esac
             if [[ "$active_tokens" != *"|${pub_token}|"* ]]; then
                 rm -f "$pub_file" "${SUB_ROOT}/nexus/${pub_token}.json" "${SUB_ROOT}/nexus/${pub_token}.yaml" \
-                    "${SUB_ROOT}/nexus/${pub_token}-vl.json" "${SUB_ROOT}/nexus/${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt" \
+                    "${SUB_ROOT}/nexus/${pub_token}-vl.json" "${SUB_ROOT}/nexus/${pub_token}-mihomo.yaml" "${SUB_ROOT}/nexus/${pub_token}-clash-verge.yaml" \
+                    "${SUB_ROOT}/nexus/${pub_token}-flclash.yaml" "${SUB_ROOT}/nexus/${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt" \
                     "${SUB_ROOT}/nexus/${pub_token}-sr.txt" "${SUB_ROOT}/nexus/${pub_token}-nekobox.txt"
             fi
         done
@@ -1147,6 +1160,8 @@ nexus_install() {
     local stats_port=""
     local domain=""
     local email=""
+    # 设备额度采用上下行合计；服务器套餐的双向/单向计费在面板内独立设置。
+    local traffic_mode_val="both"
     if [ "$choice" = "2" ]; then
         echo -e "${YELLOW}[建议] 域名模式推荐用 443 作为面板端口：访问网址无需带端口号，证书续签也更省事。${RESET}"
         echo -e "${YELLOW}        如果 443 已留给节点协议使用，可填写其他可用端口（面板将使用 HTTPS 独立端口）。${RESET}"

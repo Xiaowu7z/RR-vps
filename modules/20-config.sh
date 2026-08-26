@@ -630,7 +630,8 @@ outbound_mode_label() {
 }
 
 start_subscription_server() {
-    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}"
+    local sub_server_app="${RR_LIB_DIR}/nexus/sub_server.py"
+    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|userinfo-v1"
     local current_state=""
     local old_pid=""
 
@@ -651,7 +652,12 @@ start_subscription_server() {
     mkdir -p "$SUB_ROOT"
     (
         cd "$SUB_ROOT" || exit 1
-        nohup python3 -m http.server "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" >/dev/null 2>&1 &
+        if [ -s "$sub_server_app" ]; then
+            nohup python3 "$sub_server_app" "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" \
+                --directory "$SUB_ROOT" >/dev/null 2>&1 &
+        else
+            nohup python3 -m http.server "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" >/dev/null 2>&1 &
+        fi
         echo $! > "$SUB_PID_FILE"
     ) || return 1
     sleep 1

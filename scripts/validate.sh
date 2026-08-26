@@ -23,6 +23,7 @@ load_modules_for_tests() {
 echo "[1/13] Bash and Python syntax"
 bash -n install.sh rr modules/*.sh
 python3 -c 'compile(open("nexus/rr_nexus.py", encoding="utf-8").read(), "nexus/rr_nexus.py", "exec")'
+python3 -c 'compile(open("nexus/sub_server.py", encoding="utf-8").read(), "nexus/sub_server.py", "exec")'
 if command -v node >/dev/null 2>&1; then node --check nexus/static/app.js; fi
 
 echo "[2/13] Combined module loading"
@@ -304,10 +305,16 @@ echo "[6/13] Subscription URL control-character regression"
     raw_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" raw)
     client_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" client)
     clash_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" clash)
+    mihomo_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" mihomo)
+    verge_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" clash-verge)
+    flclash_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" flclash)
     [[ "$encoded_short_url" =~ ^http://45\.192\.205\.71:39291/s/[A-Za-z0-9_-]{12}$ ]]
     [[ "$raw_short_url" =~ ^http://45\.192\.205\.71:39291/r/[A-Za-z0-9_-]{12}$ ]]
     [[ "$client_short_url" =~ ^http://45\.192\.205\.71:39291/c/[A-Za-z0-9_-]{12}$ ]]
     [[ "$clash_short_url" =~ ^http://45\.192\.205\.71:39291/m/[A-Za-z0-9_-]{12}$ ]]
+    [[ "$mihomo_short_url" =~ ^http://45\.192\.205\.71:39291/mm/[A-Za-z0-9_-]{12}$ ]]
+    [[ "$verge_short_url" =~ ^http://45\.192\.205\.71:39291/vg/[A-Za-z0-9_-]{12}$ ]]
+    [[ "$flclash_short_url" =~ ^http://45\.192\.205\.71:39291/fc/[A-Za-z0-9_-]{12}$ ]]
     [ "${#encoded_short_url}" -lt "${#url}" ]
     SUB_ROOT=$(mktemp -d)
     UUID="$test_uuid"
@@ -316,14 +323,20 @@ echo "[6/13] Subscription URL control-character regression"
     printf '%s\n' 'vless://test' > "$SUB_ROOT/$UUID/jhsub.txt"
     printf '%s\n' '{}' > "$SUB_ROOT/$UUID/client.json"
     printf '%s\n' 'proxies: []' > "$SUB_ROOT/$UUID/clash_meta.yaml"
+    printf '%s\n' 'proxies: []' > "$SUB_ROOT/$UUID/client-mihomo.yaml"
+    printf '%s\n' 'proxies: []' > "$SUB_ROOT/$UUID/client-clash-verge.yaml"
+    printf '%s\n' 'proxies: []' > "$SUB_ROOT/$UUID/client-flclash.yaml"
     create_short_subscription_alias
     short_token=$(subscription_short_token "$UUID")
     [ "$(readlink "$SUB_ROOT/s/$short_token")" = "../${UUID}/jhsub_encoded.txt" ]
     [ "$(readlink "$SUB_ROOT/r/$short_token")" = "../${UUID}/jhsub.txt" ]
     [ "$(readlink "$SUB_ROOT/c/$short_token")" = "../${UUID}/client.json" ]
     [ "$(readlink "$SUB_ROOT/m/$short_token")" = "../${UUID}/clash_meta.yaml" ]
+    [ "$(readlink "$SUB_ROOT/mm/$short_token")" = "../${UUID}/client-mihomo.yaml" ]
+    [ "$(readlink "$SUB_ROOT/vg/$short_token")" = "../${UUID}/client-clash-verge.yaml" ]
+    [ "$(readlink "$SUB_ROOT/fc/$short_token")" = "../${UUID}/client-flclash.yaml" ]
     [ -f "$SUB_ROOT/index.html" ]
-    for route in s r c m; do
+    for route in s r c m mm vg fc; do
         [ -f "$SUB_ROOT/$route/index.html" ]
     done
     rm -f "$SUB_ROOT/$UUID/clash_meta.yaml"
@@ -391,7 +404,11 @@ import sys
 with sqlite3.connect(sys.argv[1]) as connection:
     assert connection.execute("SELECT COUNT(*) FROM admins").fetchone()[0] == 1
     columns = {row[1] for row in connection.execute("PRAGMA table_info(devices)")}
-    assert {"uploaded_bytes", "downloaded_bytes", "traffic_updated_at"} <= columns
+    assert {
+        "uploaded_bytes", "downloaded_bytes", "traffic_updated_at", "next_reset_at",
+        "reset_anchor_day", "reset_max", "reset_count",
+    } <= columns
+    assert connection.execute("SELECT COUNT(*) FROM server_traffic_policy WHERE id=1").fetchone()[0] == 1
 
 spec = importlib.util.spec_from_file_location("rr_nexus", "nexus/rr_nexus.py")
 module = importlib.util.module_from_spec(spec)
@@ -468,13 +485,18 @@ device = {
     "expires_at": None,
     "quota_bytes": 0,
     "used_bytes": 0,
+    "uploaded_bytes": 123,
+    "downloaded_bytes": 456,
 }
 handler = object.__new__(module.Handler)
 artifact_root = config_path.parent / "subscriptions"
 artifact_root.mkdir(parents=True, exist_ok=True)
 published_root = config_path.parent / "published" / "nexus"
 published_root.mkdir(parents=True, exist_ok=True)
-artifact_suffixes = ["-vl.json", ".yaml", "-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt", ".txt", ".json"]
+artifact_suffixes = [
+    "-vl.json", ".yaml", "-mihomo.yaml", "-clash-verge.yaml", "-flclash.yaml",
+    "-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt", ".txt", ".json",
+]
 for suffix in artifact_suffixes:
     (artifact_root / f"{device['id']}{suffix}").write_text("test", encoding="utf-8")
     (published_root / f"{device['subscription_token']}{suffix}").write_text("test", encoding="utf-8")
@@ -488,12 +510,16 @@ def write_config(**values):
 write_config(mode="local", domain="", ssh_host="2001:db8::99")
 local_primary, local_urls = handler._device_subscription_urls(device)
 assert local_primary == "http://[2001:db8::99]:39291/nexus/test_subscription_token_123456.txt"
-assert len(local_urls) == 8
+assert len(local_urls) == 9
+assert [item["format"] for item in local_urls] == [
+    "Sing-box 官方", "mihomo", "Clash Verge", "FlClash", "v2rayN",
+    "v2rayNG", "Shadowrocket", "NekoBox", "通用链接",
+]
 assert all(item["url"].startswith("http://[2001:db8::99]:39291/nexus/") for item in local_urls)
 # 不存在的格式不能继续显示一个注定 404 的二维码。
-(published_root / f"{device['subscription_token']}-vl.json").unlink()
+(published_root / f"{device['subscription_token']}.json").unlink()
 assert all(item["format"] != "Sing-box 官方" for item in handler._device_subscription_urls(device)[1])
-(published_root / f"{device['subscription_token']}-vl.json").write_text("test", encoding="utf-8")
+(published_root / f"{device['subscription_token']}.json").write_text("test", encoding="utf-8")
 
 write_config(mode="public", domain="45.192.205.71", ssh_host="45.192.205.71")
 ip_primary, ip_urls = handler._device_subscription_urls(device)
@@ -503,17 +529,27 @@ assert all(":9443/sub/" not in item["url"] for item in ip_urls)
 # 公网 IP/本地模式的地址必须能被真实的静态订阅服务逐一下载，且内容
 # 与刚发布的文件完全一致（覆盖 NekoBox 的 Base64 地址）。
 import functools
-import http.server
 import threading
 import urllib.request
 
-quiet_handler = type(
-    "QuietSubscriptionHandler",
-    (http.server.SimpleHTTPRequestHandler,),
-    {"log_message": lambda self, *args: None},
-)
-static_handler = functools.partial(quiet_handler, directory=str(published_root.parent))
-static_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), static_handler)
+sub_spec = importlib.util.spec_from_file_location("rr_sub_server", "nexus/sub_server.py")
+sub_module = importlib.util.module_from_spec(sub_spec)
+sys.modules[sub_spec.name] = sub_module
+sub_spec.loader.exec_module(sub_module)
+with sqlite3.connect(sys.argv[1]) as connection:
+    now = module.utc_now()
+    connection.execute(
+        "INSERT OR REPLACE INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,"
+        "used_bytes,uploaded_bytes,downloaded_bytes,expires_at,created_at,updated_at) "
+        "VALUES(?,?,?,?,1,?,?,?, ?,?,?,?)",
+        (
+            device["id"], "订阅头测试", "sub-header-credential", device["subscription_token"],
+            1000, 579, device["uploaded_bytes"], device["downloaded_bytes"], "2030-01-31", now, now,
+        ),
+    )
+static_handler = functools.partial(sub_module.SubscriptionHandler, directory=str(published_root.parent))
+static_server = sub_module.ThreadingHTTPServer(("127.0.0.1", 0), static_handler)
+static_server.config_path = config_path
 static_thread = threading.Thread(target=static_server.serve_forever, daemon=True)
 static_thread.start()
 try:
@@ -528,6 +564,18 @@ try:
     for item in live_ip_urls:
         with urllib.request.urlopen(item["url"], timeout=2) as response:
             assert response.status == 200 and response.read() == b"test"
+            assert response.headers["Subscription-Userinfo"] == (
+                "upload=123; download=456; total=1000; expire=1896134399"
+            )
+            assert response.headers["Profile-Update-Interval"] == "1"
+    # 额度用尽后仍返回空订阅和用量头，让客户端更新剩余流量，同时节点已被撤销。
+    with sqlite3.connect(sys.argv[1]) as connection:
+        connection.execute("UPDATE devices SET used_bytes=quota_bytes WHERE id=?", (device["id"],))
+    with urllib.request.urlopen(live_ip_primary, timeout=2) as response:
+        assert response.status == 200 and response.read() == b""
+        assert "total=1000" in response.headers["Subscription-Userinfo"]
+    with sqlite3.connect(sys.argv[1]) as connection:
+        connection.execute("UPDATE devices SET used_bytes=579 WHERE id=?", (device["id"],))
 finally:
     static_server.shutdown()
     static_server.server_close()
@@ -536,7 +584,11 @@ finally:
 write_config(mode="public", domain="panel.example.com", ssh_host="45.192.205.71", public_port=443)
 domain_primary, domain_urls = handler._device_subscription_urls(device)
 assert domain_primary == "https://panel.example.com/sub/dev_012345abcdef/test_subscription_token_123456/txt"
-assert len(domain_urls) == 8
+assert len(domain_urls) == 9
+assert [item["url"].rsplit("/", 1)[-1] for item in domain_urls] == [
+    "json", "mihomo", "clash-verge", "flclash", "v2rayn",
+    "v2rayng", "sr", "nekobox", "txt",
+]
 
 # 后端必须把每个节点/订阅的原文完整交给 qrencode，并使用 M 级纠错与
 # 4 模块静区；无效订阅 URL、负索引和 qrencode 超时必须受控失败。
@@ -597,13 +649,16 @@ route_suffixes = {
     "json": ".json",
     "yaml": ".yaml",
     "vl": "-vl.json",
+    "mihomo": "-mihomo.yaml",
+    "clash-verge": "-clash-verge.yaml",
+    "flclash": "-flclash.yaml",
     "v2rayn": "-v2rayn.txt",
     "v2rayng": "-v2rayng.txt",
     "sr": "-sr.txt",
     "nekobox": "-nekobox.txt",
 }
 sent = []
-handler.send_bytes = lambda status, body, content_type: sent.append((status, body, content_type))
+handler.send_bytes = lambda status, body, content_type, **kwargs: sent.append((status, body, content_type, kwargs))
 handler.send_json = lambda status, body: sent.append((status, body, "json"))
 for route, suffix in route_suffixes.items():
     expected = ("payload:" + route).encode()
@@ -611,13 +666,137 @@ for route, suffix in route_suffixes.items():
     artifact.write_bytes(expected)
     sent.clear()
     handler.handle_public_subscription(device["id"], device["subscription_token"], route)
-    assert sent == [(module.HTTPStatus.OK, expected, "text/plain; charset=utf-8")]
+    assert sent[0][:3] == (module.HTTPStatus.OK, expected, "text/plain; charset=utf-8")
+    userinfo = sent[0][3]["extra_headers"]["Subscription-Userinfo"]
+    assert userinfo == "upload=123; download=456; total=0; expire=0"
 
 missing = artifact_root / f"{device['id']}-v2rayng.txt"
 missing.unlink()
 sent.clear()
 handler.handle_public_subscription(device["id"], device["subscription_token"], "v2rayng")
 assert sent and sent[0][0] == module.HTTPStatus.NOT_FOUND
+
+# 纯备注修改必须只写管理数据库：不得触发流量采集、节点重启或订阅刷新。
+store = module.Store(Path(sys.argv[1]))
+with store.connect() as db:
+    now = module.utc_now()
+    db.execute(
+        "INSERT OR REPLACE INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,"
+        "used_bytes,uploaded_bytes,downloaded_bytes,expires_at,created_at,updated_at) "
+        "VALUES(?,?,?,?,1,0,0,0,0,NULL,?,?)",
+        (device["id"], "旧管理备注", "01234567-89ab-4cde-8fab-0123456789ab", device["subscription_token"], now, now),
+    )
+    db.execute(
+        "INSERT INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,"
+        "used_bytes,uploaded_bytes,downloaded_bytes,expires_at,created_at,updated_at) "
+        "VALUES(?,?,?,?,1,0,0,0,0,NULL,?,?)",
+        ("dev_deadbeef0000", "已存在备注", "11234567-89ab-4cde-8fab-0123456789ab", "other_subscription_token_123", now, now),
+    )
+
+class NoTrafficSync:
+    def collect_once(self, **kwargs):
+        raise AssertionError("name-only update collected traffic")
+
+module.STATE = SimpleNamespace(config=module.NexusConfig.load(), store=store, traffic=NoTrafficSync())
+rename_handler = object.__new__(module.Handler)
+rename_handler.client_address = ("127.0.0.1", 12345)
+rename_handler.headers = {}
+rename_handler.read_json = lambda: {"name": "新管理备注"}
+rename_handler._deferred_sync = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("name-only update synced nodes"))
+rename_sent = []
+rename_handler.send_json = lambda status, body: rename_sent.append((status, body))
+rename_handler.handle_update_device({"username": "tester"}, device["id"])
+assert rename_sent[-1][0] == module.HTTPStatus.OK
+assert rename_sent[-1][1]["sync"] == "not_required"
+with store.connect() as db:
+    assert db.execute("SELECT name FROM devices WHERE id=?", (device["id"],)).fetchone()[0] == "新管理备注"
+
+rename_handler.read_json = lambda: {"name": "已存在备注"}
+rename_handler.handle_update_device({"username": "tester"}, device["id"])
+assert rename_sent[-1][0] == module.HTTPStatus.CONFLICT
+assert rename_sent[-1][1]["error"] == "duplicate_name"
+
+# 每月自动重置：额度保持原值、用量归零、自然月日期不漂移，次数用尽后
+# 由预先计算的 expires_at 到期。35 天宽限常量也必须锁定。
+assert module.QUOTA_AUTO_DELETE_SECONDS == 35 * 86400
+assert module.add_calendar_month(module.parse_date("2027-01-31"), 31).isoformat() == "2027-02-28"
+assert module.add_calendar_month(module.parse_date("2027-02-28"), 31).isoformat() == "2027-03-31"
+future = module.datetime.now(module.timezone.utc).date() + module.timedelta(days=10)
+schedule_values, schedule_error = handler.validate_device_payload(
+    {"name": "计划测试", "quota_gb": 10, "reset_at": future.isoformat(), "reset_max": 6}
+)
+assert not schedule_error
+assert schedule_values["next_reset_at"] == future.isoformat()
+assert schedule_values["reset_max"] == 6 and schedule_values["reset_count"] == 0
+assert schedule_values["expires_at"] == module.add_calendar_months(future, 6, future.day).isoformat()
+_, invalid_schedule = handler.validate_device_payload(
+    {"name": "错误计划", "quota_gb": 10, "reset_at": "2020-01-01", "reset_max": 6}
+)
+assert invalid_schedule == "invalid_reset_schedule"
+
+due = module.datetime.now(module.timezone.utc).date() - module.timedelta(days=1)
+plan_expiry = module.add_calendar_months(due, 2, due.day)
+with store.connect() as db:
+    now = module.utc_now()
+    db.execute(
+        "INSERT INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,"
+        "used_bytes,uploaded_bytes,downloaded_bytes,expires_at,next_reset_at,reset_anchor_day,"
+        "reset_max,reset_count,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "dev_aabbccddeeff", "月度计划", "monthly-credential", "monthly-sub-token",
+            1000, 1000, 400, 600, plan_expiry.isoformat(), due.isoformat(), due.day, 2, 0, now, now,
+        ),
+    )
+
+class ScheduledState:
+    def __init__(self):
+        self.store = store
+        self.config = module.NexusConfig.load()
+        self.sync_count = 0
+
+    def sync_devices(self):
+        self.sync_count += 1
+        return True, "ok"
+
+scheduled_state = ScheduledState()
+collector = module.TrafficCollector(scheduled_state)
+collector.apply_scheduled_resets(True)
+with store.connect() as db:
+    scheduled = db.execute(
+        "SELECT quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,reset_count,next_reset_at "
+        "FROM devices WHERE id='dev_aabbccddeeff'"
+    ).fetchone()
+assert scheduled["quota_bytes"] == 1000
+assert scheduled["used_bytes"] == scheduled["uploaded_bytes"] == scheduled["downloaded_bytes"] == 0
+assert scheduled["reset_count"] == 1
+assert scheduled["next_reset_at"] == module.add_calendar_month(due, due.day).isoformat()
+assert scheduled_state.sync_count == 1
+
+# 服务器套餐使用宿主机网卡原始计数器；重启后沿用持久化基线，计数器回绕
+# 或服务器重启时只重建基线，不能产生巨额假流量。
+samples = iter([
+    ("eth0", 1000, 2000),
+    ("eth0", 1600, 2900),
+    ("eth0", 1700, 3100),
+    ("eth0", 50, 60),
+])
+real_counters = module.read_network_counters
+real_interfaces = module.network_interfaces
+module.read_network_counters = lambda configured="": next(samples)
+module.network_interfaces = lambda: ["eth0"]
+try:
+    collector.collect_server_traffic()
+    collector.collect_server_traffic()
+    module.TrafficCollector(scheduled_state).collect_server_traffic()
+    module.TrafficCollector(scheduled_state).collect_server_traffic()
+finally:
+    module.read_network_counters = real_counters
+    module.network_interfaces = real_interfaces
+with store.connect() as db:
+    host = db.execute(
+        "SELECT received_bytes,transmitted_bytes FROM server_traffic_policy WHERE id=1"
+    ).fetchone()
+assert host["received_bytes"] == 700 and host["transmitted_bytes"] == 1100
 PY
 rm -rf "$argon2_stub"
 
@@ -703,7 +882,8 @@ echo "[9/13] RR Nexus personal subscription compatibility"
     SHORT_ID=0123456789abcdef
     CERT_SHA256=$(printf 'a%.0s' {1..64})
     HY2_HOP_INTERVAL=30s
-    HB_ENABLED=false
+    HB_ENABLED=true
+    HB_INTERVAL=30
     CLASH_ENABLED=true
     CDN_IP=www.bing.com
     ARGO_DOMAIN=argo.example.com
@@ -752,9 +932,27 @@ PY
     grep -Eq '^hysteria2://.*obfs=salamander&obfs-password=e219c8c7-b669-4c75-b33b-a9e5227a8a24' "$raw_file"
     grep -Eq '^tuic://.*insecure=1&allow_insecure=1' "$raw_file"
     jq -e --arg credential "$device_credential" '.outbounds[] | select(.type == "vless") | .uuid == $credential' \
-        "$NEXUS_SUB_ROOT/${device_id}-vl.json" >/dev/null
+        "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
+    jq -e '.outbounds | map(.type) | index("vmess") != null and index("vless") != null and index("hysteria2") != null and index("tuic") != null and index("anytls") != null and index("naive") != null' \
+        "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
+    jq -e '.outbounds[] | select(.type == "selector" and .tag == "proxy") | .outbounds | index("naive-RR-012345AB") != null' \
+        "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
     grep -Fq 'obfs: salamander' "$NEXUS_SUB_ROOT/${device_id}.yaml"
     grep -Fq 'obfs-password: "e219c8c7-b669-4c75-b33b-a9e5227a8a24"' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    grep -Fxq 'keep-alive-idle: 30' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    grep -Fxq 'keep-alive-interval: 30' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    grep -Fq 'default-selected: "VMESS-RR-012345AB"' "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    if grep -Eq '^    (keep-alive-idle|keep-alive-interval|default):' "$NEXUS_SUB_ROOT/${device_id}.yaml"; then
+        echo "mihomo top-level/default fields are nested under a proxy or use the legacy invalid key." >&2
+        exit 1
+    fi
+    for clash_suffix in -mihomo.yaml -clash-verge.yaml -flclash.yaml; do
+        cmp -s "$NEXUS_SUB_ROOT/${device_id}.yaml" "$NEXUS_SUB_ROOT/${device_id}${clash_suffix}"
+    done
+    if command -v ruby >/dev/null 2>&1; then
+        ruby -e 'require "yaml"; value=YAML.safe_load(File.read(ARGV[0]), aliases: false); abort unless value.is_a?(Hash) && value["proxies"].is_a?(Array)' \
+            "$NEXUS_SUB_ROOT/${device_id}.yaml"
+    fi
 
     python3 - "$raw_file" "$neko_file" "$device_credential" "$UUID" <<'PY'
 import base64
@@ -766,11 +964,13 @@ raw_path, encoded_path, credential, server_password = sys.argv[1:]
 raw = open(raw_path, encoding="utf-8").read()
 encoded = open(encoded_path, encoding="utf-8").read()
 assert base64.b64decode(encoded).decode() == raw
+assert "NekoBox 测试" not in raw
 links = {line.split(":", 1)[0]: line for line in raw.splitlines()}
 assert set(links) == {"vmess", "vless", "hysteria2", "tuic", "anytls", "naive+https"}
 
 vmess = json.loads(base64.b64decode(links["vmess"].removeprefix("vmess://")))
 assert vmess["id"] == credential and vmess["allowInsecure"] == "1"
+assert "RR-012345AB" in vmess["ps"]
 
 def parsed(name):
     return urllib.parse.urlsplit(links[name].replace(f"{name}://", "https://", 1))
@@ -789,9 +989,11 @@ anytls = parsed("anytls")
 assert anytls.username == credential and urllib.parse.parse_qs(anytls.query)["insecure"] == ["1"]
 naive = urllib.parse.urlsplit(links["naive+https"].replace("naive+https://", "https://", 1))
 assert naive.username.startswith("dev_") and naive.password
+for parsed_link in (vless, hy2, tuic, anytls, naive):
+    assert "RR-012345AB" in urllib.parse.unquote(parsed_link.fragment)
 PY
 
-    for suffix in .txt .json .yaml -vl.json -v2rayn.txt -v2rayng.txt -sr.txt -nekobox.txt; do
+    for suffix in .txt .json .yaml -vl.json -mihomo.yaml -clash-verge.yaml -flclash.yaml -v2rayn.txt -v2rayng.txt -sr.txt -nekobox.txt; do
         cmp -s "$NEXUS_SUB_ROOT/${device_id}${suffix}" "$SUB_ROOT/nexus/${sub_token}${suffix}"
     done
 
@@ -802,7 +1004,7 @@ PY
     generate_nexus_device_subscriptions
     [ -s "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" ]
     cmp -s "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" "$SUB_ROOT/nexus/${sub_token}-nekobox.txt"
-    for suffix in .json .yaml -vl.json; do
+    for suffix in .json .yaml -vl.json -mihomo.yaml -clash-verge.yaml -flclash.yaml; do
         [ ! -e "$NEXUS_SUB_ROOT/${device_id}${suffix}" ]
         [ ! -e "$SUB_ROOT/nexus/${sub_token}${suffix}" ]
     done
@@ -846,8 +1048,14 @@ grep -Fq '请把 TOP 20 放进真实客户端逐个测试' nexus/static/index.ht
 grep -Fq '/optimizer.js?v=10' nexus/static/index.html
 grep -Eq '/api/devices' nexus/static/app.js
 grep -Eq '/api/traffic' nexus/static/app.js
-grep -Fq 'UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L' nexus/static/app.js
-grep -Fq 'UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L' modules/85-nexus.sh
+grep -Fq '/api/server/traffic-policy' nexus/static/app.js
+grep -Fq 'Subscription-Userinfo' nexus/rr_nexus.py nexus/sub_server.py
+grep -Fq 'QUOTA_AUTO_DELETE_SECONDS = 35 * 86400' nexus/rr_nexus.py
+grep -Fq 'id="server-traffic-form"' nexus/static/index.html
+grep -Fq 'id="rs-server-traffic-form"' nexus/static/index.html
+grep -Fq 'name="reset_at"' nexus/static/index.html
+grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' nexus/static/app.js
+grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' modules/85-nexus.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/40-subscription.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/85-nexus.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/90-auto-update.sh
@@ -864,6 +1072,14 @@ grep -Fq 'nexus/index.html' modules/85-nexus.sh
 # D9：面板设备订阅文案必须标注全协议（曾误写「仅 VMess」）
 grep -Fq 'v2rayN（Windows）· 全协议' nexus/rr_nexus.py
 grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
+grep -Fq 'SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive' nexus/rr_nexus.py
+grep -Fq 'id="rename-dialog"' nexus/static/index.html
+grep -Fq '/app.js?v=21' nexus/static/index.html
+grep -Fq 'sync": "not_required"' nexus/rr_nexus.py
+if grep -Eq 'read[[:space:]].*(-t|--timeout)|(^|[[:space:]])TMOUT=' rr modules/99-menus.sh; then
+    echo "RR main menu contains an active input timeout and may drop an idle home page." >&2
+    exit 1
+fi
 # D10：cron worker 必须用绝对路径调 rr，且 cron 条目必须补齐 PATH
 grep -Fq '"/usr/local/bin/rr", "--sync-devices"' modules/90-auto-update.sh
 grep -Fq 'PATH=/usr/local/bin:/usr/bin:/bin' modules/90-auto-update.sh

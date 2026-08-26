@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import hashlib
 import hmac
 import ipaddress
@@ -27,7 +28,7 @@ import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,9 +72,12 @@ TRAFFIC_COUNTER_RE = re.compile(
     r"^user>>>(dev_[a-f0-9]{12})>>>traffic>>>(uplink|downlink)$"
 )
 TRAFFIC_POLL_SECONDS = 5
-# 额度用尽后自动删除等待时间（秒）。15 天 = 1296000（真机验证通过后的正式值）
-QUOTA_AUTO_DELETE_SECONDS = 15 * 86400
+# 额度用尽后留给管理员手动重置的宽限期。超过 35 天仍未处理才删除设备。
+QUOTA_AUTO_DELETE_SECONDS = 35 * 86400
 TRAFFIC_BUCKET_SECONDS = 5 * 60
+MAX_AUTO_RESET_COUNT = 120
+MAX_SERVER_TRAFFIC_GB = 1024 * 1024
+SERVER_TRAFFIC_MODES = {"both", "tx", "rx"}
 MAX_JSON_BODY_BYTES = 1024 * 1024
 V2RAY_QUERY_METHOD = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 
@@ -212,6 +216,38 @@ def utc_now() -> str:
 
 def epoch_now() -> int:
     return int(time.time())
+
+
+def parse_date(value: str) -> date | None:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def add_calendar_month(value: date, anchor_day: int) -> date:
+    """Advance one calendar month while preserving the configured day when possible."""
+    year = value.year + (1 if value.month == 12 else 0)
+    month = 1 if value.month == 12 else value.month + 1
+    day = min(max(1, anchor_day), calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def add_calendar_months(value: date, months: int, anchor_day: int | None = None) -> date:
+    result = value
+    anchor = anchor_day or value.day
+    for _ in range(max(0, months)):
+        result = add_calendar_month(result, anchor)
+    return result
+
+
+def expiry_epoch(value: str | None) -> int:
+    """Return the final valid second of the configured UTC expiry date."""
+    parsed = parse_date(value or "")
+    if parsed is None:
+        return 0
+    end = datetime.combine(parsed + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    return int(end.timestamp()) - 1
 
 
 def json_compact(value: Any) -> bytes:
@@ -359,6 +395,7 @@ class NexusConfig:
         stats_port = int(raw.get("stats_port", 39091))
         ssh_host = str(raw.get("ssh_host", "服务器IP")).strip()
         sub_port = int(raw.get("sub_port", 0))
+        traffic_mode = str(raw.get("traffic_mode", "both") or "both")
         if (
             mode not in {"local", "public"}
             or listen != "127.0.0.1"
@@ -370,6 +407,7 @@ class NexusConfig:
             or not ssh_host
             or len(ssh_host) > 255
             or any(ord(char) < 33 or ord(char) == 127 for char in ssh_host)
+            or traffic_mode not in {"both", "upload"}
         ):
             raise ValueError("invalid RR Nexus config")
         return cls(
@@ -383,7 +421,7 @@ class NexusConfig:
             stats_port=stats_port,
             ssh_host=ssh_host,
             secure_cookie=mode == "public",
-            traffic_mode="both",
+            traffic_mode=traffic_mode,
             public_port=public_port,
             sub_port=sub_port,
         )
@@ -503,6 +541,20 @@ class Store:
                     uploaded_bytes INTEGER NOT NULL DEFAULT 0,
                     downloaded_bytes INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS server_traffic_policy (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    quota_bytes INTEGER NOT NULL DEFAULT 0,
+                    count_mode TEXT NOT NULL DEFAULT 'both',
+                    interface_name TEXT NOT NULL DEFAULT '',
+                    last_interface TEXT NOT NULL DEFAULT '',
+                    received_bytes INTEGER NOT NULL DEFAULT 0,
+                    transmitted_bytes INTEGER NOT NULL DEFAULT 0,
+                    initial_used_bytes INTEGER NOT NULL DEFAULT 0,
+                    last_rx_counter INTEGER,
+                    last_tx_counter INTEGER,
+                    cycle_started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS remote_failures (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     remote_ip TEXT NOT NULL,
@@ -522,6 +574,12 @@ class Store:
                 CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at);
                 """
+            )
+            now = utc_now()
+            db.execute(
+                "INSERT OR IGNORE INTO server_traffic_policy("
+                "id,cycle_started_at,updated_at) VALUES(1,?,?)",
+                (now, now),
             )
             columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(devices)").fetchall()
@@ -543,6 +601,14 @@ class Store:
             # B2/E15：到期日自然越过清扫标记（collector 检测到越过即触发 sync，幂等）
             if "expiry_enforced_at" not in columns:
                 db.execute("ALTER TABLE devices ADD COLUMN expiry_enforced_at TEXT")
+            if "next_reset_at" not in columns:
+                db.execute("ALTER TABLE devices ADD COLUMN next_reset_at TEXT")
+            if "reset_anchor_day" not in columns:
+                db.execute("ALTER TABLE devices ADD COLUMN reset_anchor_day INTEGER NOT NULL DEFAULT 0")
+            if "reset_max" not in columns:
+                db.execute("ALTER TABLE devices ADD COLUMN reset_max INTEGER NOT NULL DEFAULT 0")
+            if "reset_count" not in columns:
+                db.execute("ALTER TABLE devices ADD COLUMN reset_count INTEGER NOT NULL DEFAULT 0")
             if added_uploaded or added_downloaded:
                 db.execute(
                     "UPDATE devices SET downloaded_bytes=used_bytes "
@@ -556,6 +622,74 @@ class Store:
                 "INSERT INTO audit_log(created_at,actor,action,target,remote_ip,detail) VALUES(?,?,?,?,?,?)",
                 (utc_now(), actor[:64], action[:64], target[:128], remote_ip[:64], detail[:512]),
             )
+
+
+def network_interfaces() -> list[str]:
+    try:
+        return sorted(
+            item.name
+            for item in Path("/sys/class/net").iterdir()
+            if item.name != "lo" and (item / "statistics/rx_bytes").is_file()
+        )
+    except OSError:
+        return []
+
+
+def default_network_interface() -> str:
+    try:
+        lines = Path("/proc/net/route").read_text(encoding="ascii").splitlines()[1:]
+        for line in lines:
+            fields = line.split()
+            if len(fields) >= 4 and fields[1] == "00000000" and int(fields[3], 16) & 0x1:
+                return fields[0]
+    except (OSError, ValueError):
+        pass
+    interfaces = network_interfaces()
+    return interfaces[0] if interfaces else ""
+
+
+def read_network_counters(configured_interface: str = "") -> tuple[str, int, int]:
+    interface = configured_interface if configured_interface in network_interfaces() else default_network_interface()
+    if not interface or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,32}", interface):
+        raise OSError("未找到可统计的公网网卡")
+    base = Path("/sys/class/net") / interface / "statistics"
+    rx = int((base / "rx_bytes").read_text(encoding="ascii").strip())
+    tx = int((base / "tx_bytes").read_text(encoding="ascii").strip())
+    if rx < 0 or tx < 0:
+        raise OSError("网卡计数器无效")
+    return interface, rx, tx
+
+
+def server_traffic_snapshot(store: Store) -> dict[str, Any]:
+    with store.connect() as db:
+        row = db.execute("SELECT * FROM server_traffic_policy WHERE id=1").fetchone()
+    if row is None:
+        return {}
+    item = dict(row)
+    mode = item["count_mode"] if item["count_mode"] in SERVER_TRAFFIC_MODES else "both"
+    received = max(0, int(item["received_bytes"] or 0))
+    transmitted = max(0, int(item["transmitted_bytes"] or 0))
+    initial = max(0, int(item["initial_used_bytes"] or 0))
+    counted = transmitted if mode == "tx" else received if mode == "rx" else received + transmitted
+    used = initial + counted
+    quota = max(0, int(item["quota_bytes"] or 0))
+    return {
+        "quota_bytes": quota,
+        "count_mode": mode,
+        "interface_name": item["interface_name"] or "",
+        "active_interface": item["last_interface"] or "",
+        "received_bytes": received,
+        "transmitted_bytes": transmitted,
+        "initial_used_bytes": initial,
+        "used_bytes": used,
+        "remaining_bytes": max(0, quota - used) if quota else None,
+        "percent": min(100.0, used / quota * 100.0) if quota else 0.0,
+        "exhausted": bool(quota and used >= quota),
+        "cycle_started_at": item["cycle_started_at"],
+        "updated_at": item["updated_at"],
+        "available": bool(item["last_interface"]),
+        "interfaces": network_interfaces(),
+    }
 
 
 class TrafficCollector:
@@ -593,11 +727,97 @@ class TrafficCollector:
             if available:
                 self.last_success = utc_now()
 
+    def collect_server_traffic(self) -> None:
+        """Persist real host-interface RX/TX deltas for carrier-package monitoring."""
+        try:
+            with self.state.store.connect() as db:
+                policy = db.execute(
+                    "SELECT interface_name,last_interface,last_rx_counter,last_tx_counter "
+                    "FROM server_traffic_policy WHERE id=1"
+                ).fetchone()
+                if policy is None:
+                    return
+                interface, rx, tx = read_network_counters(str(policy["interface_name"] or ""))
+                last_interface = str(policy["last_interface"] or "")
+                last_rx = policy["last_rx_counter"]
+                last_tx = policy["last_tx_counter"]
+                rx_delta = 0
+                tx_delta = 0
+                if (
+                    interface == last_interface
+                    and last_rx is not None
+                    and last_tx is not None
+                    and rx >= int(last_rx)
+                    and tx >= int(last_tx)
+                ):
+                    rx_delta = rx - int(last_rx)
+                    tx_delta = tx - int(last_tx)
+                db.execute(
+                    "UPDATE server_traffic_policy SET last_interface=?,"
+                    "received_bytes=received_bytes+?,transmitted_bytes=transmitted_bytes+?,"
+                    "last_rx_counter=?,last_tx_counter=?,updated_at=? WHERE id=1",
+                    (interface, rx_delta, tx_delta, rx, tx, utc_now()),
+                )
+        except (OSError, sqlite3.Error, ValueError):
+            # 设备级流量统计不能因为宿主机网卡不可读而中断。
+            return
+
+    def apply_scheduled_resets(self, trigger_sync: bool) -> None:
+        if not trigger_sync:
+            return
+        today = datetime.now(timezone.utc).date()
+        reset_devices: list[tuple[str, str, int, int]] = []
+        try:
+            with self.state.store.connect() as db:
+                rows = db.execute(
+                    "SELECT id,name,next_reset_at,reset_anchor_day,reset_max,reset_count,expires_at "
+                    "FROM devices WHERE next_reset_at IS NOT NULL AND next_reset_at<>'' "
+                    "AND reset_max>0 AND reset_count<reset_max"
+                ).fetchall()
+                for row in rows:
+                    due = parse_date(row["next_reset_at"] or "")
+                    if due is None or due > today:
+                        continue
+                    expires = parse_date(row["expires_at"] or "")
+                    if expires is not None and expires < today:
+                        continue
+                    anchor = int(row["reset_anchor_day"] or due.day)
+                    count = int(row["reset_count"] or 0)
+                    old_count = count
+                    while due <= today and count < int(row["reset_max"]):
+                        count += 1
+                        due = add_calendar_month(due, anchor)
+                    if count == old_count:
+                        continue
+                    next_reset = due.isoformat() if count < int(row["reset_max"]) else None
+                    db.execute(
+                        "UPDATE devices SET used_bytes=0,uploaded_bytes=0,downloaded_bytes=0,"
+                        "traffic_updated_at=NULL,quota_reached_at=NULL,next_reset_at=?,"
+                        "reset_count=?,updated_at=? WHERE id=?",
+                        (next_reset, count, utc_now(), row["id"]),
+                    )
+                    reset_devices.append((row["id"], row["name"], count - old_count, count))
+        except sqlite3.Error:
+            return
+        if not reset_devices:
+            return
+        ok, detail = self.state.sync_devices()
+        for device_id, name, periods, count in reset_devices:
+            self.state.store.audit(
+                "system",
+                "device_auto_reset" if ok else "device_auto_reset_sync_failed",
+                device_id,
+                "local",
+                f"{name};periods={periods};reset_count={count};{detail}",
+            )
+
     def collect_once(self, trigger_sync: bool = False) -> tuple[bool, str]:
         if not self.collect_lock.acquire(blocking=False):
             return True, "collector_busy"
         quota_crossed: list[str] = []
         try:
+            self.collect_server_traffic()
+            self.apply_scheduled_resets(trigger_sync)
             raw_counters = query_v2ray_stats(self.state.config.stats_address)
             device_deltas: dict[str, dict[str, int]] = {}
             for name, value in raw_counters.items():
@@ -696,7 +916,7 @@ class TrafficCollector:
                     "device_auto_delete",
                     device["id"],
                     "local",
-                    f"额度用尽15天未处理: {device['name']}",
+                    f"额度用尽35天未处理: {device['name']}",
                 )
 
         # 到期日自然越过检测（B2/E15）：与 quota_crossed 同路径。
@@ -1388,11 +1608,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_bytes(self, status: int, body: bytes, content_type: str, cache: bool = False) -> None:
+    def send_bytes(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        cache: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.security_headers(content_type)
         if cache:
             self.send_header("Cache-Control", "public, max-age=3600")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1504,6 +1733,11 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 self.handle_traffic()
             return
+        if path == "/api/server/traffic-policy":
+            session = self.require_session()
+            if session:
+                self.handle_server_traffic_policy()
+            return
         if path == "/api/audit":
             session = self.require_session()
             if session:
@@ -1532,7 +1766,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(segments) == 3 and segments[0] == "sub" and DEVICE_ID_RE.fullmatch(segments[1]):
             self.handle_public_subscription(segments[1], segments[2], "txt")
             return
-        if len(segments) == 4 and segments[0] == "sub" and DEVICE_ID_RE.fullmatch(segments[1]) and segments[3] in {"txt", "json", "yaml", "vl", "v2rayn", "v2rayng", "sr", "nekobox"}:
+        if len(segments) == 4 and segments[0] == "sub" and DEVICE_ID_RE.fullmatch(segments[1]) and segments[3] in {
+            "txt", "json", "yaml", "vl", "mihomo", "clash-verge", "flclash",
+            "v2rayn", "v2rayng", "sr", "nekobox",
+        }:
             self.handle_public_subscription(segments[1], segments[2], segments[3])
             return
         self.serve_static(path)
@@ -1562,6 +1799,11 @@ class Handler(BaseHTTPRequestHandler):
             session = self.require_session(csrf=True)
             if session:
                 self.handle_reset_device(session, segments[2])
+            return
+        if path == "/api/server/traffic-policy/reset":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_reset_server_traffic_policy(session)
             return
         if path == "/api/change-password":
             session = self.require_session(csrf=True)
@@ -1654,7 +1896,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_PATCH(self) -> None:  # noqa: N802
-        _, segments, _ = self.parse_path()
+        path, segments, _ = self.parse_path()
+        if path == "/api/server/traffic-policy":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_update_server_traffic_policy(session)
+            return
         if len(segments) == 3 and segments[:2] == ["api", "devices"] and DEVICE_ID_RE.fullmatch(segments[2]):
             session = self.require_session(csrf=True)
             if session:
@@ -2023,6 +2270,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_devices(); return
             if path == "/api/traffic":
                 self.handle_traffic(); return
+            if path == "/api/server/traffic-policy":
+                self.handle_server_traffic_policy(); return
             if path == "/api/audit":
                 self.handle_audit(); return
             if path == "/api/server/info":
@@ -2057,6 +2306,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_create_device(self._remote_session); return
             if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "reset" and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_reset_device(self._remote_session, segments[2]); return
+            if path == "/api/server/traffic-policy/reset":
+                self.handle_reset_server_traffic_policy(self._remote_session); return
             if path == "/api/firewall/toggle":
                 port = int(inner.get("port", 0) or 0)
                 proto = str(inner.get("proto", "") or "")
@@ -2070,6 +2321,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self._run_rr_json(["/usr/local/bin/rr", "--fw-ipmode", str(inner.get("entry", "") or ""), str(inner.get("outbound", "") or "")])
                 self.send_json(HTTPStatus.OK, result); return
         elif method == "PATCH":
+            if path == "/api/server/traffic-policy":
+                self.handle_update_server_traffic_policy(self._remote_session); return
             if len(segments) == 3 and segments[:2] == ["api", "devices"] and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_update_device(self._remote_session, segments[2]); return
         elif method == "DELETE":
@@ -2365,6 +2618,7 @@ class Handler(BaseHTTPRequestHandler):
                 "devices": dict(counts),
                 "services": service_states,
                 "traffic": STATE.traffic.status_snapshot(),
+                "server_plan": server_traffic_snapshot(STATE.store),
                 "security": security_info,
                 "mode": STATE.config.mode,
                 "domain": STATE.config.domain,
@@ -2379,7 +2633,8 @@ class Handler(BaseHTTPRequestHandler):
             rows = db.execute(
                 "SELECT id,name,enabled,quota_bytes,used_bytes,uploaded_bytes,"
                 "downloaded_bytes,traffic_updated_at,expires_at,created_at,updated_at,"
-                "quota_reached_at FROM devices ORDER BY created_at DESC"
+                "quota_reached_at,next_reset_at,reset_anchor_day,reset_max,reset_count "
+                "FROM devices ORDER BY created_at DESC"
             ).fetchall()
         result: list[dict[str, Any]] = []
         today = datetime.now(timezone.utc).date().isoformat()
@@ -2390,6 +2645,7 @@ class Handler(BaseHTTPRequestHandler):
             quota_exhausted = bool(item["quota_bytes"] > 0 and item["used_bytes"] >= item["quota_bytes"])
             item["active"] = bool(item["enabled"] and not expired and not quota_exhausted)
             item["status_reason"] = "expired" if expired else "quota" if quota_exhausted else "paused" if not item["enabled"] else "active"
+            item["reset_remaining"] = max(0, int(item["reset_max"] or 0) - int(item["reset_count"] or 0))
             # 自动删除倒计时（仅在额度用尽且有记录时间戳时计算），返回剩余秒数，前端格式化
             item["auto_delete_seconds_left"] = None
             if quota_exhausted and item["quota_reached_at"]:
@@ -2439,8 +2695,80 @@ class Handler(BaseHTTPRequestHandler):
                 "devices": devices[:20],
                 "status": STATE.traffic.status_snapshot(),
                 "bucket_seconds": TRAFFIC_BUCKET_SECONDS,
+                "server_plan": server_traffic_snapshot(STATE.store),
             },
         )
+
+    def handle_server_traffic_policy(self) -> None:
+        STATE.traffic.collect_server_traffic()
+        self.send_json(HTTPStatus.OK, {"policy": server_traffic_snapshot(STATE.store)})
+
+    def handle_update_server_traffic_policy(self, session: sqlite3.Row | dict) -> None:
+        payload = self.read_json() or {}
+        try:
+            quota_gb = float(payload.get("quota_gb", 0))
+        except (TypeError, ValueError):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_server_quota"})
+            return
+        mode = str(payload.get("count_mode", "both") or "both")
+        interface = str(payload.get("interface_name", "") or "").strip()
+        if quota_gb < 0 or quota_gb > MAX_SERVER_TRAFFIC_GB:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_server_quota"})
+            return
+        if mode not in SERVER_TRAFFIC_MODES:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_traffic_mode"})
+            return
+        if interface and interface not in network_interfaces():
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_network_interface"})
+            return
+        quota_bytes = int(quota_gb * 1024**3)
+        with STATE.store.connect() as db:
+            old = db.execute(
+                "SELECT interface_name FROM server_traffic_policy WHERE id=1"
+            ).fetchone()
+            changed_interface = bool(old and str(old["interface_name"] or "") != interface)
+            db.execute(
+                "UPDATE server_traffic_policy SET quota_bytes=?,count_mode=?,interface_name=?,"
+                "last_interface=CASE WHEN ? THEN '' ELSE last_interface END,"
+                "last_rx_counter=CASE WHEN ? THEN NULL ELSE last_rx_counter END,"
+                "last_tx_counter=CASE WHEN ? THEN NULL ELSE last_tx_counter END,updated_at=? WHERE id=1",
+                (
+                    quota_bytes, mode, interface,
+                    1 if changed_interface else 0,
+                    1 if changed_interface else 0,
+                    1 if changed_interface else 0,
+                    utc_now(),
+                ),
+            )
+        STATE.traffic.collect_server_traffic()
+        detail = f"quota_gb={quota_gb};mode={mode};interface={interface or 'auto'}"
+        STATE.store.audit(session["username"], "server_traffic_policy", "server", self.remote_ip, detail)
+        self.send_json(HTTPStatus.OK, {"ok": True, "policy": server_traffic_snapshot(STATE.store)})
+
+    def handle_reset_server_traffic_policy(self, session: sqlite3.Row | dict) -> None:
+        payload = self.read_json() or {}
+        try:
+            initial_gb = float(payload.get("initial_used_gb", 0) or 0)
+        except (TypeError, ValueError):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_initial_usage"})
+            return
+        if initial_gb < 0 or initial_gb > MAX_SERVER_TRAFFIC_GB:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_initial_usage"})
+            return
+        now = utc_now()
+        with STATE.store.connect() as db:
+            db.execute(
+                "UPDATE server_traffic_policy SET received_bytes=0,transmitted_bytes=0,"
+                "initial_used_bytes=?,last_interface='',last_rx_counter=NULL,last_tx_counter=NULL,"
+                "cycle_started_at=?,updated_at=? WHERE id=1",
+                (int(initial_gb * 1024**3), now, now),
+            )
+        STATE.traffic.collect_server_traffic()
+        STATE.store.audit(
+            session["username"], "server_traffic_reset", "server", self.remote_ip,
+            f"initial_used_gb={initial_gb}",
+        )
+        self.send_json(HTTPStatus.OK, {"ok": True, "policy": server_traffic_snapshot(STATE.store)})
 
     def handle_audit(self) -> None:
         with STATE.store.connect() as db:
@@ -2466,9 +2794,42 @@ class Handler(BaseHTTPRequestHandler):
             values["quota_bytes"] = int(quota_gb * 1024**3)
         if "expires_at" in payload:
             expires_at = str(payload.get("expires_at") or "")
-            if expires_at and not DATE_RE.fullmatch(expires_at):
+            if expires_at and (not DATE_RE.fullmatch(expires_at) or parse_date(expires_at) is None):
                 return {}, "invalid_expiry"
             values["expires_at"] = expires_at or None
+        schedule_requested = "reset_at" in payload or "reset_max" in payload
+        if schedule_requested:
+            reset_at = str(payload.get("reset_at") or "")
+            try:
+                reset_max = int(payload.get("reset_max") or 0)
+            except (TypeError, ValueError):
+                return {}, "invalid_reset_schedule"
+            if not reset_at and reset_max == 0:
+                values.update(
+                    next_reset_at=None,
+                    reset_anchor_day=0,
+                    reset_max=0,
+                    reset_count=0,
+                )
+            else:
+                first_reset = parse_date(reset_at)
+                if (
+                    first_reset is None
+                    or first_reset < datetime.now(timezone.utc).date()
+                    or not 1 <= reset_max <= MAX_AUTO_RESET_COUNT
+                ):
+                    return {}, "invalid_reset_schedule"
+                try:
+                    plan_expiry = add_calendar_months(first_reset, reset_max, first_reset.day)
+                except (OverflowError, ValueError):
+                    return {}, "invalid_reset_schedule"
+                values.update(
+                    next_reset_at=first_reset.isoformat(),
+                    reset_anchor_day=first_reset.day,
+                    reset_max=reset_max,
+                    reset_count=0,
+                    expires_at=plan_expiry.isoformat(),
+                )
         if "enabled" in payload:
             if not isinstance(payload["enabled"], bool):
                 return {}, "invalid_enabled"
@@ -2569,8 +2930,14 @@ class Handler(BaseHTTPRequestHandler):
             db.execute(
                 "INSERT INTO devices(id,name,credential,subscription_token,enabled,"
                 "quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,"
-                "expires_at,created_at,updated_at) VALUES(?,?,?,?,1,?,0,0,0,NULL,?,?,?)",
-                (device_id, values["name"], credential, subscription_token, values["quota_bytes"], values.get("expires_at"), now, now),
+                "expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) "
+                "VALUES(?,?,?,?,1,?,0,0,0,NULL,?,?,?,?,0,?,?)",
+                (
+                    device_id, values["name"], credential, subscription_token,
+                    values["quota_bytes"], values.get("expires_at"),
+                    values.get("next_reset_at"), values.get("reset_anchor_day", 0),
+                    values.get("reset_max", 0), now, now,
+                ),
             )
         STATE.store.audit(session["username"], "device_create", device_id, self.remote_ip, values["name"])
         self._deferred_sync(session["username"], "device_create", device_id, values["name"])
@@ -2581,10 +2948,10 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def handle_reset_device(self, session: sqlite3.Row, device_id: str) -> None:
-        """重置设备流量：used/uploaded/downloaded 归零；可选同时修改额度（quota_gb）。
+        """重置设备流量，并可同时修改额度与每月自动重置计划。
 
-        payload: {"quota_gb": <新额度GB, 可省略保持原额度>}
-        重置后清除 quota_reached_at（取消 15 天自动删除倒计时）。
+        payload 可包含 quota_gb、reset_at、reset_max、expires_at。
+        重置后清除 quota_reached_at（取消 35 天自动删除倒计时）。
         """
         payload = self.read_json() or {}
         new_quota: int | None = None
@@ -2598,6 +2965,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_quota"})
                 return
             new_quota = int(quota_gb * 1024**3)
+        schedule_values: dict[str, Any] = {}
+        if "reset_at" in payload or "reset_max" in payload or "expires_at" in payload:
+            schedule_values, schedule_error = self.validate_device_payload(
+                {key: payload[key] for key in ("reset_at", "reset_max", "expires_at") if key in payload},
+                partial=True,
+            )
+            if schedule_error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": schedule_error})
+                return
         with STATE.store.connect() as db:
             old = db.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
             if not old:
@@ -2613,7 +2989,16 @@ class Handler(BaseHTTPRequestHandler):
                     "UPDATE devices SET quota_bytes=?,quota_reached_at=NULL WHERE id=?",
                     (new_quota, device_id),
                 )
-        detail = f"quota_gb={payload.get('quota_gb')}" if new_quota is not None else "keep_quota"
+            if schedule_values:
+                columns = [f"{key}=?" for key in schedule_values]
+                db.execute(
+                    f"UPDATE devices SET {','.join(columns)},expiry_enforced_at=NULL WHERE id=?",
+                    list(schedule_values.values()) + [device_id],
+                )
+        detail_parts = [f"quota_gb={payload.get('quota_gb')}" if new_quota is not None else "keep_quota"]
+        if schedule_values:
+            detail_parts.append(f"reset_max={schedule_values.get('reset_max', 'keep')}")
+        detail = ";".join(detail_parts)
         STATE.store.audit(session["username"], "device_reset", device_id, self.remote_ip, detail)
         self._deferred_sync(session["username"], "device_reset", device_id, detail)
         self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
@@ -2628,22 +3013,46 @@ class Handler(BaseHTTPRequestHandler):
         if error or not values:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": error or "empty_update"})
             return
-        STATE.traffic.collect_once(trigger_sync=False)
+        requires_node_sync = any(key != "name" for key in values)
+        if requires_node_sync:
+            STATE.traffic.collect_once(trigger_sync=False)
         with STATE.store.connect() as db:
             old = db.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
             if not old:
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "device_not_found"})
                 return
+            if "name" in values:
+                duplicate = db.execute(
+                    "SELECT id FROM devices WHERE name=? AND id<>?",
+                    (values["name"], device_id),
+                ).fetchone()
+                if duplicate:
+                    self.send_json(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "error": "duplicate_name",
+                            "message": "设备备注「{}」已存在（{}），请换一个备注".format(
+                                values["name"], duplicate["id"]
+                            ),
+                        },
+                    )
+                    return
             columns = [f"{key}=?" for key in values]
             parameters = list(values.values()) + [utc_now(), device_id]
             db.execute(f"UPDATE devices SET {','.join(columns)},updated_at=? WHERE id=?", parameters)
-            # 增加额度（新额度 > 已用流量）时清除"额度用尽"时间戳，取消 15 天自动删除倒计时
+            # 增加额度（新额度 > 已用流量）时清除"额度用尽"时间戳，取消 35 天自动删除倒计时
             if values.get("quota_bytes", 0) > old["used_bytes"]:
                 db.execute("UPDATE devices SET quota_reached_at=NULL WHERE id=?", (device_id,))
         STATE.store.audit(session["username"], "device_update", device_id, self.remote_ip, ",".join(values.keys()))
-        self._deferred_sync(session["username"], "device_update", device_id, ",".join(values.keys()))
-        self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
-                                       "message": "修改已保存，节点配置正在后台同步"})
+        if requires_node_sync:
+            self._deferred_sync(session["username"], "device_update", device_id, ",".join(values.keys()))
+            self.send_json(HTTPStatus.OK, {"ok": True, "sync": "deferred",
+                                           "message": "修改已保存，节点配置正在后台同步"})
+        else:
+            # 纯备注修改只写管理数据库：不重启 sing-box、不刷新订阅，客户端
+            # 节点名由随机设备别名生成，永远不会跟随管理员备注变化。
+            self.send_json(HTTPStatus.OK, {"ok": True, "sync": "not_required",
+                                           "message": "设备备注已保存，不影响订阅与节点名称"})
 
     def handle_delete_device(self, session: sqlite3.Row, device_id: str) -> None:
         STATE.traffic.collect_once(trigger_sync=False)
@@ -2685,14 +3094,15 @@ class Handler(BaseHTTPRequestHandler):
             config = STATE.config
 
         specs = [
-            ("Sing-box 官方", "Sing-box 官方客户端（SFA/SFI/SFW）· 单独 VL-Reality 节点", "vl", "-vl.json"),
-            ("Clash Meta", "Clash Meta YAML（mihomo / Clash Verge / FlClash）", "yaml", ".yaml"),
+            ("Sing-box 官方", "SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive", "json", ".json"),
+            ("mihomo", "mihomo 核心 · 专用 YAML", "mihomo", "-mihomo.yaml"),
+            ("Clash Verge", "Clash Verge Rev · 专用 YAML", "clash-verge", "-clash-verge.yaml"),
+            ("FlClash", "FlClash · 专用 YAML", "flclash", "-flclash.yaml"),
             ("v2rayN", "v2rayN（Windows）· 全协议", "v2rayn", "-v2rayn.txt"),
             ("v2rayNG", "v2rayNG（安卓）· 全协议", "v2rayng", "-v2rayng.txt"),
             ("Shadowrocket", "Shadowrocket（iOS）· 全协议", "sr", "-sr.txt"),
             ("NekoBox", "NekoBox · 全协议", "nekobox", "-nekobox.txt"),
             ("通用链接", "URI 全集（通用，兼容旧客户端）", "txt", ".txt"),
-            ("Sing-box 完整", "Sing-box 完整多协议配置", "json", ".json"),
         ]
 
         def artifact_exists(suffix: str, *, published: bool = False) -> bool:
@@ -2822,29 +3232,52 @@ class Handler(BaseHTTPRequestHandler):
             return
         device = self.device_record(device_id)
         path = self.subscription_file(device_id)
-        if fmt in {"json", "yaml"}:
-            path = STATE.config.subscription_root / f"{device_id}.{fmt}"
-        elif fmt in {"vl", "v2rayn", "v2rayng", "sr", "nekobox"}:
-            ext = "json" if fmt == "vl" else "txt"
-            path = STATE.config.subscription_root / f"{device_id}-{fmt}.{ext}"
+        suffixes = {
+            "json": ".json",
+            "yaml": ".yaml",  # 旧版 Clash Meta 地址继续兼容
+            "vl": "-vl.json",  # 旧版 sing-box Reality 单节点地址继续兼容
+            "mihomo": "-mihomo.yaml",
+            "clash-verge": "-clash-verge.yaml",
+            "flclash": "-flclash.yaml",
+            "v2rayn": "-v2rayn.txt",
+            "v2rayng": "-v2rayng.txt",
+            "sr": "-sr.txt",
+            "nekobox": "-nekobox.txt",
+        }
+        if fmt in suffixes:
+            path = STATE.config.subscription_root / f"{device_id}{suffixes[fmt]}"
+        if not device or not safe_compare(token, device["subscription_token"]):
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "subscription_not_found"})
+            return
         expired = bool(device and device["expires_at"] and device["expires_at"] < datetime.now(timezone.utc).date().isoformat())
         quota_exhausted = bool(
             device
             and device["quota_bytes"] > 0
             and device["used_bytes"] >= device["quota_bytes"]
         )
-        if (
-            not device
-            or not device["enabled"]
-            or expired
-            or quota_exhausted
-            or not safe_compare(token, device["subscription_token"])
-            or not path.is_file()
-        ):
+        inactive = not device["enabled"] or expired or quota_exhausted
+        if not inactive and not path.is_file():
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "subscription_not_found"})
             return
-        encoded = path.read_bytes()
-        self.send_bytes(HTTPStatus.OK, encoded, "text/plain; charset=utf-8")
+        encoded = b"" if inactive else path.read_bytes()
+        alias = "RR-{}".format(device_id.removeprefix("dev_")[:8].upper())
+        headers = {
+            "Subscription-Userinfo": "upload={}; download={}; total={}; expire={}".format(
+                max(0, int(device["uploaded_bytes"] or 0)),
+                max(0, int(device["downloaded_bytes"] or 0)),
+                max(0, int(device["quota_bytes"] or 0)),
+                expiry_epoch(device["expires_at"]),
+            ),
+            "Profile-Update-Interval": "1",
+            "Profile-Title": alias,
+            "Access-Control-Expose-Headers": "Subscription-Userinfo, Profile-Update-Interval, Profile-Title",
+        }
+        self.send_bytes(
+            HTTPStatus.OK,
+            encoded,
+            "text/plain; charset=utf-8",
+            extra_headers=headers,
+        )
 
     def serve_static(self, path: str) -> None:
         if path in {"", "/"}:

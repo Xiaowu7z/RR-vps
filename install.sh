@@ -417,7 +417,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "ced3abe9a2e583fa01c9ef2bc8e18ca8db98a07e4052603a10b13c3b10863b9a" ] && \
+        if [ "$actual" = "6886993e37854c3d53336012ed0747925e46be86d0cfcc3410fe2d7f7ae95464" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -475,6 +475,7 @@ rr_fetch_release() {
     done
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
         python3 -c 'compile(open("'"$PAYLOAD_DIR/nexus/rr_nexus.py"'", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
+        python3 -c 'compile(open("'"$PAYLOAD_DIR/nexus/sub_server.py"'", encoding="utf-8").read(), "sub_server.py", "exec")' || return 1
         [ -s "$PAYLOAD_DIR/nexus/static/index.html" ] && \
         [ -s "$PAYLOAD_DIR/nexus/static/app.css" ] && \
         [ -s "$PAYLOAD_DIR/nexus/static/app.js" ] || return 1
@@ -526,6 +527,7 @@ rr_install_release() {
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
         install -d -m 755 "$NEW_RUNTIME/nexus/static" || return 1
         install -m 755 "$PAYLOAD_DIR/nexus/rr_nexus.py" "$NEW_RUNTIME/nexus/rr_nexus.py" || return 1
+        install -m 755 "$PAYLOAD_DIR/nexus/sub_server.py" "$NEW_RUNTIME/nexus/sub_server.py" || return 1
         # 静态资源以已校验的 manifest 为唯一来源，避免新增 optimizer/i18n
         # 等文件后仍被固定三文件复制逻辑漏装。
         local relative_path=""

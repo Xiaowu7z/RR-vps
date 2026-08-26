@@ -199,9 +199,10 @@ generate_node_and_sub() {
     chmod 600 "$sub_tmp" "$encoded_tmp" 2>/dev/null || true
     mv -f "$sub_tmp" "$SUB_PATH_DIR/jhsub.txt"
     mv -f "$encoded_tmp" "$SUB_PATH_DIR/jhsub_encoded.txt"
-    # 生成客户端 JSON (含所有已启用的协议 outbounds)
+    # sing-box 官方客户端：一条完整配置包含所有已启用且受支持的协议。
     generate_client_json "$SERVER_IP_RAW" || return 1
-    # sing-box 官方客户端：单独 VL Reality 订阅（五哥指定，最大保活）
+    # 旧版面板曾发布单独 VL Reality 地址；继续生成以保证已订阅用户热更后不断链，
+    # 新面板不再把它作为 sing-box 官方主入口展示。
     generate_client_json "$SERVER_IP_RAW" vless 2>/dev/null || true
     # 其他软件：一个软件一条订阅（内容按兼容性裁剪）
     generate_client_split_subs
@@ -209,8 +210,10 @@ generate_node_and_sub() {
     # 当 Clash Meta 开关开启时，自动生成 Clash YAML 订阅
     if [ "$CLASH_ENABLED" = "true" ]; then
         generate_clash_yaml "$SERVER_IP_RAW" || return 1
+        generate_clash_client_copies || return 1
     else
-        rm -f "$SUB_PATH_DIR/clash_meta.yaml"
+        rm -f "$SUB_PATH_DIR/clash_meta.yaml" "$SUB_PATH_DIR/client-mihomo.yaml" \
+            "$SUB_PATH_DIR/client-clash-verge.yaml" "$SUB_PATH_DIR/client-flclash.yaml"
     fi
     # 所有目标文件写入完成后再原子刷新短地址；旧 UUID 长路径继续保留兼容。
     create_short_subscription_alias || return 1
@@ -276,6 +279,9 @@ r jhsub.txt
 c client.json
 m clash_meta.yaml
 cv client-vl.json
+mm client-mihomo.yaml
+vg client-clash-verge.yaml
+fc client-flclash.yaml
 sv client-v2rayn.txt
 sg client-v2rayng.txt
 sr client-sr.txt
@@ -291,6 +297,9 @@ subscription_short_route() {
         client|client.json) printf 'c' ;;
         clash|clash_meta.yaml) printf 'm' ;;
         client-vl.json|vl) printf 'cv' ;;
+        client-mihomo.yaml|mihomo) printf 'mm' ;;
+        client-clash-verge.yaml|clash-verge) printf 'vg' ;;
+        client-flclash.yaml|flclash) printf 'fc' ;;
         client-v2rayn.txt) printf 'sv' ;;
         client-v2rayng.txt) printf 'sg' ;;
         client-sr.txt) printf 'sr' ;;
@@ -324,7 +333,7 @@ build_subscription_url() {
     local user_id="$3"
     local file_name="$4"
     case "$file_name" in
-        jhsub.txt|jhsub_encoded.txt|client.json|clash_meta.yaml) ;;
+        jhsub.txt|jhsub_encoded.txt|client.json|clash_meta.yaml|client-mihomo.yaml|client-clash-verge.yaml|client-flclash.yaml) ;;
         *) return 1 ;;
     esac
     [[ "$server_ip$public_port$user_id" != *$'\n'* && \
@@ -374,8 +383,11 @@ generate_client_json() {
         hy2) file_suffix="-hy2" ;;
         tuic5) file_suffix="-tu5" ;;
         anytls) file_suffix="-an" ;;
+        naive) file_suffix="-naive" ;;
     esac
-    local hostname="${HOSTNAME:-node}"
+    # 个人订阅使用与管理员备注无关的稳定随机别名。修改面板备注时，
+    # 客户端节点名称不会变化，也不会把管理备注泄露到订阅中。
+    local hostname="${RR_CLIENT_NAME_OVERRIDE:-${HOSTNAME:-node}}"
     # 设备订阅复用：RR_CLIENT_UUID_OVERRIDE 覆盖节点凭据，RR_SUB_OUTPUT_DIR 覆盖输出目录
     local uuid_val="${RR_CLIENT_UUID_OVERRIDE:-$UUID}"
     local SUB_PATH_DIR="${RR_SUB_OUTPUT_DIR:-${SUB_ROOT}/${uuid_val}}"
@@ -397,10 +409,18 @@ generate_client_json() {
 
     local outbounds_json='"outbounds":['
     local first=true
+    local tags=""
+
+    append_client_tag() {
+        local tag="$1"
+        [ -n "$tags" ] && tags+=','
+        tags+='"'"$tag"'"'
+    }
 
     # Vmess (VM_ENABLED控制)
     if [ "$VM_ENABLED" != "false" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "vmess-${hostname}"
         if [ "$VM_TLS_ENABLED" = "true" ]; then
             outbounds_json+='{"type":"vmess","tag":"vmess-'"$hostname"'","server":"'"$SERVER_IP"'","server_port":'"$PORT"',"uuid":"'"$uuid_val"'","security":"auto","packet_encoding":"packetaddr",'"$hb_tcp_field"'"tls":{"enabled":true,"server_name":"www.bing.com","insecure":true,"utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"/'"${UUID}"'-vm"}}'
         else
@@ -411,6 +431,7 @@ generate_client_json() {
                 while IFS= read -r pref_add; do
                     [ -n "$pref_add" ] || continue
                     outbounds_json+=',{"type":"vmess","tag":"vmess-pref'"$pref_idx"'-'"$hostname"'","server":"'"$pref_add"'","server_port":'"$ARGO_EDGE_PORT"',"uuid":"'"$uuid_val"'","security":"auto","packet_encoding":"packetaddr",'"$hb_tcp_field"'"tls":{"enabled":true,"server_name":"'"$ARGO_DOMAIN"'","utls":{"enabled":true,"fingerprint":"chrome"}},"transport":{"type":"ws","path":"/'"${UUID}"'-vm","max_early_data":2048,"early_data_header_name":"Sec-WebSocket-Protocol","headers":{"Host":["'"$ARGO_DOMAIN"'"]}}}'
+                    append_client_tag "vmess-pref${pref_idx}-${hostname}"
                     pref_idx=$((pref_idx + 1))
                 done < /tmp/sub_server/preferred_cnames.txt
             fi
@@ -420,12 +441,14 @@ generate_client_json() {
     # Vless
     if [ "$VL_ENABLED" = "true" ] && [ -n "$VL_PORT" ] && [ "$VL_PORT" != "0" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "vless-${hostname}"
         outbounds_json+='{"type":"vless","tag":"vless-'"$hostname"'","server":"'"$SERVER_IP"'","server_port":'"$VL_PORT"',"uuid":"'"$uuid_val"'","flow":"xtls-rprx-vision",'"$hb_tcp_field"'"tls":{"enabled":true,"server_name":"apple.com","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"'"$PUBLIC_KEY"'","short_id":"'"$SHORT_ID"'"}}}'
     fi
 
     # Hysteria2
     if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_PORT" ] && [ "$HY2_PORT" != "0" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "hy2-${hostname}"
         local hy2_hop_ports=""
         local hy2_port_fields=""
         local hy2_ports_json=""
@@ -444,12 +467,14 @@ generate_client_json() {
     # Tuic5
     if [ "$TU5_ENABLED" = "true" ] && [ -n "$TU5_PORT" ] && [ "$TU5_PORT" != "0" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "tuic5-${hostname}"
         outbounds_json+='{"type":"tuic","tag":"tuic5-'"$hostname"'","server":"'"$SERVER_IP"'","server_port":'"$TU5_PORT"',"uuid":"'"$uuid_val"'","password":"'"$uuid_val"'","congestion_control":"bbr","zero_rtt_handshake":true,"udp_relay_mode":"native","tls":{"enabled":true,"server_name":"www.bing.com","insecure":true,"alpn":["h3"]}}'
     fi
 
     # Anytls
     if [ "$AN_ENABLED" = "true" ] && [ -n "$AN_PORT" ] && [ "$AN_PORT" != "0" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "anytls-${hostname}"
         outbounds_json+='{"type":"anytls","tag":"anytls-'"$hostname"'","server":"'"$SERVER_IP"'","server_port":'"$AN_PORT"',"password":"'"$uuid_val"'",'"$hb_tcp_field"'"tls":{"enabled":true,"server_name":"www.bing.com","insecure":true}}'
     fi
 
@@ -457,19 +482,13 @@ generate_client_json() {
     # 设备订阅通过 RR_NAIVE_USER_OVERRIDE/RR_NAIVE_PASS_OVERRIDE 注入独立凭据，流量按 username 精确归属
     if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+        append_client_tag "naive-${hostname}"
         local naive_ou="${RR_NAIVE_USER_OVERRIDE:-$NAIVE_USER}"
         local naive_op="${RR_NAIVE_PASS_OVERRIDE:-$NAIVE_PASS}"
         outbounds_json+='{"type":"naive","tag":"naive-'"$hostname"'","server":"'"$NAIVE_DOMAIN"'","server_port":'"$NAIVE_PORT"',"username":"'"$naive_ou"'","password":"'"$naive_op"'","tls":{"enabled":true,"server_name":"'"$NAIVE_DOMAIN"'"}}'
     fi
 
-    # Selector
-    local tags=""
-    [ "$VM_ENABLED" != "false" ] && tags='"vmess-'"$hostname"'"'
-    [ "$VL_ENABLED" = "true" ] && [ "$VL_PORT" != "0" ] && { [ -n "$tags" ] && tags+=','; tags+='"vless-'"$hostname"'"'; }
-    [ "$HY2_ENABLED" = "true" ] && [ "$HY2_PORT" != "0" ] && { [ -n "$tags" ] && tags+=','; tags+='"hy2-'"$hostname"'"'; }
-    [ "$TU5_ENABLED" = "true" ] && [ "$TU5_PORT" != "0" ] && { [ -n "$tags" ] && tags+=','; tags+='"tuic5-'"$hostname"'"'; }
-    [ "$AN_ENABLED" = "true" ] && [ "$AN_PORT" != "0" ] && { [ -n "$tags" ] && tags+=','; tags+='"anytls-'"$hostname"'"'; }
-
+    # Selector / URLTest 覆盖全部已生成节点，包括 Argo 优选副节点与 Naive。
     if [ -n "$tags" ]; then
         if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
         outbounds_json+='{"tag":"proxy","type":"selector","default":"auto","outbounds":["auto",'"$tags"']},{"tag":"auto","type":"urltest","outbounds":['"$tags"'],"url":"http://www.gstatic.com/generate_204","interval":"10m","tolerance":50}'
@@ -527,16 +546,16 @@ generate_clash_yaml() {
     mkdir -p "$SUB_PATH_DIR"
     local yaml_file=""
     yaml_file=$(mktemp "$SUB_PATH_DIR/.clash_meta.yaml.XXXXXX") || return 1
-    local hostname="${HOSTNAME:-node}"
+    local hostname="${RR_CLIENT_NAME_OVERRIDE:-${HOSTNAME:-node}}"
     local clash_ipv6=false
     is_ip_version "$SERVER_IP" 6 && clash_ipv6=true
     local proxy_names=""
     local proxy_name=""
     # 默认选中第一个可用协议（兼容性优先：VMess > VL > HY2 > TU5 > ANYTLS）
     local clash_default_node=""
-    # 主动心跳：Clash 订阅只注入 TCP keepalive（UDP 协议 QUIC 保活由协议自管）
-    local clash_ka_idle=""
-    local clash_ka_interval=""
+    # mihomo 的 TCP Keep Alive 是顶层通用配置，不是单个 proxy 字段。
+    # 写进节点块时部分前端会静默忽略，部分前端会拒绝整份配置。
+    local clash_keepalive=""
     if [ "$HB_ENABLED" = "true" ]; then
         local hb_sec="${HB_INTERVAL:-30}"
         case "$hb_sec" in
@@ -544,8 +563,7 @@ generate_clash_yaml() {
         esac
         [ "$hb_sec" -ge 1 ] 2>/dev/null || hb_sec=30
         [ "$hb_sec" -le 3600 ] 2>/dev/null || hb_sec=3600
-        clash_ka_idle="    keep-alive-idle: $hb_sec"
-        clash_ka_interval="    keep-alive-interval: $hb_sec"
+        clash_keepalive="keep-alive-idle: $hb_sec"$'\n'"keep-alive-interval: $hb_sec"
     fi
 
     cat > "$yaml_file" <<EOF
@@ -556,6 +574,7 @@ mode: rule
 log-level: info
 ipv6: $clash_ipv6
 global-client-fingerprint: chrome
+$clash_keepalive
 
 dns:
   enable: true
@@ -619,7 +638,7 @@ EOF
 
     if [ "$VM_ENABLED" != "false" ]; then
         proxy_name="VMESS-${hostname}"
-        [ -z "$clash_default_node" ] && clash_default_node="    default: $proxy_name"
+        [ -z "$clash_default_node" ] && clash_default_node="    default-selected: \"$proxy_name\""
         proxy_names+="      - \"${proxy_name}\""$'\n'
         if [ "$VM_TLS_ENABLED" = "true" ]; then
             cat >> "$yaml_file" <<EOF
@@ -635,8 +654,6 @@ EOF
     servername: www.bing.com
     skip-cert-verify: true
     network: ws
-$clash_ka_idle
-$clash_ka_interval
     ws-opts:
       path: "/${UUID}-vm"
 EOF
@@ -653,8 +670,6 @@ EOF
     tls: true
     servername: "$ARGO_DOMAIN"
     network: ws
-$clash_ka_idle
-$clash_ka_interval
     ws-opts:
       path: "/${UUID}-vm"
       headers:
@@ -679,8 +694,6 @@ EOF
     tls: true
     servername: "$ARGO_DOMAIN"
     network: ws
-$clash_ka_idle
-$clash_ka_interval
     ws-opts:
       path: "/${UUID}-vm"
       headers:
@@ -694,7 +707,7 @@ EOF
 
     if [ "$VL_ENABLED" = "true" ] && [ -n "$VL_PORT" ] && [ "$VL_PORT" != "0" ]; then
         proxy_name="VL-REALITY-$hostname"
-        [ -z "$clash_default_node" ] && clash_default_node="    default: $proxy_name"
+        [ -z "$clash_default_node" ] && clash_default_node="    default-selected: \"$proxy_name\""
         proxy_names+="      - \"${proxy_name}\""$'\n'
         cat >> "$yaml_file" <<EOF
   - name: "$proxy_name"
@@ -707,8 +720,6 @@ EOF
     tls: true
     flow: xtls-rprx-vision
     servername: apple.com
-$clash_ka_idle
-$clash_ka_interval
     reality-opts:
       public-key: $PUBLIC_KEY
       short-id: $SHORT_ID
@@ -718,6 +729,7 @@ EOF
 
     if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_PORT" ] && [ "$HY2_PORT" != "0" ]; then
         proxy_name="HY2-$hostname"
+        [ -z "$clash_default_node" ] && clash_default_node="    default-selected: \"$proxy_name\""
         proxy_names+="      - \"${proxy_name}\""$'\n'
         local hy2_hop=""
         local hy2_clash_ports=""
@@ -750,6 +762,7 @@ EOF
 
     if [ "$TU5_ENABLED" = "true" ] && [ -n "$TU5_PORT" ] && [ "$TU5_PORT" != "0" ]; then
         proxy_name="TU5-$hostname"
+        [ -z "$clash_default_node" ] && clash_default_node="    default-selected: \"$proxy_name\""
         proxy_names+="      - \"${proxy_name}\""$'\n'
         cat >> "$yaml_file" <<EOF
   - name: "$proxy_name"
@@ -769,6 +782,7 @@ EOF
 
     if [ "$AN_ENABLED" = "true" ] && [ -n "$AN_PORT" ] && [ "$AN_PORT" != "0" ]; then
         proxy_name="ANYTLS-$hostname"
+        [ -z "$clash_default_node" ] && clash_default_node="    default-selected: \"$proxy_name\""
         proxy_names+="      - \"${proxy_name}\""$'\n'
         cat >> "$yaml_file" <<EOF
   - name: "$proxy_name"
@@ -780,8 +794,6 @@ EOF
     udp: true
     idle-session-check-interval: 30
     idle-session-timeout: 30
-$clash_ka_idle
-$clash_ka_interval
     sni: www.bing.com
     skip-cert-verify: true
 EOF
@@ -805,6 +817,24 @@ rules:
 EOF
     chmod 600 "$yaml_file" 2>/dev/null || true
     mv -f "$yaml_file" "$SUB_PATH_DIR/clash_meta.yaml"
+}
+
+# mihomo、Clash Verge 与 FlClash 使用同一 mihomo 配置语法，但分别发布
+# 独立文件，便于面板为每个软件提供独立地址/二维码并单独排障。
+generate_clash_client_copies() {
+    local SUB_PATH_DIR="${RR_SUB_OUTPUT_DIR:-${SUB_ROOT}/${RR_CLIENT_UUID_OVERRIDE:-$UUID}}"
+    local source_file="${SUB_PATH_DIR}/clash_meta.yaml"
+    local target_name=""
+    local target_tmp=""
+    [ -s "$source_file" ] || return 1
+    for target_name in client-mihomo.yaml client-clash-verge.yaml client-flclash.yaml; do
+        target_tmp=$(mktemp "$SUB_PATH_DIR/.${target_name}.XXXXXX") || return 1
+        if ! install -m 600 "$source_file" "$target_tmp"; then
+            rm -f "$target_tmp"
+            return 1
+        fi
+        mv -f "$target_tmp" "$SUB_PATH_DIR/$target_name" || { rm -f "$target_tmp"; return 1; }
+    done
 }
 
 # ==========================================

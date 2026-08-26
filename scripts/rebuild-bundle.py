@@ -35,6 +35,7 @@ MANIFEST_FILES = (
     ]
     + [
         "nexus/rr_nexus.py",
+        "nexus/sub_server.py",
         "nexus/static/index.html",
         "nexus/static/app.js",
         "nexus/static/app.css",

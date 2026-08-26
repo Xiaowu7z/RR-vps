@@ -370,7 +370,7 @@ is_subscription_pid() {
     # 必须核对进程身份，绝不因陈旧 PID 文件误杀其他服务。
     [ -r "/proc/${pid}/cmdline" ] || return 1
     cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
-    [[ "$cmdline" == *"python3 -m http.server"* ]] || return 1
+    [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || return 1
     process_cwd=$(readlink -f "/proc/${pid}/cwd" 2>/dev/null) || return 1
     expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 1
     [ "$process_cwd" = "$expected_cwd" ]

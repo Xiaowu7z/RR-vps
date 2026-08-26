@@ -3,7 +3,7 @@
 const state = {
   csrf: "", mode: "local", domain: "", port: 7900, sshHost: "服务器IP",
   devices: [], traffic: null, overview: null, activeView: "overview",
-  filter: "all", query: "", refreshTimer: null, _prevTraffic: {},
+  filter: "all", query: "", refreshTimer: null, _prevTraffic: {}, serverPlan: null,
 };
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -19,6 +19,11 @@ function errorText(code) {
     invalid_name: "设备备注需为 1–64 个可见字符。",
     invalid_quota: "额度范围应为 0–10240 GB。",
     invalid_expiry: "到期日期格式不正确。",
+    invalid_reset_schedule: "自动重置计划无效：日期不能早于今天，次数应为 1–120。",
+    invalid_server_quota: "服务器套餐额度无效。",
+    invalid_traffic_mode: "服务器流量计费方式无效。",
+    invalid_network_interface: "所选网卡不存在，请重新选择。",
+    invalid_initial_usage: "运营商当前已用流量无效。",
     invalid_request: "请求数据无效，请刷新页面后重试。",
     invalid_enabled: "启停参数无效，请刷新页面后重试。",
     node_sync_failed: "节点配置同步失败，变更已回滚。",
@@ -240,6 +245,9 @@ function renderDevices() {
     const used = Number(device.used_bytes || 0);
     const percent = quota ? Math.min(100, used / quota * 100) : 0;
     const expiry = device.expires_at || "长期有效";
+    const resetPlan = device.next_reset_at
+      ? `${device.next_reset_at} · 剩余 ${device.reset_remaining} 次`
+      : Number(device.reset_max || 0) ? "自动重置已完成" : "未设置自动重置";
     const updated = device.traffic_updated_at ? relativeTime(device.traffic_updated_at) : "等待首笔流量";
     const now_ts = Date.now();
     const prev = state._prevTraffic[device.id] || { up: device.uploaded_bytes || 0, down: device.downloaded_bytes || 0, ts: now_ts - 1000 };
@@ -256,8 +264,8 @@ function renderDevices() {
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(up_rate)}</span><span class="r-down">↓ ${formatRate(down_rate)}</span></div>
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
-      <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span><span><small>最近统计</small><b>${escapeHtml(updated)}</b></span></div>
-      <div class="device-actions"><button data-action="links">链接与二维码</button><button data-action="reset">重置流量</button><button data-action="toggle">${device.enabled ? "暂停" : "启用"}</button><button class="danger" data-action="delete" title="删除">×</button></div>
+      <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span><span><small>自动重置</small><b>${escapeHtml(resetPlan)}</b></span><span><small>最近统计</small><b>${escapeHtml(updated)}</b></span></div>
+      <div class="device-actions"><button data-action="links">链接与二维码</button><button data-action="rename">改备注</button><button data-action="reset">重置流量</button><button data-action="toggle">${device.enabled ? "暂停" : "启用"}</button><button class="danger" data-action="delete" title="删除">×</button></div>
     </article>`;
   }).join("");
 }
@@ -272,9 +280,74 @@ async function loadTraffic(notify = true) {
     $("#traffic-upload-rate").textContent = `↑ ${formatRate(data.status.upload_rate)}`;
     $("#traffic-download-rate").textContent = `↓ ${formatRate(data.status.download_rate)}`;
     renderTrafficHealth(data.status);
+    state.serverPlan = data.server_plan || null;
+    renderServerPlan(data.server_plan || {}, "");
     renderRanking(data.devices || []);
     renderCharts();
   } catch (error) { if (notify) toast(error.message, true); }
+}
+
+function renderServerPlan(plan, prefix = "") {
+  const id = name => $(`#${prefix}${name}`);
+  const quotaInput = id("server-plan-quota");
+  const modeInput = id("server-plan-mode");
+  const interfaceInput = id("server-plan-interface");
+  const form = id("server-traffic-form");
+  const editing = form && form.contains(document.activeElement);
+  if (!editing) {
+    quotaInput.value = Number(plan.quota_bytes || 0) ? (Number(plan.quota_bytes) / 1024 ** 3).toFixed(2) : "0";
+    modeInput.value = plan.count_mode || "both";
+    const selected = plan.interface_name || "";
+    interfaceInput.innerHTML = '<option value="">自动识别公网默认网卡</option>' + (plan.interfaces || []).map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
+    interfaceInput.value = selected;
+  }
+  id("server-plan-rx").textContent = formatBytes(plan.received_bytes || 0);
+  id("server-plan-tx").textContent = formatBytes(plan.transmitted_bytes || 0);
+  id("server-plan-used").textContent = formatBytes(plan.used_bytes || 0);
+  id("server-plan-cycle").textContent = plan.cycle_started_at ? `周期开始：${new Date(plan.cycle_started_at).toLocaleString("zh-CN", { hour12: false })}` : "计费周期尚未开始";
+  id("server-plan-remaining").textContent = Number(plan.quota_bytes || 0)
+    ? `${plan.exhausted ? "套餐已用尽" : "剩余"} ${formatBytes(plan.remaining_bytes || 0)}`
+    : "未设置额度";
+  const progress = id("server-plan-progress");
+  progress.dataset.w = Number(plan.percent || 0).toFixed(1);
+  applyBarWidths(form || document);
+  const stateEl = id("server-plan-state");
+  stateEl.className = `live-badge ${plan.available ? (plan.exhausted ? "offline" : "live") : "pending"}`;
+  stateEl.innerHTML = `<i></i>${plan.available ? `${plan.active_interface || "网卡"} · ${plan.exhausted ? "额度用尽" : "统计中"}` : "等待网卡采样"}`;
+}
+
+async function saveServerPlan(event, remote = false) {
+  event.preventDefault();
+  const prefix = remote ? "rs-" : "";
+  const payload = {
+    quota_gb: Number($(`#${prefix}server-plan-quota`).value || 0),
+    count_mode: $(`#${prefix}server-plan-mode`).value,
+    interface_name: $(`#${prefix}server-plan-interface`).value,
+  };
+  try {
+    const result = remote
+      ? await rsRemoteApi("PATCH", "/api/server/traffic-policy", payload)
+      : await api("/api/server/traffic-policy", { method: "PATCH", body: payload });
+    renderServerPlan(result.policy || {}, prefix);
+    toast(remote ? "副服务器套餐设置已保存。" : "服务器套餐设置已保存。");
+  } catch (error) { toast(error.message, true); }
+}
+
+async function resetServerPlan(remote = false) {
+  const value = prompt("开始新的运营商计费周期。\n若运营商面板已经产生用量，可填写当前已用 GB；否则填 0：", "0");
+  if (value === null) return;
+  const initial = Number(value);
+  if (!Number.isFinite(initial) || initial < 0 || initial > 1048576) {
+    toast("当前已用流量应为有效的 GB 数值。", true);
+    return;
+  }
+  try {
+    const result = remote
+      ? await rsRemoteApi("POST", "/api/server/traffic-policy/reset", { initial_used_gb: initial })
+      : await api("/api/server/traffic-policy/reset", { method: "POST", body: { initial_used_gb: initial } });
+    renderServerPlan(result.policy || {}, remote ? "rs-" : "");
+    toast("新计费周期已经开始。");
+  } catch (error) { toast(error.message, true); }
 }
 
 function renderRanking(devices) {
@@ -358,7 +431,7 @@ function renderCharts() {
 function configureAccessGuide() {
   let host = state.sshHost;
   if (host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
-  const command = `ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -N -L ${state.port}:127.0.0.1:${state.port} root@${host}`;
+  const command = `ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${state.port}:127.0.0.1:${state.port} root@${host}`;
   $("#ssh-command").textContent = command;
   const localUrl = `http://127.0.0.1:${state.port}`;
   $("#local-panel-link").href = localUrl;
@@ -423,8 +496,10 @@ async function refreshLive(notify = false) {
   if (state.activeView === "remote" && !state.remoteActive) await loadRemoteServers();
 }
 
-function openCreate() {
+function openCreate(remote = false) {
   $("#device-form").reset();
+  $("#device-dialog").dataset.remote = remote ? "1" : "0";
+  $("#device-dialog h2").textContent = remote ? "远程添加设备" : "添加设备";
   $("#device-form-error").textContent = "";
   $("#device-dialog").showModal();
 }
@@ -437,10 +512,20 @@ async function createDevice(event) {
   submit.disabled = true;
   $("#device-form-error").textContent = "";
   try {
-    await api("/api/devices", { method: "POST", body: JSON.stringify({ name: values.get("name"), quota_gb: Number(values.get("quota_gb") || 0), expires_at: values.get("expires_at") || "" }) });
+    const payload = {
+      name: values.get("name"),
+      quota_gb: Number(values.get("quota_gb") || 0),
+      expires_at: values.get("expires_at") || "",
+      reset_at: values.get("reset_at") || "",
+      reset_max: Number(values.get("reset_max") || 0),
+    };
+    const remote = $("#device-dialog").dataset.remote === "1";
+    if (remote) await rsRemoteApi("POST", "/api/devices", payload);
+    else await api("/api/devices", { method: "POST", body: payload });
     $("#device-dialog").close();
-    await refreshLive();
-    toast("设备已创建，节点配置正在后台同步（不影响现有用户在线）。");
+    if (remote) await rsLoadDevices();
+    else await refreshLive();
+    toast(remote ? "远程设备已创建，副服务器正在同步。" : "设备已创建，节点配置正在后台同步（不影响现有用户在线）。");
   } catch (error) { $("#device-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message; }
   finally { submit.disabled = false; }
 }
@@ -453,11 +538,52 @@ async function toggleDevice(device) {
   } catch (error) { toast(error.message, true); }
 }
 
+function openRenameDialog(device, remote = false) {
+  const dialog = $("#rename-dialog");
+  dialog.dataset.deviceId = device.id;
+  dialog.dataset.remote = remote ? "1" : "0";
+  $("#rename-input").value = device.name || "";
+  $("#rename-form-error").textContent = "";
+  dialog.showModal();
+  requestAnimationFrame(() => $("#rename-input").focus());
+}
+
+async function submitRename(event) {
+  event.preventDefault();
+  const dialog = $("#rename-dialog");
+  const deviceId = dialog.dataset.deviceId || "";
+  const name = $("#rename-input").value.trim();
+  if (!deviceId || !name) {
+    $("#rename-form-error").textContent = "设备备注不能为空。";
+    return;
+  }
+  const submit = $("#rename-submit");
+  submit.disabled = true;
+  $("#rename-form-error").textContent = "";
+  try {
+    if (dialog.dataset.remote === "1") {
+      await rsRemoteApi("PATCH", `/api/devices/${deviceId}`, { name });
+      await rsLoadDevices();
+    } else {
+      await api(`/api/devices/${deviceId}`, { method: "PATCH", body: { name } });
+      await loadDevices(false);
+      await loadTraffic(false);
+    }
+    dialog.close();
+    toast("设备备注已保存，不影响订阅和节点名称。");
+  } catch (error) {
+    $("#rename-form-error").textContent = error.message || "备注保存失败。";
+  } finally { submit.disabled = false; }
+}
+
 async function resetDevice(device) {
   $("#reset-device-name").textContent = device.name;
   $("#reset-current").textContent = `${formatBytes(device.used_bytes)} / ${Number(device.quota_bytes || 0) ? formatBytes(device.quota_bytes) : "不限"}`;
   const input = $("#reset-quota-input");
   input.value = device.quota_bytes ? (Number(device.quota_bytes) / 1024 ** 3).toFixed(2) : "0";
+  $("#reset-at-input").value = device.next_reset_at || "";
+  $("#reset-max-input").value = Number(device.reset_remaining || 0);
+  $("#reset-expiry-input").value = device.expires_at || "";
   $("#reset-form-error").textContent = "";
   $("#reset-dialog").showModal();
 }
@@ -480,18 +606,27 @@ async function submitReset(event) {
   submit.disabled = true;
   $("#reset-form-error").textContent = "";
   try {
-    const body = quotaGb === null ? {} : { quota_gb: quotaGb };
-    await api(`/api/devices/${deviceId}/reset`, { method: "POST", body: JSON.stringify(body) });
+    const body = {
+      reset_at: $("#reset-at-input").value || "",
+      reset_max: Number($("#reset-max-input").value || 0),
+      expires_at: $("#reset-expiry-input").value || "",
+    };
+    if (quotaGb !== null) body.quota_gb = quotaGb;
+    const remote = dialog.dataset.remote === "1";
+    if (remote) await rsRemoteApi("POST", `/api/devices/${deviceId}/reset`, body);
+    else await api(`/api/devices/${deviceId}/reset`, { method: "POST", body });
     dialog.close();
-    await refreshLive();
-    toast("流量已重置，设备恢复可用。");
+    if (remote) await rsLoadDevices();
+    else await refreshLive();
+    toast(remote ? "副服务器设备流量及计划已更新。" : "流量已重置，设备恢复可用。");
   } catch (error) {
     $("#reset-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message;
   } finally { submit.disabled = false; }
 }
 
-function openResetDialog(device) {
+function openResetDialog(device, remote = false) {
   $("#reset-dialog").dataset.deviceId = device.id;
+  $("#reset-dialog").dataset.remote = remote ? "1" : "0";
   resetDevice(device);
 }
 
@@ -564,10 +699,14 @@ $("#refresh-button").addEventListener("click", async () => { await refreshLive(t
 $("#audit-refresh").addEventListener("click", loadAudit);
 $$(".nav-item[data-view]").forEach(button => button.addEventListener("click", () => setView(button.dataset.view)));
 $$('[data-jump]').forEach(button => button.addEventListener("click", () => setView(button.dataset.jump)));
-$$('[data-open-create]').forEach(button => button.addEventListener("click", openCreate));
-$("#add-device-button").addEventListener("click", openCreate);
+$$('[data-open-create]').forEach(button => button.addEventListener("click", () => openCreate(false)));
+$("#add-device-button").addEventListener("click", () => openCreate(false));
 $("#device-form").addEventListener("submit", createDevice);
+$("#server-traffic-form").addEventListener("submit", event => saveServerPlan(event, false));
+$("#server-plan-reset").addEventListener("click", () => resetServerPlan(false));
+$("#rename-form").addEventListener("submit", submitRename);
 $("#reset-form").addEventListener("submit", submitReset);
+$$('[data-close-rename]').forEach(button => button.addEventListener("click", () => $("#rename-dialog").close()));
 $$('[data-close-reset]').forEach(button => button.addEventListener("click", () => $("#reset-dialog").close()));
 $$('[data-close-dialog]').forEach(button => button.addEventListener("click", () => $("#device-dialog").close()));
 $$('[data-close-links]').forEach(button => button.addEventListener("click", () => $("#links-dialog").close()));
@@ -587,6 +726,7 @@ $("#device-grid").addEventListener("click", event => {
   const device = state.devices.find(item => item.id === card.dataset.deviceId);
   if (!device) return;
   if (action.dataset.action === "links") openLinks(device);
+  if (action.dataset.action === "rename") openRenameDialog(device);
   if (action.dataset.action === "toggle") toggleDevice(device);
   if (action.dataset.action === "reset") openResetDialog(device);
   if (action.dataset.action === "delete") deleteDevice(device);
@@ -1109,9 +1249,12 @@ async function rsOpenDetail(id) {
   $("#rs-detail-title").textContent = server.name;
   $("#rs-detail-sub").textContent = `${server.addr} · 远程管理（副面板全权限）`;
   $("#rs-update-box").classList.add("hidden");
-  await rsLoadDevices();
+  await Promise.all([rsLoadDevices(), rsLoadServerPlan()]);
   if (state.remoteTimer) clearInterval(state.remoteTimer);
-  state.remoteTimer = setInterval(rsLoadDevices, 3000);
+  state.remoteTimer = setInterval(() => {
+    rsLoadDevices();
+    rsLoadServerPlan(false);
+  }, 3000);
 }
 
 function rsBack() {
@@ -1131,6 +1274,14 @@ async function rsLoadDevices() {
   } catch (e) { toast(e.message, true); }
 }
 
+async function rsLoadServerPlan(notify = true) {
+  if (!state.remoteActive) return;
+  try {
+    const data = await rsRemoteApi("GET", "/api/server/traffic-policy", {});
+    renderServerPlan(data.policy || {}, "rs-");
+  } catch (error) { if (notify) toast(error.message, true); }
+}
+
 function renderRemoteDevices(devices) {
   const grid = $("#rs-device-grid");
   $("#rs-device-empty").classList.toggle("hidden", devices.length > 0);
@@ -1143,6 +1294,9 @@ function renderRemoteDevices(devices) {
     const active = device.active === true || device.active === 1 || enabled;
     const quotaLabel = quota ? `${formatBytes(used)} / ${formatBytes(quota)}` : `${formatBytes(used)} · 不限`;
     const expiry = device.expires_at || "长期有效";
+    const resetPlan = device.next_reset_at
+      ? `${device.next_reset_at} · 剩余 ${device.reset_remaining} 次`
+      : Number(device.reset_max || 0) ? "自动重置已完成" : "未设置";
     return `
     <article class="device-card glass ${enabled ? "" : "disabled"}" data-rs-dev="${escapeHtml(device.id)}">
       <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${active ? "" : "off"}"><i></i>${statusLabel(device)}</span></div>
@@ -1150,9 +1304,10 @@ function renderRemoteDevices(devices) {
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rsRateOf(device.id, device.uploaded_bytes))}</span><span class="r-down">↓ ${formatRate(rsRateOf(device.id, device.downloaded_bytes, true))}</span></div>
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
-      <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span></div>
+      <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span><span><small>自动重置</small><b>${escapeHtml(resetPlan)}</b></span></div>
       <div class="device-actions">
         <button data-rs-links="${escapeHtml(device.id)}">链接与二维码</button>
+        <button data-rs-rename="${escapeHtml(device.id)}">改备注</button>
         <button data-rs-reset="${escapeHtml(device.id)}">重置流量</button>
         <button data-rs-toggle="${escapeHtml(device.id)}">${enabled ? "暂停" : "启用"}</button>
         <button class="danger" data-rs-del="${escapeHtml(device.id)}" title="删除">×</button>
@@ -1160,6 +1315,10 @@ function renderRemoteDevices(devices) {
     </article>`;
   }).join("");
   $$("#rs-device-grid [data-rs-links]").forEach(btn => btn.addEventListener("click", () => rsOpenLinks(btn.dataset.rsLinks)));
+  $$("#rs-device-grid [data-rs-rename]").forEach(btn => btn.addEventListener("click", () => {
+    const device = (state.remoteDevices || []).find(item => String(item.id) === String(btn.dataset.rsRename));
+    if (device) openRenameDialog(device, true);
+  }));
   $$("#rs-device-grid [data-rs-toggle]").forEach(btn => btn.addEventListener("click", () => rsToggleDevice(btn.dataset.rsToggle)));
   $$("#rs-device-grid [data-rs-reset]").forEach(btn => btn.addEventListener("click", () => rsResetDevice(btn.dataset.rsReset)));
   $$("#rs-device-grid [data-rs-del]").forEach(btn => btn.addEventListener("click", () => rsDeleteDevice(btn.dataset.rsDel)));
@@ -1216,14 +1375,9 @@ async function rsToggleDevice(id) {
 }
 
 async function rsResetDevice(id) {
-  const name = $(`[data-rs-dev="${id}"] b`)?.textContent || id;
-  const quota = prompt(`重置「${name}」的流量。\n新额度（GB，留空保持原额度，0 不限）：`, "");
-  if (quota === null) return;
-  try {
-    await rsRemoteApi("POST", `/api/devices/${id}/reset`, quota === "" ? {} : { quota_gb: Number(quota) });
-    toast("流量已重置");
-    rsLoadDevices();
-  } catch (e) { toast(e.message, true); }
+  const device = (state.remoteDevices || []).find(item => String(item.id) === String(id));
+  if (!device) { toast("未找到该设备，请刷新重试", true); return; }
+  openResetDialog(device, true);
 }
 
 async function rsDeleteDevice(id) {
@@ -1237,17 +1391,7 @@ async function rsDeleteDevice(id) {
 }
 
 async function rsCreateDevice() {
-  const name = prompt("远程添加设备\n\n设备备注：", "");
-  if (name === null) return;
-  const quota = prompt("额度（GB，0 不限，留空不限）：", "0");
-  if (quota === null) return;
-  const expiry = prompt("到期日期（YYYY-MM-DD，留空长期）：", "");
-  if (expiry === null) return;
-  try {
-    await rsRemoteApi("POST", "/api/devices", { name, quota_gb: Number(quota) || 0, expires_at: expiry });
-    toast("设备已创建，节点配置正在后台同步");
-    rsLoadDevices();
-  } catch (e) { toast(e.message, true); }
+  openCreate(true);
 }
 
 // ---- 副面板：远程钥匙 ----
@@ -1293,6 +1437,8 @@ $("#local-update-btn")?.addEventListener("click", localCheckUpdate);
 $("#local-update-run-btn")?.addEventListener("click", localRunUpdate);
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 $("#rs-device-add")?.addEventListener("click", rsCreateDevice);
+$("#rs-server-traffic-form")?.addEventListener("submit", event => saveServerPlan(event, true));
+$("#rs-server-plan-reset")?.addEventListener("click", () => resetServerPlan(true));
 $("#rs-key-issue")?.addEventListener("click", rsKeyIssue);
 $("#rs-key-revoke")?.addEventListener("click", rsKeyRevoke);
 $("#rs-key-copy")?.addEventListener("click", async () => {

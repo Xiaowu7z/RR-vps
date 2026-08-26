@@ -8,13 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.0.2** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.0.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### New in 7.0.2: browser-based Edge candidate screening
+### New in 7.0.3: personal subscriptions, recurring quotas, and server traffic plans
 
-RR Nexus now provides a local browser-based Cloudflare Edge screener for users without an Android test environment. It narrows the built-in 1,000-domain pool to a TOP 20 shortlist. Mobile networks use `openai.com` as the quality baseline, while Wi-Fi/broadband uses `openai.com`, `deepl.com`, and `cloudflare.com`.
+RR Nexus 7.0.3 separates subscriptions for mihomo, Clash Verge Rev, FlClash, and the official Sing-box client, completes multi-protocol node coverage, and publishes standard usage and expiry metadata. Personal devices now support calendar-month quota renewals, a finite renewal count, and admin-only notes. The main and remote consoles can also track a carrier traffic allowance from actual interface counters using RX+TX, TX-only, or RX-only accounting.
 
-**Do not judge optimization quality by the panel ranking alone.** Browser DNS, SNI, TLS, connection reuse, and CORS limitations mean that the ranking is only a candidate order, not real proxy quality. Users must test the TOP 20 one by one in the actual client and decide by real speed, stability, and peak-hour performance. The standalone [**RR Edge Atlas multi-platform optimizer**](https://github.com/Xiaowu7z/RR-Edge-Atlas) is the recommended final test.
+The server plan is a persistent monitoring and warning meter for comparison with carrier billing; it does not shut down the entire VPS. A device is blocked as soon as its quota is exhausted, restored on its next scheduled reset, and deleted only after 35 days without an automatic or manual reset.
 
 ## One-command installation
 
@@ -94,13 +94,16 @@ Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to rem
 - No forced reservation of local port 443 for Argo
 - Optional RR Nexus web console with local-only or public HTTPS access
 - Per-device credentials, protocol links, QR codes, enable/disable state, and expiry
+- Calendar-month automatic quota resets with a first date and renewal count; depleted devices stop immediately and are removed after 35 unattended days
+- A server carrier-package meter with a manually entered allowance and bidirectional, TX-only, or RX-only host-interface accounting
 - Panel live server status page: per-second CPU / memory / disk / network, zero-dependency `/proc` sampling
 - Panel firewall settings page: port toggles, IPv4/IPv6 inbound/outbound split, SSH port protection, and a permission tutorial
 - Panel streaming unlock checker: unlock status and region for Netflix / Disney+ / YouTube Premium and more
 - Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be retested with RR Edge Atlas desktop 1.0, Android 2.7.1, or the actual client
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
-- Device subscriptions in three formats (universal link / Sing-box full config / Clash Meta YAML), automatic alternate-node optimization sync, live Argo domain display
+- Per-client device subscriptions: a full multi-protocol sing-box profile; separate YAML URLs for mihomo, Clash Verge, and FlClash; dedicated v2rayN, v2rayNG, Shadowrocket, and NekoBox feeds; plus universal links, each with its own QR code
+- Every personal subscription returns `Subscription-Userinfo`, allowing compatible clients to display upload, download, allowance, remaining traffic, and expiry
 
 ## Client tools and protocol support
 
@@ -127,6 +130,7 @@ Protocol support matrix:
 | Hysteria2 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TUIC v5 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | AnyTLS | ✅ | ✅ (not with Reality) | ✅ (recent versions) | ✅ (2.2.65+) | ✅ (1.3.8+) |
+| NaiveProxy | ✅ (1.13+, platform-dependent builds) | ❌ | Depends on client core | Version-dependent | Version-dependent |
 
 Tip: for fast recovery after screen lock/suspend, enable the active heartbeat mode (main menu 9 → 11) and prefer clients with sing-box core 1.13+.
 
@@ -142,11 +146,17 @@ Choose menu option `14`, then select one access mode:
 
 Public mode never offers bare-IP login or plain HTTP. RR Nexus uses Argon2id password hashes, application and Nginx login rate limits, CSRF protection, HttpOnly/SameSite sessions, Secure cookies in public mode, eight one-time recovery codes, and an audit log.
 
-Each device is an access identity, not another administrator. It receives an independent UUID and protocol links. Disabling, deleting, or expiring a device transactionally rebuilds the Sing-box user list. Public mode exposes a random-token subscription URL for each device; local mode also syncs each device's personal subscription under the main subscription address (`http://SERVER-IP:SUBSCRIPTION-PORT/nexus/<random-token>.txt`) without exposing the management port.
+Each device is an access identity, not another administrator. It receives an independent UUID and protocol links. Disabling, deleting, expiring, or changing a quota transactionally rebuilds the Sing-box user list. An administrator-only device note can be renamed without restarting the node or refreshing subscriptions; client node names use a stable random alias such as `RR-A1B2C3D4`, so the note is never exposed. Public mode exposes a random-token subscription URL for each device; local mode also syncs each device's personal subscription under the main subscription address (`http://SERVER-IP:SUBSCRIPTION-PORT/nexus/<random-token>.txt`) without exposing the management port.
 
-For local mode, run the command printed by the installer on your **own computer**, enter the server root password when prompted, keep that terminal open, and browse to `http://127.0.0.1:7900`. The command uses `UserKnownHostsFile=/dev/null`, `StrictHostKeyChecking=no`, and an SSH `-L` forward; the console displays the exact command for the configured server and port.
+A device can define a first automatic-reset date and a maximum number of monthly renewals. At each boundary, used/upload/download counters return to zero while the allowance stays unchanged; calendar anchoring prevents a 31st-of-the-month plan from drifting permanently after February. A depleted device remains blocked until the next scheduled or manual reset. After all renewals, it expires on the calculated final date. A quota-depleted device left untouched for 35 days is automatically deleted with its credential.
 
-RR Nexus downloads a SHA256-verified core built by the project GitHub Actions workflow from the official stable Sing-box source with the additional `with_v2ray_api` tag. It polls counters named by device ID every five seconds, persists upload and download totals, and revokes access when a quota is reached. This is intended for operational usage and quota management, not carrier-grade billing; an abnormal Sing-box exit or the instant around a reload can still lose a small uncollected delta.
+Both the HTTPS panel route and the standalone HTTP subscription service attach the standard `Subscription-Userinfo` header, plus an hourly refresh recommendation. NekoBox, Clash-family clients, and other compatible apps can show usage, remaining allowance, and expiry; clients that ignore the header continue to import nodes normally.
+
+For local mode, run the command printed by the installer on your **own computer**, enter the server root password when prompted, keep that terminal open, and browse to `http://127.0.0.1:7900`. The command uses an SSH `-L` forward plus a 30-second client keepalive (`ServerAliveInterval=30`, six missed replies) and fails fast when the forward cannot be created; the console displays the exact command for the configured server and port.
+
+RR Nexus downloads a SHA256-verified core built by the project GitHub Actions workflow from the official stable Sing-box source with the additional `with_v2ray_api` tag. It polls counters named by device ID every five seconds, persists upload and download totals, and revokes access when a quota is reached. These per-device figures are application-layer accounting; an abnormal Sing-box exit or the instant around a reload can still lose a small uncollected delta.
+
+The server carrier-package meter is separate. It reads RX/TX byte counters from the selected Linux public interface, persists its baseline across panel restarts, and safely re-baselines after a VPS reboot, counter rollback, or interface change. The operator can count RX+TX, TX only, or RX only and seed a new cycle with the provider's already-used amount. This is closer to provider billing than application counters, but provider-specific overhead and unit conversion still make the provider invoice authoritative. Exhausting this monitor raises a warning; it never takes the whole VPS offline automatically.
 
 ## Which protocol fits my VPS?
 
