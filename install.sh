@@ -90,11 +90,12 @@ rr_manifest_is_valid() {
         $2 == "rr" { launcher = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
+        $2 == "nexus/sub_server.py" { nexus_sub = 1; next }
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
             if (!launcher || modules < 2) exit 1
-            if (!nexus_app || nexus_assets < 3) exit 1
+            if (!nexus_app || !nexus_sub || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
 }
@@ -106,7 +107,7 @@ rr_bundle_archive_is_safe() {
     # downloads and any archive member outside the exact release namespace.
     [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
     tar -tzf "$archive_file" 2>/dev/null | awk '
-        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/rr_nexus\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
+        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/(rr_nexus|sub_server)\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
         seen[$0]++ { exit 1 }
         END { if (NR < 2) exit 1 }
     '
@@ -133,6 +134,7 @@ rr_bundle_tree_is_valid() {
         bash -n "$shell_file" || return 1
     done
     python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
+    python3 -c 'compile(open("'"$bundle_root"'/nexus/sub_server.py", encoding="utf-8").read(), "sub_server.py", "exec")' || return 1
 }
 
 rr_version_ge() {
