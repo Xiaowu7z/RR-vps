@@ -23,10 +23,13 @@
 - 移动网络、宽带、运营商和协议的历史结果相互隔离，避免跨环境污染
 - 更新器增加用户镜像 → GitHub Raw → GitHub 官方 Contents API → IPv4 CDN 多源回退，并区分下载链路失败与远程清单无效
 - CI 正式执行仓库完整回归套件，覆盖 Bash 语法、发布清单、SHA256、Nexus 与更新链路契约
+- 脚本终端为 VMess、VLESS Reality、Hysteria2、TUIC、AnyTLS、NaiveProxy 全部节点补齐二维码，并统一使用 M 级纠错与标准静区
+- RR Nexus 修复公网 IP、IPv6、NAT/LXD 映射端口的订阅二维码地址；只展示真实生成的订阅格式，缺失格式不再产生无效二维码或错误回退
+- 本地与远程面板二维码统一校验目标 URL、PNG 输出和异常超时，节点与订阅二维码使用同一条受检生成链
 
 ### 验证
 - 1000 域名浏览器完整流程、移动网络 OpenAI 单基准、宽带三基准和 390px 手机布局通过
-- 20 个发布清单文件、24 个 bundle 成员、前端单元检查与 Linux GitHub Actions 全部通过
+- 20 个发布清单文件、21 个 bundle 成员、6 种节点 URI、8 种面板订阅格式、前端单元检查与 Linux GitHub Actions 全部通过
 
 ## 7.0.1 - 正式版：Nexus 面板修复与远程设备管理闭环
 

@@ -7,6 +7,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -358,6 +359,8 @@ class NexusConfig:
             mode not in {"local", "public"}
             or listen != "127.0.0.1"
             or not 1 <= port <= 65535
+            or not 1 <= public_port <= 65535
+            or not 0 <= sub_port <= 65535
             or not 1 <= stats_port <= 65535
             or stats_port == port
             or not ssh_host
@@ -1290,6 +1293,20 @@ STATE: NexusState
 
 
 STATE: NexusState
+
+
+def _is_ip_address(value: str) -> bool:
+    try:
+        ipaddress.ip_address((value or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _url_host(value: str) -> str:
+    """Return an RFC 3986 host, adding brackets around an IPv6 literal."""
+    host = (value or "").strip().strip("[]")
+    return "[{}]".format(host) if ":" in host else host
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2644,6 +2661,71 @@ class Handler(BaseHTTPRequestHandler):
         return STATE.config.subscription_root / f"{device_id}.txt"
 
 
+    def _device_subscription_urls(self, device: dict) -> tuple[str, list[dict[str, str]]]:
+        """Build every subscription URL shown or encoded by the panel.
+
+        A real certificate domain can serve subscriptions through the panel's HTTPS
+        routes.  Local mode and public IP mode use RR's plain HTTP subscription
+        service instead: the latter panel is HTTPS-only with a self-signed
+        certificate, which subscription clients cannot reliably trust.
+        """
+        device_id = str(device["id"])
+        token = str(device["subscription_token"])
+        # Shell-side subscription generation atomically refreshes ssh_host/sub_port
+        # after entry-family or NAT mapping changes.  Reload here so QR URLs update
+        # immediately without restarting the management panel.
+        try:
+            config = NexusConfig.load()
+        except (OSError, ValueError, json.JSONDecodeError):
+            config = STATE.config
+
+        specs = [
+            ("Sing-box 官方", "Sing-box 官方客户端（SFA/SFI/SFW）· 单独 VL-Reality 节点", "vl", "-vl.json"),
+            ("Clash Meta", "Clash Meta YAML（mihomo / Clash Verge / FlClash）", "yaml", ".yaml"),
+            ("v2rayN", "v2rayN（Windows）· 全协议", "v2rayn", "-v2rayn.txt"),
+            ("v2rayNG", "v2rayNG（安卓）· 全协议", "v2rayng", "-v2rayng.txt"),
+            ("Shadowrocket", "Shadowrocket（iOS）· 全协议", "sr", "-sr.txt"),
+            ("NekoBox", "NekoBox · 全协议", "nekobox", "-nekobox.txt"),
+            ("通用链接", "URI 全集（通用，兼容旧客户端）", "txt", ".txt"),
+            ("Sing-box 完整", "Sing-box 完整多协议配置", "json", ".json"),
+        ]
+
+        def artifact_exists(suffix: str) -> bool:
+            return (config.subscription_root / f"{device_id}{suffix}").is_file()
+
+        if (
+            config.mode == "public"
+            and config.domain
+            and config.domain != "ip"
+            and not _is_ip_address(config.domain)
+        ):
+            port = config.public_port or config.port
+            base = "https://{}".format(_url_host(config.domain))
+            if port and port != 443:
+                base = "{}:{}".format(base, port)
+            subscription_url = f"{base}/sub/{device_id}/{token}/txt" if artifact_exists(".txt") else ""
+            urls = [
+                {"format": fmt, "name": name, "url": f"{base}/sub/{device_id}/{token}/{route}"}
+                for fmt, name, route, suffix in specs
+                if artifact_exists(suffix)
+            ]
+            return subscription_url, urls
+
+        # 本地模式与公网 IP 直连模式均从主订阅服务取文件。sub_port 保存
+        # 当前入口族对应的公网端口（普通 VPS 与本地监听端口相同；NAT/LXD
+        # 则是服务商映射后的公网端口）。
+        sub_port = getattr(config, "sub_port", 0)
+        host = config.ssh_host or config.domain
+        if not sub_port or not host:
+            return "", []
+        base = "http://{}:{}/nexus/{}".format(_url_host(host), sub_port, token)
+        subscription_url = f"{base}.txt" if artifact_exists(".txt") else ""
+        urls = [
+            {"format": fmt, "name": name, "url": f"{base}{suffix}"}
+            for fmt, name, _route, suffix in specs
+            if artifact_exists(suffix)
+        ]
+        return subscription_url, urls
 
     def handle_device_links(self, device_id: str) -> None:
         device = self.device_record(device_id)
@@ -2652,45 +2734,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "links_not_found"})
             return
         links = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
-        subscription_url = ""
-        subscription_urls: list[dict[str, str]] = []
-        if STATE.config.mode == "public" and STATE.config.domain:
-            port = STATE.config.public_port or STATE.config.port
-            # 域名模式（Let's Encrypt 真证书）用 https；IP 直连（自签证书）用 http 免警告
-            domain = STATE.config.domain
-            is_ip = bool(re.fullmatch(r"[0-9.]+|[\da-fA-F:]+", domain)) if domain else True
-            scheme = "http" if is_ip else "https"
-            base = f"{scheme}://{STATE.config.domain}"
-            if port and port != 443:
-                base = f"{base}:{port}"
-            subscription_url = f"{base}/sub/{device_id}/{device['subscription_token']}"
-            subscription_urls = [
-                {"format": "Sing-box 官方", "name": "Sing-box 官方客户端（SFA/SFI/SFW）· 单独 VL-Reality 节点", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/vl"},
-                {"format": "Clash Meta", "name": "Clash Meta YAML（mihomo / Clash Verge / FlClash）", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/yaml"},
-                {"format": "v2rayN", "name": "v2rayN（Windows）· 全协议", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/v2rayn"},
-                {"format": "v2rayNG", "name": "v2rayNG（安卓）· 全协议", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/v2rayng"},
-                {"format": "Shadowrocket", "name": "Shadowrocket（iOS）· 全协议", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/sr"},
-                {"format": "NekoBox", "name": "NekoBox · 全协议", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/nekobox"},
-                {"format": "通用链接", "name": "URI 全集（通用，兼容旧客户端）", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/txt"},
-                {"format": "Sing-box 完整", "name": "Sing-box 完整多协议配置", "url": f"{base}/sub/{device_id}/{device['subscription_token']}/json"},
-            ]
-        elif STATE.config.mode == "local":
-            # 本地模式：订阅由主订阅服务器（SUB_PORT 静态服务）对外提供
-            sub_port = getattr(STATE.config, "sub_port", None)
-            if sub_port and sub_port != 0:
-                host = STATE.config.ssh_host or STATE.config.domain
-                if host:
-                    subscription_url = f"http://{host}:{sub_port}/nexus/{device['subscription_token']}.txt"
-                    subscription_urls = [
-                        {"format": "Sing-box 官方", "name": "Sing-box 官方客户端（SFA/SFI/SFW）· 单独 VL-Reality 节点", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}-vl.json"},
-                        {"format": "Clash Meta", "name": "Clash Meta YAML（mihomo / Clash Verge / FlClash）", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}.yaml"},
-                        {"format": "v2rayN", "name": "v2rayN（Windows）· 全协议", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}-v2rayn.txt"},
-                        {"format": "v2rayNG", "name": "v2rayNG（安卓）· 全协议", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}-v2rayng.txt"},
-                        {"format": "Shadowrocket", "name": "Shadowrocket（iOS）· 全协议", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}-sr.txt"},
-                        {"format": "NekoBox", "name": "NekoBox · 全协议", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}-nekobox.txt"},
-                        {"format": "通用链接", "name": "URI 全集（通用，兼容旧客户端）", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}.txt"},
-                        {"format": "Sing-box 完整", "name": "Sing-box 完整多协议配置", "url": f"http://{host}:{sub_port}/nexus/{device['subscription_token']}.json"},
-                    ]
+        subscription_url, subscription_urls = self._device_subscription_urls(device)
         # 自动优选状态与 Argo 实时信息（随主脚本实时读取，开/关即时同步到面板）
         # 自动优选状态以 worker 程序存在性为准（主脚本开关即增删 /usr/local/bin/auto_update_sub.py）
         auto_enabled = os.path.exists("/usr/local/bin/auto_update_sub.py")
@@ -2716,23 +2760,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _subscription_txt_url(self, device: dict) -> str:
-        # 总订阅地址（通用链接 txt），与 handle_device_links 的 subscription_urls[0] 保持一致
-        token = device["subscription_token"]
-        if STATE.config.mode == "public" and STATE.config.domain:
-            port = STATE.config.public_port or STATE.config.port
-            domain = STATE.config.domain
-            is_ip = bool(re.fullmatch(r"[0-9.]+|[\da-fA-F:]+", domain)) if domain else True
-            scheme = "http" if is_ip else "https"
-            base = f"{scheme}://{domain}"
-            if port and port != 443:
-                base = f"{base}:{port}"
-            return f"{base}/sub/{device['id']}/{token}/txt"
-        sub_port = getattr(STATE.config, "sub_port", None)
-        if sub_port and sub_port != 0:
-            host = STATE.config.ssh_host or STATE.config.domain
-            if host:
-                return f"http://{host}:{sub_port}/nexus/{token}.txt"
-        return ""
+        return self._device_subscription_urls(device)[0]
 
     def _qr_png_bytes(self, device_id: str, query: dict[str, list[str]]):
         """生成设备链接二维码 PNG。返回 (status, payload)：成功 payload 为 bytes，
@@ -2745,18 +2773,32 @@ class Handler(BaseHTTPRequestHandler):
             link = self._subscription_txt_url(device)
             if not link:
                 return HTTPStatus.BAD_REQUEST, {"error": "no_subscription_url"}
-        elif query.get("raw", [""])[0].startswith(("http://", "https://")):
-            # 6.6.16：订阅地址列表每项二维码——前端直接传 URL 生成
+        elif query.get("raw", [""])[0]:
+            # 只接受本设备实际展示的订阅 URL，防止二维码与面板文案/文件路由漂移。
             link = query["raw"][0]
+            valid_urls = {item["url"] for item in self._device_subscription_urls(device)[1]}
+            if link not in valid_urls:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid_subscription_url"}
         else:
             links = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
             try:
                 index = int(query.get("index", ["0"])[0])
+                if index < 0:
+                    raise IndexError
                 link = links[index]
             except (ValueError, IndexError):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid_link_index"}
-        result = subprocess.run(["qrencode", "-t", "PNG", "-s", "6", "-m", "2", "-o", "-", link], capture_output=True, timeout=5, check=False)
-        if result.returncode != 0:
+        try:
+            # 4 模块静区符合 QR 规范；M 级纠错提升手机截图/相册识别率。
+            result = subprocess.run(
+                ["qrencode", "-t", "PNG", "-l", "M", "-s", "6", "-m", "4", "-o", "-", "--", link],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "qr_generation_failed"}
+        if result.returncode != 0 or not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
             return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "qr_generation_failed"}
         return HTTPStatus.OK, result.stdout
 
@@ -2774,14 +2816,10 @@ class Handler(BaseHTTPRequestHandler):
         device = self.device_record(device_id)
         path = self.subscription_file(device_id)
         if fmt in {"json", "yaml"}:
-            alt = STATE.config.subscription_root / f"{device_id}.{fmt}"
-            if alt.is_file():
-                path = alt
+            path = STATE.config.subscription_root / f"{device_id}.{fmt}"
         elif fmt in {"vl", "v2rayn", "v2rayng", "sr", "nekobox"}:
             ext = "json" if fmt == "vl" else "txt"
-            alt = STATE.config.subscription_root / f"{device_id}-{fmt}.{ext}"
-            if alt.is_file():
-                path = alt
+            path = STATE.config.subscription_root / f"{device_id}-{fmt}.{ext}"
         expired = bool(device and device["expires_at"] and device["expires_at"] < datetime.now(timezone.utc).date().isoformat())
         quota_exhausted = bool(
             device

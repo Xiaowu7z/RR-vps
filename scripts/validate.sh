@@ -334,6 +334,14 @@ echo "[6/12] Subscription URL control-character regression"
         echo "Control character in subscription host was accepted." >&2
         exit 1
     fi
+    qr_payload='vless://test@example.com:443?security=reality#RR-test'
+    qrencode() {
+        [ "$#" -eq 8 ] && [ "$1" = "-t" ] && [ "$2" = "ANSIUTF8" ] && \
+            [ "$3" = "-l" ] && [ "$4" = "M" ] && [ "$5" = "-m" ] && \
+            [ "$6" = "4" ] && [ "$7" = "--" ] && [ "$8" = "$qr_payload" ]
+    }
+    # shellcheck disable=SC2317
+    render_terminal_qr "$qr_payload" "VLESS Reality 节点" >/dev/null
 )
 
 echo "[7/12] Ubuntu 22.04 Python and Argon2 compatibility"
@@ -376,6 +384,7 @@ init_output=$(printf '%s\n' 'StrongPassword123!' | \
 [[ "$init_output" == RR_NEXUS_RECOVERY_CODES=* ]]
 PYTHONPATH="$argon2_stub" RR_NEXUS_CONFIG="$argon2_config" python3 - "$argon2_db" <<'PY'
 import importlib.util
+import json
 import sqlite3
 import sys
 
@@ -435,6 +444,137 @@ assert module.query_v2ray_stats("127.0.0.1:39091") == counters
 config = module.NexusConfig.load()
 assert config.port == 7900 and config.stats_port == 39091
 assert config.ssh_host == "服务器IP"
+
+# 二维码回归：域名模式必须走真证书 HTTPS；公网 IP/本地模式必须走主
+# 订阅 HTTP 服务及其 NAT 公网端口；IPv6 URL 必须带方括号。
+from pathlib import Path
+from types import SimpleNamespace
+
+config_path = Path(module.CONFIG_PATH)
+base_config = {
+    "listen": "127.0.0.1",
+    "port": 7900,
+    "database": sys.argv[1],
+    "subscription_root": str(config_path.parent / "subscriptions"),
+    "stats_port": 39091,
+    "public_port": 9443,
+    "sub_port": 39291,
+}
+device = {
+    "id": "dev_012345abcdef",
+    "subscription_token": "test_subscription_token_123456",
+    "enabled": 1,
+    "expires_at": None,
+    "quota_bytes": 0,
+    "used_bytes": 0,
+}
+handler = object.__new__(module.Handler)
+artifact_root = config_path.parent / "subscriptions"
+artifact_root.mkdir(parents=True, exist_ok=True)
+artifact_suffixes = ["-vl.json", ".yaml", "-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt", ".txt", ".json"]
+for suffix in artifact_suffixes:
+    (artifact_root / f"{device['id']}{suffix}").write_text("test", encoding="utf-8")
+
+def write_config(**values):
+    payload = dict(base_config)
+    payload.update(values)
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    module.STATE = SimpleNamespace(config=module.NexusConfig.load())
+
+write_config(mode="local", domain="", ssh_host="2001:db8::99")
+local_primary, local_urls = handler._device_subscription_urls(device)
+assert local_primary == "http://[2001:db8::99]:39291/nexus/test_subscription_token_123456.txt"
+assert len(local_urls) == 8
+assert all(item["url"].startswith("http://[2001:db8::99]:39291/nexus/") for item in local_urls)
+# 不存在的格式不能继续显示一个注定 404 的二维码。
+(artifact_root / f"{device['id']}-vl.json").unlink()
+assert all(item["format"] != "Sing-box 官方" for item in handler._device_subscription_urls(device)[1])
+(artifact_root / f"{device['id']}-vl.json").write_text("test", encoding="utf-8")
+
+write_config(mode="public", domain="45.192.205.71", ssh_host="45.192.205.71")
+ip_primary, ip_urls = handler._device_subscription_urls(device)
+assert ip_primary == "http://45.192.205.71:39291/nexus/test_subscription_token_123456.txt"
+assert all(":9443/sub/" not in item["url"] for item in ip_urls)
+
+write_config(mode="public", domain="panel.example.com", ssh_host="45.192.205.71", public_port=443)
+domain_primary, domain_urls = handler._device_subscription_urls(device)
+assert domain_primary == "https://panel.example.com/sub/dev_012345abcdef/test_subscription_token_123456/txt"
+assert len(domain_urls) == 8
+
+# 后端必须把每个节点/订阅的原文完整交给 qrencode，并使用 M 级纠错与
+# 4 模块静区；无效订阅 URL、负索引和 qrencode 超时必须受控失败。
+links = [
+    "vmess://dGVzdA==",
+    "vless://test@example.com:443?security=reality#VL",
+    "hysteria2://test@example.com:8443?insecure=1#HY2",
+    "tuic://test:test@example.com:8444#TUIC",
+    "anytls://test@example.com:8445#AnyTLS",
+    "naive+https://test:password@example.com:443#Naive",
+]
+links_path = artifact_root / "dev_012345abcdef.txt"
+links_path.write_text("\n".join(links) + "\n", encoding="utf-8")
+handler.device_record = lambda device_id: device if device_id == device["id"] else None
+handler.subscription_file = lambda device_id: links_path
+captured = []
+
+def fake_run(argv, **kwargs):
+    captured.append((argv, kwargs))
+    return SimpleNamespace(returncode=0, stdout=b"\x89PNG\r\n\x1a\nqr")
+
+real_run = module.subprocess.run
+module.subprocess.run = fake_run
+try:
+    for index, expected in enumerate(links):
+        status, png = handler._qr_png_bytes(device["id"], {"index": [str(index)]})
+        assert status == module.HTTPStatus.OK and png.startswith(b"\x89PNG")
+        argv, kwargs = captured[-1]
+        assert argv[-2:] == ["--", expected]
+        assert argv[argv.index("-l") + 1] == "M"
+        assert argv[argv.index("-m") + 1] == "4"
+        assert kwargs["timeout"] == 5
+    for item in domain_urls:
+        status, _ = handler._qr_png_bytes(device["id"], {"raw": [item["url"]]})
+        assert status == module.HTTPStatus.OK
+        assert captured[-1][0][-1] == item["url"]
+    assert handler._qr_png_bytes(device["id"], {"raw": ["https://invalid.example/sub"]})[0] == module.HTTPStatus.BAD_REQUEST
+    assert handler._qr_png_bytes(device["id"], {"index": ["-1"]})[0] == module.HTTPStatus.BAD_REQUEST
+finally:
+    module.subprocess.run = real_run
+
+module.subprocess.run = lambda *args, **kwargs: (_ for _ in ()).throw(module.subprocess.TimeoutExpired("qrencode", 5))
+try:
+    assert handler._qr_png_bytes(device["id"], {"index": ["0"]})[0] == module.HTTPStatus.INTERNAL_SERVER_ERROR
+finally:
+    module.subprocess.run = real_run
+
+# 公网订阅路由必须逐格式返回精确文件，文件缺失时返回 404，绝不能回退
+# 到通用 URI 原文冒充 JSON/YAML/Base64 订阅。
+route_suffixes = {
+    "txt": ".txt",
+    "json": ".json",
+    "yaml": ".yaml",
+    "vl": "-vl.json",
+    "v2rayn": "-v2rayn.txt",
+    "v2rayng": "-v2rayng.txt",
+    "sr": "-sr.txt",
+    "nekobox": "-nekobox.txt",
+}
+sent = []
+handler.send_bytes = lambda status, body, content_type: sent.append((status, body, content_type))
+handler.send_json = lambda status, body: sent.append((status, body, "json"))
+for route, suffix in route_suffixes.items():
+    expected = ("payload:" + route).encode()
+    artifact = artifact_root / f"{device['id']}{suffix}"
+    artifact.write_bytes(expected)
+    sent.clear()
+    handler.handle_public_subscription(device["id"], device["subscription_token"], route)
+    assert sent == [(module.HTTPStatus.OK, expected, "text/plain; charset=utf-8")]
+
+missing = artifact_root / f"{device['id']}-v2rayng.txt"
+missing.unlink()
+sent.clear()
+handler.handle_public_subscription(device["id"], device["subscription_token"], "v2rayng")
+assert sent and sent[0][0] == module.HTTPStatus.NOT_FOUND
 PY
 rm -rf "$argon2_stub"
 

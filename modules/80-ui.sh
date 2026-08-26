@@ -92,6 +92,22 @@ show_ports() {
 # ==========================================
 # 7. 显示节点信息
 # ==========================================
+render_terminal_qr() {
+    local payload="${1:-}"
+    local label="${2:-二维码}"
+    [ -n "$payload" ] || return 1
+    command -v qrencode >/dev/null 2>&1 || return 0
+
+    echo -e "${YELLOW}${label}（可截图后从客户端相册导入）：${RESET}"
+    # M 级纠错 + QR 标准 4 模块静区提升 SSH 截图/相册识别率。显式传 --，
+    # 防止任何分享内容被 qrencode 当作命令行参数解析。
+    if ! qrencode -t ANSIUTF8 -l M -m 4 -- "$payload" 2>/dev/null; then
+        echo -e "${YELLOW}[警告] ${label}生成失败，请直接复制上方链接。${RESET}" >&2
+        return 1
+    fi
+    return 0
+}
+
 show_info() {
     clear
     load_config_with_defaults || return 1
@@ -164,8 +180,7 @@ show_info() {
     printf ' 8. 通用订阅（全协议, 兼容旧客户端）: \033[1;36m%s\033[0m\n' "$encoded_sub_url"
     echo -e "${YELLOW}以上均为手机 SSH 可复制短地址；原 UUID 长地址继续保留兼容，但不再显示。${RESET}"
     if command -v qrencode >/dev/null 2>&1; then
-        echo -e "${YELLOW}默认二维码为通用 Base64 订阅；也可截图后从客户端相册导入：${RESET}"
-        qrencode -t ANSIUTF8 "$short_sub_url" 2>/dev/null || true
+        render_terminal_qr "$short_sub_url" "通用 Base64 订阅二维码" || true
     fi
     echo ""
     echo -e "${CYAN}--- 各协议独立节点链接 ---${RESET}"
@@ -176,11 +191,18 @@ show_info() {
             if [ -n "$line" ]; then
                 echo ""
                 echo -e "${GREEN}$line${RESET}"
-                if echo "$line" | grep -q "^vmess://"; then
-                    if command -v qrencode &> /dev/null; then
-                        echo ""
-                        qrencode -t ANSIUTF8 "$line" 2>/dev/null
-                    fi
+                if command -v qrencode >/dev/null 2>&1; then
+                    local qr_protocol="节点"
+                    case "$line" in
+                        vmess://*) qr_protocol="VMess 节点" ;;
+                        vless://*) qr_protocol="VLESS Reality 节点" ;;
+                        hysteria2://*) qr_protocol="Hysteria2 节点" ;;
+                        tuic://*) qr_protocol="TUIC 节点" ;;
+                        anytls://*) qr_protocol="AnyTLS 节点" ;;
+                        naive+https://*) qr_protocol="NaiveProxy 节点" ;;
+                    esac
+                    echo ""
+                    render_terminal_qr "$line" "$qr_protocol" || true
                 fi
             fi
         done

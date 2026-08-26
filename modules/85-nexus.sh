@@ -312,6 +312,9 @@ generate_nexus_device_subscriptions() {
     load_config_with_defaults || return 1
     validate_subscription_crypto_material || return 1
     select_entry_ip || return 1
+    # 面板进程会在每次打开「链接与二维码」时重读这两个值。这样入口 IP、
+    # IPv4/IPv6 或 NAT 公网订阅端口变化后，无需重启面板也不会生成旧二维码。
+    nexus_sync_subscription_endpoint || return 1
     install -d -m 700 "$NEXUS_DATA_DIR" "$NEXUS_SUB_ROOT" || return 1
 
     local rows_file=""
@@ -633,10 +636,36 @@ nexus_write_config() {
     cfg="${cfg//__STATS_PORT__/$stats_port}"
     cfg="${cfg//__SSH_HOST__/$ssh_host}"
     cfg="${cfg//__USER_PORT__/$user_port}"
-    cfg="${cfg//__SUB_PORT__/${SUB_PORT:-0}}"
+    # sub_port 在 Nexus 配置里表示二维码/订阅地址应使用的公网端口。
+    # 普通 VPS 与 SUB_PORT 相同；NAT/LXD 必须使用当前入口族的映射端口。
+    cfg="${cfg//__SUB_PORT__/${SUB_URL_PORT:-${SUB_PORT:-0}}}"
     cfg="${cfg//__TRAFFIC_MODE__/$traffic_mode_val}"
     echo "$cfg" > "$NEXUS_CONFIG_FILE"
     chmod 600 "$NEXUS_CONFIG_FILE"
+}
+
+nexus_sync_subscription_endpoint() {
+    [ -r "$NEXUS_CONFIG_FILE" ] || return 0
+    [ -n "${ENTRY_IP_RAW:-}" ] || return 1
+    is_valid_port "${SUB_URL_PORT:-}" || return 1
+
+    local current_host=""
+    local current_port=""
+    local tmp=""
+    current_host=$(jq -r '.ssh_host // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
+    current_port=$(jq -r '.sub_port // 0' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
+    if [ "$current_host" = "$ENTRY_IP_RAW" ] && [ "$current_port" = "$SUB_URL_PORT" ]; then
+        return 0
+    fi
+
+    tmp=$(mktemp /tmp/rr-nexus-endpoint.XXXXXX) || return 1
+    if ! jq --arg ssh_host "$ENTRY_IP_RAW" --argjson sub_port "$SUB_URL_PORT" \
+        '.ssh_host=$ssh_host | .sub_port=$sub_port' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    install -m 600 "$tmp" "$NEXUS_CONFIG_FILE"
+    rm -f "$tmp"
 }
 
 nexus_migrate_runtime_config() {
@@ -644,6 +673,7 @@ nexus_migrate_runtime_config() {
     local panel_port=""
     local stats_port=""
     local ssh_host=""
+    local sub_url_port=""
     local tmp=""
     panel_port=$(jq -r '.port // 7900' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     is_valid_port "$panel_port" || return 1
@@ -652,17 +682,26 @@ nexus_migrate_runtime_config() {
         stats_port=$(nexus_choose_stats_port "$panel_port") || return 1
     fi
     ssh_host=$(jq -r '.ssh_host // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null)
-    if [ -z "$ssh_host" ]; then
-        if select_entry_ip >/dev/null 2>&1; then
-            ssh_host="$ENTRY_IP_RAW"
-        else
+    sub_url_port=$(jq -r '.sub_port // 0' "$NEXUS_CONFIG_FILE" 2>/dev/null)
+    if select_entry_ip >/dev/null 2>&1; then
+        ssh_host="$ENTRY_IP_RAW"
+        if is_valid_port "${SUB_URL_PORT:-}"; then
+            sub_url_port="$SUB_URL_PORT"
+        elif ! is_valid_port "$sub_url_port"; then
+            sub_url_port="${SUB_PORT:-0}"
+            is_valid_port "$sub_url_port" || sub_url_port=0
+        fi
+    else
+        if [ -z "$ssh_host" ]; then
             ssh_host=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null)
             ssh_host="${ssh_host:-服务器IP}"
         fi
+        is_valid_port "$sub_url_port" || sub_url_port="${SUB_PORT:-0}"
+        is_valid_port "$sub_url_port" || sub_url_port=0
     fi
     tmp=$(mktemp /tmp/rr-nexus-migrate.XXXXXX) || return 1
-    if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" \
-        '.stats_port=$stats_port | .ssh_host=$ssh_host' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+    if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" --argjson sub_port "$sub_url_port" \
+        '.stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port' "$NEXUS_CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
