@@ -60,12 +60,12 @@ def _subscription_value(device: Any, key: str, default: Any = None) -> Any:
 
 def _compact_bytes(value: int) -> str:
     amount = max(0, int(value or 0))
-    for unit, divisor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2)):
+    for unit, divisor in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
         if amount >= divisor:
             number = amount / divisor
             rendered = f"{number:.2f}".rstrip("0").rstrip(".")
             return f"{rendered}{unit}"
-    return f"{amount / 1024:.1f}KB" if amount >= 1024 else f"{amount}B"
+    return f"{amount / 1024:.1f}KiB" if amount >= 1024 else f"{amount}B"
 
 
 def subscription_usage_name(device: Any) -> str:
@@ -73,7 +73,58 @@ def subscription_usage_name(device: Any) -> str:
     quota = max(0, int(_subscription_value(device, "quota_bytes", 0) or 0))
     remaining = _compact_bytes(max(0, quota - used)) if quota else "不限"
     expiry = str(_subscription_value(device, "expires_at", "") or "长期有效")
-    return f"流量｜已用{_compact_bytes(used)}｜剩余{remaining}｜到期{expiry}"
+    return f"流量信息(勿选)｜已用{_compact_bytes(used)}｜剩余{remaining}｜到期{expiry}"
+
+
+def subscription_transfer_values(device: Any, traffic_mode: str = "both") -> tuple[int, int]:
+    """Return header counters whose sum always matches RR's quota counter."""
+    used = max(0, int(_subscription_value(device, "used_bytes", 0) or 0))
+    uploaded = max(0, int(_subscription_value(device, "uploaded_bytes", 0) or 0))
+    downloaded = max(0, int(_subscription_value(device, "downloaded_bytes", 0) or 0))
+    if traffic_mode == "upload":
+        return used, 0
+    if uploaded + downloaded == used:
+        return uploaded, downloaded
+    normalized_upload = min(uploaded, used)
+    return normalized_upload, used - normalized_upload
+
+
+def subscription_userinfo(device: Any, traffic_mode: str = "both") -> str:
+    uploaded, downloaded = subscription_transfer_values(device, traffic_mode)
+    return "upload={}; download={}; total={}; expire={}".format(
+        uploaded,
+        downloaded,
+        max(0, int(_subscription_value(device, "quota_bytes", 0) or 0)),
+        expiry_epoch(str(_subscription_value(device, "expires_at", "") or "")),
+    )
+
+
+def _uri_information_marker(name: str) -> str:
+    """Build an importable marker that survives NekoBox address/port deduplication.
+
+    URI subscription formats have no non-selectable information-row primitive.  A
+    loopback VMess marker is therefore used: it is safe (cannot send traffic to a
+    remote host), imports in URI/Base64 clients, and cannot collide with a real RR
+    node's public address and port.
+    """
+    marker = {
+        "v": "2",
+        "ps": name,
+        "add": "127.0.0.1",
+        "port": "9",
+        "id": "00000000-0000-4000-8000-000000000000",
+        "aid": "0",
+        "scy": "auto",
+        "net": "tcp",
+        "type": "none",
+        "host": "",
+        "path": "",
+        "tls": "",
+    }
+    encoded = base64.b64encode(
+        json.dumps(marker, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return "vmess://" + encoded
 
 
 def _clone_uri_with_name(uri: str, name: str) -> str | None:
@@ -110,9 +161,9 @@ def _enrich_uri_subscription(raw: bytes, name: str) -> bytes:
         return raw
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for line in lines:
-        info_uri = _clone_uri_with_name(line, name)
-        if info_uri:
-            return (info_uri + "\n" + "\n".join(lines) + "\n").encode("utf-8")
+        if _clone_uri_with_name(line, name):
+            marker = _uri_information_marker(name)
+            return (marker + "\n" + "\n".join(lines) + "\n").encode("utf-8")
     return raw
 
 
@@ -183,6 +234,7 @@ def _enrich_clash_subscription(raw: bytes, name: str) -> bytes:
 
 
 def enrich_subscription_content(raw: bytes, filename: str, device: Any) -> bytes:
+    """Add a live first information entry without modifying stored artifacts."""
     lower = filename.lower()
     name = subscription_usage_name(device)
     if lower.endswith(PERSONAL_BASE64_SUFFIXES):
@@ -203,6 +255,15 @@ def load_database_path(config_path: Path) -> Path | None:
         return database if database.is_file() else None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
+
+
+def load_traffic_mode(config_path: Path) -> str:
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        mode = str(payload.get("traffic_mode", "both") or "both")
+        return mode if mode in {"both", "upload"} else "both"
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "both"
 
 
 class SubscriptionHandler(SimpleHTTPRequestHandler):
@@ -240,13 +301,9 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
 
     def subscription_headers(self, device: sqlite3.Row) -> dict[str, str]:
         alias = "RR-{}".format(str(device["id"]).removeprefix("dev_")[:8].upper())
+        traffic_mode = load_traffic_mode(self.server.config_path)  # type: ignore[attr-defined]
         return {
-            "Subscription-Userinfo": "upload={}; download={}; total={}; expire={}".format(
-                max(0, int(device["uploaded_bytes"] or 0)),
-                max(0, int(device["downloaded_bytes"] or 0)),
-                max(0, int(device["quota_bytes"] or 0)),
-                expiry_epoch(device["expires_at"]),
-            ),
+            "Subscription-Userinfo": subscription_userinfo(device, traffic_mode),
             "Profile-Update-Interval": "1",
             "Profile-Title": alias,
             "Access-Control-Expose-Headers": (

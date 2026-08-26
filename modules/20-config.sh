@@ -631,7 +631,15 @@ outbound_mode_label() {
 
 start_subscription_server() {
     local sub_server_app="${RR_LIB_DIR}/nexus/sub_server.py"
-    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|userinfo-v1"
+    local server_signature="builtin-http"
+    if [ -s "$sub_server_app" ]; then
+        server_signature=$(sha256sum "$sub_server_app" 2>/dev/null | awk '{print $1}') || return 1
+        [[ "$server_signature" =~ ^[a-f0-9]{64}$ ]] || return 1
+    fi
+    # 订阅服务是常驻 Python 进程。仅比较端口/监听地址会导致热更新虽然
+    # 替换了 sub_server.py，旧进程却继续返回旧正文。把程序哈希写入状态，
+    # 文件内容一变就安全重启；端口和代码都没变时仍保持无扰动幂等。
+    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|${server_signature}"
     local current_state=""
     local old_pid=""
 

@@ -298,6 +298,32 @@ post_update_function=$(awk '
 echo "[6/13] Subscription URL control-character regression"
 (
     load_modules_for_tests
+    # 常驻订阅进程必须在 sub_server.py 内容变化时重启。旧实现只比较
+    # 端口和监听地址，导致热更新文件已替换但进程仍执行旧代码。
+    rr_restart_tmp=$(mktemp -d)
+    RR_LIB_DIR="$rr_restart_tmp/lib"
+    SUB_ROOT="$rr_restart_tmp/root"
+    SUB_PID_FILE="$rr_restart_tmp/sub.pid"
+    SUB_BIND_STATE_FILE="$rr_restart_tmp/sub.bind"
+    SUB_PORT=39291
+    SUB_BIND_ADDRESS=127.0.0.1
+    mkdir -p "$RR_LIB_DIR/nexus" "$SUB_ROOT"
+    printf '%s\n' 'print("old")' > "$RR_LIB_DIR/nexus/sub_server.py"
+    rr_old_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
+    printf '%s\n' 4242 > "$SUB_PID_FILE"
+    printf '%s\n' "${SUB_PORT}|${SUB_BIND_ADDRESS}|${rr_old_signature}" > "$SUB_BIND_STATE_FILE"
+    printf '%s\n' 'print("new")' > "$RR_LIB_DIR/nexus/sub_server.py"
+    kill() { printf '%s\n' "$1" > "$rr_restart_tmp/killed"; }
+    sleep() { :; }
+    is_subscription_pid() { return 0; }
+    nohup() { : > "$rr_restart_tmp/launched"; }
+    start_subscription_server
+    rr_new_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
+    [ "$(cat "$rr_restart_tmp/killed")" = 4242 ]
+    [ -f "$rr_restart_tmp/launched" ]
+    [ "$(cat "$SUB_BIND_STATE_FILE")" = "${SUB_PORT}|${SUB_BIND_ADDRESS}|${rr_new_signature}" ]
+    rm -rf "$rr_restart_tmp"
+
     test_uuid="e219c8c7-b669-4c75-b33b-a9e5227a8a24"
     url=$(build_subscription_url "45.192.205.71" 39291 "$test_uuid" jhsub_encoded.txt)
     [ "$url" = "http://45.192.205.71:39291/${test_uuid}/jhsub_encoded.txt" ]
@@ -570,9 +596,9 @@ try:
             )
             assert response.headers["Profile-Update-Interval"] == "1"
 
-    # 有效订阅应在响应时动态插入一个可连接的信息节点，源文件保持不变。
-    # 覆盖 URI、NekoBox Base64、Sing-box JSON 与 mihomo YAML 四种结构，
-    # 其余拆分客户端与这四种结构共用同一转换路径。
+    # 有效订阅应在响应时动态插入首位信息项，源文件保持不变。URI/Base64
+    # 使用 127.0.0.1:9 的 VMess 标记，确保 NekoBox 开启按“地址+端口+类型”
+    # 去重后仍保留；Sing-box 与 mihomo 使用可连接的真实节点副本。
     info_raw = b"vless://id@example.com:443?security=reality#REAL\n"
     info_json = json.dumps({
         "outbounds": [
@@ -582,28 +608,78 @@ try:
     }).encode()
     info_yaml = b'''proxies:\n  - name: "REAL"\n    type: vless\n    server: example.com\n    port: 443\n\nproxy-groups:\n  - name: select\n    type: select\n    proxies:\n      - "REAL"\n'''
     (published_root / f"{device['subscription_token']}.txt").write_bytes(info_raw)
-    (published_root / f"{device['subscription_token']}-nekobox.txt").write_bytes(base64.b64encode(info_raw))
+    for suffix in ("-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt"):
+        (published_root / f"{device['subscription_token']}{suffix}").write_bytes(base64.b64encode(info_raw))
     (published_root / f"{device['subscription_token']}.json").write_bytes(info_json)
     (published_root / f"{device['subscription_token']}-mihomo.yaml").write_bytes(info_yaml)
     url_by_format = {item["format"]: item["url"] for item in live_ip_urls}
+
+    def decode_info_marker(line):
+        assert line.startswith("vmess://")
+        encoded = line.removeprefix("vmess://")
+        return json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4)))
+
     with urllib.request.urlopen(url_by_format["通用链接"], timeout=2) as response:
         info_text = response.read().decode()
-        assert info_text.count("vless://") == 2
-        assert "%E6%B5%81%E9%87%8F" in info_text.splitlines()[0]
-    with urllib.request.urlopen(url_by_format["NekoBox"], timeout=2) as response:
-        neko_text = base64.b64decode(response.read()).decode()
-        assert neko_text.count("vless://") == 2
-        assert "%E6%B5%81%E9%87%8F" in neko_text.splitlines()[0]
+        info_lines = info_text.splitlines()
+        assert info_lines[1].startswith("vless://") and len(info_lines) == 2
+        marker = decode_info_marker(info_lines[0])
+        assert marker["ps"].startswith("流量信息(勿选)｜已用")
+        assert marker["add"] == "127.0.0.1" and marker["port"] == "9"
+    for client_name in ("v2rayN", "v2rayNG", "Shadowrocket", "NekoBox"):
+        with urllib.request.urlopen(url_by_format[client_name], timeout=2) as response:
+            client_lines = base64.b64decode(response.read()).decode().splitlines()
+            assert client_lines[1].startswith("vless://") and len(client_lines) == 2
+            marker = decode_info_marker(client_lines[0])
+            assert marker["ps"].startswith("流量信息(勿选)｜已用")
+            # NekoBox 的去重键是协议类型+地址+端口；该组合必须与真实节点不同。
+            assert (marker["add"], marker["port"]) == ("127.0.0.1", "9")
     with urllib.request.urlopen(url_by_format["Sing-box 官方"], timeout=2) as response:
         singbox_info = json.loads(response.read())
-        assert singbox_info["outbounds"][0]["tag"].startswith("流量｜已用")
+        assert singbox_info["outbounds"][0]["tag"].startswith("流量信息(勿选)｜已用")
         assert singbox_info["outbounds"][0]["server"] == "example.com"
-        assert singbox_info["outbounds"][2]["outbounds"][0].startswith("流量｜已用")
+        assert singbox_info["outbounds"][2]["outbounds"][0].startswith("流量信息(勿选)｜已用")
     with urllib.request.urlopen(url_by_format["mihomo"], timeout=2) as response:
         clash_info = response.read().decode()
-        assert clash_info.index("流量｜已用") < clash_info.index("REAL")
+        assert clash_info.index("流量信息(勿选)｜已用") < clash_info.index("REAL")
         assert clash_info.count("server: example.com") == 2
     assert (published_root / f"{device['subscription_token']}.txt").read_bytes() == info_raw
+
+    # 公网域名路由由 rr_nexus 自身提供，必须和独立 sub_server 产生完全
+    # 相同的标记，不能只修本地/公网 IP 模式。
+    rr_body = module.enrich_subscription_content(
+        base64.b64encode(info_raw), "device-nekobox.txt",
+        {"used_bytes": 579, "quota_bytes": 1000, "expires_at": "2030-01-31"},
+    )
+    rr_lines = base64.b64decode(rr_body).decode().splitlines()
+    assert decode_info_marker(rr_lines[0])["add"] == "127.0.0.1"
+
+    # 单向计费时响应头也必须以 used_bytes 为准，否则客户端卡片会把真实
+    # 下行量再次相加，和信息节点/面板额度出现不同数字。
+    with sqlite3.connect(sys.argv[1]) as connection:
+        connection.execute(
+            "UPDATE devices SET used_bytes=123,uploaded_bytes=123,downloaded_bytes=456 WHERE id=?",
+            (device["id"],),
+        )
+    write_config(
+        mode="public", domain="127.0.0.1", ssh_host="127.0.0.1",
+        sub_port=static_server.server_port, traffic_mode="upload",
+    )
+    with urllib.request.urlopen(url_by_format["NekoBox"], timeout=2) as response:
+        assert response.headers["Subscription-Userinfo"] == (
+            "upload=123; download=0; total=1000; expire=1896134399"
+        )
+        marker = decode_info_marker(base64.b64decode(response.read()).decode().splitlines()[0])
+        assert "已用123B" in marker["ps"]
+    with sqlite3.connect(sys.argv[1]) as connection:
+        connection.execute(
+            "UPDATE devices SET used_bytes=579,uploaded_bytes=123,downloaded_bytes=456 WHERE id=?",
+            (device["id"],),
+        )
+    write_config(
+        mode="public", domain="127.0.0.1", ssh_host="127.0.0.1",
+        sub_port=static_server.server_port, traffic_mode="both",
+    )
 
     # 额度用尽后仍返回空订阅和用量头，让客户端更新剩余流量，同时节点已被撤销。
     with sqlite3.connect(sys.argv[1]) as connection:
@@ -705,7 +781,7 @@ for route, suffix in route_suffixes.items():
     handler.handle_public_subscription(device["id"], device["subscription_token"], route)
     assert sent[0][:3] == (module.HTTPStatus.OK, expected, "text/plain; charset=utf-8")
     userinfo = sent[0][3]["extra_headers"]["Subscription-Userinfo"]
-    assert userinfo == "upload=123; download=456; total=0; expire=0"
+    assert userinfo == "upload=0; download=0; total=0; expire=0"
 
 missing = artifact_root / f"{device['id']}-v2rayng.txt"
 missing.unlink()
