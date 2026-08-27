@@ -3,7 +3,8 @@
 const state = {
   csrf: "", mode: "local", domain: "", port: 7900, sshHost: "服务器IP",
   devices: [], traffic: null, overview: null, activeView: "overview",
-  filter: "all", query: "", refreshTimer: null, _prevTraffic: {}, serverPlan: null,
+  filter: "all", groupFilter: "all", query: "", metricRange: "24h",
+  refreshTimer: null, _prevTraffic: {}, serverPlan: null,
 };
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -45,6 +46,10 @@ function errorText(code) {
     cred_rejected: "副面板拒绝了这把钥匙，请重新生成接入钥匙。",
     network_error: "网络连接中断：服务器未响应（可能正在同步节点配置）。若刚提交过操作，请刷新页面查看结果，勿重复提交。",
     remote_call_failed: "远程操作失败，请检查副面板状态后重试。",
+    two_factor_required: "请输入身份验证器中的 6 位动态码。",
+    invalid_two_factor_code: "动态码无效或已过期。",
+    invalid_passkey: "Passkey 验证失败。",
+    passkey_unavailable: "当前访问地址不支持 Passkey，请使用 HTTPS 域名或本地 127.0.0.1。",
   };
   return messages[code] || "操作未完成，请稍后重试。";
 }
@@ -134,6 +139,7 @@ function showConsole(session) {
   $("#console").classList.remove("hidden");
   setView("overview");
   configureAccessGuide();
+  window.RRAdmin?.onConsole?.();
   clearInterval(state.refreshTimer);
   state.refreshTimer = setInterval(() => {
     if (!document.hidden && state.csrf) refreshLive(false);
@@ -162,7 +168,7 @@ function setView(name) {
   $("#view-title").textContent = titles[name][0];
   $("#view-kicker").textContent = titles[name][1];
   if (name === "audit") loadAudit();
-  if (name === "security") { renderSecurity(); rsKeyLoad(); loadLocalVersion(); }
+  if (name === "security") { renderSecurity(); rsKeyLoad(); loadLocalVersion(); window.RRAdmin?.loadSecurity?.(); }
   if (name === "server") { startServerStats(); loadMediaUnlock(); } else { stopServerStats(); }
   if (name === "firewall") loadFirewall();
   if (name === "remote" && state.remoteActive === null) loadRemoteServers();
@@ -228,8 +234,9 @@ function visibleDevices() {
   const query = state.query.trim().toLowerCase();
   return state.devices.filter(device => {
     const statusMatch = state.filter === "all" || (state.filter === "active" ? device.active : !device.active);
+    const groupMatch = state.groupFilter === "all" || String(device.group_id || "") === state.groupFilter;
     const queryMatch = !query || device.name.toLowerCase().includes(query) || device.id.toLowerCase().includes(query);
-    return statusMatch && queryMatch;
+    return statusMatch && groupMatch && queryMatch;
   });
 }
 
@@ -260,8 +267,9 @@ function renderDevices() {
       ? `额度用尽 · ${formatAutoDelete(device.auto_delete_seconds_left)}`
       : quota ? `${formatBytes(used)} / ${formatBytes(quota)}` : updated;
     return `<article class="device-card glass" data-device-id="${escapeHtml(device.id)}">
-      <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${device.active ? "" : "off"}"><i></i>${statusLabel(device)}</span></div>
+      <div class="device-top"><label class="device-select"><input type="checkbox" data-device-select="${escapeHtml(device.id)}" aria-label="选择 ${escapeHtml(device.name)}"></label><span class="device-avatar">◇</span><span class="status-pill ${device.active ? "" : "off"}"><i></i>${statusLabel(device)}</span></div>
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
+      ${device.group_name ? `<span class="group-chip" style="--group-color:${escapeHtml(device.group_color || "#4f8cff")}">${escapeHtml(device.group_name)}</span>` : ""}
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
       <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(up_rate)}</span><span class="r-down">↓ ${formatRate(down_rate)}</span></div>
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
@@ -273,7 +281,7 @@ function renderDevices() {
 
 async function loadTraffic(notify = true) {
   try {
-    const data = await api("/api/traffic");
+    const data = await api(`/api/traffic?range=${encodeURIComponent(state.metricRange)}`);
     state.traffic = data;
     $("#traffic-upload").textContent = formatBytes(data.totals.uploaded);
     $("#traffic-download").textContent = formatBytes(data.totals.downloaded);
@@ -285,6 +293,7 @@ async function loadTraffic(notify = true) {
     renderServerPlan(data.server_plan || {}, "");
     renderRanking(data.devices || []);
     renderCharts();
+    window.RRAdmin?.loadMetrics?.(false);
   } catch (error) { if (notify) toast(error.message, true); }
 }
 
@@ -515,6 +524,9 @@ async function refreshLive(notify = false) {
 
 function openCreate(remote = false) {
   $("#device-form").reset();
+  $("#device-org-fields").classList.toggle("hidden", remote);
+  $("#device-form-group").disabled = remote;
+  $("#device-form-template").disabled = remote;
   $("#device-dialog").dataset.remote = remote ? "1" : "0";
   $("#device-dialog h2").textContent = remote ? "远程添加设备" : "添加设备";
   $("#device-form-error").textContent = "";
@@ -535,13 +547,19 @@ async function createDevice(event) {
       expires_at: values.get("expires_at") || "",
       reset_at: values.get("reset_at") || "",
       reset_max: Number(values.get("reset_max") || 0),
+      group_id: values.get("group_id") || null,
+      template_id: values.get("template_id") || null,
+      template_values_applied: Boolean(values.get("template_id")),
     };
     const remote = $("#device-dialog").dataset.remote === "1";
     if (remote) await rsRemoteApi("POST", "/api/devices", payload);
     else await api("/api/devices", { method: "POST", body: payload });
     $("#device-dialog").close();
     if (remote) await rsLoadDevices();
-    else await refreshLive();
+    else {
+      await refreshLive();
+      await window.RRAdmin?.loadOrganization?.();
+    }
     toast(remote ? "远程设备已创建，副服务器正在同步。" : "设备已创建，节点配置正在后台同步（不影响现有用户在线）。");
   } catch (error) { $("#device-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message; }
   finally { submit.disabled = false; }
@@ -657,8 +675,8 @@ async function deleteDevice(device) {
 }
 
 function protocolName(link) {
-  // NAIVE-SUPPORT: naive 链接以 naive+https:// 开头，split(":") 首段会带上 +https，需剥掉再查协议映射
-  const value = link.split(":", 1)[0].toLowerCase().replace(/\+https$/, "");
+  // Naive H2/H3 分享链接分别使用 naive+https / naive+quic。
+  const value = link.split(":", 1)[0].toLowerCase().replace(/\+(https|quic)$/, "");
   return ({ vless: "VLESS Reality", vmess: "VMess", hysteria2: "Hysteria2", tuic: "TUIC", anytls: "AnyTLS", naive: "NaiveProxy" })[value] || value.toUpperCase();
 }
 
@@ -702,12 +720,19 @@ $("#login-form").addEventListener("submit", async event => {
   submit.disabled = true;
   $("#login-error").textContent = "";
   try {
-    await api("/api/login", { method: "POST", body: JSON.stringify({ username: values.get("username"), password: values.get("password") }) });
+    await api("/api/login", { method: "POST", body: JSON.stringify({ username: values.get("username"), password: values.get("password"), otp: values.get("otp") || "" }) });
     const session = await api("/api/session");
     showConsole(session);
     form.reset();
     await refreshLive();
-  } catch (error) { $("#login-error").textContent = error.message; }
+  } catch (error) {
+    $("#login-error").textContent = error.message;
+    if (error.code === "two_factor_required") {
+      $("#login-otp-wrap").classList.remove("hidden");
+      form.otp.required = true;
+      form.otp.focus();
+    }
+  }
   finally { submit.disabled = false; }
 });
 
@@ -730,6 +755,7 @@ $$('[data-close-links]').forEach(button => button.addEventListener("click", () =
 $("#copy-ssh-command").addEventListener("click", () => copyText($("#ssh-command").textContent));
 
 $("#device-search").addEventListener("input", event => { state.query = event.target.value; renderDevices(); });
+$("#device-group-filter")?.addEventListener("change", event => { state.groupFilter = event.target.value; renderDevices(); });
 $$(".filter-button").forEach(button => button.addEventListener("click", () => {
   state.filter = button.dataset.filter;
   $$(".filter-button").forEach(item => item.classList.toggle("active", item === button));
@@ -1185,14 +1211,19 @@ async function localCheckUpdate() {
   box.classList.remove("hidden");
   box.innerHTML = `<div class="rs-update-row"><span>⏳ 正在检查版本…</span></div>`;
   try {
-    const r = await api("/api/update/check", { method: "POST", body: {} });
+    const channel = $("#update-channel")?.value || "stable";
+    const r = await api("/api/update/check", { method: "POST", body: { channel } });
     if (r.error) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ ${escapeHtml(r.message || r.error)}</span></div>`; return; }
     if (r.manifest_checked === false) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ 检查失败：无法连接更新源，请稍后重试</span></div>`; return; }
     const cur = r.current || "未知";
     const ver = $("#local-ver");
     if (ver) ver.textContent = "v" + escapeHtml(cur);
+    if (r.preflight && r.preflight.ok === false) {
+      box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ 更新预检未通过：${escapeHtml(r.preflight.summary || r.preflight.error || "请先运行 rr doctor")}</span></div>`;
+      return;
+    }
     if (r.update_available) {
-      box.innerHTML = `<div class="rs-update-row"><span><b>发现新版本</b>：当前 v${escapeHtml(cur)}，仓库已有更新</span><button class="button tiny primary" id="local-update-run">⬆ 一键升级（自动拉起新版本）</button></div>`;
+      box.innerHTML = `<div class="rs-update-row"><span><b>发现新版本</b>：当前 v${escapeHtml(cur)} · ${escapeHtml(r.channel || channel)} 通道 · 预检通过</span><button class="button tiny primary" id="local-update-run">⬆ 一键升级（自动拉起新版本）</button></div>`;
       const btn = $("#local-update-run");
       if (btn) btn.addEventListener("click", localRunUpdate);
     } else {
@@ -1210,7 +1241,7 @@ async function localRunUpdate() {
   box.classList.remove("hidden");
   box.innerHTML = `<div class="rs-update-row"><span>🚀 已下发升级任务，正在执行…</span></div>`;
   try {
-    const run = await api("/api/update/run", { method: "POST", body: {} });
+    const run = await api("/api/update/run", { method: "POST", body: { channel: $("#update-channel")?.value || "stable" } });
     if (!run.started) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ ${escapeHtml(run.message || "升级任务未启动")}</span></div>`; return; }
     // 轮询状态（升级中面板会重启，请求失败=仍在升级）
     for (let i = 0; i < 72; i++) {

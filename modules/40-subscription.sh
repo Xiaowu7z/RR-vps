@@ -52,6 +52,21 @@ validate_node_port() {
             echo -e "${RED}[拒绝变更] TCP 端口 ${new_port} 已被其他进程占用。${RESET}"
             return 1
         fi
+        # Naive H3 与 H2 共用端口；在事务落盘前同时验证 UDP 侧。
+        if [ "$owner" = "NAIVE_PORT" ] && [ "${NAIVE_MODE:-h2}" != "h2" ]; then
+            for pair in "HY2_PORT:$HY2_PORT" "TU5_PORT:$TU5_PORT"; do
+                key="${pair%%:*}"
+                value="${pair#*:}"
+                if [ "$value" != "0" ] && [ "$new_port" = "$value" ]; then
+                    echo -e "${RED}[拒绝变更] UDP 端口 ${new_port} 已分配给 ${key}。${RESET}"
+                    return 1
+                fi
+            done
+            if udp_port_in_use "$new_port"; then
+                echo -e "${RED}[拒绝变更] UDP 端口 ${new_port} 已被其他进程占用。${RESET}"
+                return 1
+            fi
+        fi
     elif [ "$proto_type" = "udp" ]; then
         for pair in "HY2_PORT:$HY2_PORT" "TU5_PORT:$TU5_PORT"; do
             key="${pair%%:*}"
@@ -180,13 +195,16 @@ generate_node_and_sub() {
         fi
     fi
 
-    # NAIVE-SUPPORT: NaiveProxy 分享链接（naive+https://用户:密码@域名:端口#名称，仅支持 naive 系列客户端）
+    # NAIVE-SUPPORT: H2 使用 naive+https，H3 使用 naive+quic。
     if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
-        local naive_link="naive+https://${NAIVE_USER}:${NAIVE_PASS}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive"
-        if [ -z "$all_links" ]; then
-            all_links="$naive_link"
-        else
-            all_links="$all_links"$'\n'"$naive_link"
+        local naive_link=""
+        if [ "${NAIVE_MODE:-h2}" != "h3" ]; then
+            naive_link="naive+https://${NAIVE_USER}:${NAIVE_PASS}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive-H2"
+            all_links="${all_links:+$all_links$'\n'}$naive_link"
+        fi
+        if [ "${NAIVE_MODE:-h2}" != "h2" ]; then
+            naive_link="naive+quic://${NAIVE_USER}:${NAIVE_PASS}@${NAIVE_DOMAIN}:${NAIVE_PORT}?congestion_control=${NAIVE_QUIC_CC:-bbr}#RR-Naive-H3"
+            all_links="${all_links:+$all_links$'\n'}$naive_link"
         fi
     fi
 
@@ -478,14 +496,21 @@ generate_client_json() {
         outbounds_json+='{"type":"anytls","tag":"anytls-'"$hostname"'","server":"'"$SERVER_IP"'","server_port":'"$AN_PORT"',"password":"'"$uuid_val"'",'"$hb_tcp_field"'"tls":{"enabled":true,"server_name":"www.bing.com","insecure":true}}'
     fi
 
-    # NAIVE-SUPPORT: NaiveProxy 出站（sing-box 官方 naive outbound 字段：server/server_port/username/password/tls）
+    # NAIVE-SUPPORT: H2/H3 各自生成出站，双栈时可独立切换。
     # 设备订阅通过 RR_NAIVE_USER_OVERRIDE/RR_NAIVE_PASS_OVERRIDE 注入独立凭据，流量按 username 精确归属
     if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
-        if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
-        append_client_tag "naive-${hostname}"
         local naive_ou="${RR_NAIVE_USER_OVERRIDE:-$NAIVE_USER}"
         local naive_op="${RR_NAIVE_PASS_OVERRIDE:-$NAIVE_PASS}"
-        outbounds_json+='{"type":"naive","tag":"naive-'"$hostname"'","server":"'"$NAIVE_DOMAIN"'","server_port":'"$NAIVE_PORT"',"username":"'"$naive_ou"'","password":"'"$naive_op"'","tls":{"enabled":true,"server_name":"'"$NAIVE_DOMAIN"'"}}'
+        if [ "${NAIVE_MODE:-h2}" != "h3" ]; then
+            if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+            append_client_tag "naive-h2-${hostname}"
+            outbounds_json+='{"type":"naive","tag":"naive-h2-'"$hostname"'","server":"'"$NAIVE_DOMAIN"'","server_port":'"$NAIVE_PORT"',"username":"'"$naive_ou"'","password":"'"$naive_op"'","tls":{"enabled":true,"server_name":"'"$NAIVE_DOMAIN"'"}}'
+        fi
+        if [ "${NAIVE_MODE:-h2}" != "h2" ]; then
+            if [ "$first" = true ]; then first=false; else outbounds_json+=','; fi
+            append_client_tag "naive-h3-${hostname}"
+            outbounds_json+='{"type":"naive","tag":"naive-h3-'"$hostname"'","server":"'"$NAIVE_DOMAIN"'","server_port":'"$NAIVE_PORT"',"username":"'"$naive_ou"'","password":"'"$naive_op"'","quic":true,"quic_congestion_control":"'"${NAIVE_QUIC_CC:-bbr}"'","tls":{"enabled":true,"server_name":"'"$NAIVE_DOMAIN"'"}}'
+        fi
     fi
 
     # Selector / URLTest 覆盖全部已生成节点，包括 Argo 优选副节点与 Naive。

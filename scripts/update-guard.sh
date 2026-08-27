@@ -6,13 +6,19 @@
 # 成员结构。它只判断“远程清单字节是否变化”，然后把真正的安全校验、
 # 下载、事务安装和回滚交给当次最新 bootstrap install.sh。
 
-RR_UPDATE_GUARD_VERSION="1"
+RR_UPDATE_GUARD_VERSION="2"
 
 rr_update_guard_pause() {
     local prompt="${1:-按回车键返回...}"
     if [ -t 0 ] && [ -t 1 ]; then
         read -r -p "$prompt" _ || true
     fi
+}
+
+rr_update_guard_alert() {
+    declare -F rr_emit_alert >/dev/null 2>&1 || return 0
+    rr_emit_alert update_failed critical "RR-vps 更新失败" "$1" \
+        "update_failed:$(date -u '+%Y%m%d%H')" --interval 300
 }
 
 rr_update_guard_download() {
@@ -128,6 +134,25 @@ rr_update_guard_prepare_bootstrap() {
 # 当前发布清单/文件类型/Bundle 如何验证和安装。保险层本身不维护发布白名单。
 do_update() {
     local bootstrap_tmp=""
+    local preflight_tmp=""
+
+    # 上次更新如果被断电/SIGKILL 中断，先由独立恢复器收敛到旧版。
+    if [ -x /usr/local/sbin/rr-update-recover ]; then
+        /usr/local/sbin/rr-update-recover recover || {
+            echo -e "${RED:-}[失败] 上次更新事务未能完整恢复，已停止新更新。${RESET:-}"
+            return 1
+        }
+    fi
+    preflight_tmp=$(mktemp /tmp/rr-update-preflight.XXXXXX) || return 1
+    if [ -x /usr/local/bin/rr ] && ! /usr/local/bin/rr --update-preflight >"$preflight_tmp" 2>/dev/null; then
+        echo -e "${RED:-}[失败] 更新预检未通过，当前节点未改动。${RESET:-}"
+        cat "$preflight_tmp" 2>/dev/null || true
+        rr_update_guard_alert "更新预检未通过，当前节点未改动。"
+        rm -f "$preflight_tmp"
+        rr_update_guard_pause
+        return 1
+    fi
+    rm -f "$preflight_tmp"
 
     echo -e "\n${YELLOW:-}检查 RR-vps 远程更新...${RESET:-}"
     check_update
@@ -150,6 +175,7 @@ do_update() {
     if ! rr_update_guard_prepare_bootstrap "$bootstrap_tmp"; then
         rm -f "$bootstrap_tmp"
         echo -e "${RED:-}[失败] 最新更新程序下载或完整性检查失败，当前节点未改动。${RESET:-}"
+        rr_update_guard_alert "安全引导器下载或完整性检查失败，当前节点未改动。"
         rr_update_guard_pause
         return 1
     fi
@@ -168,6 +194,7 @@ do_update() {
 
     rm -f "$bootstrap_tmp"
     echo -e "${RED:-}[失败] 热更新未完成；最新安装程序已按事务规则回滚，当前节点保持升级前状态。${RESET:-}"
+    rr_update_guard_alert "热更新事务失败，已执行自动回滚；请运行 rr doctor。"
     rr_update_guard_pause
     return 1
 }

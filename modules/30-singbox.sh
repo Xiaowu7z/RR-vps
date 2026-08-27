@@ -605,7 +605,7 @@ build_singbox_config() {
         json+='{"type":"anytls","tag":"anytls-in"'"$legacy_sniff_fields"',"listen":"'"$listen_address"'","listen_port":'"$AN_PORT"',"users":'"$anytls_users"',"tls":{"enabled":true,"certificate_path":"/etc/sing-box/cert.pem","key_path":"/etc/sing-box/private.key"}}'
     fi
 
-    # NAIVE-SUPPORT：NaiveProxy（sing-box 1.13+ 原生 naive inbound，HTTP/2+padding 伪装，Let's Encrypt 真证书）
+    # NAIVE-SUPPORT：sing-box 1.13+ 原生 Naive HTTP/2(TCP) / HTTP/3(QUIC)。
     # 用户数组 = 主凭据 + 每活跃设备独立凭据（username=设备ID，密码=无状态复算），
     # 使 v2ray_api 按 username 统计流量可精确归属到设备。
     if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
@@ -621,7 +621,15 @@ build_singbox_config() {
                 done
             fi
             naive_users_json+="]"
-            json+='{"type":"naive","tag":"naive-in","listen":"'"$listen_address"'","listen_port":'"$NAIVE_PORT"',"users":'"$naive_users_json"',"tls":{"enabled":true,"certificate_path":"/etc/rr-naive/fullchain.pem","key_path":"/etc/rr-naive/privkey.pem"}}'
+            local naive_transport_json=""
+            case "${NAIVE_MODE:-h2}" in
+                h2) naive_transport_json=',"network":"tcp"' ;;
+                h3) printf -v naive_transport_json ',"network":"udp","quic_congestion_control":"%s"' "${NAIVE_QUIC_CC:-bbr}" ;;
+                *) printf -v naive_transport_json ',"quic_congestion_control":"%s"' "${NAIVE_QUIC_CC:-bbr}" ;;
+            esac
+            json+='{"type":"naive","tag":"naive-in","listen":"'"$listen_address"'","listen_port":'"$NAIVE_PORT"',"users":'
+            json+="$naive_users_json$naive_transport_json"
+            json+=',"tls":{"enabled":true,"certificate_path":"/etc/rr-naive/fullchain.pem","key_path":"/etc/rr-naive/privkey.pem"}}'
         else
             echo -e "${YELLOW}[提示] NaiveProxy 证书缺失（/etc/rr-naive/），已跳过 naive 入站。请运行证书申请后重新生成配置。${RESET}" >&2
         fi
@@ -999,7 +1007,7 @@ sync_runtime_state() {
     return 0
 }
 
-# NAIVE-SUPPORT：Let's Encrypt 真证书申请与续签（NaiveProxy 专用）
+# NAIVE-SUPPORT：Let’s Encrypt 真证书申请与续签（NaiveProxy 专用）
 ensure_naive_certificate() {
     # 返回 0=证书就绪；非 0=失败。真证书，不允许自签。
     local naive_domain="${1:-$NAIVE_DOMAIN}"
@@ -1020,14 +1028,14 @@ ensure_naive_certificate() {
 
     # certbot webroot 申请（域名必须已解析到本机）
     if ! command -v certbot >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 certbot（Let's Encrypt 官方客户端）……${RESET}"
+        echo -e "${YELLOW}正在安装 certbot（Let’s Encrypt 官方客户端）……${RESET}"
         apt-get install -y certbot >/dev/null 2>&1 || { echo -e "${RED}[失败] certbot 安装失败。${RESET}" >&2; return 1; }
     fi
     # 6.6.15：root umask 077（DMIT 模板等）会让目录 700/文件 600，
     # nginx(www-data) 读不了挑战文件 → LE 403。显式 chmod + umask 022。
     mkdir -p /var/www/rr-nexus-certbot/.well-known/acme-challenge
     chmod 755 /var/www/rr-nexus-certbot /var/www/rr-nexus-certbot/.well-known /var/www/rr-nexus-certbot/.well-known/acme-challenge
-    echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let's Encrypt 真证书……${RESET}"
+    echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let’s Encrypt 真证书……${RESET}"
     if ! (umask 022 && certbot certonly --webroot -w /var/www/rr-nexus-certbot -d "$naive_domain" \
         -m "$le_email" --agree-tos --non-interactive --quiet 2>/dev/null); then
         echo -e "${RED}[失败] 证书申请失败：请确认 ${naive_domain} 已解析到本机公网 IP、80 端口可访问；如日志提示邮箱被拒（invalid email），请在 /etc/argo_vmess.conf 添加 LE_EMAIL=你的邮箱 后重试。${RESET}" >&2
@@ -1037,7 +1045,7 @@ ensure_naive_certificate() {
     cp -f "/etc/letsencrypt/live/${naive_domain}/privkey.pem" /etc/rr-naive/privkey.pem || return 1
     chmod 600 /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem
     deploy_naive_cert_hook
-    echo -e "${GREEN}[成功] NaiveProxy Let's Encrypt 真证书已就绪（/etc/rr-naive/）。${RESET}"
+    echo -e "${GREEN}[成功] NaiveProxy Let’s Encrypt 真证书已就绪（/etc/rr-naive/）。${RESET}"
     return 0
 }
 
@@ -1046,20 +1054,10 @@ deploy_naive_cert_hook() {
     local naive_domain="${1:-$NAIVE_DOMAIN}"
     [ -n "$naive_domain" ] || return 0
     local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    local hook_source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
     mkdir -p "$hook_dir"
     local hook_file="${hook_dir}/rr-naive-cert.sh"
-    cat > "$hook_file" <<'HOOKEOF'
-#!/bin/bash
-# RR-vps NaiveProxy 证书续签钩子：同步到 /etc/rr-naive 并重启 sing-box
-for cert_dir in /etc/letsencrypt/live/*/; do
-    domain=$(basename "$cert_dir")
-    [ -f "$cert_dir/fullchain.pem" ] || continue
-    cp -f "$cert_dir/fullchain.pem" /etc/rr-naive/fullchain.pem 2>/dev/null
-    cp -f "$cert_dir/privkey.pem" /etc/rr-naive/privkey.pem 2>/dev/null
-done
-chmod 600 /etc/rr-naive/*.pem 2>/dev/null
-systemctl restart sing-box >/dev/null 2>&1 || true
-HOOKEOF
-    chmod 700 "$hook_file"
+    [ -s "$hook_source" ] && bash -n "$hook_source" || return 1
+    install -m 700 "$hook_source" "$hook_file" || return 1
     return 0
 }

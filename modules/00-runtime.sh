@@ -10,13 +10,21 @@ WHITE="\033[1;37m"
 RESET="\033[0m"
 
 RR_REPOSITORY="Xiaowu7z/RR-vps"
+RR_UPDATE_CHANNEL_FILE="/etc/rr-update/channel"
+RR_UPDATE_CHANNEL="stable"
+if [ -r "$RR_UPDATE_CHANNEL_FILE" ]; then
+    case "$(tr -d '[:space:]' < "$RR_UPDATE_CHANNEL_FILE")" in
+        beta) RR_UPDATE_CHANNEL="beta" ;;
+    esac
+fi
 RR_BRANCH="main"
+[ "$RR_UPDATE_CHANNEL" = "beta" ] && RR_BRANCH="beta"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
-SCRIPT_VERSION="7.0.3"
+SCRIPT_VERSION="7.1.0"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"  # 干净URL+?t=防CDN旧缓存(2026-08)
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LOCAL_MANIFEST="${RR_LIB_DIR}/manifest.sha256"
@@ -28,9 +36,10 @@ SUB_PID_FILE="/tmp/sub_server.pid"
 SUB_BIND_STATE_FILE="/tmp/sub_server.bind"
 SUB_ROOT="/tmp/sub_server"
 ARGO_PID_FILE="/tmp/argo_rr_cloudflared.pid"
+RR_CF_TOKEN_FILE="/etc/rr-cloudflared/token"
 FIREWALL_COMMENT="argo-rr-managed"
 FIREWALL_BLOCK_COMMENT="argo-rr-managed-block"
-CONFIG_SCHEMA_VERSION="7"
+CONFIG_SCHEMA_VERSION="8"
 MIN_SINGBOX_VERSION="1.12.0"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 UPDATE_AVAILABLE=false

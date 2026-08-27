@@ -438,8 +438,14 @@ $link"
         if [ "$NAIVE_ENABLED" = "true" ] && [ "$NAIVE_PORT" != "0" ]; then
             local ndev_pw=""
             ndev_pw=$(nexus_device_naive_password "$device_id") || ndev_pw="$NAIVE_PASS"
-            link="naive+https://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive·${display_name}"
-            all_links="${all_links:+$all_links$'\n'}$link"
+            if [ "${NAIVE_MODE:-h2}" != h3 ]; then
+                link="naive+https://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive-H2·${display_name}"
+                all_links="${all_links:+$all_links$'\n'}$link"
+            fi
+            if [ "${NAIVE_MODE:-h2}" != h2 ]; then
+                link="naive+quic://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}?congestion_control=${NAIVE_QUIC_CC:-bbr}#RR-Naive-H3·${display_name}"
+                all_links="${all_links:+$all_links$'\n'}$link"
+            fi
         fi
 
         output_tmp=$(mktemp "$NEXUS_SUB_ROOT/.${device_id}.XXXXXX") || { rm -f "$rows_file"; return 1; }
@@ -602,7 +608,7 @@ nexus_install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     apt-get -o DPkg::Lock::Timeout=120 install -y \
-        python3 python3-pip python3-argon2 qrencode sqlite3 jq || return 1
+        python3 python3-pip python3-argon2 python3-cryptography qrencode sqlite3 jq || return 1
 
     # P1 修复：grpcio < 1.43 在 Ubuntu 22.04 上会导致面板 CPU 死循环。
     # 优先级：已装新版跳过 → apt 源版（Debian12=1.51 / Ubuntu24=1.60 直接满足，
@@ -1386,15 +1392,41 @@ open('/etc/nginx/nginx.conf','w').write(''.join(lines))
         echo -e "公网访问：${GREEN}https://${show_ip}:${up}${RESET}"
         echo -e "${YELLOW}自签证书，浏览器会警告，点击「高级」→「继续访问」即可。${RESET}"
     fi
-            echo -e "${YELLOW}面板始终只监听 127.0.0.1；公网访问由 Nginx HTTPS 反向代理。${RESET}"
-        echo -e "${CYAN}正在检测公网可达性……${RESET}"
-        local test_url=""
-        test_url=$(jq -r '"https://" + (.ssh_host // "127.0.0.1") + ":" + (.public_port|tostring)' "$NEXUS_CONFIG_FILE" 2>/dev/null)
-        if curl -sk --connect-timeout 5 --max-time 10 "$test_url" >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ 公网可达，面板可正常访问。${RESET}"
-        else
-            echo -e "${YELLOW}⚠ 端口 ${ngx_port} 可能被上游防火墙拦截，请尝试换常用端口重装。${RESET}"
-        fi
+    echo -e "${YELLOW}面板始终只监听 127.0.0.1；公网访问由 Nginx HTTPS 反向代理。${RESET}"
+    local test_url=""
+    local reachability_ok=false
+    case "$choice" in
+        1)
+            echo -e "${CYAN}正在检测本机健康端点……${RESET}"
+            test_url="http://127.0.0.1:7900/healthz"
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+                "$test_url" >/dev/null 2>&1 && reachability_ok=true
+            ;;
+        2)
+            echo -e "${CYAN}正在检测公网域名与证书……${RESET}"
+            if [ "$port" = "443" ]; then
+                test_url="https://${domain,,}/healthz"
+            else
+                test_url="https://${domain,,}:${port}/healthz"
+            fi
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+                "$test_url" >/dev/null 2>&1 && reachability_ok=true
+            ;;
+        3)
+            echo -e "${CYAN}正在检测公网 IP 入口……${RESET}"
+            test_url=$(nexus_access_url)
+            # 仅自签 IP 模式允许跳过 CA 校验；域名模式必须通过完整 TLS 校验。
+            curl --fail --silent --show-error --insecure --connect-timeout 5 --max-time 10 \
+                "${test_url%/}/healthz" >/dev/null 2>&1 && reachability_ok=true
+            ;;
+    esac
+    if [ "$reachability_ok" = true ]; then
+        echo -e "${GREEN}✓ Nexus 可达，面板可正常访问。${RESET}"
+    elif [ "$choice" = "1" ]; then
+        echo -e "${YELLOW}⚠ 本机健康检查失败，请运行 rr doctor 查看 Nexus 日志。${RESET}"
+    else
+        echo -e "${YELLOW}⚠ 面板入口暂不可达，请检查 DNS、证书和上游防火墙。${RESET}"
+    fi
     read -rp "按回车键返回……"
     systemctl enable --now nginx 2>/dev/null || true
 }

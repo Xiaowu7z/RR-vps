@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
   pull_request:
-    branches: [main]
+    branches: [main, beta]
 
 permissions:
   contents: read
@@ -23,7 +23,7 @@ jobs:
       - name: ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck python3-cryptography python3-argon2
           shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh
 
       - name: Update guard compatibility contract
@@ -60,7 +60,9 @@ jobs:
 
       - name: Python syntax
         run: |
-          python3 -m py_compile nexus/rr_nexus.py scripts/rebuild-bundle.py
+          find nexus -type f -name '*.py' -print0 | xargs -0 python3 -m py_compile
+          python3 -m py_compile scripts/rebuild-bundle.py
+          python3 scripts/validate-7.1.py
 
       - name: Manifest SHA256
         run: |
@@ -72,3 +74,33 @@ jobs:
 
       - name: Repository regression suite
         run: bash scripts/validate.sh
+
+  os-matrix:
+    name: ${{ matrix.name }} clean install / hot update / rollback / uninstall
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12
+            image: debian:12
+          - name: Ubuntu 22.04
+            image: ubuntu:22.04
+          - name: Ubuntu 24.04
+            image: ubuntu:24.04
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bash ca-certificates coreutils curl findutils gawk grep gzip jq \
+            openssl procps python3 sed sqlite3 systemd tar util-linux wget \
+            python3-cryptography python3-argon2
+      - name: Full OS transaction smoke
+        run: bash scripts/os-matrix-smoke.sh

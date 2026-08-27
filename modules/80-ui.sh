@@ -199,7 +199,8 @@ show_info() {
                         hysteria2://*) qr_protocol="Hysteria2 节点" ;;
                         tuic://*) qr_protocol="TUIC 节点" ;;
                         anytls://*) qr_protocol="AnyTLS 节点" ;;
-                        naive+https://*) qr_protocol="NaiveProxy 节点" ;;
+                        naive+https://*) qr_protocol="NaiveProxy H2 节点" ;;
+                        naive+quic://*) qr_protocol="NaiveProxy H3 节点" ;;
                     esac
                     echo ""
                     render_terminal_qr "$line" "$qr_protocol" || true

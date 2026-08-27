@@ -50,7 +50,7 @@ install_deps() {
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y \
-        ca-certificates curl wget jq python3 openssl iproute2 qrencode dnsutils cron \
+        ca-certificates curl wget jq python3 python3-cryptography sqlite3 openssl iproute2 qrencode dnsutils cron \
         iptables iptables-persistent procps tar gzip coreutils util-linux || return 1
 
     if ! command -v vnstat &> /dev/null; then
@@ -390,8 +390,11 @@ nexus_fw_known_ports() {
     [ "$HY2_ENABLED" = "true" ] && [ "$HY2_PORT" != "0" ] && echo "${HY2_PORT}:udp:Hysteria2 节点"
     [ "$TU5_ENABLED" = "true" ] && [ "$TU5_PORT" != "0" ] && echo "${TU5_PORT}:udp:Tuic5 节点"
     [ "$AN_ENABLED" = "true" ] && [ "$AN_PORT" != "0" ] && echo "${AN_PORT}:tcp:AnyTLS 节点"
-    # NAIVE-SUPPORT
-    [ "$NAIVE_ENABLED" = "true" ] && [ "${NAIVE_PORT:-0}" != "0" ] && echo "${NAIVE_PORT}:tcp:NaiveProxy 节点"
+    # NAIVE-SUPPORT: H2/TCP 与 H3/UDP 可同端口并存。
+    if [ "$NAIVE_ENABLED" = "true" ] && [ "${NAIVE_PORT:-0}" != "0" ]; then
+        [ "${NAIVE_MODE:-h2}" != h3 ] && echo "${NAIVE_PORT}:tcp:NaiveProxy H2 节点"
+        [ "${NAIVE_MODE:-h2}" != h2 ] && echo "${NAIVE_PORT}:udp:NaiveProxy H3 节点"
+    fi
     [ "$VM_ENABLED" = "true" ] && [ "$VM_TLS_ENABLED" = "true" ] && [ "$PORT" != "0" ] && echo "${PORT}:tcp:VMess-TLS 直连节点"
     [ "${SUB_PORT:-0}" != "0" ] && echo "${SUB_PORT}:tcp:订阅服务"
     [ -n "${SSH_PORT:-22}" ] && echo "${SSH_PORT}:tcp:SSH 管理端口（保护）"

@@ -8,13 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.0.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.1.0** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### New in 7.0.3: personal subscriptions, recurring quotas, and server traffic plans
+### New in 7.1.0: recoverable updates, diagnostics, migration, security, and alerts
 
-RR Nexus 7.0.3 separates subscriptions for mihomo, Clash Verge Rev, FlClash, and the official Sing-box client, completes multi-protocol node coverage, and publishes standard usage and expiry metadata. Personal devices now support calendar-month quota renewals, a finite renewal count, and admin-only notes. The main and remote consoles can also track a carrier traffic allowance from actual interface counters using RX+TX, TX-only, or RX-only accounting.
+7.1.0 turns hot updates into durable transactions that survive process termination and reboot. Every update runs preflight checks and a runtime/database snapshot, validates the bundle, launcher, and guard with pinned SHA256 values, switches atomically, then gates the commit on configuration, database, process, and HTTP health. Interrupted work is recovered automatically on boot; failed work rolls back, and `rr update --rollback` restores the previous committed release.
 
-The server plan is a persistent monitoring and warning meter for comparison with carrier billing; it does not shut down the entire VPS. A device is blocked as soon as its quota is exhausted, restored on its next scheduled reset, and deleted only after 35 days without an automatic or manual reset.
+This release also adds `rr doctor` with redacted reports, encrypted `.rrbak` migration backups, Telegram/HTTPS-webhook alerts, TOTP and Passkeys, 24-hour/7-day/30-day charts, device groups/templates/batch actions, Stable/Beta channels, and NaiveProxy HTTP/3 over QUIC. Existing installations retain HTTP/2 for NaiveProxy during migration unless the administrator opts into H3.
 
 ## One-command installation
 
@@ -66,6 +66,19 @@ rr --version
 
 Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to remove RR-vps. The uninstall result prints the project URL and reinstall command for future use.
 
+Common operations:
+
+```bash
+rr doctor
+rr doctor --repair
+rr doctor --report
+rr backup
+rr restore /path/file.rrbak
+rr update --check
+rr update --channel stable   # or beta
+rr update --rollback
+```
+
 ## Companion tool: RR Edge Atlas
 
 [RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) is now a standalone open-source multi-platform project with desktop **1.0** and Android **2.7.1** editions. Both use native fixed-IP probing, SNI and certificate validation, and layered screening. The Android edition has been field-tested across China Mobile, China Telecom, and China Unicom; the browser panel remains a shortlist fallback when no native test environment is available.
@@ -84,13 +97,15 @@ Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to rem
 - Hysteria2 with configurable port hopping and interval
 - TUIC v5
 - AnyTLS
-- NaiveProxy (sing-box 1.13 native naive inbound, HTTP/2 + padding camouflage, real Let's Encrypt certificate, official naiveproxy client supported; Clash lacks native naive support and is skipped automatically)
+- NaiveProxy (sing-box 1.13 native naive inbound with selectable HTTP/2, HTTP/3 over QUIC, or dual mode; configurable QUIC congestion control and a real Let's Encrypt certificate)
 - Independent protocol switches and ports
 - Independent IPv4/IPv6 inbound and outbound preferences
 - Public subscription-port mapping for NAT/LXD VPS instances
 - Sing-box validation, health checks, and guarded automatic restart
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Transactional modular updates with GitHub Raw/API/IPv4-CDN fallback, SHA256 verification, Bash syntax checks, migration, and rollback
+- Durable Stable/Beta update transactions with multi-source fallback, three pinned SHA256 layers, boot-time recovery, consistent database snapshots, health gates, automatic rollback, and manual rollback
+- `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
+- Password-encrypted `.rrbak` backup/migration with authenticated encryption, scoped restore, and local rollback on health failure
 - No forced reservation of local port 443 for Argo
 - Optional RR Nexus web console with local-only or public HTTPS access
 - Per-device credentials, protocol links, QR codes, enable/disable state, and expiry
@@ -101,7 +116,9 @@ Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to rem
 - Panel streaming unlock checker: unlock status and region for Netflix / Disney+ / YouTube Premium and more
 - Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be retested with RR Edge Atlas desktop 1.0, Android 2.7.1, or the actual client
 - Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
-- Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
+- TOTP, one-time recovery codes, and origin-bound WebAuthn Passkeys
+- Telegram and HTTPS-webhook alerts for service, disk, allowance, certificate, device quota, Argo domain change, update/backup failure, and security lockout events, with deduplication and optional HMAC signatures
+- Device groups, templates, filters, and batch actions; traffic and system history for 24 hours, 7 days, or 30 days
 - Per-client device subscriptions: a full multi-protocol sing-box profile; separate YAML URLs for mihomo, Clash Verge, and FlClash; dedicated v2rayN, v2rayNG, Shadowrocket, and NekoBox feeds; plus universal links, each with its own QR code
 - Every personal subscription returns `Subscription-Userinfo`, allowing compatible clients to display upload, download, allowance, remaining traffic, and expiry
 
@@ -130,7 +147,7 @@ Protocol support matrix:
 | Hysteria2 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TUIC v5 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | AnyTLS | ✅ | ✅ (not with Reality) | ✅ (recent versions) | ✅ (2.2.65+) | ✅ (1.3.8+) |
-| NaiveProxy | ✅ (1.13+, platform-dependent builds) | ❌ | Depends on client core | Version-dependent | Version-dependent |
+| NaiveProxy H2 / H3 | ✅ (1.13+, platform-dependent builds) | ❌ | Depends on client core | Version-dependent | Version-dependent |
 
 Tip: for fast recovery after screen lock/suspend, enable the active heartbeat mode (main menu 9 → 11) and prefer clients with sing-box core 1.13+.
 

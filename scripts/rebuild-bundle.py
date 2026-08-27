@@ -24,32 +24,56 @@ BASE = Path(__file__).resolve().parent.parent
 VERSION_FILE = BASE / "version"
 RUNTIME_FILE = BASE / "modules/00-runtime.sh"
 INSTALL_SH = BASE / "install.sh"
+INSTALL_CORE = BASE / "scripts/install-core.sh"
+UPDATE_GUARD = BASE / "scripts/update-guard.sh"
 MANIFEST = BASE / "manifest.sha256"
 BUNDLE = BASE / "rr-bundle.tar.gz"
 
-MANIFEST_FILES = (
-    ["rr"]
-    + [
+def release_files() -> list[str]:
+    """Return the complete runtime payload in a deterministic order.
+
+    The 7.0 installer carried a hand-maintained Nexus allow-list.  That made a
+    successful source change surprisingly easy to omit from the hot-update
+    bundle.  Runtime file types are deliberately narrow, while discovery is
+    recursive so backend/frontend modules can be split without changing the
+    release builder again.
+    """
+
+    members = ["rr", "scripts/naive-cert-hook.sh", "scripts/update-recover.sh"]
+    members.extend(
         f"modules/{path.name}"
         for path in sorted((BASE / "modules").glob("*.sh"), key=lambda item: item.name)
-    ]
-    + [
-        "nexus/rr_nexus.py",
-        "nexus/sub_server.py",
-        "nexus/static/index.html",
-        "nexus/static/app.js",
-        "nexus/static/app.css",
-        "nexus/static/optimizer.js",
-        "nexus/static/optimizer.css",
-    ]
-)
+    )
+    nexus_root = BASE / "nexus"
+    for path in sorted(nexus_root.rglob("*"), key=lambda item: item.as_posix()):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        if path.suffix not in {".py", ".html", ".css", ".js"}:
+            continue
+        members.append(path.relative_to(BASE).as_posix())
+    return members
+
+
+MANIFEST_FILES = release_files()
 # The bundle is an install payload, not a source snapshot. Keeping install.sh
 # inside it made the archive self-referential because install.sh pins the bundle
 # digest. Test scripts also do not belong in /usr/local/lib/rr.
 BUNDLE_MEMBERS = MANIFEST_FILES + ["manifest.sha256"]
-EXEC_MEMBERS = {"rr"}
+EXEC_MEMBERS = {
+    "rr",
+    "scripts/naive-cert-hook.sh",
+    "scripts/update-recover.sh",
+    *[item for item in MANIFEST_FILES if item.endswith(".py")],
+}
 BUNDLE_HASH_PATTERN = re.compile(r'\[ "\$actual" = "([0-9a-f]{64})" \]')
+CORE_PIN_PATTERN = re.compile(r'^RR_CORE_SHA256="([0-9a-f]{64})"$', re.MULTILINE)
+GUARD_PIN_PATTERN = re.compile(r'^RR_GUARD_SHA256="([0-9a-f]{64})"$', re.MULTILINE)
 VERSION_PATTERN = re.compile(r"^(\d+\.\d+\.\d+)$")
+
+
+def write_text_lf(path: Path, value: str) -> None:
+    """Write deterministic UTF-8/LF text even on a Windows release host."""
+    path.write_bytes(value.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
 
 
 def sha256(raw: bytes) -> str:
@@ -71,10 +95,7 @@ def sync_version(version: str) -> None:
         raise ValueError(f"版本号格式无效：{version}")
 
     lines = VERSION_FILE.read_text(encoding="utf-8").splitlines()
-    VERSION_FILE.write_text(
-        "\n".join([f"RR-vps {version}", *lines[1:]]) + "\n",
-        encoding="utf-8",
-    )
+    write_text_lf(VERSION_FILE, "\n".join([f"RR-vps {version}", *lines[1:]]) + "\n")
 
     runtime = RUNTIME_FILE.read_text(encoding="utf-8")
     updated, count = re.subn(
@@ -85,7 +106,7 @@ def sync_version(version: str) -> None:
     )
     if count != 1:
         raise ValueError("modules/00-runtime.sh 中 SCRIPT_VERSION 不唯一或不存在")
-    RUNTIME_FILE.write_text(updated, encoding="utf-8")
+    write_text_lf(RUNTIME_FILE, updated)
 
 
 def expected_manifest() -> bytes:
@@ -135,7 +156,8 @@ def verify_bundle_structure(bundle_raw: bytes, manifest_raw: bytes) -> None:
         for member in members:
             if not member.isfile() or member.size <= 0:
                 raise ValueError(f"bundle 含非普通文件或空文件：{member.name}")
-            expected_mode = 0o755 if member.name == "rr-bundle/rr" else 0o644
+            relative = member.name.removeprefix("rr-bundle/")
+            expected_mode = 0o755 if relative in EXEC_MEMBERS else 0o644
             if member.mode != expected_mode:
                 raise ValueError(f"bundle 权限错误：{member.name} {oct(member.mode)}")
         packed_manifest = archive.extractfile("rr-bundle/manifest.sha256")
@@ -144,21 +166,55 @@ def verify_bundle_structure(bundle_raw: bytes, manifest_raw: bytes) -> None:
 
 
 def pinned_bundle_hash() -> str:
-    install = INSTALL_SH.read_text(encoding="utf-8")
-    matches = BUNDLE_HASH_PATTERN.findall(install)
+    core = INSTALL_CORE.read_text(encoding="utf-8")
+    matches = BUNDLE_HASH_PATTERN.findall(core)
     if len(matches) != 1:
         raise ValueError("install.sh 中 bundle SHA256 固定值不唯一或不存在")
     return matches[0]
 
 
 def update_pinned_bundle_hash(digest: str) -> None:
-    install = INSTALL_SH.read_text(encoding="utf-8")
+    core = INSTALL_CORE.read_text(encoding="utf-8")
     updated, count = BUNDLE_HASH_PATTERN.subn(
-        f'[ "$actual" = "{digest}" ]', install, count=1
+        f'[ "$actual" = "{digest}" ]', core, count=1
     )
     if count != 1:
         raise ValueError("install.sh 中 bundle SHA256 固定值不唯一或不存在")
-    INSTALL_SH.write_text(updated, encoding="utf-8")
+    write_text_lf(INSTALL_CORE, updated)
+    # Keep the historical validation anchor synchronized for 7.0 clients and
+    # repository regression tests; the executable comparison lives in core.
+    install = INSTALL_SH.read_text(encoding="utf-8")
+    install, anchor_count = BUNDLE_HASH_PATTERN.subn(
+        f'[ "$actual" = "{digest}" ]', install, count=1
+    )
+    if anchor_count != 1:
+        raise ValueError("install.sh 中 bundle SHA256 兼容锚点不唯一或不存在")
+    write_text_lf(INSTALL_SH, install)
+
+
+def update_bootstrap_pins() -> None:
+    install = INSTALL_SH.read_text(encoding="utf-8")
+    core_digest = sha256(INSTALL_CORE.read_bytes())
+    guard_digest = sha256(UPDATE_GUARD.read_bytes())
+    install, core_count = CORE_PIN_PATTERN.subn(
+        f'RR_CORE_SHA256="{core_digest}"', install, count=1
+    )
+    install, guard_count = GUARD_PIN_PATTERN.subn(
+        f'RR_GUARD_SHA256="{guard_digest}"', install, count=1
+    )
+    if core_count != 1 or guard_count != 1:
+        raise ValueError("install.sh 引导器 SHA256 锚点缺失")
+    write_text_lf(INSTALL_SH, install)
+
+
+def verify_bootstrap_pins() -> None:
+    install = INSTALL_SH.read_text(encoding="utf-8")
+    core = CORE_PIN_PATTERN.findall(install)
+    guard = GUARD_PIN_PATTERN.findall(install)
+    if core != [sha256(INSTALL_CORE.read_bytes())]:
+        raise ValueError("核心安装器 SHA256 锚点过期")
+    if guard != [sha256(UPDATE_GUARD.read_bytes())]:
+        raise ValueError("热更新保险模块 SHA256 锚点过期")
 
 
 def check() -> int:
@@ -183,6 +239,7 @@ def check() -> int:
     digest = sha256(bundle_raw)
     if pinned_bundle_hash() != digest:
         raise ValueError("install.sh 固定的 bundle SHA256 与发布包不一致")
+    verify_bootstrap_pins()
     print(
         f"release check passed: RR-vps {version}, "
         f"{len(BUNDLE_MEMBERS)} members, sha256={digest}"
@@ -202,9 +259,10 @@ def build(version: str) -> int:
     bundle_raw = expected_bundle(manifest_raw)
     BUNDLE.write_bytes(bundle_raw)
 
-    print("[4/4] 更新 install.sh 固定的 bundle SHA256")
+    print("[4/4] 更新 bundle 与引导器 SHA256 锚点")
     digest = sha256(bundle_raw)
     update_pinned_bundle_hash(digest)
+    update_bootstrap_pins()
     verify_bundle_structure(bundle_raw, manifest_raw)
     print(f"完成：{len(BUNDLE_MEMBERS)} 个成员，bundle sha256={digest}")
     print("下一步：python3 scripts/rebuild-bundle.py --check && bash scripts/pre-push-test.sh")

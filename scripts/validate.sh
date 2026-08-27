@@ -21,10 +21,12 @@ load_modules_for_tests() {
 }
 
 echo "[1/13] Bash and Python syntax"
-bash -n install.sh rr modules/*.sh
-python3 -c 'compile(open("nexus/rr_nexus.py", encoding="utf-8").read(), "nexus/rr_nexus.py", "exec")'
-python3 -c 'compile(open("nexus/sub_server.py", encoding="utf-8").read(), "nexus/sub_server.py", "exec")'
-if command -v node >/dev/null 2>&1; then node --check nexus/static/app.js; fi
+bash -n install.sh rr modules/*.sh scripts/*.sh
+find nexus -type f -name '*.py' -print0 | xargs -0 python3 -m py_compile
+if command -v node >/dev/null 2>&1; then
+    node --check nexus/static/app.js
+    node --check nexus/static/admin.js
+fi
 
 echo "[2/13] Combined module loading"
 bash -c '
@@ -95,11 +97,20 @@ snapshot_function=$(awk '
     /^rr_snapshot_runtime\(\) \{/ { capture = 1 }
     capture { print }
     capture && /^}$/ { exit }
-' install.sh)
+' scripts/install-core.sh)
 (
     eval "$snapshot_function"
+    RR_TX_ROOT=$(mktemp -d)
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    mkdir -p "$RR_TX_ROOT/transactions"
     BACKUP_DIR=""
+    TX_DIR=""
+    RR_LIB_DIR="/nonexistent/rr-runtime"
     RR_LAUNCHER="/nonexistent/rr"
+    rr_prepare_recovery_runtime() { return 0; }
+    rr_discard_previous_transaction() { return 0; }
+    rr_prune_stale_transactions() { return 0; }
+    rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
@@ -111,12 +122,21 @@ snapshot_function=$(awk '
     [ ! -e "$BACKUP_DIR/singbox_was_running" ]
     [ ! -e "$BACKUP_DIR/nexus_was_running" ]
     [ ! -e "$BACKUP_DIR/health_timer_was_enabled" ]
-    rm -rf "$BACKUP_DIR"
+    rm -rf "$RR_TX_ROOT"
 )
 (
     eval "$snapshot_function"
+    RR_TX_ROOT=$(mktemp -d)
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    mkdir -p "$RR_TX_ROOT/transactions"
     BACKUP_DIR=""
+    TX_DIR=""
+    RR_LIB_DIR="/nonexistent/rr-runtime"
     RR_LAUNCHER="/nonexistent/rr"
+    rr_prepare_recovery_runtime() { return 0; }
+    rr_discard_previous_transaction() { return 0; }
+    rr_prune_stale_transactions() { return 0; }
+    rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
@@ -127,12 +147,21 @@ snapshot_function=$(awk '
     [ -e "$BACKUP_DIR/singbox_was_running" ]
     [ -e "$BACKUP_DIR/nexus_was_running" ]
     [ -e "$BACKUP_DIR/health_timer_was_enabled" ]
-    rm -rf "$BACKUP_DIR"
+    rm -rf "$RR_TX_ROOT"
 )
 (
     eval "$snapshot_function"
+    RR_TX_ROOT=$(mktemp -d)
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    mkdir -p "$RR_TX_ROOT/transactions"
     BACKUP_DIR=""
+    TX_DIR=""
+    RR_LIB_DIR="/nonexistent/rr-runtime"
     RR_LAUNCHER="/nonexistent/rr"
+    rr_prepare_recovery_runtime() { return 0; }
+    rr_discard_previous_transaction() { return 0; }
+    rr_prune_stale_transactions() { return 0; }
+    rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 1; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
@@ -143,7 +172,7 @@ snapshot_function=$(awk '
         echo "Snapshot unexpectedly ignored a real backup failure." >&2
         exit 1
     fi
-    rm -rf "$BACKUP_DIR"
+    rm -rf "$RR_TX_ROOT"
 )
 
 echo "[5/13] Fresh-install crypto material regression"
@@ -712,6 +741,7 @@ links = [
     "tuic://test:test@example.com:8444#TUIC",
     "anytls://test@example.com:8445#AnyTLS",
     "naive+https://test:password@example.com:443#Naive",
+    "naive+quic://test:password@example.com:443#Naive-H3",
 ]
 links_path = artifact_root / "dev_012345abcdef.txt"
 links_path.write_text("\n".join(links) + "\n", encoding="utf-8")
@@ -1025,6 +1055,8 @@ echo "[9/13] RR Nexus personal subscription compatibility"
     NAIVE_USER=rr-naive
     NAIVE_PASS=server-naive-password
     NAIVE_DOMAIN=naive.example.com
+    NAIVE_MODE=both
+    NAIVE_QUIC_CC=bbr
     PUBLIC_KEY=test-reality-public-key
     SHORT_ID=0123456789abcdef
     CERT_SHA256=$(printf 'a%.0s' {1..64})
@@ -1075,14 +1107,14 @@ PY
     [ -s "$raw_file" ] && [ -s "$neko_file" ]
     base64 -d "$neko_file" > "$sub_tmp/nekobox-decoded.txt"
     cmp -s "$raw_file" "$sub_tmp/nekobox-decoded.txt"
-    [ "$(wc -l < "$raw_file")" -eq 6 ]
+    [ "$(wc -l < "$raw_file")" -eq 7 ]
     grep -Eq '^hysteria2://.*obfs=salamander&obfs-password=e219c8c7-b669-4c75-b33b-a9e5227a8a24' "$raw_file"
     grep -Eq '^tuic://.*insecure=1&allow_insecure=1' "$raw_file"
     jq -e --arg credential "$device_credential" '.outbounds[] | select(.type == "vless") | .uuid == $credential' \
         "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
     jq -e '.outbounds | map(.type) | index("vmess") != null and index("vless") != null and index("hysteria2") != null and index("tuic") != null and index("anytls") != null and index("naive") != null' \
         "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
-    jq -e '.outbounds[] | select(.type == "selector" and .tag == "proxy") | .outbounds | index("naive-RR-012345AB") != null' \
+    jq -e '.outbounds[] | select(.type == "selector" and .tag == "proxy") | .outbounds | index("naive-h2-RR-012345AB") != null and index("naive-h3-RR-012345AB") != null' \
         "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
     grep -Fq 'obfs: salamander' "$NEXUS_SUB_ROOT/${device_id}.yaml"
     grep -Fq 'obfs-password: "e219c8c7-b669-4c75-b33b-a9e5227a8a24"' "$NEXUS_SUB_ROOT/${device_id}.yaml"
@@ -1113,7 +1145,7 @@ encoded = open(encoded_path, encoding="utf-8").read()
 assert base64.b64decode(encoded).decode() == raw
 assert "NekoBox 测试" not in raw
 links = {line.split(":", 1)[0]: line for line in raw.splitlines()}
-assert set(links) == {"vmess", "vless", "hysteria2", "tuic", "anytls", "naive+https"}
+assert set(links) == {"vmess", "vless", "hysteria2", "tuic", "anytls", "naive+https", "naive+quic"}
 
 vmess = json.loads(base64.b64decode(links["vmess"].removeprefix("vmess://")))
 assert vmess["id"] == credential and vmess["allowInsecure"] == "1"
@@ -1135,8 +1167,11 @@ assert urllib.parse.parse_qs(tuic.query)["allow_insecure"] == ["1"]
 anytls = parsed("anytls")
 assert anytls.username == credential and urllib.parse.parse_qs(anytls.query)["insecure"] == ["1"]
 naive = urllib.parse.urlsplit(links["naive+https"].replace("naive+https://", "https://", 1))
+naive_h3 = urllib.parse.urlsplit(links["naive+quic"].replace("naive+quic://", "https://", 1))
 assert naive.username.startswith("dev_") and naive.password
-for parsed_link in (vless, hy2, tuic, anytls, naive):
+assert naive_h3.username == naive.username and naive_h3.password == naive.password
+assert urllib.parse.parse_qs(naive_h3.query)["congestion_control"] == ["bbr"]
+for parsed_link in (vless, hy2, tuic, anytls, naive, naive_h3):
     assert "RR-012345AB" in urllib.parse.unquote(parsed_link.fragment)
 PY
 
@@ -1163,6 +1198,8 @@ manifest_paths=$(mktemp)
 trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
 {
     echo rr
+    echo scripts/naive-cert-hook.sh
+    echo scripts/update-recover.sh
     find modules -maxdepth 1 -type f -name '*.sh' -print
     find nexus -maxdepth 2 -type f \( -name '*.py' -o -name '*.html' -o -name '*.css' -o -name '*.js' \) -print
 } | LC_ALL=C sort > "$expected_paths"
@@ -1225,7 +1262,7 @@ grep -Fq 'v2rayN（Windows）· 全协议' nexus/rr_nexus.py
 grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
 grep -Fq 'SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive' nexus/rr_nexus.py
 grep -Fq 'id="rename-dialog"' nexus/static/index.html
-grep -Fq '/app.js?v=22' nexus/static/index.html
+grep -Fq '/app.js?v=23' nexus/static/index.html
 grep -Fq 'sync": "not_required"' nexus/rr_nexus.py
 if grep -Eq 'read[[:space:]].*(-t|--timeout)|(^|[[:space:]])TMOUT=' rr modules/99-menus.sh; then
     echo "RR main menu contains an active input timeout and may drop an idle home page." >&2
@@ -1244,6 +1281,10 @@ grep -Fq 'UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"' modules/60-u
 grep -Fq 'rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"' modules/60-update.sh
 grep -Fq 'RR_BUNDLE_FILE="$bundle_tmp" bash "$bootstrap_tmp" --upgrade' modules/60-update.sh
 grep -Fq 'rr_bundle_tree_is_valid "$PAYLOAD_DIR"' install.sh
+grep -Fq 'rr_verify_restored_state || failed=true' scripts/update-recover.sh
+grep -Fq 'systemctl restart --no-block sing-box' scripts/update-recover.sh
+grep -Fq 'systemctl start --no-block argo-rr-health.service' scripts/update-recover.sh
+grep -Fq 'NAIVE_QUIC_CC=reno' modules/70-protocols.sh
 grep -Fxq 'rr_check_system || exit 1' install.sh
 grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh
 grep -Fq 'rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db' install.sh

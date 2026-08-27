@@ -149,7 +149,11 @@ check_protocol_status() {
     # NAIVE-SUPPORT
     if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
         if [ -f /etc/rr-naive/fullchain.pem ]; then
-            NAIVE_STATUS="${GREEN}已开启 (${NAIVE_PORT} TCP)${RESET}"
+            case "${NAIVE_MODE:-h2}" in
+                h2) NAIVE_STATUS="${GREEN}已开启 H2 (${NAIVE_PORT}/TCP)${RESET}" ;;
+                h3) NAIVE_STATUS="${GREEN}已开启 H3 (${NAIVE_PORT}/UDP)${RESET}" ;;
+                *) NAIVE_STATUS="${GREEN}已开启 H2+H3 (${NAIVE_PORT}/TCP+UDP)${RESET}" ;;
+            esac
         else
             NAIVE_STATUS="${YELLOW}已配置·证书缺失${RESET}"
         fi

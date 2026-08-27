@@ -79,8 +79,39 @@ toggle_naive() {
     fi
     load_config_with_defaults || return 1
     if [ "$NAIVE_ENABLED" = "true" ]; then
+        local old_naive_port="$NAIVE_PORT"
         toggle_single_protocol "NAIVE" "NaiveProxy" "tcp"
+        load_config_with_defaults || return 1
+        close_protocol_firewall "$old_naive_port" udp
+        if [ "$NAIVE_ENABLED" = "true" ]; then
+            case "$NAIVE_MODE" in
+                h2) close_protocol_firewall "$NAIVE_PORT" udp ;;
+                h3) close_protocol_firewall "$NAIVE_PORT" tcp; open_protocol_firewall "$NAIVE_PORT" udp ;;
+                both) open_protocol_firewall "$NAIVE_PORT" tcp; open_protocol_firewall "$NAIVE_PORT" udp ;;
+            esac
+        fi
+        save_firewall
         return
+    fi
+    echo ""
+    echo -e "${CYAN}传输模式：1) HTTP/2 TCP  2) HTTP/3 QUIC  3) H2+H3 双栈（推荐）${RESET}"
+    local naive_mode_choice=""
+    read -r -p "请选择 [1-3，回车默认 3]: " naive_mode_choice
+    case "$naive_mode_choice" in
+        1) NAIVE_MODE=h2 ;;
+        2) NAIVE_MODE=h3 ;;
+        *) NAIVE_MODE=both ;;
+    esac
+    safe_sed NAIVE_MODE "$NAIVE_MODE" || return 1
+    if [ "$NAIVE_MODE" != h2 ]; then
+        echo -e "${CYAN}QUIC 拥塞控制：1) BBR（推荐）  2) Cubic  3) New Reno${RESET}"
+        read -r -p "请选择 [1-3，回车默认 1]: " naive_mode_choice
+        case "$naive_mode_choice" in
+            2) NAIVE_QUIC_CC=cubic ;;
+            3) NAIVE_QUIC_CC=reno ;;
+            *) NAIVE_QUIC_CC=bbr ;;
+        esac
+        safe_sed NAIVE_QUIC_CC "$NAIVE_QUIC_CC" || return 1
     fi
     # 开启：先确认域名（真证书必需）
     if [ -z "$NAIVE_DOMAIN" ]; then
@@ -126,6 +157,15 @@ toggle_naive() {
         return
     fi
     toggle_single_protocol "NAIVE" "NaiveProxy" "tcp"
+    load_config_with_defaults || return 1
+    if [ "$NAIVE_ENABLED" = "true" ]; then
+        case "$NAIVE_MODE" in
+            h2) close_protocol_firewall "$NAIVE_PORT" udp ;;
+            h3) close_protocol_firewall "$NAIVE_PORT" tcp; open_protocol_firewall "$NAIVE_PORT" udp ;;
+            both) open_protocol_firewall "$NAIVE_PORT" tcp; open_protocol_firewall "$NAIVE_PORT" udp ;;
+        esac
+        save_firewall
+    fi
 }
 
 # 主动心跳模式：给客户端订阅注入保活参数（TCP keepalive + QUIC idle）。
@@ -417,6 +457,11 @@ launch_quick_argo_tunnel() {
     cp -f "$log_file" /tmp/argo.log 2>/dev/null || true
     rm -f "$log_file"
     echo -e "${GREEN}[成功] Argo 临时隧道已切换：${new_domain}${RESET}"
+    if [ -n "$old_domain" ] && [ "$old_domain" != "$new_domain" ]; then
+        rr_emit_alert argo_domain_changed warning "Argo 临时域名已变化" \
+            "旧域名 ${old_domain} 已切换为 ${new_domain}，设备订阅已同步刷新。" \
+            "argo_domain_changed:${new_domain}" --interval 0
+    fi
     return 0
 }
 
@@ -442,6 +487,34 @@ rotate_quick_argo_origin_port() {
     return 0
 }
 
+rr_cloudflared_service_token() {
+    systemctl cat cloudflared 2>/dev/null | awk '
+        /^[[:space:]]*ExecStart=/ {
+            for (i=1; i<=NF; i++) {
+                if ($i == "--token" && i < NF) { print $(i+1); exit }
+                if ($i ~ /^--token=/) { sub(/^--token=/, "", $i); print $i; exit }
+            }
+        }
+    '
+}
+
+ensure_fixed_argo_service() {
+    local token_file="${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}"
+    local desired_token=""
+    if systemctl cat cloudflared >/dev/null 2>&1; then
+        systemctl enable --now cloudflared >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet cloudflared
+        return $?
+    else
+        [ -r "$token_file" ] || return 1
+        IFS= read -r desired_token < "$token_file" || return 1
+        [ -n "$desired_token" ] && [[ "$desired_token" != *[[:space:]]* ]] || return 1
+        cloudflared service install "$desired_token" >/dev/null 2>&1 || return 1
+    fi
+    systemctl enable --now cloudflared >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet cloudflared
+}
+
 start_argo_tunnel() {
     load_config_with_defaults || return 1
     if [ "$VM_ENABLED" = "false" ] || [ "$VM_TLS_ENABLED" = "true" ]; then
@@ -450,8 +523,7 @@ start_argo_tunnel() {
     fi
     install_cloudflared || return 1
     if [ "${TUNNEL_MODE:-1}" = "2" ]; then
-        systemctl restart cloudflared >/dev/null 2>&1 || return 1
-        systemctl is-active --quiet cloudflared
+        ensure_fixed_argo_service
     else
         launch_quick_argo_tunnel
     fi
@@ -965,6 +1037,7 @@ disable_all_protocols() {
         close_protocol_firewall "$old_an" tcp
         # NAIVE-SUPPORT
         close_protocol_firewall "$NAIVE_PORT" tcp
+        close_protocol_firewall "$NAIVE_PORT" udp
     fi
     sleep 2
 }

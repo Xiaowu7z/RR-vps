@@ -114,7 +114,10 @@ _install_repair_existing() {
     [ "$TU5_ENABLED" = "true" ] && open_protocol_firewall "$TU5_PORT" udp
     [ "$AN_ENABLED" = "true" ] && open_protocol_firewall "$AN_PORT" tcp
     # NAIVE-SUPPORT
-    [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ] && open_protocol_firewall "$NAIVE_PORT" tcp
+    if [ "$NAIVE_ENABLED" = "true" ] && [ -n "$NAIVE_PORT" ] && [ "$NAIVE_PORT" != "0" ]; then
+        [ "${NAIVE_MODE:-h2}" != h3 ] && open_protocol_firewall "$NAIVE_PORT" tcp
+        [ "${NAIVE_MODE:-h2}" != h2 ] && open_protocol_firewall "$NAIVE_PORT" udp
+    fi
     if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_HOP_PORTS" ] && \
        ! install_hop_rules HY2 "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1; then
         echo -e "${RED}[失败] 当前入口地址族无法恢复 HY2 跳跃规则；原配置未改动。${RESET}"
@@ -219,6 +222,8 @@ uninstall_all() {
     rm -f /etc/systemd/system/argo-rr-health.timer /etc/systemd/system/argo-rr-health.service
     systemctl disable --now rr-nexus >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/rr-nexus.service
+    systemctl disable --now rr-update-recovery.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/rr-update-recovery.service /usr/local/sbin/rr-update-recover
     declare -F nexus_remove_public_proxy >/dev/null 2>&1 && nexus_remove_public_proxy
     stop_singbox_instances >/dev/null 2>&1 || true
     systemctl disable sing-box 2>/dev/null
@@ -238,11 +243,14 @@ uninstall_all() {
     [ -n "${HY2_PORT:-}" ] && close_protocol_firewall "$HY2_PORT" udp
     [ -n "${TU5_PORT:-}" ] && close_protocol_firewall "$TU5_PORT" udp
     [ -n "${AN_PORT:-}" ] && close_protocol_firewall "$AN_PORT" tcp
+    [ -n "${NAIVE_PORT:-}" ] && close_protocol_firewall "$NAIVE_PORT" tcp
+    [ -n "${NAIVE_PORT:-}" ] && close_protocol_firewall "$NAIVE_PORT" udp
 
     if crontab -l 2>/dev/null | grep -q "auto_update_sub.py"; then
         (crontab -l 2>/dev/null | grep -v "auto_update_sub.py") | crontab -
     fi
     rm -f /usr/local/bin/auto_update_sub.py
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh
     if [ -f /etc/fail2ban/jail.d/argo-rr-sshd.local ]; then
         rm -f /etc/fail2ban/jail.d/argo-rr-sshd.local
         fail2ban-client -t >/dev/null 2>&1 && \
@@ -257,7 +265,9 @@ uninstall_all() {
     fi
     rm -f "$SUB_BIND_STATE_FILE"
 
-    rm -rf "$SUB_ROOT" /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /var/lib/rr-nexus "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
+    rm -rf "$SUB_ROOT" /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
+        /etc/rr-update /var/lib/rr-nexus /var/lib/rr-update /var/lib/rr-backup \
+        "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
     rm -f /etc/sysctl.d/99-argo-rr.conf "$ARGO_PID_FILE" /tmp/argo.log
     echo -e "${GREEN}清理完毕，欢迎随时再次使用 RR-vps！${RESET}"
     echo -e "${CYAN}项目地址 / Project:${RESET} ${project_url}"
@@ -305,7 +315,7 @@ select_initial_protocols() {
         echo -e "  ${PURPLE}6.${RESET} VMess-WS + Argo        ${YELLOW}按需安装 Cloudflared${RESET}"
         echo -e "  ${PURPLE}7.${RESET} 安装全部协议           ${CYAN}随后选择 VMess 工作模式${RESET}"
         # NAIVE-SUPPORT
-        echo -e "  ${PURPLE}8.${RESET} NaiveProxy              ${CYAN}HTTP/2+padding 伪装 / 需域名真证书${RESET}"
+        echo -e "  ${PURPLE}8.${RESET} NaiveProxy H2/H3        ${CYAN}TCP+QUIC 双栈 / 需域名真证书${RESET}"
         echo -e "  ${PURPLE}0.${RESET} 仅初始化管理框架       ${CYAN}以后在选项 9 开启协议${RESET}"
         echo -e "${CYAN}=================================================================================${RESET}"
         read -p "请输入协议编号: " selection_input
@@ -368,6 +378,7 @@ select_initial_protocols() {
             INSTALL_HY2_ENABLED=true
             INSTALL_TU5_ENABLED=true
             INSTALL_AN_ENABLED=true
+            INSTALL_NAIVE_ENABLED=true
             while true; do
                 echo ""
                 echo -e "全部协议中的 VMess 请选择一种工作模式："
@@ -410,11 +421,19 @@ initial_port_available() {
         for allocated in "${PORT:-0}" "${SUB_PORT:-0}" "${VL_PORT:-0}" "${AN_PORT:-0}"; do
             [ "$allocated" != "0" ] && [ "$candidate" = "$allocated" ] && return 1
         done
+        if [ "${INSTALL_NAIVE_ENABLED:-false}" = true ] && [ "${NAIVE_MODE:-h2}" != h3 ] && \
+           [ "${NAIVE_PORT:-0}" != 0 ] && [ "$candidate" = "$NAIVE_PORT" ]; then
+            return 1
+        fi
         tcp_port_in_use "$candidate" && return 1
     elif [ "$transport" = "udp" ]; then
         for allocated in "${HY2_PORT:-0}" "${TU5_PORT:-0}"; do
             [ "$allocated" != "0" ] && [ "$candidate" = "$allocated" ] && return 1
         done
+        if [ "${INSTALL_NAIVE_ENABLED:-false}" = true ] && [ "${NAIVE_MODE:-h2}" != h2 ] && \
+           [ "${NAIVE_PORT:-0}" != 0 ] && [ "$candidate" = "$NAIVE_PORT" ]; then
+            return 1
+        fi
         udp_port_in_use "$candidate" && return 1
     else
         return 1
@@ -445,6 +464,28 @@ prompt_initial_port() {
             return 0
         fi
         echo -e "${RED}端口须在 1-65535、未被占用，并且不能与已选协议端口冲突。${RESET}"
+    done
+}
+
+prompt_initial_naive_port() {
+    local candidate=443 random_port="" entered_port=""
+    while true; do
+        if { [ "$NAIVE_MODE" = h3 ] || initial_port_available "$candidate" tcp; } && \
+           { [ "$NAIVE_MODE" = h2 ] || initial_port_available "$candidate" udp; }; then
+            break
+        fi
+        candidate=$((RANDOM % 39001 + 10000))
+    done
+    random_port="$candidate"
+    while true; do
+        read -r -p "请设置 NaiveProxy 端口（H2/H3 共用，回车 ${random_port}）: " entered_port
+        entered_port="${entered_port:-$random_port}"
+        if { [ "$NAIVE_MODE" = h3 ] || initial_port_available "$entered_port" tcp; } && \
+           { [ "$NAIVE_MODE" = h2 ] || initial_port_available "$entered_port" udp; }; then
+            NAIVE_PORT="$entered_port"
+            return 0
+        fi
+        echo -e "${RED}端口与已选协议或系统进程冲突。${RESET}"
     done
 }
 
@@ -507,6 +548,9 @@ install_main() {
     HY2_PORT=0
     TU5_PORT=0
     AN_PORT=0
+    NAIVE_PORT=0
+    NAIVE_MODE=h2
+    NAIVE_QUIC_CC=bbr
     HY2_HOP_PORTS=""
     HY2_HOP_INTERVAL="30s"
     TU5_HOP_PORTS=""
@@ -532,9 +576,13 @@ install_main() {
     prompt_initial_port SUB_PORT "本地订阅服务" tcp || return 1
     if [ "$INSTALL_VL_ENABLED" = true ]; then prompt_initial_port VL_PORT "VLESS Reality Vision" tcp || return 1; fi
     if [ "$INSTALL_AN_ENABLED" = true ]; then prompt_initial_port AN_PORT "AnyTLS" tcp || return 1; fi
-    # NAIVE-SUPPORT：NaiveProxy 需独立域名 + Let's Encrypt 真证书 + 标准 443
+    # NAIVE-SUPPORT：NaiveProxy 需独立域名 + Let's Encrypt 真证书。
     if [ "$INSTALL_NAIVE_ENABLED" = true ]; then
-        NAIVE_PORT=443
+        echo -e "${CYAN}Naive 传输：1) H2/TCP  2) H3/QUIC  3) H2+H3 双栈（推荐）${RESET}"
+        read -r -p "请选择 [1-3，回车 3]: " USER_PORT
+        case "$USER_PORT" in 1) NAIVE_MODE=h2 ;; 2) NAIVE_MODE=h3 ;; *) NAIVE_MODE=both ;; esac
+        NAIVE_QUIC_CC=bbr
+        prompt_initial_naive_port || return 1
         read -p "NaiveProxy 域名（必须已解析到本机，例如 naive.example.com）: " NAIVE_DOMAIN
         while [ -z "$NAIVE_DOMAIN" ] || ! is_valid_domain "$NAIVE_DOMAIN" 2>/dev/null; do
             [ -z "$NAIVE_DOMAIN" ] && echo -e "${RED}域名不能为空。${RESET}"
@@ -591,6 +639,8 @@ _install_prompt_identity || return 1
     safe_sed NAIVE_USER "${NAIVE_USER:-}" || config_write_ok=false
     safe_sed NAIVE_PASS "${NAIVE_PASS:-}" || config_write_ok=false
     safe_sed NAIVE_DOMAIN "${NAIVE_DOMAIN:-}" || config_write_ok=false
+    safe_sed NAIVE_MODE "${NAIVE_MODE:-h2}" || config_write_ok=false
+    safe_sed NAIVE_QUIC_CC "${NAIVE_QUIC_CC:-bbr}" || config_write_ok=false
     safe_sed CLASH_ENABLED false || config_write_ok=false
     safe_sed VM_ENABLED "$INSTALL_VM_ENABLED" || config_write_ok=false
     safe_sed ENTRY_IP_MODE auto || config_write_ok=false
@@ -648,6 +698,12 @@ _install_prompt_identity || return 1
     if [ "$INSTALL_ANY_PROTOCOL" = true ]; then
         ensure_singbox_core || { echo -e "${RED}内核安装失败，安装中止。${RESET}"; return 1; }
         generate_certs_and_keys || { echo -e "${RED}证书/密钥生成失败，安装中止${RESET}"; return 1; }
+        if [ "$INSTALL_NAIVE_ENABLED" = true ]; then
+            ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || {
+                echo -e "${RED}NaiveProxy 真证书申请失败，安装已停止；其他协议配置保留为未完成状态。${RESET}"
+                return 1
+            }
+        fi
         build_singbox_config || return 1
         setup_systemd || return 1
     fi
@@ -672,7 +728,12 @@ _install_prompt_identity || return 1
             fi
             cloudflared service uninstall >/dev/null 2>&1 || return 1
         fi
+        install -d -m 700 "$(dirname "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}")" || return 1
+        (umask 077; printf '%s\n' "$CF_TOKEN" > "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}.tmp") || return 1
+        mv -f "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}.tmp" \
+            "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" || return 1
         if ! cloudflared service install "$CF_TOKEN" >/dev/null 2>&1; then
+            rm -f "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}"
             echo -e "${RED}固定隧道服务安装失败。${RESET}"
             return 1
         fi
@@ -688,6 +749,14 @@ _install_prompt_identity || return 1
     fi
 
     open_firewall
+    [ "$INSTALL_VL_ENABLED" = true ] && open_protocol_firewall "$VL_PORT" tcp
+    [ "$INSTALL_HY2_ENABLED" = true ] && open_protocol_firewall "$HY2_PORT" udp
+    [ "$INSTALL_TU5_ENABLED" = true ] && open_protocol_firewall "$TU5_PORT" udp
+    [ "$INSTALL_AN_ENABLED" = true ] && open_protocol_firewall "$AN_PORT" tcp
+    if [ "$INSTALL_NAIVE_ENABLED" = true ]; then
+        [ "$NAIVE_MODE" != h3 ] && open_protocol_firewall "$NAIVE_PORT" tcp
+        [ "$NAIVE_MODE" != h2 ] && open_protocol_firewall "$NAIVE_PORT" udp
+    fi
     if [ "$INSTALL_HY2_ENABLED" = true ] && [ -n "$HY2_HOP_PORTS" ]; then
         if ! install_hop_rules HY2 "$HY2_PORT" "$HY2_HOP_PORTS"; then
             echo -e "${RED}Hysteria2 端口跳跃规则安装失败，安装已停止。${RESET}"

@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -33,7 +34,19 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from rr_nexus_lib.notifications import NotificationManager
+from rr_nexus_lib.security import (
+    b64url_decode,
+    b64url_encode,
+    generate_totp_secret,
+    parse_registration,
+    totp_uri,
+    verify_authentication,
+    verify_totp,
+    webauthn_available,
+)
 
 try:
     from argon2 import PasswordHasher
@@ -75,6 +88,9 @@ TRAFFIC_POLL_SECONDS = 5
 # 额度用尽后留给管理员手动重置的宽限期。超过 35 天仍未处理才删除设备。
 QUOTA_AUTO_DELETE_SECONDS = 35 * 86400
 TRAFFIC_BUCKET_SECONDS = 5 * 60
+TRAFFIC_RETENTION_SECONDS = 30 * 24 * 3600
+SYSTEM_SAMPLE_SECONDS = 60
+SYSTEM_RETENTION_SECONDS = 30 * 24 * 3600
 MAX_AUTO_RESET_COUNT = 120
 MAX_SERVER_TRAFFIC_GB = 1024 * 1024
 SERVER_TRAFFIC_MODES = {"both", "tx", "rx"}
@@ -101,8 +117,8 @@ UPDATE_LOG_PATH = Path("/var/lib/rr-nexus/update.log")
 UPDATE_LOCK_PATH = Path("/var/lib/rr-nexus/update.lock")
 UPDATE_LOCK_STALE_AGE = 30  # 秒：残留锁判死需锁龄超阈值，防误删刚认领（systemd unit 尚未注册）的新锁
 _UPDATE_CLAIM_LOCK = threading.Lock()  # 进程内认领互斥：本地/远程通道同进程，串行化认领全序列
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/manifest.sha256"
 UPDATE_LOCAL_MANIFEST = Path("/usr/local/lib/rr/manifest.sha256")
+UPDATE_CHANNEL_PATH = Path("/etc/rr-update/channel")
 UPDATE_CMD = [
     "systemd-run", "--unit=rr-remote-upgrade", "--collect", "--wait",
     "/bin/bash", "-c",
@@ -112,6 +128,39 @@ UPDATE_CMD = [
     'rc=$?; '
     'echo "[2/2] 完成（退出码 $rc）"; exit $rc',
 ]
+
+
+def update_channel(value: str | None = None) -> str:
+    """Read or atomically update the stable/beta channel selection."""
+    if value is not None:
+        normalized = str(value).strip().lower()
+        if normalized not in {"stable", "beta"}:
+            raise ValueError("invalid_update_channel")
+        UPDATE_CHANNEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = UPDATE_CHANNEL_PATH.with_name(
+            f".channel.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+        )
+        try:
+            with temporary.open("x", encoding="ascii") as output:
+                output.write(normalized + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, UPDATE_CHANNEL_PATH)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return normalized
+    try:
+        normalized = UPDATE_CHANNEL_PATH.read_text(encoding="ascii").strip().lower()
+    except OSError:
+        normalized = "stable"
+    return normalized if normalized in {"stable", "beta"} else "stable"
+
+
+def update_manifest_url() -> str:
+    branch = "main" if update_channel() == "stable" else "beta"
+    return f"https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/{branch}/manifest.sha256"
 
 
 def remote_key_load_or_create() -> bytes:
@@ -361,7 +410,7 @@ def _clone_uri_with_name(uri: str, name: str) -> str | None:
     except ValueError:
         return None
     if parsed.scheme not in {
-        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "trojan", "ss"
+        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "naive+quic", "trojan", "ss"
     } or not parsed.netloc:
         return None
     return urllib.parse.urlunsplit(parsed._replace(fragment=urllib.parse.quote(name, safe="")))
@@ -653,14 +702,22 @@ class Store:
         self.verify_integrity()
         self.initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        # busy_timeout 必须先于 journal_mode 设置：WAL 切换需要独占锁，否则并发轮询抢锁
-        connection.execute("PRAGMA busy_timeout = 15000")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            # busy_timeout 必须先于 journal_mode 设置：WAL 切换需要独占锁，否则并发轮询抢锁
+            connection.execute("PRAGMA busy_timeout = 15000")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def verify_integrity(self) -> None:
         # T4：启动时快速完整性检查（PRAGMA quick_check）。损坏的库（写坏半截、
@@ -699,6 +756,9 @@ class Store:
                     id INTEGER PRIMARY KEY,
                     username TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
+                    totp_secret TEXT NOT NULL DEFAULT '',
+                    totp_pending_secret TEXT NOT NULL DEFAULT '',
+                    totp_enabled INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -723,6 +783,23 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_login_failures_ip ON login_failures(remote_ip, failed_at);
                 CREATE INDEX IF NOT EXISTS idx_login_failures_user ON login_failures(username, failed_at);
+                CREATE TABLE IF NOT EXISTS device_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    color TEXT NOT NULL DEFAULT '#4f8cff',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS device_templates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    quota_bytes INTEGER NOT NULL DEFAULT 0,
+                    expiry_days INTEGER NOT NULL DEFAULT 0,
+                    reset_max INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS devices (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -734,6 +811,7 @@ class Store:
                     uploaded_bytes INTEGER NOT NULL DEFAULT 0,
                     downloaded_bytes INTEGER NOT NULL DEFAULT 0,
                     traffic_updated_at TEXT,
+                    group_id INTEGER REFERENCES device_groups(id) ON DELETE SET NULL,
                     expires_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -751,6 +829,13 @@ class Store:
                     bucket INTEGER PRIMARY KEY,
                     uploaded_bytes INTEGER NOT NULL DEFAULT 0,
                     downloaded_bytes INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS system_samples (
+                    bucket INTEGER PRIMARY KEY,
+                    cpu_percent REAL NOT NULL DEFAULT 0,
+                    memory_percent REAL NOT NULL DEFAULT 0,
+                    disk_percent REAL NOT NULL DEFAULT 0,
+                    load1 REAL NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS server_traffic_policy (
                     id INTEGER PRIMARY KEY CHECK(id=1),
@@ -782,8 +867,59 @@ class Store:
                     last_status TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS notification_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    telegram_token TEXT NOT NULL DEFAULT '',
+                    telegram_chat_id TEXT NOT NULL DEFAULT '',
+                    webhook_url TEXT NOT NULL DEFAULT '',
+                    webhook_secret TEXT NOT NULL DEFAULT '',
+                    events_json TEXT NOT NULL DEFAULT '["service_down","disk_high","traffic_threshold","certificate_expiry","device_quota","update_failed","backup_failed","security_lockout","argo_domain_changed"]',
+                    disk_threshold INTEGER NOT NULL DEFAULT 90,
+                    traffic_threshold INTEGER NOT NULL DEFAULT 90,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS notification_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    delivered INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS notification_dedup (
+                    event_key TEXT PRIMARY KEY,
+                    sent_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS webauthn_credentials (
+                    credential_id TEXT PRIMARY KEY,
+                    admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    public_key_pem BLOB NOT NULL,
+                    algorithm INTEGER NOT NULL,
+                    sign_count INTEGER NOT NULL DEFAULT 0,
+                    transports TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS webauthn_challenges (
+                    id TEXT PRIMARY KEY,
+                    challenge TEXT NOT NULL,
+                    ceremony TEXT NOT NULL,
+                    admin_id INTEGER REFERENCES admins(id) ON DELETE CASCADE,
+                    remote_ip TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at);
+                CREATE INDEX IF NOT EXISTS system_samples_bucket_idx ON system_samples(bucket);
+                CREATE INDEX IF NOT EXISTS notification_log_created_idx ON notification_log(created_at);
                 """
             )
             now = utc_now()
@@ -792,6 +928,32 @@ class Store:
                 "id,cycle_started_at,updated_at) VALUES(1,?,?)",
                 (now, now),
             )
+            db.execute(
+                "INSERT OR IGNORE INTO notification_settings(id,updated_at) VALUES(1,?)",
+                (now,),
+            )
+            notification_row = db.execute(
+                "SELECT events_json FROM notification_settings WHERE id=1"
+            ).fetchone()
+            try:
+                notification_events = json.loads(notification_row["events_json"] if notification_row else "[]")
+            except (TypeError, json.JSONDecodeError):
+                notification_events = []
+            if "argo_domain_changed" not in notification_events:
+                notification_events.append("argo_domain_changed")
+                db.execute(
+                    "UPDATE notification_settings SET events_json=?,updated_at=? WHERE id=1",
+                    (json.dumps(notification_events, separators=(",", ":")), now),
+                )
+            admin_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(admins)").fetchall()
+            }
+            if "totp_secret" not in admin_columns:
+                db.execute("ALTER TABLE admins ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ''")
+            if "totp_pending_secret" not in admin_columns:
+                db.execute("ALTER TABLE admins ADD COLUMN totp_pending_secret TEXT NOT NULL DEFAULT ''")
+            if "totp_enabled" not in admin_columns:
+                db.execute("ALTER TABLE admins ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
             columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(devices)").fetchall()
             }
@@ -820,11 +982,20 @@ class Store:
                 db.execute("ALTER TABLE devices ADD COLUMN reset_max INTEGER NOT NULL DEFAULT 0")
             if "reset_count" not in columns:
                 db.execute("ALTER TABLE devices ADD COLUMN reset_count INTEGER NOT NULL DEFAULT 0")
+            if "group_id" not in columns:
+                db.execute(
+                    "ALTER TABLE devices ADD COLUMN group_id INTEGER REFERENCES device_groups(id) ON DELETE SET NULL"
+                )
+            db.execute("CREATE INDEX IF NOT EXISTS devices_group_idx ON devices(group_id)")
             if added_uploaded or added_downloaded:
                 db.execute(
                     "UPDATE devices SET downloaded_bytes=used_bytes "
                     "WHERE used_bytes>0 AND uploaded_bytes=0 AND downloaded_bytes=0"
                 )
+            db.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(710,?)",
+                (now,),
+            )
         os.chmod(self.path, 0o600)
 
     def audit(self, actor: str, action: str, target: str, remote_ip: str, detail: str = "") -> None:
@@ -917,6 +1088,39 @@ class TrafficCollector:
         self.upload_rate = 0.0
         self.download_rate = 0.0
         self.last_poll_monotonic: float | None = None
+        self.last_system_sample = 0
+
+    def collect_system_sample(self) -> None:
+        now = epoch_now()
+        if now - self.last_system_sample < SYSTEM_SAMPLE_SECONDS:
+            return
+        self.last_system_sample = now
+        try:
+            sample = SERVER_STATS.refresh()
+            disks = sample.get("disks") or []
+            disk_percent = max((float(item.get("percent", 0)) for item in disks), default=0.0)
+            load = sample.get("loadavg") or [0]
+            bucket = now // SYSTEM_SAMPLE_SECONDS * SYSTEM_SAMPLE_SECONDS
+            with self.state.store.connect() as db:
+                db.execute(
+                    "INSERT INTO system_samples(bucket,cpu_percent,memory_percent,disk_percent,load1) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET "
+                    "cpu_percent=excluded.cpu_percent,memory_percent=excluded.memory_percent,"
+                    "disk_percent=excluded.disk_percent,load1=excluded.load1",
+                    (
+                        bucket,
+                        float((sample.get("cpu") or {}).get("percent", 0)),
+                        float((sample.get("memory") or {}).get("percent", 0)),
+                        disk_percent,
+                        float(load[0] if load else 0),
+                    ),
+                )
+                db.execute(
+                    "DELETE FROM system_samples WHERE bucket < ?",
+                    (now - SYSTEM_RETENTION_SECONDS,),
+                )
+        except (OSError, ValueError, sqlite3.Error):
+            return
 
     def status_snapshot(self) -> dict[str, Any]:
         with self.status_lock:
@@ -1028,7 +1232,10 @@ class TrafficCollector:
         quota_crossed: list[str] = []
         try:
             self.collect_server_traffic()
+            self.collect_system_sample()
             self.apply_scheduled_resets(trigger_sync)
+            if trigger_sync:
+                self.state.check_alerts_async()
             raw_counters = query_v2ray_stats(self.state.config.stats_address)
             device_deltas: dict[str, dict[str, int]] = {}
             for name, value in raw_counters.items():
@@ -1087,7 +1294,7 @@ class TrafficCollector:
                     )
                     db.execute(
                         "DELETE FROM traffic_samples WHERE bucket < ?",
-                        (epoch_now() - 7 * 24 * 3600,),
+                        (epoch_now() - TRAFFIC_RETENTION_SECONDS,),
                     )
             with self.status_lock:
                 self.upload_rate = total_upload / elapsed
@@ -1173,6 +1380,14 @@ class TrafficCollector:
                     "local",
                     detail,
                 )
+                self.state.notifications.emit(
+                    "device_quota",
+                    "warning",
+                    "设备额度已用尽",
+                    f"设备 {device_id} 已达到流量额度，节点权限已自动停用。",
+                    f"device_quota:{device_id}",
+                    minimum_interval=24 * 3600,
+                )
         return True, ""
 
     def run(self) -> None:
@@ -1201,6 +1416,9 @@ class NexusState:
         self.config = config
         self.store = Store(config.database)
         self.password_hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+        # Keep unknown-user and wrong-password paths at comparable Argon2 cost
+        # so login timing does not reveal whether an administrator name exists.
+        self.dummy_password_hash = self.password_hasher.hash(secrets.token_urlsafe(32))
         self.login_failures: dict[str, list[int]] = {}
         self.login_lock = threading.Lock()
         self.sync_lock = threading.Lock()
@@ -1211,6 +1429,102 @@ class NexusState:
         self._sync_inflight = False
         self._sync_pending = False
         self.traffic = TrafficCollector(self)
+        self.notifications = NotificationManager(self.store)
+        self._alert_lock = threading.Lock()
+        self._last_alert_check = 0
+
+    def check_alerts_async(self) -> None:
+        now = epoch_now()
+        if now - self._last_alert_check < 60 or not self._alert_lock.acquire(blocking=False):
+            return
+        self._last_alert_check = now
+
+        def run() -> None:
+            try:
+                self.evaluate_alerts()
+            finally:
+                self._alert_lock.release()
+
+        threading.Thread(target=run, name="rr-nexus-alerts", daemon=True).start()
+
+    def evaluate_alerts(self) -> None:
+        cfg = self.notifications.settings(masked=False)
+        if not cfg.get("enabled"):
+            return
+        singbox_config = Path("/etc/sing-box/config.json")
+        node_expected = False
+        if singbox_config.is_file():
+            try:
+                node_expected = bool(json.loads(singbox_config.read_text(encoding="utf-8")).get("inbounds"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                node_expected = True
+        if node_expected:
+            try:
+                service = subprocess.run(
+                    ["systemctl", "is-active", "sing-box"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                ).stdout.strip()
+                if service != "active":
+                    self.notifications.emit(
+                        "service_down", "critical", "Sing-box 服务异常",
+                        f"当前状态：{service or 'unknown'}。建议先运行 rr doctor。",
+                        "service_down:sing-box", minimum_interval=900,
+                    )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            stats = SERVER_STATS.refresh()
+            maximum = max(
+                (float(item.get("percent", 0)) for item in stats.get("disks", [])),
+                default=0.0,
+            )
+            if maximum >= int(cfg.get("disk_threshold", 90)):
+                self.notifications.emit(
+                    "disk_high", "warning", "服务器磁盘空间不足",
+                    f"最高磁盘使用率 {maximum:.1f}%。", "disk_high", minimum_interval=3600,
+                )
+        except (OSError, ValueError):
+            pass
+        plan = server_traffic_snapshot(self.store)
+        quota = int(plan.get("quota_bytes", 0) or 0)
+        used = int(plan.get("used_bytes", 0) or 0)
+        if quota > 0:
+            percent = used * 100 / quota
+            if percent >= int(cfg.get("traffic_threshold", 90)):
+                self.notifications.emit(
+                    "traffic_threshold", "warning", "服务器套餐流量接近上限",
+                    f"当前已使用 {percent:.1f}%（{used}/{quota} bytes）。",
+                    f"traffic_threshold:{int(percent // 5) * 5}", minimum_interval=6 * 3600,
+                )
+        domain = (self.config.domain or "").strip()
+        certificate_targets: list[tuple[str, Path]] = []
+        if self.config.mode == "public" and domain and domain != "ip" and not _is_ip_address(domain):
+            certificate_targets.append((domain, Path(f"/etc/letsencrypt/live/{domain}/cert.pem")))
+        naive_cert = Path("/etc/rr-naive/fullchain.pem")
+        if naive_cert.is_file():
+            certificate_targets.append(("NaiveProxy", naive_cert))
+        for certificate_name, cert in certificate_targets:
+            try:
+                result = subprocess.run(
+                    ["openssl", "x509", "-enddate", "-noout", "-in", str(cert)],
+                    capture_output=True, text=True, timeout=3, check=False,
+                )
+                if result.returncode == 0 and "=" in result.stdout:
+                    expires = datetime.strptime(
+                        result.stdout.strip().split("=", 1)[1], "%b %d %H:%M:%S %Y %Z"
+                    ).replace(tzinfo=timezone.utc)
+                    days = int((expires - datetime.now(timezone.utc)).total_seconds() // 86400)
+                    if days <= 14:
+                        self.notifications.emit(
+                            "certificate_expiry", "critical" if days <= 3 else "warning",
+                            "TLS 证书即将到期", f"{certificate_name} 的证书剩余 {days} 天。",
+                            f"certificate_expiry:{certificate_name}:{max(days, 0) // 3}", minimum_interval=24 * 3600,
+                        )
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                pass
 
     def _lockout_for_count(self, count: int, window: int) -> int:
         # 指数退避：5→30分钟，8→2小时，12→24小时，16+→72小时
@@ -1262,6 +1576,16 @@ class NexusState:
                                 )
                         except Exception:
                             pass
+                        threading.Thread(
+                            target=self.notifications.emit,
+                            args=(
+                                "security_lockout", "critical", "RR Nexus 登录已锁定",
+                                f"来源 {remote_ip} 对账号 {username or '-'} 触发了防爆破锁定。",
+                                f"security_lockout:{remote_ip}", LOGIN_WINDOW,
+                            ),
+                            daemon=True,
+                            name="rr-security-alert",
+                        ).start()
                 return (retry_ip > 0), retry_ip
 
     def record_login_failure(self, remote_ip: str, username: str = "") -> None:
@@ -1299,7 +1623,7 @@ class NexusState:
             n = 0
         return min(LOGIN_FAIL_DELAY + n * LOGIN_FAIL_DELAY_STEP, LOGIN_FAIL_DELAY_MAX)
 
-    def authenticate(self, username: str, password: str) -> sqlite3.Row | None:
+    def authenticate_with_method(self, username: str, password: str) -> tuple[sqlite3.Row | None, str]:
         with self.store.connect() as db:
             admin = db.execute("SELECT * FROM admins WHERE username = ?", (username,)).fetchone()
             if admin:
@@ -1310,19 +1634,66 @@ class NexusState:
                                 "UPDATE admins SET password_hash=?, updated_at=? WHERE id=?",
                                 (self.password_hasher.hash(password), utc_now(), admin["id"]),
                             )
-                        return admin
+                        return admin, "password"
                 except (VerifyMismatchError, InvalidHash):
                     pass
 
                 recovery_hash = sha256_text(password.strip().upper())
                 recovery = db.execute(
-                    "SELECT code_hash FROM recovery_codes WHERE code_hash=? AND admin_id=? AND used_at IS NULL",
-                    (recovery_hash, admin["id"]),
-                ).fetchone()
-                if recovery:
-                    db.execute("UPDATE recovery_codes SET used_at=? WHERE code_hash=?", (utc_now(), recovery_hash))
-                    return admin
-        return None
+                    "UPDATE recovery_codes SET used_at=? WHERE code_hash=? AND admin_id=? AND used_at IS NULL",
+                    (utc_now(), recovery_hash, admin["id"]),
+                )
+                if recovery.rowcount == 1:
+                    return admin, "recovery"
+            else:
+                try:
+                    self.password_hasher.verify(self.dummy_password_hash, password)
+                except (VerifyMismatchError, InvalidHash):
+                    pass
+        return None, ""
+
+    def authenticate(self, username: str, password: str) -> sqlite3.Row | None:
+        return self.authenticate_with_method(username, password)[0]
+
+    def create_webauthn_challenge(
+        self, ceremony: str, remote_ip: str, admin_id: int | None = None
+    ) -> tuple[str, str]:
+        challenge_id = secrets.token_urlsafe(24)
+        challenge = b64url_encode(secrets.token_bytes(32))
+        now = epoch_now()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM webauthn_challenges WHERE expires_at<=?", (now,))
+            if ceremony == "login":
+                recent = db.execute(
+                    "SELECT COUNT(*) FROM webauthn_challenges WHERE ceremony='login' "
+                    "AND remote_ip=? AND created_at>?",
+                    (remote_ip, now - 60),
+                ).fetchone()[0]
+                if int(recent) >= 20:
+                    raise ValueError("passkey_challenge_rate_limited")
+            db.execute(
+                "INSERT INTO webauthn_challenges(id,challenge,ceremony,admin_id,remote_ip,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (challenge_id, challenge, ceremony, admin_id, remote_ip, now, now + 300),
+            )
+        return challenge_id, challenge
+
+    def consume_webauthn_challenge(
+        self, challenge_id: str, ceremony: str, remote_ip: str
+    ) -> sqlite3.Row | None:
+        now = epoch_now()
+        with self.store.connect() as db:
+            # Serialize SELECT+DELETE so one WebAuthn ceremony cannot be
+            # consumed twice by concurrent requests.
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM webauthn_challenges WHERE id=? AND ceremony=? AND remote_ip=? AND expires_at>?",
+                (challenge_id, ceremony, remote_ip, now),
+            ).fetchone()
+            if row:
+                db.execute("DELETE FROM webauthn_challenges WHERE id=?", (challenge_id,))
+        return row
 
     def create_session(self, admin_id: int, remote_ip: str) -> tuple[str, str]:
         token = secrets.token_urlsafe(36)
@@ -1728,9 +2099,6 @@ SERVER_STATS = ServerStatsSampler()
 STATE: NexusState
 
 
-STATE: NexusState
-
-
 def _is_ip_address(value: str) -> bool:
     try:
         ipaddress.ip_address((value or "").strip().strip("[]"))
@@ -1894,12 +2262,43 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path, segments, query = self.parse_path()
+        if path == "/healthz":
+            database = None
+            try:
+                database = sqlite3.connect(f"file:{STATE.config.database}?mode=ro", uri=True, timeout=3)
+                row = database.execute("PRAGMA quick_check").fetchone()
+                healthy = bool(row and row[0] == "ok")
+            except (OSError, sqlite3.Error):
+                healthy = False
+            finally:
+                if database is not None:
+                    database.close()
+            self.send_json(
+                HTTPStatus.OK if healthy else HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": healthy, "service": "rr-nexus"},
+            )
+            return
         if path == "/api/session":
             session = self.current_session()
             if not session:
                 self.send_json(HTTPStatus.OK, {"authenticated": False, "mode": STATE.config.mode})
             else:
                 self.send_json(HTTPStatus.OK, {"authenticated": True, "username": session["username"], "csrf": session["csrf_token"], "mode": STATE.config.mode, "domain": STATE.config.domain, "port": STATE.config.port, "ssh_host": STATE.config.ssh_host})
+            return
+        if path == "/api/security":
+            session = self.require_session()
+            if session:
+                self.handle_security_status(session)
+            return
+        if path == "/api/security/totp/qr":
+            session = self.require_session()
+            if session:
+                self.handle_totp_qr(session)
+            return
+        if path == "/api/notifications":
+            session = self.require_session()
+            if session:
+                self.send_json(HTTPStatus.OK, {"settings": STATE.notifications.settings(masked=True)})
             return
         if path == "/api/overview":
             session = self.require_session()
@@ -1910,6 +2309,16 @@ class Handler(BaseHTTPRequestHandler):
             session = self.require_session()
             if session:
                 self.handle_devices()
+            return
+        if path == "/api/device-groups":
+            session = self.require_session()
+            if session:
+                self.handle_device_groups()
+            return
+        if path == "/api/device-templates":
+            session = self.require_session()
+            if session:
+                self.handle_device_templates()
             return
         if path == "/api/server/info":
             session = self.require_session()
@@ -1942,7 +2351,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/traffic":
             session = self.require_session()
             if session:
-                self.handle_traffic()
+                self.handle_traffic(query)
+            return
+        if path == "/api/metrics":
+            session = self.require_session()
+            if session:
+                self.handle_metrics(query)
             return
         if path == "/api/server/traffic-policy":
             session = self.require_session()
@@ -1990,6 +2404,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/login":
             self.handle_login()
             return
+        if path == "/api/passkeys/login/begin":
+            self.handle_passkey_login_begin()
+            return
+        if path == "/api/passkeys/login/finish":
+            self.handle_passkey_login_finish()
+            return
         if path == "/api/logout":
             session = self.require_session(csrf=True)
             if session:
@@ -2006,6 +2426,21 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 self.handle_create_device(session)
             return
+        if path == "/api/devices/batch":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_devices_batch(session)
+            return
+        if path == "/api/device-groups":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_group_create(session)
+            return
+        if path == "/api/device-templates":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_template_create(session)
+            return
         if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "reset" and DEVICE_ID_RE.fullmatch(segments[2]):
             session = self.require_session(csrf=True)
             if session:
@@ -2020,6 +2455,41 @@ class Handler(BaseHTTPRequestHandler):
             session = self.require_session(csrf=True)
             if session:
                 self.handle_change_password(session)
+            return
+        if path == "/api/security/totp/begin":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_totp_begin(session)
+            return
+        if path == "/api/security/totp/confirm":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_totp_confirm(session)
+            return
+        if path == "/api/security/totp/disable":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_totp_disable(session)
+            return
+        if path == "/api/security/passkeys/register/begin":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_passkey_register_begin(session)
+            return
+        if path == "/api/security/passkeys/register/finish":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_passkey_register_finish(session)
+            return
+        if path == "/api/notifications":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_notifications_update(session)
+            return
+        if path == "/api/notifications/test":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_notifications_test(session)
             return
         if path == "/api/firewall/toggle":
             session = self.require_session(csrf=True)
@@ -2118,6 +2588,16 @@ class Handler(BaseHTTPRequestHandler):
             if session:
                 self.handle_update_device(session, segments[2])
             return
+        if len(segments) == 3 and segments[:2] == ["api", "device-groups"] and segments[2].isdigit():
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_group_update(session, int(segments[2]))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "device-templates"] and segments[2].isdigit():
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_template_update(session, int(segments[2]))
+            return
         if len(segments) == 3 and segments[:2] == ["api", "remote-servers"] and segments[2].isdigit():
             session = self.require_session(csrf=True)
             if session:
@@ -2127,6 +2607,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         _, segments, _ = self.parse_path()
+        if len(segments) == 4 and segments[:3] == ["api", "security", "passkeys"]:
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_passkey_delete(session, segments[3])
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "device-groups"] and segments[2].isdigit():
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_group_delete(session, int(segments[2]))
+            return
+        if len(segments) == 3 and segments[:2] == ["api", "device-templates"] and segments[2].isdigit():
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_device_template_delete(session, int(segments[2]))
+            return
         if len(segments) == 3 and segments[:2] == ["api", "devices"] and DEVICE_ID_RE.fullmatch(segments[2]):
             session = self.require_session(csrf=True)
             if session:
@@ -2241,6 +2736,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_update_check(self) -> None:
         """检查脚本更新：下载远程 manifest 与本地比对（防 CDN 缓存加 ?t=）。"""
+        body = self.read_json() or {}
+        requested_channel = body.get("channel")
+        if requested_channel is not None:
+            try:
+                update_channel(str(requested_channel))
+            except (ValueError, OSError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_update_channel"})
+                return
+        channel = update_channel()
+        manifest_url = update_manifest_url()
         local_sha = ""
         if UPDATE_LOCAL_MANIFEST.exists():
             try:
@@ -2250,7 +2755,7 @@ class Handler(BaseHTTPRequestHandler):
         remote_sha = ""
         remote_error = ""
         try:
-            request = urllib.request.Request("{}?t={}".format(UPDATE_MANIFEST_URL, int(time.time())), headers={"User-Agent": "rr-nexus-update/6.6"})
+            request = urllib.request.Request("{}?t={}".format(manifest_url, int(time.time())), headers={"User-Agent": "rr-nexus-update/7.1"})
             with urllib.request.urlopen(request, timeout=8) as resp:
                 remote_sha = hashlib.sha256(resp.read()).hexdigest()
         except Exception:
@@ -2263,12 +2768,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             current = ""
         update_available = bool(remote_sha and local_sha and remote_sha != local_sha)
+        preflight: dict[str, Any] = {}
+        try:
+            result = subprocess.run(
+                ["/usr/local/bin/rr", "--update-preflight"], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+            if result.stdout.strip():
+                preflight = json.loads(result.stdout.strip().splitlines()[-1])
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            preflight = {"ok": False, "error": "preflight_unavailable"}
         payload = {
             "current": current,
+            "channel": channel,
             "update_available": update_available,
             "manifest_checked": bool(remote_sha),
             "local_sha": local_sha[:12],
             "remote_sha": remote_sha[:12],
+            "preflight": preflight,
         }
         if remote_error:
             # manifest 下载失败必须显式报错：前端以此区分"检查失败"与"已是最新"，杜绝误报
@@ -2279,6 +2796,28 @@ class Handler(BaseHTTPRequestHandler):
         """启动远程升级任务（异步线程执行升级，升级完自动拉起新面板）。
         任务认领双重原子化：进程内互斥锁 + O_EXCL 锁文件——本地/远程双通道并发时
         只有一个请求能认领成功，杜绝重复下发（systemd unit 名冲突）与任务状态互相覆盖。"""
+        body = self.read_json() or {}
+        if "channel" in body:
+            try:
+                update_channel(str(body["channel"]))
+            except (ValueError, OSError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_update_channel"})
+                return
+        try:
+            preflight = subprocess.run(
+                ["/usr/local/bin/rr", "--update-preflight"], capture_output=True, text=True,
+                timeout=30, check=False,
+            )
+            if preflight.returncode != 0:
+                detail = (preflight.stdout or preflight.stderr or "update preflight failed").strip()
+                self.send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "started": False, "error": "update_preflight_failed", "message": detail[-1000:]},
+                )
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            self.send_json(HTTPStatus.CONFLICT, {"ok": False, "started": False, "error": "update_preflight_failed"})
+            return
         with _UPDATE_CLAIM_LOCK:
             job = self.update_job_read()
             # running 超过 90 秒但 systemd unit 已不存在 = 任务实际已死（面板被重启/进程被杀），
@@ -2319,6 +2858,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     final = ("failed", "升级进程异常：{}".format(str(exc)[:160]))
             finally:
+                alert_detail = ""
                 # 终写与释锁在同一临界区：新任务的认领只能在本次释锁之后发生，
                 # 杜绝"旧任务 finally 误删新锁（inode 复用）"与结果互相覆盖
                 with _UPDATE_CLAIM_LOCK:
@@ -2328,6 +2868,8 @@ class Handler(BaseHTTPRequestHandler):
                         current = self.update_job_read()
                         if current and current.get("started_at") == token:
                             self.update_job_write({"state": state, "started_at": token, "finished_at": utc_now(), "output": out[-4000:], "detail": detail})
+                            if state == "failed":
+                                alert_detail = detail
                     try:
                         # token 归属：锁文件内容与本次认领的 token 一致才释放
                         # （内容比对不受 inode 复用影响，杜绝旧任务误删新锁）
@@ -2335,6 +2877,13 @@ class Handler(BaseHTTPRequestHandler):
                             UPDATE_LOCK_PATH.unlink()
                     except (FileNotFoundError, OSError):
                         pass
+                # 网络告警可能等待数秒，不得占用更新认领锁。
+                if alert_detail:
+                    STATE.notifications.emit(
+                        "update_failed", "critical", "RR-vps 更新失败", alert_detail,
+                        f"update_failed:{datetime.now(timezone.utc).strftime('%Y%m%d%H')}",
+                        minimum_interval=300,
+                    )
 
         threading.Thread(target=_worker, daemon=True).start()
         self.send_json(HTTPStatus.OK, {"ok": True, "started": True, "message": "升级任务已启动，完成后自动拉起新版本面板"})
@@ -2393,7 +2942,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 任务进程已不在但 done 标记没写上（面板曾被重启）：按 manifest 比对判定实际结果
                 try:
                     remote_sha = ""
-                    request = urllib.request.Request("{}?t={}".format(UPDATE_MANIFEST_URL, int(time.time())), headers={"User-Agent": "rr-nexus-update/6.6"})
+                    request = urllib.request.Request("{}?t={}".format(update_manifest_url(), int(time.time())), headers={"User-Agent": "rr-nexus-update/7.1"})
                     with urllib.request.urlopen(request, timeout=8) as resp:
                         remote_sha = hashlib.sha256(resp.read()).hexdigest()
                     local_sha = hashlib.sha256(UPDATE_LOCAL_MANIFEST.read_bytes()).hexdigest() if UPDATE_LOCAL_MANIFEST.exists() else ""
@@ -2479,6 +3028,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_overview(); return
             if path == "/api/devices":
                 self.handle_devices(); return
+            if path == "/api/device-groups":
+                self.handle_device_groups(); return
+            if path == "/api/device-templates":
+                self.handle_device_templates(); return
+            if path == "/api/metrics":
+                self.handle_metrics({}); return
             if path == "/api/traffic":
                 self.handle_traffic(); return
             if path == "/api/server/traffic-policy":
@@ -2515,6 +3070,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_update_status(); return
             if path == "/api/devices":
                 self.handle_create_device(self._remote_session); return
+            if path == "/api/devices/batch":
+                self.handle_devices_batch(self._remote_session); return
+            if path == "/api/device-groups":
+                self.handle_device_group_create(self._remote_session); return
+            if path == "/api/device-templates":
+                self.handle_device_template_create(self._remote_session); return
             if len(segments) == 4 and segments[:2] == ["api", "devices"] and segments[3] == "reset" and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_reset_device(self._remote_session, segments[2]); return
             if path == "/api/server/traffic-policy/reset":
@@ -2536,9 +3097,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_update_server_traffic_policy(self._remote_session); return
             if len(segments) == 3 and segments[:2] == ["api", "devices"] and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_update_device(self._remote_session, segments[2]); return
+            if len(segments) == 3 and segments[:2] == ["api", "device-groups"] and segments[2].isdigit():
+                self.handle_device_group_update(self._remote_session, int(segments[2])); return
+            if len(segments) == 3 and segments[:2] == ["api", "device-templates"] and segments[2].isdigit():
+                self.handle_device_template_update(self._remote_session, int(segments[2])); return
         elif method == "DELETE":
             if len(segments) == 3 and segments[:2] == ["api", "devices"] and DEVICE_ID_RE.fullmatch(segments[2]):
                 self.handle_delete_device(self._remote_session, segments[2]); return
+            if len(segments) == 3 and segments[:2] == ["api", "device-groups"] and segments[2].isdigit():
+                self.handle_device_group_delete(self._remote_session, int(segments[2])); return
+            if len(segments) == 3 and segments[:2] == ["api", "device-templates"] and segments[2].isdigit():
+                self.handle_device_template_delete(self._remote_session, int(segments[2])); return
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "remote_unsupported"})
 
     # ---------- 主面板侧：多服务器管理 ----------
@@ -2764,20 +3333,325 @@ class Handler(BaseHTTPRequestHandler):
                 {"Retry-After": str(retry_after)},
             )
             return
-        admin = STATE.authenticate(username, password)
+        admin, method = STATE.authenticate_with_method(username, password)
         if not admin:
             STATE.record_login_failure(self.remote_ip, username)
             STATE.store.audit(username or "unknown", "login_failed", "session", self.remote_ip)
             time.sleep(STATE.login_fail_delay(self.remote_ip))
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_credentials"})
             return
+        if method == "password" and bool(admin["totp_enabled"]):
+            otp = str(payload.get("otp", ""))[:16]
+            if not otp:
+                self.send_json(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"error": "two_factor_required", "message": "请输入身份验证器中的 6 位动态码"},
+                )
+                return
+            if not verify_totp(str(admin["totp_secret"]), otp):
+                STATE.record_login_failure(self.remote_ip, username)
+                STATE.store.audit(username, "totp_failed", "session", self.remote_ip)
+                time.sleep(STATE.login_fail_delay(self.remote_ip))
+                self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_two_factor_code"})
+                return
         STATE.clear_login_failures(self.remote_ip, admin["username"])
+        self.finish_login(admin, "recovery" if method == "recovery" else "password_totp" if admin["totp_enabled"] else "password")
+
+    def finish_login(self, admin: sqlite3.Row, method: str) -> None:
         token, csrf = STATE.create_session(admin["id"], self.remote_ip)
-        STATE.store.audit(admin["username"], "login", "session", self.remote_ip)
+        STATE.store.audit(admin["username"], "login", "session", self.remote_ip, method)
         cookie = f"rr_nexus_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_HOURS * 3600}"
         if STATE.config.secure_cookie:
             cookie += "; Secure"
         self.send_json(HTTPStatus.OK, {"ok": True, "username": admin["username"], "csrf": csrf}, {"Set-Cookie": cookie})
+
+    @staticmethod
+    def webauthn_context() -> tuple[str, str] | None:
+        if not webauthn_available():
+            return None
+        cfg = STATE.config
+        if cfg.mode == "public":
+            domain = (cfg.domain or "").strip().strip("[]")
+            if not domain or domain == "ip" or _is_ip_address(domain):
+                return None
+            port = cfg.public_port or 443
+            origin = f"https://{domain}" + (f":{port}" if port != 443 else "")
+            return origin, domain
+        port = cfg.public_port or cfg.port
+        return f"http://127.0.0.1:{port}", "127.0.0.1"
+
+    def handle_security_status(self, session: sqlite3.Row) -> None:
+        with STATE.store.connect() as db:
+            admin = db.execute(
+                "SELECT totp_enabled,totp_pending_secret FROM admins WHERE id=?", (session["admin_id"],)
+            ).fetchone()
+            credentials = db.execute(
+                "SELECT credential_id,name,transports,created_at,last_used_at FROM webauthn_credentials "
+                "WHERE admin_id=? ORDER BY created_at DESC",
+                (session["admin_id"],),
+            ).fetchall()
+            recovery = db.execute(
+                "SELECT COUNT(*) FROM recovery_codes WHERE admin_id=? AND used_at IS NULL",
+                (session["admin_id"],),
+            ).fetchone()[0]
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "totp_enabled": bool(admin and admin["totp_enabled"]),
+                "totp_pending": bool(admin and admin["totp_pending_secret"]),
+                "passkey_available": self.webauthn_context() is not None,
+                "passkeys": [dict(row) for row in credentials],
+                "recovery_codes_remaining": int(recovery),
+            },
+        )
+
+    def handle_totp_begin(self, session: sqlite3.Row) -> None:
+        secret = generate_totp_secret()
+        with STATE.store.connect() as db:
+            db.execute(
+                "UPDATE admins SET totp_pending_secret=?,updated_at=? WHERE id=?",
+                (secret, utc_now(), session["admin_id"]),
+            )
+        uri = totp_uri(secret, session["username"])
+        STATE.store.audit(session["username"], "totp_begin", "security", self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"secret": secret, "uri": uri})
+
+    def handle_totp_qr(self, session: sqlite3.Row) -> None:
+        with STATE.store.connect() as db:
+            row = db.execute(
+                "SELECT totp_pending_secret FROM admins WHERE id=?", (session["admin_id"],)
+            ).fetchone()
+        secret = str(row["totp_pending_secret"] if row else "")
+        if not secret:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "totp_setup_not_started"})
+            return
+        uri = totp_uri(secret, session["username"])
+        try:
+            result = subprocess.run(
+                ["qrencode", "-t", "PNG", "-l", "M", "-s", "6", "-m", "4", "-o", "-", "--", uri],
+                capture_output=True, timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if not result or result.returncode != 0 or not result.stdout.startswith(b"\x89PNG"):
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "qr_generation_failed"})
+            return
+        self.send_bytes(HTTPStatus.OK, result.stdout, "image/png")
+
+    def handle_totp_confirm(self, session: sqlite3.Row) -> None:
+        payload = self.read_json() or {}
+        code = str(payload.get("code", ""))
+        with STATE.store.connect() as db:
+            admin = db.execute(
+                "SELECT totp_pending_secret FROM admins WHERE id=?", (session["admin_id"],)
+            ).fetchone()
+            secret = str(admin["totp_pending_secret"] if admin else "")
+            if not secret or not verify_totp(secret, code):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_two_factor_code"})
+                return
+            db.execute(
+                "UPDATE admins SET totp_secret=?,totp_pending_secret='',totp_enabled=1,updated_at=? WHERE id=?",
+                (secret, utc_now(), session["admin_id"]),
+            )
+            db.execute("DELETE FROM sessions WHERE admin_id=? AND token_hash<>?", (
+                session["admin_id"], sha256_text(self.cookie_token()),
+            ))
+        STATE.store.audit(session["username"], "totp_enabled", "security", self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_totp_disable(self, session: sqlite3.Row) -> None:
+        payload = self.read_json() or {}
+        password = str(payload.get("password", ""))[:512]
+        code = str(payload.get("code", ""))[:16]
+        admin, method = STATE.authenticate_with_method(session["username"], password)
+        if not admin or method != "password" or not verify_totp(str(admin["totp_secret"]), code):
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": "security_verification_failed"})
+            return
+        with STATE.store.connect() as db:
+            db.execute(
+                "UPDATE admins SET totp_secret='',totp_pending_secret='',totp_enabled=0,updated_at=? WHERE id=?",
+                (utc_now(), session["admin_id"]),
+            )
+        STATE.store.audit(session["username"], "totp_disabled", "security", self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_passkey_register_begin(self, session: sqlite3.Row) -> None:
+        context = self.webauthn_context()
+        if context is None:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "passkey_unavailable"})
+            return
+        origin, rp_id = context
+        challenge_id, challenge = STATE.create_webauthn_challenge(
+            "register", self.remote_ip, int(session["admin_id"])
+        )
+        with STATE.store.connect() as db:
+            existing = [
+                {"type": "public-key", "id": row[0]}
+                for row in db.execute(
+                    "SELECT credential_id FROM webauthn_credentials WHERE admin_id=?",
+                    (session["admin_id"],),
+                ).fetchall()
+            ]
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "challenge_id": challenge_id,
+                "publicKey": {
+                    "challenge": challenge,
+                    "rp": {"id": rp_id, "name": "RR Nexus"},
+                    "user": {
+                        "id": b64url_encode(int(session["admin_id"]).to_bytes(8, "big")),
+                        "name": session["username"],
+                        "displayName": session["username"],
+                    },
+                    "pubKeyCredParams": [
+                        {"type": "public-key", "alg": -7},
+                        {"type": "public-key", "alg": -257},
+                        {"type": "public-key", "alg": -8},
+                    ],
+                    "timeout": 60000,
+                    "attestation": "none",
+                    "authenticatorSelection": {
+                        "residentKey": "required", "requireResidentKey": True,
+                        "userVerification": "required",
+                    },
+                    "excludeCredentials": existing,
+                },
+                "origin": origin,
+            },
+        )
+
+    def handle_passkey_register_finish(self, session: sqlite3.Row) -> None:
+        payload = self.read_json() or {}
+        context = self.webauthn_context()
+        challenge_row = STATE.consume_webauthn_challenge(
+            str(payload.get("challenge_id", "")), "register", self.remote_ip
+        )
+        if context is None or not challenge_row or int(challenge_row["admin_id"] or 0) != int(session["admin_id"]):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_passkey_challenge"})
+            return
+        try:
+            origin, rp_id = context
+            credential = parse_registration(
+                str(payload.get("client_data", "")),
+                str(payload.get("attestation", "")),
+                str(challenge_row["challenge"]), origin, rp_id,
+                payload.get("transports") if isinstance(payload.get("transports"), list) else [],
+            )
+            credential_id = b64url_encode(credential.credential_id)
+            if payload.get("credential_id") and not safe_compare(
+                credential_id, str(payload.get("credential_id"))
+            ):
+                raise ValueError("credential id mismatch")
+            name = str(payload.get("name", "通行密钥")).strip()[:64] or "通行密钥"
+            with STATE.store.connect() as db:
+                db.execute(
+                    "INSERT INTO webauthn_credentials(credential_id,admin_id,name,public_key_pem,"
+                    "algorithm,sign_count,transports,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (credential_id, session["admin_id"], name, credential.public_key_pem,
+                     credential.algorithm, credential.sign_count, credential.transports, utc_now()),
+                )
+        except (ValueError, RuntimeError, sqlite3.IntegrityError) as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "passkey_registration_failed", "message": str(exc)[:160]})
+            return
+        STATE.store.audit(session["username"], "passkey_added", credential_id, self.remote_ip, name)
+        self.send_json(HTTPStatus.CREATED, {"ok": True, "credential_id": credential_id})
+
+    def handle_passkey_login_begin(self) -> None:
+        context = self.webauthn_context()
+        if context is None:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "passkey_unavailable"})
+            return
+        with STATE.store.connect() as db:
+            count = db.execute("SELECT COUNT(*) FROM webauthn_credentials").fetchone()[0]
+        if not count:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "no_passkeys"})
+            return
+        _origin, rp_id = context
+        try:
+            challenge_id, challenge = STATE.create_webauthn_challenge("login", self.remote_ip)
+        except ValueError:
+            self.send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "too_many_attempts", "retry_after": 60},
+                {"Retry-After": "60"},
+            )
+            return
+        self.send_json(
+            HTTPStatus.OK,
+            {"challenge_id": challenge_id, "publicKey": {
+                "challenge": challenge, "rpId": rp_id, "timeout": 60000,
+                "userVerification": "required",
+            }},
+        )
+
+    def handle_passkey_login_finish(self) -> None:
+        payload = self.read_json() or {}
+        context = self.webauthn_context()
+        challenge_row = STATE.consume_webauthn_challenge(
+            str(payload.get("challenge_id", "")), "login", self.remote_ip
+        )
+        if context is None or not challenge_row:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_passkey_challenge"})
+            return
+        credential_id = str(payload.get("credential_id", ""))[:2048]
+        with STATE.store.connect() as db:
+            row = db.execute(
+                "SELECT c.*,a.username FROM webauthn_credentials c JOIN admins a ON a.id=c.admin_id "
+                "WHERE c.credential_id=?", (credential_id,),
+            ).fetchone()
+        if not row:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_passkey"})
+            return
+        try:
+            origin, rp_id = context
+            sign_count = verify_authentication(
+                str(payload.get("client_data", "")), str(payload.get("authenticator_data", "")),
+                str(payload.get("signature", "")), str(challenge_row["challenge"]), origin, rp_id,
+                bytes(row["public_key_pem"]), int(row["algorithm"]), int(row["sign_count"]),
+            )
+        except Exception as exc:
+            STATE.record_login_failure(self.remote_ip, str(row["username"]))
+            STATE.store.audit(str(row["username"]), "passkey_failed", credential_id, self.remote_ip, str(exc)[:160])
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_passkey"})
+            return
+        with STATE.store.connect() as db:
+            db.execute(
+                "UPDATE webauthn_credentials SET sign_count=?,last_used_at=? WHERE credential_id=?",
+                (sign_count, utc_now(), credential_id),
+            )
+            admin = db.execute("SELECT * FROM admins WHERE id=?", (row["admin_id"],)).fetchone()
+        STATE.clear_login_failures(self.remote_ip, str(row["username"]))
+        self.finish_login(admin, "passkey")
+
+    def handle_passkey_delete(self, session: sqlite3.Row, credential_id: str) -> None:
+        with STATE.store.connect() as db:
+            cursor = db.execute(
+                "DELETE FROM webauthn_credentials WHERE credential_id=? AND admin_id=?",
+                (credential_id, session["admin_id"]),
+            )
+        if cursor.rowcount == 0:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "passkey_not_found"})
+            return
+        STATE.store.audit(session["username"], "passkey_deleted", credential_id, self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_notifications_update(self, session: sqlite3.Row) -> None:
+        try:
+            settings = STATE.notifications.update(self.read_json() or {})
+        except (ValueError, TypeError) as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        STATE.store.audit(session["username"], "notifications_updated", "alerts", self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True, "settings": settings})
+
+    def handle_notifications_test(self, session: sqlite3.Row) -> None:
+        ok, detail = STATE.notifications.emit(
+            "test", "info", "RR-vps 告警测试", "如果你收到这条消息，告警通道配置正常。",
+            f"test:{epoch_now()}", minimum_interval=0, force=True,
+        )
+        STATE.store.audit(session["username"], "notifications_test", "alerts", self.remote_ip, detail)
+        self.send_json(HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY, {"ok": ok, "detail": detail})
 
     def handle_overview(self) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -2842,10 +3716,12 @@ class Handler(BaseHTTPRequestHandler):
     def device_rows(self) -> list[dict[str, Any]]:
         with STATE.store.connect() as db:
             rows = db.execute(
-                "SELECT id,name,enabled,quota_bytes,used_bytes,uploaded_bytes,"
-                "downloaded_bytes,traffic_updated_at,expires_at,created_at,updated_at,"
-                "quota_reached_at,next_reset_at,reset_anchor_day,reset_max,reset_count "
-                "FROM devices ORDER BY created_at DESC"
+                "SELECT d.id,d.name,d.enabled,d.quota_bytes,d.used_bytes,d.uploaded_bytes,"
+                "d.downloaded_bytes,d.traffic_updated_at,d.expires_at,d.created_at,d.updated_at,"
+                "d.quota_reached_at,d.next_reset_at,d.reset_anchor_day,d.reset_max,d.reset_count,"
+                "d.group_id,g.name group_name,g.color group_color "
+                "FROM devices d LEFT JOIN device_groups g ON g.id=d.group_id "
+                "ORDER BY d.created_at DESC"
             ).fetchall()
         result: list[dict[str, Any]] = []
         today = datetime.now(timezone.utc).date().isoformat()
@@ -2880,13 +3756,278 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
-    def handle_traffic(self) -> None:
-        cutoff = epoch_now() - 24 * 3600
+    def handle_device_groups(self) -> None:
+        with STATE.store.connect() as db:
+            rows = db.execute(
+                "SELECT g.id,g.name,g.color,g.created_at,g.updated_at,COUNT(d.id) device_count "
+                "FROM device_groups g LEFT JOIN devices d ON d.group_id=g.id "
+                "GROUP BY g.id ORDER BY g.name COLLATE NOCASE"
+            ).fetchall()
+        self.send_json(HTTPStatus.OK, {"groups": [dict(row) for row in rows]})
+
+    def _group_payload(self) -> tuple[dict[str, str], str]:
+        payload = self.read_json() or {}
+        name = str(payload.get("name", "")).strip()
+        color = str(payload.get("color", "#4f8cff")).strip().lower()
+        if not DEVICE_NAME_RE.fullmatch(name):
+            return {}, "invalid_group_name"
+        if not re.fullmatch(r"#[0-9a-f]{6}", color):
+            return {}, "invalid_group_color"
+        return {"name": name, "color": color}, ""
+
+    def handle_device_group_create(self, session: sqlite3.Row) -> None:
+        values, error = self._group_payload()
+        if error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        try:
+            with STATE.store.connect() as db:
+                cursor = db.execute(
+                    "INSERT INTO device_groups(name,color,created_at,updated_at) VALUES(?,?,?,?)",
+                    (values["name"], values["color"], utc_now(), utc_now()),
+                )
+                group_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "duplicate_group"})
+            return
+        STATE.store.audit(session["username"], "group_create", str(group_id), self.remote_ip, values["name"])
+        self.send_json(HTTPStatus.CREATED, {"ok": True, "id": group_id})
+
+    def handle_device_group_update(self, session: sqlite3.Row, group_id: int) -> None:
+        values, error = self._group_payload()
+        if error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        try:
+            with STATE.store.connect() as db:
+                cursor = db.execute(
+                    "UPDATE device_groups SET name=?,color=?,updated_at=? WHERE id=?",
+                    (values["name"], values["color"], utc_now(), group_id),
+                )
+        except sqlite3.IntegrityError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "duplicate_group"})
+            return
+        if cursor.rowcount == 0:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "group_not_found"})
+            return
+        STATE.store.audit(session["username"], "group_update", str(group_id), self.remote_ip, values["name"])
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_device_group_delete(self, session: sqlite3.Row, group_id: int) -> None:
+        with STATE.store.connect() as db:
+            row = db.execute("SELECT name FROM device_groups WHERE id=?", (group_id,)).fetchone()
+            if row:
+                db.execute("DELETE FROM device_groups WHERE id=?", (group_id,))
+        if not row:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "group_not_found"})
+            return
+        STATE.store.audit(session["username"], "group_delete", str(group_id), self.remote_ip, row["name"])
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_device_templates(self) -> None:
+        with STATE.store.connect() as db:
+            rows = db.execute("SELECT * FROM device_templates ORDER BY name COLLATE NOCASE").fetchall()
+        self.send_json(HTTPStatus.OK, {"templates": [dict(row) for row in rows]})
+
+    def _template_payload(self, partial: bool = False) -> tuple[dict[str, Any], str]:
+        payload = self.read_json() or {}
+        values: dict[str, Any] = {}
+        if "name" in payload or not partial:
+            name = str(payload.get("name", "")).strip()
+            if not DEVICE_NAME_RE.fullmatch(name):
+                return {}, "invalid_template_name"
+            values["name"] = name
+        number_fields = {
+            "quota_gb": (0, 10240), "expiry_days": (0, 3650), "reset_max": (0, MAX_AUTO_RESET_COUNT)
+        }
+        for key, (minimum, maximum) in number_fields.items():
+            if key not in payload and partial:
+                continue
+            try:
+                value = float(payload.get(key, 0)) if key == "quota_gb" else int(payload.get(key, 0))
+            except (TypeError, ValueError):
+                return {}, "invalid_template_value"
+            if value < minimum or value > maximum:
+                return {}, "invalid_template_value"
+            values["quota_bytes" if key == "quota_gb" else key] = (
+                int(value * 1024**3) if key == "quota_gb" else int(value)
+            )
+        if "enabled" in payload or not partial:
+            if not isinstance(payload.get("enabled", True), bool):
+                return {}, "invalid_enabled"
+            values["enabled"] = int(payload.get("enabled", True))
+        return values, ""
+
+    def handle_device_template_create(self, session: sqlite3.Row) -> None:
+        values, error = self._template_payload()
+        if error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        try:
+            with STATE.store.connect() as db:
+                cursor = db.execute(
+                    "INSERT INTO device_templates(name,quota_bytes,expiry_days,reset_max,enabled,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (values["name"], values["quota_bytes"], values["expiry_days"], values["reset_max"],
+                     values["enabled"], utc_now(), utc_now()),
+                )
+                template_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "duplicate_template"})
+            return
+        STATE.store.audit(session["username"], "template_create", str(template_id), self.remote_ip, values["name"])
+        self.send_json(HTTPStatus.CREATED, {"ok": True, "id": template_id})
+
+    def handle_device_template_update(self, session: sqlite3.Row, template_id: int) -> None:
+        values, error = self._template_payload(partial=True)
+        if error or not values:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": error or "empty_update"})
+            return
+        columns = [f"{key}=?" for key in values]
+        try:
+            with STATE.store.connect() as db:
+                cursor = db.execute(
+                    f"UPDATE device_templates SET {','.join(columns)},updated_at=? WHERE id=?",
+                    [*values.values(), utc_now(), template_id],
+                )
+        except sqlite3.IntegrityError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "duplicate_template"})
+            return
+        if cursor.rowcount == 0:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "template_not_found"})
+            return
+        STATE.store.audit(session["username"], "template_update", str(template_id), self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_device_template_delete(self, session: sqlite3.Row, template_id: int) -> None:
+        with STATE.store.connect() as db:
+            cursor = db.execute("DELETE FROM device_templates WHERE id=?", (template_id,))
+        if cursor.rowcount == 0:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "template_not_found"})
+            return
+        STATE.store.audit(session["username"], "template_delete", str(template_id), self.remote_ip)
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def handle_devices_batch(self, session: sqlite3.Row) -> None:
+        payload = self.read_json() or {}
+        raw_ids = payload.get("device_ids")
+        if not isinstance(raw_ids, list):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_device_ids"})
+            return
+        device_ids = list(dict.fromkeys(str(item) for item in raw_ids))
+        if not device_ids or len(device_ids) > MAX_DEVICES or any(not DEVICE_ID_RE.fullmatch(item) for item in device_ids):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_device_ids"})
+            return
+        action = str(payload.get("action", ""))
+        placeholders = ",".join("?" for _ in device_ids)
+        changed = 0
+        sync_required = action not in {"move_group"}
+        now = utc_now()
+        with STATE.store.connect() as db:
+            existing = db.execute(
+                f"SELECT id FROM devices WHERE id IN ({placeholders})", device_ids
+            ).fetchall()
+            existing_ids = [row["id"] for row in existing]
+            if not existing_ids:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "device_not_found"})
+                return
+            actual = ",".join("?" for _ in existing_ids)
+            if action in {"enable", "disable"}:
+                cursor = db.execute(
+                    f"UPDATE devices SET enabled=?,updated_at=? WHERE id IN ({actual})",
+                    [1 if action == "enable" else 0, now, *existing_ids],
+                )
+            elif action == "reset":
+                cursor = db.execute(
+                    f"UPDATE devices SET used_bytes=0,uploaded_bytes=0,downloaded_bytes=0,"
+                    f"traffic_updated_at=NULL,quota_reached_at=NULL,updated_at=? WHERE id IN ({actual})",
+                    [now, *existing_ids],
+                )
+            elif action == "delete":
+                cursor = db.execute(f"DELETE FROM devices WHERE id IN ({actual})", existing_ids)
+            elif action == "move_group":
+                raw_group = payload.get("group_id")
+                try:
+                    group_id = None if raw_group in (None, "", 0, "0") else int(raw_group)
+                except (TypeError, ValueError):
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_group"})
+                    return
+                if group_id is not None and not db.execute(
+                    "SELECT 1 FROM device_groups WHERE id=?", (group_id,)
+                ).fetchone():
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_group"})
+                    return
+                cursor = db.execute(
+                    f"UPDATE devices SET group_id=?,updated_at=? WHERE id IN ({actual})",
+                    [group_id, now, *existing_ids],
+                )
+            elif action == "apply_template":
+                try:
+                    template_id = int(payload.get("template_id", 0))
+                except (TypeError, ValueError):
+                    template_id = 0
+                template = db.execute(
+                    "SELECT * FROM device_templates WHERE id=?", (template_id,)
+                ).fetchone()
+                if not template:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_template"})
+                    return
+                expiry = None
+                if int(template["expiry_days"] or 0) > 0:
+                    expiry = (
+                        datetime.now(timezone.utc).date() + timedelta(days=int(template["expiry_days"]))
+                    ).isoformat()
+                reset_max = int(template["reset_max"] or 0)
+                next_reset = None
+                reset_anchor = 0
+                if reset_max > 0:
+                    today = datetime.now(timezone.utc).date()
+                    first_reset = add_calendar_month(today, today.day)
+                    next_reset = first_reset.isoformat()
+                    reset_anchor = first_reset.day
+                    expiry = add_calendar_months(first_reset, reset_max, reset_anchor).isoformat()
+                cursor = db.execute(
+                    f"UPDATE devices SET quota_bytes=?,enabled=?,expires_at=?,next_reset_at=?,"
+                    f"reset_anchor_day=?,reset_max=?,reset_count=0,quota_reached_at=NULL,"
+                    f"expiry_enforced_at=NULL,updated_at=? WHERE id IN ({actual})",
+                    [template["quota_bytes"], template["enabled"], expiry, next_reset,
+                     reset_anchor, reset_max, now, *existing_ids],
+                )
+            else:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_batch_action"})
+                return
+            changed = cursor.rowcount
+        STATE.store.audit(
+            session["username"], "device_batch", action, self.remote_ip,
+            f"count={changed};ids={','.join(device_ids[:20])}",
+        )
+        if sync_required:
+            self._deferred_sync(session["username"], "device_batch", action, f"count={changed}")
+        self.send_json(
+            HTTPStatus.OK,
+            {"ok": True, "changed": changed, "sync": "deferred" if sync_required else "not_required"},
+        )
+
+    @staticmethod
+    def metric_window(query: dict[str, list[str]]) -> tuple[str, int, int]:
+        name = str(query.get("range", ["24h"])[0]).lower()
+        windows = {
+            "24h": (24 * 3600, TRAFFIC_BUCKET_SECONDS),
+            "7d": (7 * 24 * 3600, 3600),
+            "30d": (30 * 24 * 3600, 6 * 3600),
+        }
+        seconds, step = windows.get(name, windows["24h"])
+        return name if name in windows else "24h", seconds, step
+
+    def handle_traffic(self, query: dict[str, list[str]] | None = None) -> None:
+        range_name, window_seconds, step = self.metric_window(query or {})
+        cutoff = epoch_now() - window_seconds
         with STATE.store.connect() as db:
             samples = db.execute(
-                "SELECT bucket,uploaded_bytes,downloaded_bytes FROM traffic_samples "
-                "WHERE bucket>=? ORDER BY bucket",
-                (cutoff,),
+                "SELECT (bucket / ?) * ? bucket,SUM(uploaded_bytes) uploaded_bytes,"
+                "SUM(downloaded_bytes) downloaded_bytes FROM traffic_samples "
+                "WHERE bucket>=? GROUP BY (bucket / ?) ORDER BY bucket",
+                (step, step, cutoff, step),
             ).fetchall()
             totals = db.execute(
                 "SELECT COALESCE(SUM(uploaded_bytes),0) uploaded, "
@@ -2905,9 +4046,26 @@ class Handler(BaseHTTPRequestHandler):
                 "samples": [dict(row) for row in samples],
                 "devices": devices[:20],
                 "status": STATE.traffic.status_snapshot(),
-                "bucket_seconds": TRAFFIC_BUCKET_SECONDS,
+                "bucket_seconds": step,
+                "range": range_name,
                 "server_plan": server_traffic_snapshot(STATE.store),
             },
+        )
+
+    def handle_metrics(self, query: dict[str, list[str]]) -> None:
+        range_name, window_seconds, step = self.metric_window(query)
+        cutoff = epoch_now() - window_seconds
+        with STATE.store.connect() as db:
+            rows = db.execute(
+                "SELECT (bucket / ?) * ? bucket,AVG(cpu_percent) cpu_percent,"
+                "AVG(memory_percent) memory_percent,MAX(disk_percent) disk_percent,"
+                "AVG(load1) load1 FROM system_samples WHERE bucket>=? "
+                "GROUP BY (bucket / ?) ORDER BY bucket",
+                (step, step, cutoff, step),
+            ).fetchall()
+        self.send_json(
+            HTTPStatus.OK,
+            {"range": range_name, "bucket_seconds": step, "samples": [dict(row) for row in rows]},
         )
 
     def handle_server_traffic_policy(self) -> None:
@@ -3068,6 +4226,20 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload["enabled"], bool):
                 return {}, "invalid_enabled"
             values["enabled"] = 1 if payload["enabled"] else 0
+        if "group_id" in payload:
+            raw_group = payload.get("group_id")
+            if raw_group in (None, "", 0, "0"):
+                values["group_id"] = None
+            else:
+                try:
+                    group_id = int(raw_group)
+                except (TypeError, ValueError):
+                    return {}, "invalid_group"
+                with STATE.store.connect() as db:
+                    exists = db.execute("SELECT 1 FROM device_groups WHERE id=?", (group_id,)).fetchone()
+                if not exists:
+                    return {}, "invalid_group"
+                values["group_id"] = group_id
         return values, ""
 
     
@@ -3141,6 +4313,36 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
             return
+        template_id = payload.get("template_id")
+        if template_id not in (None, "", 0, "0"):
+            try:
+                template_key = int(template_id)
+            except (TypeError, ValueError):
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_template"})
+                return
+            with STATE.store.connect() as db:
+                template = db.execute("SELECT * FROM device_templates WHERE id=?", (template_key,)).fetchone()
+            if not template:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_template"})
+                return
+            payload = dict(payload)
+            # 7.1 前端会先把模板值回填到表单，允许管理员随后微调。
+            # 旧前端仍会提交 quota_gb=0 等默认值；没有此标记时以模板为准，
+            # 防止浏览器缓存导致“选了模板却创建成不限流量”。
+            template_values_applied = payload.get("template_values_applied") is True
+            if not template_values_applied:
+                payload["quota_gb"] = int(template["quota_bytes"]) / 1024**3
+            payload.setdefault("enabled", bool(template["enabled"]))
+            expiry_days = int(template["expiry_days"] or 0)
+            reset_max = int(template["reset_max"] or 0)
+            if expiry_days > 0 and not payload.get("expires_at"):
+                payload["expires_at"] = (
+                    datetime.now(timezone.utc).date() + timedelta(days=expiry_days)
+                ).isoformat()
+            if reset_max > 0 and not payload.get("reset_at"):
+                first_reset = add_calendar_month(datetime.now(timezone.utc).date(), datetime.now(timezone.utc).day)
+                payload["reset_at"] = first_reset.isoformat()
+                payload["reset_max"] = reset_max
         values, error = self.validate_device_payload(payload)
         if error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": error})
@@ -3164,11 +4366,12 @@ class Handler(BaseHTTPRequestHandler):
             db.execute(
                 "INSERT INTO devices(id,name,credential,subscription_token,enabled,"
                 "quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,"
-                "expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) "
-                "VALUES(?,?,?,?,1,?,0,0,0,NULL,?,?,?,?,0,?,?)",
+                "group_id,expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) "
+                "VALUES(?,?,?,?,?, ?,0,0,0,NULL,?,?,?,?,?,0,?,?)",
                 (
                     device_id, values["name"], credential, subscription_token,
-                    values["quota_bytes"], values.get("expires_at"),
+                    values.get("enabled", 1), values["quota_bytes"], values.get("group_id"),
+                    values.get("expires_at"),
                     values.get("next_reset_at"), values.get("reset_anchor_day", 0),
                     values.get("reset_max", 0), now, now,
                 ),
@@ -3516,7 +4719,7 @@ class Handler(BaseHTTPRequestHandler):
     def serve_static(self, path: str) -> None:
         if path in {"", "/"}:
             file_path = STATIC_ROOT / "index.html"
-        elif path in {"/app.css", "/app.js", "/i18n.js", "/optimizer.js", "/optimizer.css"}:
+        elif path in {"/app.css", "/app.js", "/admin.js", "/i18n.js", "/optimizer.js", "/optimizer.css"}:
             file_path = STATIC_ROOT / path.removeprefix("/")
         else:
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})

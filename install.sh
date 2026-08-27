@@ -4,14 +4,18 @@
 # 这里故意不解析 manifest、不读取 bundle 成员，也不维护发布文件白名单。
 # 它只获取当前 main 的核心安装器与更新保险层；发布安全校验、事务安装和
 # 回滚全部交给 scripts/install-core.sh。这样未来发布文件增删不会锁死 8 号更新。
+# shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="2"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_BRANCH="main"
+[ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
 RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"
 RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"
+RR_CORE_SHA256="e7ae1cfde8da5db8d25c5118b096e07f5e33821b4575249d5e3413b39f2d313c"
+RR_GUARD_SHA256="9b2ca7d908ae0e0c47da25d8bdf371fee9ee4353e9fed494cb0f728933a35b13"
 RR_MODE="${1:-install}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 
@@ -97,36 +101,6 @@ rr_version_ge() {
         [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n 1)" = "$1" ]
 }
 
-# 保留给仓库回归测试的事务快照契约。真正安装时由 install-core.sh 使用同一实现。
-rr_snapshot_runtime() {
-    BACKUP_DIR=$(mktemp -d /tmp/rr-update-backup.XXXXXX) || return 1
-    chmod 700 "$BACKUP_DIR"
-
-    rr_backup_file "$RR_LAUNCHER" rr_launcher || return 1
-    rr_backup_file /etc/argo_vmess.conf argo_vmess.conf || return 1
-    rr_backup_file /etc/sing-box/config.json singbox_config.json || return 1
-    rr_backup_file /etc/sing-box/cert.pem singbox_cert.pem || return 1
-    rr_backup_file /etc/sing-box/private.key singbox_private.key || return 1
-    rr_backup_file /usr/local/bin/sing-box singbox_binary || return 1
-    rr_backup_file /etc/systemd/system/sing-box.service singbox.service || return 1
-    rr_backup_file /etc/systemd/system/argo-rr-health.service health.service || return 1
-    rr_backup_file /etc/systemd/system/argo-rr-health.timer health.timer || return 1
-    rr_backup_file /usr/local/bin/auto_update_sub.py auto_update_sub.py || return 1
-    rr_backup_file /etc/rr-nexus/nexus.json nexus.json || return 1
-    rr_backup_file /etc/systemd/system/rr-nexus.service nexus.service || return 1
-    rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db || return 1
-    rr_backup_dir /tmp/sub_server sub_server || return 1
-
-    systemctl is-active --quiet sing-box 2>/dev/null && : > "$BACKUP_DIR/singbox_was_running"
-    systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$BACKUP_DIR/nexus_was_running"
-    pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && \
-        : > "$BACKUP_DIR/subscription_was_running"
-    systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
-        : > "$BACKUP_DIR/health_timer_was_enabled"
-
-    return 0
-}
-
 rr_validate_core() {
     local file="$1"
     [ -s "$file" ] || return 1
@@ -194,6 +168,10 @@ rr_validate_core "$CORE_TMP" || {
     rr_error "核心安装器完整性检查失败，当前系统未改动。"
     exit 1
 }
+[ "$(sha256sum "$CORE_TMP" | awk '{print $1}')" = "$RR_CORE_SHA256" ] || {
+    rr_error "核心安装器 SHA256 不匹配，已拒绝执行。"
+    exit 1
+}
 
 rr_download_bootstrap_file "$RR_GUARD_URL" "$GUARD_TMP" 10 || {
     rr_error "热更新保险模块下载失败，当前系统未改动。"
@@ -203,18 +181,24 @@ rr_validate_guard "$GUARD_TMP" || {
     rr_error "热更新保险模块完整性检查失败，当前系统未改动。"
     exit 1
 }
+[ "$(sha256sum "$GUARD_TMP" | awk '{print $1}')" = "$RR_GUARD_SHA256" ] || {
+    rr_error "热更新保险模块 SHA256 不匹配，已拒绝执行。"
+    exit 1
+}
 
 chmod 700 "$CORE_TMP"
 echo "[RR-vps] 已加载稳定引导器，交由核心安装器执行事务更新……"
 # 无论首次安装还是热更新，核心都以 --upgrade 模式运行，避免它在保险模块
 # 落盘前抢先进入交互菜单；核心对空机器同样支持该模式。
-if ! bash "$CORE_TMP" --upgrade; then
+if ! RR_GUARD_FILE="$GUARD_TMP" bash "$CORE_TMP" --upgrade; then
     rr_error "核心安装/更新失败；事务安装器已按自身规则回滚。"
     exit 1
 fi
 
-if ! rr_install_update_guard; then
-    rr_error "严重：核心已更新，但热更新保险模块未能落盘。请重新执行本安装命令修复。"
+if [ ! -s /usr/local/lib/rr/modules/61-update-guard.sh ] || \
+   ! cmp -s "$GUARD_TMP" /usr/local/lib/rr/modules/61-update-guard.sh; then
+    rr_error "严重：事务更新后保险模块验证失败，正在回滚。"
+    /usr/local/sbin/rr-update-recover rollback >/dev/null 2>&1 || true
     exit 1
 fi
 
@@ -235,7 +219,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "f9f6cfda20202795b88669ba176bf0f7bcc41a5614692b7011690c48685153f3" ]
+# [ "$actual" = "f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

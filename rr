@@ -32,6 +32,68 @@ if [ "$module_count" -lt 2 ] || ! declare -F main_menu >/dev/null 2>&1; then
 fi
 
 case "${1:-}" in
+    doctor)
+        shift
+        rr_doctor "$@"
+        exit $?
+        ;;
+    backup)
+        if rr_backup_create "${2:-}"; then
+            exit 0
+        fi
+        rr_emit_alert backup_failed critical "RR-vps 备份失败" \
+            "加密备份未能生成，请运行 rr doctor 检查依赖、磁盘与数据库。" \
+            "backup_failed:$(date -u '+%Y%m%d%H')" --interval 0
+        exit 1
+        ;;
+    restore)
+        [ -n "${2:-}" ] || { echo "用法：rr restore <backup.rrbak>" >&2; exit 2; }
+        if rr_restore_backup "$2"; then
+            exit 0
+        fi
+        rr_emit_alert backup_failed critical "RR-vps 恢复失败" \
+            "备份验证或恢复后健康检查未通过，本机已尝试回到恢复前状态。" \
+            "restore_failed:$(date -u '+%Y%m%d%H')" --interval 0
+        exit 1
+        ;;
+    update)
+        case "${2:-}" in
+            --channel)
+                rr_set_update_channel "${3:-}"
+                exit $?
+                ;;
+            --check)
+                rr_update_preflight
+                exit $?
+                ;;
+            --rollback)
+                [ -x /usr/local/sbin/rr-update-recover ] || { echo "当前没有可用的更新回滚器。" >&2; exit 1; }
+                /usr/local/sbin/rr-update-recover rollback
+                exit $?
+                ;;
+            "")
+                do_update
+                exit $?
+                ;;
+            *)
+                echo "用法：rr update [--check | --channel stable|beta | --rollback]" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    --update-preflight)
+        rr_update_preflight
+        exit $?
+        ;;
+    --set-update-channel)
+        rr_set_update_channel "${2:-}"
+        exit $?
+        ;;
+    --recover-update)
+        [ -x /usr/local/sbin/rr-update-recover ] || exit 0
+        /usr/local/sbin/rr-update-recover recover
+        exit $?
+        ;;
     --post-update)
         post_update_migrate
         exit $?

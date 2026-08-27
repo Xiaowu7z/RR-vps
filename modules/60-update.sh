@@ -65,12 +65,16 @@ rr_manifest_is_valid() {
         length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 }
         seen[$2]++ { exit 1 }
         $2 == "rr" { launcher = 1; next }
+        $2 == "scripts/naive-cert-hook.sh" { naive_hook = 1; next }
+        $2 == "scripts/update-recover.sh" { recovery = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
+        $2 ~ /^nexus\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
+        $2 ~ /^nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
-            if (!launcher || modules < 2) exit 1
+            if (!launcher || !naive_hook || !recovery || modules < 2) exit 1
             if (!nexus_app || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
@@ -81,7 +85,7 @@ rr_bundle_archive_is_safe() {
     [ -s "$archive_file" ] || return 1
     [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
     tar -tzf "$archive_file" 2>/dev/null | awk '
-        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/rr_nexus\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
+        !/^rr-bundle\/(manifest\.sha256|rr|scripts\/(naive-cert-hook|update-recover)\.sh|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/[A-Za-z0-9._-]+\.py|nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
         seen[$0]++ { exit 1 }
         END { if (NR < 2) exit 1 }
     '
@@ -93,6 +97,7 @@ rr_bundle_tree_is_valid() {
     local expected_count=0
     local actual_count=0
     local shell_file=""
+    local python_file=""
 
     rr_manifest_is_valid "$manifest_file" || return 1
     if find "$bundle_root" -mindepth 1 ! -type d ! -type f -print -quit | grep -q .; then
@@ -107,7 +112,13 @@ rr_bundle_tree_is_valid() {
         [ -f "$shell_file" ] || return 1
         bash -n "$shell_file" || return 1
     done
-    python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
+    for shell_file in "$bundle_root"/scripts/*.sh; do
+        [ -f "$shell_file" ] || return 1
+        bash -n "$shell_file" || return 1
+    done
+    while IFS= read -r python_file; do
+        python3 -m py_compile "$python_file" || return 1
+    done < <(find "$bundle_root/nexus" -type f -name '*.py' -print | LC_ALL=C sort)
 }
 
 rr_prepare_bootstrap() {
@@ -166,6 +177,12 @@ rr_health_log() {
 }
 
 post_update_migrate() {
+    local update_tx="${RR_UPDATE_TRANSACTION:-0}"
+    local singbox_was_running="${RR_UPDATE_SINGBOX_WAS_RUNNING:-true}"
+    local nexus_was_running="${RR_UPDATE_NEXUS_WAS_RUNNING:-true}"
+    local subscription_was_running="${RR_UPDATE_SUBSCRIPTION_WAS_RUNNING:-true}"
+    local argo_was_running="${RR_UPDATE_ARGO_WAS_RUNNING:-true}"
+    local health_timer_was_enabled="${RR_UPDATE_HEALTH_TIMER_WAS_ENABLED:-true}"
     check_supported_os >/dev/null 2>&1 || return 1
     # A machine without RR-vps configuration has no managed runtime to stop or
     # migrate. Returning before service operations avoids touching an unrelated
@@ -179,6 +196,12 @@ post_update_migrate() {
     sleep 1
     migrate_config_schema || return 1
     load_config_with_defaults || return 1
+    if [ "${NAIVE_ENABLED:-false}" = true ]; then
+        # Replace the legacy inline certbot hook during hot update.  The 7.1
+        # hook only accepts the configured Naive lineage and cannot copy an
+        # unrelated certificate renewed in the same certbot run.
+        deploy_naive_cert_hook || return 1
+    fi
 
     # A failed first-install candidate intentionally contains empty keys and
     # no runnable service.  Updating the script must still succeed so the user
@@ -219,16 +242,26 @@ post_update_migrate() {
     fi
 
     load_config_with_defaults || return 1
-    if any_node_protocol_enabled && [ "$SINGBOX_AUTO_RESTART" = "true" ] && ! managed_singbox_running; then
+    if any_node_protocol_enabled && [ "$SINGBOX_AUTO_RESTART" = "true" ] && \
+       { [ "$update_tx" != 1 ] || [ "$singbox_was_running" = true ]; } && ! managed_singbox_running; then
         restart_singbox || return 1
     fi
     if [ "$VM_ENABLED" != "false" ] && [ "$VM_TLS_ENABLED" != "true" ] && \
+       { [ "$update_tx" != 1 ] || [ "$argo_was_running" = true ]; } && \
        ! expected_argo_tunnel_running; then
-        start_argo_tunnel >/dev/null 2>&1 || true
+        start_argo_tunnel >/dev/null 2>&1 || return 1
+    elif [ "$update_tx" = 1 ] && [ "$argo_was_running" != true ]; then
+        if [ "${TUNNEL_MODE:-1}" = 2 ]; then
+            systemctl stop cloudflared >/dev/null 2>&1 || true
+        else
+            stop_quick_argo_tunnel
+        fi
     fi
-    if any_node_protocol_enabled; then
+    if any_node_protocol_enabled && { [ "$update_tx" != 1 ] || [ "$health_timer_was_enabled" = true ]; }; then
         setup_health_monitor >/dev/null 2>&1 || true
-    else
+    elif [ "$update_tx" = 1 ]; then
+        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
+    elif ! any_node_protocol_enabled; then
         systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
     fi
     if [ -f "$NEXUS_SERVICE_FILE" ]; then
@@ -238,7 +271,48 @@ post_update_migrate() {
         ensure_nexus_service_guards
         RR_NEXUS_CONFIG="$NEXUS_CONFIG_FILE" python3 "$NEXUS_APP" --check || return 1
         systemctl daemon-reload >/dev/null 2>&1 || return 1
-        systemctl restart rr-nexus >/dev/null 2>&1 || return 1
+        if [ "$update_tx" != 1 ] || [ "$nexus_was_running" = true ]; then
+            systemctl restart rr-nexus >/dev/null 2>&1 || return 1
+        else
+            systemctl stop rr-nexus >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # 事务健康门：任一关失败都让核心安装器自动回滚。
+    if any_node_protocol_enabled; then
+        "$SINGBOX_BIN" check -c /etc/sing-box/config.json >/dev/null 2>&1 || return 1
+        if [ "$update_tx" != 1 ] || [ "$singbox_was_running" = true ]; then
+            systemctl is-active --quiet sing-box || return 1
+        else
+            systemctl stop sing-box >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ -r /var/lib/rr-nexus/nexus.db ]; then
+        python3 - /var/lib/rr-nexus/nexus.db <<'PY' || return 1
+import sqlite3, sys
+db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=10)
+try:
+    row = db.execute("PRAGMA quick_check").fetchone()
+    raise SystemExit(0 if row and row[0] == "ok" else 1)
+finally:
+    db.close()
+PY
+    fi
+    if [ -f "$NEXUS_SERVICE_FILE" ] && { [ "$update_tx" != 1 ] || [ "$nexus_was_running" = true ]; }; then
+        systemctl is-active --quiet rr-nexus || return 1
+        local nexus_health_port=""
+        nexus_health_port=$(jq -r '.port // 7900' "$NEXUS_CONFIG_FILE" 2>/dev/null || printf 7900)
+        curl -fsS --connect-timeout 3 --max-time 8 "http://127.0.0.1:${nexus_health_port}/healthz" >/dev/null || return 1
+    fi
+    if [ "$update_tx" = 1 ] && [ "$subscription_was_running" != true ]; then
+        local migrated_sub_pid=""
+        [ -f "$SUB_PID_FILE" ] && migrated_sub_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
+        is_subscription_pid "$migrated_sub_pid" && kill "$migrated_sub_pid" >/dev/null 2>&1 || true
+        rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE"
+    elif [ "$subscription_was_running" = true ]; then
+        local migrated_sub_pid=""
+        [ -f "$SUB_PID_FILE" ] && migrated_sub_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
+        is_subscription_pid "$migrated_sub_pid" || return 1
     fi
     return 0
 }

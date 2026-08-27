@@ -305,8 +305,13 @@ naive_port = env.get("NAIVE_PORT", "0")
 naive_user = env.get("NAIVE_USER", "")
 naive_pass = env.get("NAIVE_PASS", "")
 naive_domain = env.get("NAIVE_DOMAIN", "")
+naive_mode = env.get("NAIVE_MODE", "h2")
+naive_quic_cc = env.get("NAIVE_QUIC_CC", "bbr")
 if naive_enabled and naive_port != "0" and naive_user and naive_pass and naive_domain:
-    all_links.append(f"naive+https://{naive_user}:{naive_pass}@{naive_domain}:{naive_port}#RR-Naive")
+    if naive_mode != "h3":
+        all_links.append(f"naive+https://{naive_user}:{naive_pass}@{naive_domain}:{naive_port}#RR-Naive-H2")
+    if naive_mode != "h2":
+        all_links.append(f"naive+quic://{naive_user}:{naive_pass}@{naive_domain}:{naive_port}?congestion_control={naive_quic_cc}#RR-Naive-H3")
 
 sub_content = "\n".join(all_links)
 final_b64 = base64.b64encode(sub_content.encode("utf-8")).decode("utf-8")

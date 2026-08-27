@@ -148,7 +148,7 @@ def _clone_uri_with_name(uri: str, name: str) -> str | None:
     except ValueError:
         return None
     if parsed.scheme not in {
-        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "trojan", "ss"
+        "vless", "hysteria2", "hy2", "tuic", "anytls", "naive+https", "naive+quic", "trojan", "ss"
     } or not parsed.netloc:
         return None
     return urllib.parse.urlunsplit(parsed._replace(fragment=urllib.parse.quote(name, safe="")))

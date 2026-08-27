@@ -1,8 +1,10 @@
 #!/bin/bash
 
+# shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_BRANCH="main"
+[ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
@@ -22,9 +24,25 @@ NEW_LAUNCHER=""
 RUNTIME_REPLACED=false
 TRANSACTION_ACTIVE=false
 ROLLBACK_FAILED=false
+RR_TX_ROOT="/var/lib/rr-update"
+RR_ACTIVE_TX="${RR_TX_ROOT}/active"
+TX_DIR=""
+KEEP_TRANSACTION=false
+UPDATE_LOCK_FD=""
 
 rr_error() {
     echo "[RR-vps] $*" >&2
+}
+
+rr_test_fault() {
+    # CI-only fault injection.  Two explicit gates prevent an accidental user
+    # environment variable from ever interrupting a real update.
+    local phase="$1"
+    [ "${RR_TEST_FAULTS:-0}" = 1 ] || return 0
+    if [ "${RR_TEST_CRASH_PHASE:-}" = "$phase" ]; then
+        kill -KILL $$
+    fi
+    [ "${RR_TEST_FAIL_PHASE:-}" != "$phase" ]
 }
 
 rr_download() {
@@ -88,13 +106,16 @@ rr_manifest_is_valid() {
         length($1) != 64 || $1 !~ /^[0-9a-f]+$/ { exit 1 }
         seen[$2]++ { exit 1 }
         $2 == "rr" { launcher = 1; next }
+        $2 == "scripts/naive-cert-hook.sh" { naive_hook = 1; next }
+        $2 == "scripts/update-recover.sh" { recovery = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
         $2 == "nexus/sub_server.py" { nexus_sub = 1; next }
+        $2 ~ /^nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
-            if (!launcher || modules < 2) exit 1
+            if (!launcher || !naive_hook || !recovery || modules < 2) exit 1
             if (!nexus_app || !nexus_sub || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
@@ -107,7 +128,7 @@ rr_bundle_archive_is_safe() {
     # downloads and any archive member outside the exact release namespace.
     [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
     tar -tzf "$archive_file" 2>/dev/null | awk '
-        !/^rr-bundle\/(manifest\.sha256|rr|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/(rr_nexus|sub_server)\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
+        !/^rr-bundle\/(manifest\.sha256|rr|scripts\/(naive-cert-hook|update-recover)\.sh|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/[A-Za-z0-9._-]+\.py|nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
         seen[$0]++ { exit 1 }
         END { if (NR < 2) exit 1 }
     '
@@ -133,8 +154,12 @@ rr_bundle_tree_is_valid() {
         [ -f "$shell_file" ] || return 1
         bash -n "$shell_file" || return 1
     done
-    python3 -c 'compile(open("'"$bundle_root"'/nexus/rr_nexus.py", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
-    python3 -c 'compile(open("'"$bundle_root"'/nexus/sub_server.py", encoding="utf-8").read(), "sub_server.py", "exec")' || return 1
+    bash -n "$bundle_root/scripts/naive-cert-hook.sh" || return 1
+    bash -n "$bundle_root/scripts/update-recover.sh" || return 1
+    local python_file=""
+    while IFS= read -r python_file; do
+        python3 -m py_compile "$python_file" || return 1
+    done < <(find "$bundle_root/nexus" -type f -name '*.py' -print | LC_ALL=C sort)
 }
 
 rr_version_ge() {
@@ -183,7 +208,7 @@ rr_check_system() {
             ;;
     esac
 
-    for required_command in bash awk sed grep wc head sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 tar find stat cmp pgrep pkill sort tail; do
+    for required_command in bash awk sed grep wc head sha256sum install mktemp cp mv rm mkdir dirname basename systemctl python3 tar find stat cmp pgrep pkill sort tail flock; do
         command -v "$required_command" >/dev/null 2>&1 || {
             rr_error "系统缺少必要命令：${required_command}"
             return 1
@@ -284,9 +309,84 @@ rr_restore_sqlite() {
     return 0
 }
 
+rr_write_phase() {
+    local phase="$1" temporary=""
+    [ -n "$TX_DIR" ] || return 1
+    temporary="$TX_DIR/.phase.$$"
+    printf '%s\n' "$phase" > "$temporary" && mv -f "$temporary" "$TX_DIR/phase"
+}
+
+rr_prepare_recovery_runtime() {
+    local recovery_source="$PAYLOAD_DIR/scripts/update-recover.sh"
+    local recovery_target="/usr/local/sbin/rr-update-recover"
+    local recovery_tmp=""
+    [ -s "$recovery_source" ] && bash -n "$recovery_source" || return 1
+    mkdir -p /usr/local/sbin /etc/systemd/system "$RR_TX_ROOT/transactions" || return 1
+    chmod 700 "$RR_TX_ROOT"
+    recovery_tmp=$(mktemp /usr/local/sbin/.rr-update-recover.XXXXXX) || return 1
+    install -m 755 "$recovery_source" "$recovery_tmp" && mv -f "$recovery_tmp" "$recovery_target" || {
+        rm -f "$recovery_tmp"
+        return 1
+    }
+    cat > /etc/systemd/system/rr-update-recovery.service <<'EOF'
+[Unit]
+Description=RR-vps interrupted update recovery
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target
+ConditionPathExists=/var/lib/rr-update/active
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rr-update-recover recover
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    systemctl enable rr-update-recovery.service >/dev/null 2>&1 || return 1
+}
+
+rr_discard_previous_transaction() {
+    local previous="" phase=""
+    [ -r "$RR_ACTIVE_TX" ] || return 0
+    previous=$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null)
+    case "$previous" in "$RR_TX_ROOT"/transactions/*) ;; *) return 1 ;; esac
+    [ -d "$previous" ] || { rm -f "$RR_ACTIVE_TX"; return 0; }
+    phase=$(head -n 1 "$previous/phase" 2>/dev/null || true)
+    case "$phase" in
+        committed|rolled_back|aborted)
+            rm -rf -- "$previous" || return 1
+            rm -f "$RR_ACTIVE_TX"
+            ;;
+        *)
+            /usr/local/sbin/rr-update-recover recover || return 1
+            ;;
+    esac
+}
+
+rr_prune_stale_transactions() {
+    local transaction="" phase="" active=""
+    [ -r "$RR_ACTIVE_TX" ] && active=$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null || true)
+    while IFS= read -r transaction; do
+        [ "$transaction" = "$active" ] && continue
+        case "$transaction" in "$RR_TX_ROOT"/transactions/*) ;; *) continue ;; esac
+        phase=$(head -n 1 "$transaction/phase" 2>/dev/null || true)
+        case "$phase" in rolled_back|aborted) rm -rf -- "$transaction" || return 1 ;; esac
+    done < <(find "$RR_TX_ROOT/transactions" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+}
+
 rr_snapshot_runtime() {
-    BACKUP_DIR=$(mktemp -d /tmp/rr-update-backup.XXXXXX) || return 1
-    chmod 700 "$BACKUP_DIR"
+    rr_prepare_recovery_runtime || return 1
+    rr_discard_previous_transaction || return 1
+    rr_prune_stale_transactions || return 1
+    TX_DIR="$RR_TX_ROOT/transactions/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+    BACKUP_DIR="$TX_DIR/backup"
+    mkdir -p "$BACKUP_DIR" || return 1
+    chmod 700 "$TX_DIR" "$BACKUP_DIR"
+    printf '%s\n' "$TX_DIR" > "${RR_ACTIVE_TX}.tmp.$$" || return 1
+    mv -f "${RR_ACTIVE_TX}.tmp.$$" "$RR_ACTIVE_TX" || return 1
+    rr_write_phase snapshotting || return 1
 
     rr_backup_file "$RR_LAUNCHER" rr_launcher || return 1
     rr_backup_file /etc/argo_vmess.conf argo_vmess.conf || return 1
@@ -300,6 +400,9 @@ rr_snapshot_runtime() {
     rr_backup_file /usr/local/bin/auto_update_sub.py auto_update_sub.py || return 1
     rr_backup_file /etc/rr-nexus/nexus.json nexus.json || return 1
     rr_backup_file /etc/systemd/system/rr-nexus.service nexus.service || return 1
+    rr_backup_file /etc/rr-update/channel update_channel || return 1
+    rr_backup_file /var/lib/rr-nexus/remote.key remote.key || return 1
+    rr_backup_dir /etc/rr-naive rr-naive || return 1
     rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db || return 1
     rr_backup_dir /tmp/sub_server sub_server || return 1
 
@@ -307,13 +410,15 @@ rr_snapshot_runtime() {
     systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$BACKUP_DIR/nexus_was_running"
     pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && \
         : > "$BACKUP_DIR/subscription_was_running"
+    pgrep -f 'cloudflared.*tunnel' >/dev/null 2>&1 && : > "$BACKUP_DIR/argo_was_running"
     systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
         : > "$BACKUP_DIR/health_timer_was_enabled"
 
     # Service state probes are optional metadata. A fresh server has none of
     # these units yet, so their non-zero status must not turn a valid empty
     # snapshot into a failed update backup.
-    return 0
+    [ -e "$RR_LIB_DIR" ] || : > "$BACKUP_DIR/runtime_did_not_exist"
+    rr_write_phase prepared
 }
 
 rr_rollback() {
@@ -351,6 +456,9 @@ rr_rollback() {
     rr_restore_file auto_update_sub.py /usr/local/bin/auto_update_sub.py || rollback_failed=true
     rr_restore_file nexus.json /etc/rr-nexus/nexus.json || rollback_failed=true
     rr_restore_file nexus.service /etc/systemd/system/rr-nexus.service || rollback_failed=true
+    rr_restore_file update_channel /etc/rr-update/channel || rollback_failed=true
+    rr_restore_file remote.key /var/lib/rr-nexus/remote.key || rollback_failed=true
+    rr_restore_dir rr-naive /etc/rr-naive || rollback_failed=true
     rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db || rollback_failed=true
     rr_restore_dir sub_server /tmp/sub_server || rollback_failed=true
 
@@ -383,21 +491,31 @@ rr_rollback() {
         [ -n "$OLD_RUNTIME" ] && rr_error "旧运行目录仍保留在 ${OLD_RUNTIME}。"
         return 1
     fi
+    rr_write_phase rolled_back >/dev/null 2>&1 || true
+    rm -f "$RR_ACTIVE_TX"
+    if [ -f "$BACKUP_DIR/runtime_did_not_exist" ]; then
+        systemctl disable rr-update-recovery.service >/dev/null 2>&1 || true
+        rm -f -- /etc/systemd/system/rr-update-recovery.service /usr/local/sbin/rr-update-recover
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        rm -rf -- "$RR_TX_ROOT"
+    fi
     rr_error "回滚完成：原 rr、配置、内核、Nexus 数据库和订阅已恢复。"
     return 0
 }
 
 rr_cleanup() {
-    local result=$?
+    local result="${1:-0}"
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
         rr_rollback || result=1
     fi
     [ -n "$STAGE_ROOT" ] && rm -rf "$STAGE_ROOT"
     [ -n "$NEW_RUNTIME" ] && [ -e "$NEW_RUNTIME" ] && rm -rf "$NEW_RUNTIME"
     [ -n "$NEW_LAUNCHER" ] && [ -e "$NEW_LAUNCHER" ] && rm -f "$NEW_LAUNCHER"
-    if [ "$ROLLBACK_FAILED" != true ]; then
+    if [ "$ROLLBACK_FAILED" != true ] && [ "$KEEP_TRANSACTION" != true ]; then
         [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
         [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
+        [ -n "$TX_DIR" ] && [ -d "$TX_DIR" ] && rm -rf "$TX_DIR"
+        [ -n "$TX_DIR" ] && [ "$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null || true)" = "$TX_DIR" ] && rm -f "$RR_ACTIVE_TX"
     fi
     return "$result"
 }
@@ -419,7 +537,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "6886993e37854c3d53336012ed0747925e46be86d0cfcc3410fe2d7f7ae95464" ] && \
+        if [ "$actual" = "f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -458,7 +576,7 @@ rr_fetch_release() {
         mkdir -p "$PAYLOAD_DIR"
         rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
         rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || { rr_error "远程发布清单格式无效。"; return 1; }
-        while read -r expected_hash relative_path; do
+        while read -r _ relative_path; do
             mkdir -p "$PAYLOAD_DIR/$(dirname "$relative_path")"
             rr_download "${RR_RAW_BASE}/${relative_path}" "$PAYLOAD_DIR/$relative_path" || {
                 rr_error "重试下载失败：${relative_path}"
@@ -476,8 +594,10 @@ rr_fetch_release() {
         bash -n "$shell_file" || return 1
     done
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
-        python3 -c 'compile(open("'"$PAYLOAD_DIR/nexus/rr_nexus.py"'", encoding="utf-8").read(), "rr_nexus.py", "exec")' || return 1
-        python3 -c 'compile(open("'"$PAYLOAD_DIR/nexus/sub_server.py"'", encoding="utf-8").read(), "sub_server.py", "exec")' || return 1
+        local python_file=""
+        while IFS= read -r python_file; do
+            python3 -m py_compile "$python_file" || return 1
+        done < <(find "$PAYLOAD_DIR/nexus" -type f -name '*.py' -print | LC_ALL=C sort)
         [ -s "$PAYLOAD_DIR/nexus/static/index.html" ] && \
         [ -s "$PAYLOAD_DIR/nexus/static/app.css" ] && \
         [ -s "$PAYLOAD_DIR/nexus/static/app.js" ] || return 1
@@ -526,17 +646,32 @@ rr_install_release() {
     for module_file in "$PAYLOAD_DIR"/modules/*.sh; do
         install -m 644 "$module_file" "$NEW_RUNTIME/modules/$(basename "$module_file")" || return 1
     done
+    if [ -n "${RR_GUARD_FILE:-}" ]; then
+        [ -s "$RR_GUARD_FILE" ] && bash -n "$RR_GUARD_FILE" && \
+            grep -q '^RR_UPDATE_GUARD_VERSION=' "$RR_GUARD_FILE" && \
+            grep -q '^do_update() {' "$RR_GUARD_FILE" || return 1
+        install -m 644 "$RR_GUARD_FILE" "$NEW_RUNTIME/modules/61-update-guard.sh" || return 1
+    fi
+    install -d -m 755 "$NEW_RUNTIME/scripts"
+    install -m 755 "$PAYLOAD_DIR/scripts/naive-cert-hook.sh" \
+        "$NEW_RUNTIME/scripts/naive-cert-hook.sh" || return 1
+    install -m 755 "$PAYLOAD_DIR/scripts/update-recover.sh" \
+        "$NEW_RUNTIME/scripts/update-recover.sh" || return 1
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
-        install -d -m 755 "$NEW_RUNTIME/nexus/static" || return 1
-        install -m 755 "$PAYLOAD_DIR/nexus/rr_nexus.py" "$NEW_RUNTIME/nexus/rr_nexus.py" || return 1
-        install -m 755 "$PAYLOAD_DIR/nexus/sub_server.py" "$NEW_RUNTIME/nexus/sub_server.py" || return 1
-        # 静态资源以已校验的 manifest 为唯一来源，避免新增 optimizer/i18n
-        # 等文件后仍被固定三文件复制逻辑漏装。
+        # Nexus 后端与前端均以已校验的 manifest 为唯一来源。允许安全地
+        # 拆分 Python/JS/CSS 模块，不再需要同步维护安装器文件白名单。
         local relative_path=""
         while read -r _ relative_path; do
             case "$relative_path" in
+                nexus/rr_nexus.py|nexus/sub_server.py|nexus/rr_nexus_lib/*.py)
+                    [ -f "$PAYLOAD_DIR/$relative_path" ] || return 1
+                    install -d -m 755 "$NEW_RUNTIME/$(dirname "$relative_path")" || return 1
+                    install -m 755 "$PAYLOAD_DIR/$relative_path" \
+                        "$NEW_RUNTIME/$relative_path" || return 1
+                    ;;
                 nexus/static/*.html|nexus/static/*.css|nexus/static/*.js)
                     [ -f "$PAYLOAD_DIR/$relative_path" ] || return 1
+                    install -d -m 755 "$NEW_RUNTIME/$(dirname "$relative_path")" || return 1
                     install -m 644 "$PAYLOAD_DIR/$relative_path" \
                         "$NEW_RUNTIME/$relative_path" || return 1
                     ;;
@@ -547,27 +682,42 @@ rr_install_release() {
     install -m 755 "$PAYLOAD_DIR/rr" "$NEW_LAUNCHER" || return 1
 
     TRANSACTION_ACTIVE=true
+    rr_write_phase switching || return 1
     if [ -e "$RR_LIB_DIR" ]; then
-        OLD_RUNTIME="${RR_LIB_DIR}.previous.$$"
+        OLD_RUNTIME="$TX_DIR/old-runtime"
         if ! mv "$RR_LIB_DIR" "$OLD_RUNTIME"; then
             TRANSACTION_ACTIVE=false
             return 1
         fi
+        rr_test_fault old_runtime_moved || return 1
     fi
     RUNTIME_REPLACED=true
     mv "$NEW_RUNTIME" "$RR_LIB_DIR" || return 1
     NEW_RUNTIME=""
+    rr_write_phase runtime_swapped || return 1
+    rr_test_fault runtime_swapped || return 1
     mv "$NEW_LAUNCHER" "$RR_LAUNCHER" || return 1
     NEW_LAUNCHER=""
 
-    if ! "$RR_LAUNCHER" --post-update; then
+    rr_write_phase migrating || return 1
+    if ! RR_UPDATE_TRANSACTION=1 \
+        RR_UPDATE_SINGBOX_WAS_RUNNING="$([ -f "$BACKUP_DIR/singbox_was_running" ] && printf true || printf false)" \
+        RR_UPDATE_NEXUS_WAS_RUNNING="$([ -f "$BACKUP_DIR/nexus_was_running" ] && printf true || printf false)" \
+        RR_UPDATE_SUBSCRIPTION_WAS_RUNNING="$([ -f "$BACKUP_DIR/subscription_was_running" ] && printf true || printf false)" \
+        RR_UPDATE_ARGO_WAS_RUNNING="$([ -f "$BACKUP_DIR/argo_was_running" ] && printf true || printf false)" \
+        RR_UPDATE_HEALTH_TIMER_WAS_ENABLED="$([ -f "$BACKUP_DIR/health_timer_was_enabled" ] && printf true || printf false)" \
+        "$RR_LAUNCHER" --post-update; then
         rr_rollback
         return 1
     fi
+    rr_test_fault migrated || return 1
 
+    if ! rr_write_phase committed; then
+        rr_rollback
+        return 1
+    fi
     TRANSACTION_ACTIVE=false
-    [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
-    OLD_RUNTIME=""
+    KEEP_TRANSACTION=true
     return 0
 }
 
@@ -579,10 +729,16 @@ case "$RR_MODE" in
         ;;
 esac
 
-trap rr_cleanup EXIT
+trap 'rr_cleanup "$?"' EXIT
 trap 'exit 130' INT TERM HUP
 
 rr_check_system || exit 1
+mkdir -p /run/lock || exit 1
+exec {UPDATE_LOCK_FD}>/run/lock/rr-update.lock || exit 1
+if ! flock -n "$UPDATE_LOCK_FD"; then
+    rr_error "另一个安装/更新任务正在运行，本次未改动系统。"
+    exit 1
+fi
 rr_fetch_release || exit 1
 rr_install_release || exit 1
 
@@ -593,7 +749,7 @@ if [ "$RR_MODE" = "--upgrade" ]; then
     exit 0
 fi
 echo "[RR-vps] 安装/迁移完成，原有节点配置（如有）已保留。"
-rr_cleanup
+rr_cleanup 0
 trap - EXIT
 if [ -r /dev/tty ] && [ -w /dev/tty ]; then
     exec "$RR_LAUNCHER" </dev/tty >/dev/tty

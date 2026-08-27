@@ -2,6 +2,38 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 7.1.0 - 正式版：可恢复热更新、体检迁移、安全告警与 Naive H3（2026-08-27）
+
+### 持久事务式热更新
+- 更新流程升级为持久事务状态机：预检、运行快照、准备、原子切换、数据库迁移、健康门禁、提交或回滚均记录在 `/var/lib/rr-update/transactions`
+- 新增开机早期恢复服务和独立 `rr-update-recover`，更新进程被杀、SSH 中断或系统重启后会先识别事务阶段，再恢复旧运行目录、配置、数据库及服务启停状态
+- bundle、安装核心和更新守卫分别使用固定 SHA256 校验；运行目录切换前完成完整性、版本、防降级与 Python / JavaScript / Bash 预检
+- 更新后检查 Sing-box 配置与进程、Nexus 数据库 quick_check、Nexus `/healthz`、订阅进程和原服务状态；任一门禁失败自动回滚
+- 保留最近一次已提交事务，支持 `rr update --rollback`；新增 Stable / Beta 通道和 `rr update --check`，发布构建可确定性复现并验证所有固定摘要
+- CI 故障注入覆盖旧运行目录已移动、新运行目录已切换和数据库迁移阶段；Debian 12、Ubuntu 22.04、Ubuntu 24.04 容器矩阵执行安装、更新、中断恢复、手动回滚及卸载闭环
+
+### 一键体检、加密备份与跨机迁移
+- 新增 `rr doctor`，检查系统、DNS、时间、公网 IPv4/IPv6、Sing-box 配置与端口、防火墙、证书、Argo、Nexus、订阅、数据库、磁盘和更新源
+- `rr doctor --repair` 只执行服务重载、目录权限等白名单安全修复；`--report` 输出自动遮蔽 UUID、IP、Token、域名和密钥的报告，`--json` 便于自动化接入
+- 新增 `rr backup` / `rr restore`：`.rrbak` 使用 scrypt 派生密钥与 AES-256-GCM 认证加密，内含校验清单、SQLite 一致性备份、配置、设备、额度、流量周期、协议、Reality、Argo、Nexus、自动优选和 RR 定时任务
+- 恢复前验证文件成员、摘要、数据库和系统环境；只覆盖 RR 管理范围并保留其他 crontab 项，恢复后健康检查失败会自动还原新服务器原状态
+
+### RR Nexus 安全、告警与管理效率
+- 新增 TOTP 两步验证、一次性恢复码登录和 WebAuthn Passkey；严格校验 RP ID、Origin、挑战、签名算法及签名计数器
+- 新增 Telegram / HTTPS Webhook 告警中心，覆盖服务离线、磁盘、服务器套餐、证书、设备额度、Argo 临时域名变化、更新/备份失败和安全锁定，支持事件去重、敏感字段遮蔽及 Webhook HMAC 签名
+- 新增 CPU / 内存 / 磁盘和上下行 24 小时、7 天、30 天历史趋势；样本自动聚合与清理
+- 新增设备分组、配置模板、筛选和批量启停、移组、套模板、重置、删除；修复旧缓存前端选择模板后被默认“0 GB”覆盖的问题
+- 将 TOTP / Passkey、通知和备份加密拆入独立库模块；SQLite 连接改为确定提交、回滚与关闭，降低长时间运行的文件描述符占用
+
+### NaiveProxy HTTP/3 与安装完整性
+- NaiveProxy 支持 HTTP/2、HTTP/3/QUIC 或双模式，新增 BBR / CUBIC / New Reno 拥塞控制和 `naive+quic://` 分享链接
+- 旧配置升级默认保持 HTTP/2，新安装默认双模式；按模式分别开放 TCP / UDP，订阅、二维码、设备配置、Nexus 和远程面板同步识别 H2/H3
+- 修复首次安装 Naive 时证书申请顺序、共享端口 TCP/UDP 校验，以及新装多协议未完整写入防火墙规则的问题
+
+### 验证
+- 新增 TOTP RFC 向量、WebAuthn ES256、Origin/计数器、CBOR 严格解析、AES-GCM 篡改拒绝与原子输出、Webhook HMAC、7.0.3 数据库无损迁移测试
+- 完成 Nexus 登录、分组模板、模板回填、设备创建、批量停用/启用、告警保存、TOTP 初始化和 30 天历史范围浏览器实测
+
 ## 7.0.3 - 正式版：个人订阅、周期配额与服务器流量管理（2026-08-26）
 
 ### 个人订阅与客户端兼容

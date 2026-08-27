@@ -8,13 +8,13 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.0.3** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.1.0** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### 7.0.3 新功能：个人订阅、周期配额与服务器流量管理
+### 7.1.0 新功能：自愈更新、体检迁移、安全与主动告警
 
-RR Nexus 7.0.3 将 mihomo、Clash Verge Rev、FlClash 和 Sing-box 官方客户端订阅分开，补齐多协议节点并返回标准流量与到期信息；个人设备支持按自然月自动重置额度、设置续期次数和独立管理备注；主面板及远程副面板新增按真实网卡统计的服务器套餐额度，可选择双向、仅上传或仅下载计费。
+7.1.0 把热更新改造成可跨进程、跨重启恢复的持久事务：升级前预检和快照，下载包、启动器与守卫脚本多层 SHA256 锁定，原子切换后执行配置、数据库与服务健康门禁；中途断电或进程被杀会在下次启动自动恢复，失败自动回滚，也可运行 `rr update --rollback` 回到上一版。
 
-服务器套餐统计采用系统网卡计数并保存跨重启基线，用于对照运营商账单和预警，不会自动停止整台 VPS。设备额度用尽后立即停用，到自动重置日恢复；连续 35 天没有发生自动或手动重置才会删除。
+本版同时加入 `rr doctor` 一键体检与脱敏报告、加密 `.rrbak` 备份迁移、Telegram / HTTPS Webhook 告警、TOTP 与 Passkey、24 小时 / 7 天 / 30 天历史图表、设备分组模板和批量管理、Stable / Beta 更新通道，以及 NaiveProxy HTTP/3 / QUIC 模式。旧配置迁移默认保留原 HTTP/2 行为，不会静默改变现有节点。
 
 ## 一键安装
 
@@ -66,6 +66,19 @@ rr --version
 
 更新请选择主菜单 `8`；卸载请选择主菜单 `6`，再输入 `UNINSTALL` 二次确认。卸载完成后终端会再次显示项目地址和重新安装命令。
 
+常用运维命令：
+
+```bash
+rr doctor                    # 一键体检
+rr doctor --repair           # 仅执行白名单内的安全修复
+rr doctor --report           # 生成自动脱敏报告
+rr backup                    # 创建密码加密的迁移备份
+rr restore /path/file.rrbak  # 恢复到新 VPS
+rr update --check            # 只做更新预检
+rr update --channel stable   # 切换 Stable；也支持 beta
+rr update --rollback         # 回滚上一次已提交更新
+```
+
 ## 配套工具：RR Edge Atlas 多端域名优选
 
 [RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) 已作为独立开源项目发布，同时提供电脑端正式版 **1.0** 与 Android **2.7.1**。两端都使用原生固定 IP、SNI 与证书校验及分层筛选思路，适合中国移动、中国电信、中国联通三网测试；RR 面板浏览器版继续作为没有原生测试环境时的候选初筛。
@@ -86,14 +99,16 @@ rr --version
 - Hysteria2，支持端口跳跃与跳跃间隔设置
 - TUIC v5
 - AnyTLS
-- NaiveProxy（sing-box 1.13 原生 naive inbound，HTTP/2 + padding 伪装，Let's Encrypt 真证书，官方 naiveproxy 客户端可用；Clash 原生不支持自动跳过）
+- NaiveProxy（sing-box 1.13 原生 naive inbound，可选 HTTP/2、HTTP/3/QUIC 或双模式，支持 QUIC 拥塞控制与 Let's Encrypt 真证书；Clash 原生不支持自动跳过）
 - 每种协议独立开关、独立端口修改
 - IPv4 / IPv6 入口与出口独立选择
 - NAT/LXD 场景的订阅公网端口映射
 - Sing-box 配置校验、健康检查和异常自动重启
 - 节点、通用订阅、Base64 订阅、Sing-box 客户端配置和 Clash Meta 订阅同步刷新
 - 主动心跳模式：客户端保活参数注入订阅，锁屏/挂起后秒级恢复网络通道（4 档 + 自定义 1~3600 秒）
-- 选项 8 模块化热更新：GitHub Raw / 官方 API / IPv4 CDN 多源回退、bundle 完整性校验、SHA256 校验、语法检查、防旧包降级、运行迁移、失败自动回滚、升级后服务自动恢复
+- 顶级事务式热更新：Stable / Beta 通道、多源回退、三层 SHA256 锁定、持久事务日志、启动前自动恢复、运行快照、数据库一致性备份、配置迁移、健康门禁、失败自动回滚与手动回滚
+- `rr doctor` 系统 / DNS / 时间 / 公网网络 / 核心 / 端口 / 防火墙 / 证书 / 面板 / 订阅 / 数据库 / 磁盘 / 更新源体检，支持安全修复与自动脱敏报告
+- 密码加密的 `.rrbak` 完整备份、跨 VPS 迁移与失败原机回滚；只恢复 RR 管理范围，不覆盖其他应用服务
 - Vmess/Argo 本地源站端口不再强制占用 `443`
 - 可选安装的 RR Nexus（星枢）Web 管理界面
 - 每台设备独立凭据、独立协议链接、二维码、启停和到期时间
@@ -104,6 +119,9 @@ rr --version
 - 面板「流媒体解锁检测」：Netflix / Disney+ / YouTube Premium 等平台解锁状态与地区
 - 面板「Edge 候选初筛」：浏览器本地将 1000 域名缩小到 TOP 20；排名不代表真实代理质量，必须使用 RR Edge Atlas 电脑端 1.0、Android 2.7.1 或真实客户端逐个复测
 - 面板登录防爆破：IP + 账号双维锁定、30 分钟 5 次失败、指数退避、状态持久化；重置入口在脚本菜单 14 → 2
+- 面板多因素认证：TOTP 动态码、一次性恢复码与 WebAuthn Passkey；公网与本地回环来源严格校验
+- Telegram / HTTPS Webhook 主动告警：服务、磁盘、流量、证书、设备额度、Argo 域名变化、更新/备份失败与安全锁定，支持去重和 HMAC 签名
+- 设备分组、配置模板、筛选与批量启停 / 移组 / 套模板 / 重置；系统及流量历史可切换 24 小时、7 天和 30 天
 - 设备订阅按客户端独立发布：Sing-box 完整多协议配置、mihomo / Clash Verge / FlClash 各自 YAML、v2rayN / v2rayNG / Shadowrocket / NekoBox 与通用链接；每条地址均有独立二维码
 - 所有个人订阅返回 `Subscription-Userinfo`，兼容客户端可直接显示上传、下载、总额度、剩余额度与到期日期
 
@@ -132,7 +150,7 @@ RR-vps 生成的订阅兼容以下主流客户端工具：
 | Hysteria2 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TUIC v5 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | AnyTLS | ✅ | ✅（不支持与 Reality 组合） | ✅（新版本） | ✅（2.2.65+） | ✅（1.3.8+） |
-| NaiveProxy | ✅（1.13+，部分平台构建） | ❌ | 视客户端内核 | 视版本 | 视版本 |
+| NaiveProxy H2 / H3 | ✅（1.13+，部分平台构建） | ❌ | 视客户端内核 | 视版本 | 视版本 |
 
 使用提示：锁屏/挂起后需要快速恢复网络通道的场景，建议配合「主动心跳模式」（主菜单 9 → 11）使用，并优先选择 sing-box 内核 1.13+ 的客户端。
 

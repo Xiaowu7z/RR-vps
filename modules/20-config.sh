@@ -23,7 +23,7 @@ allowed_keys = {
     "SUB_PUBLIC_PORT_IPV6", "ENTRY_IPV4_ADDRESS", "ENTRY_IPV6_ADDRESS", "VM_TLS_ENABLED",
     "VM_PREVIOUS_PORT", "VM_ENABLED", "VL_ENABLED", "VL_PORT", "HY2_ENABLED", "HY2_PORT",
     "HY2_HOP_PORTS", "HY2_HOP_INTERVAL", "TU5_ENABLED", "TU5_PORT", "TU5_HOP_PORTS",
-    "AN_ENABLED", "AN_PORT", "NAIVE_ENABLED", "NAIVE_PORT", "NAIVE_USER", "NAIVE_PASS", "NAIVE_DOMAIN", "CLASH_ENABLED", "SINGBOX_AUTO_RESTART", "CONFIG_VERSION",
+    "AN_ENABLED", "AN_PORT", "NAIVE_ENABLED", "NAIVE_PORT", "NAIVE_USER", "NAIVE_PASS", "NAIVE_DOMAIN", "NAIVE_MODE", "NAIVE_QUIC_CC", "CLASH_ENABLED", "SINGBOX_AUTO_RESTART", "CONFIG_VERSION",
     "PRIVATE_KEY", "PUBLIC_KEY", "SHORT_ID", "CERT_SHA256", "INSTALL_COMPLETE",
     "HB_ENABLED", "HB_INTERVAL", "LE_EMAIL",
 }
@@ -56,9 +56,9 @@ PY
             VM_TLS_ENABLED|VM_PREVIOUS_PORT|VM_ENABLED|VL_ENABLED|VL_PORT|\
             HY2_ENABLED|HY2_PORT|HY2_HOP_PORTS|HY2_HOP_INTERVAL|\
             TU5_ENABLED|TU5_PORT|TU5_HOP_PORTS|AN_ENABLED|AN_PORT|\
-            NAIVE_ENABLED|NAIVE_PORT|NAIVE_USER|NAIVE_PASS|NAIVE_DOMAIN|\
+            NAIVE_ENABLED|NAIVE_PORT|NAIVE_USER|NAIVE_PASS|NAIVE_DOMAIN|NAIVE_MODE|NAIVE_QUIC_CC|\
             CLASH_ENABLED|SINGBOX_AUTO_RESTART|CONFIG_VERSION|PRIVATE_KEY|\
-            PUBLIC_KEY|SHORT_ID|CERT_SHA256|INSTALL_COMPLETE|HB_ENABLED|HB_INTERVAL)
+            PUBLIC_KEY|SHORT_ID|CERT_SHA256|INSTALL_COMPLETE|HB_ENABLED|HB_INTERVAL|LE_EMAIL)
                 printf -v "$config_key" '%s' "$config_value"
                 ;;
         esac
@@ -103,6 +103,8 @@ load_config_with_defaults() {
     NAIVE_USER=""
     NAIVE_PASS=""
     NAIVE_DOMAIN=""
+    NAIVE_MODE=""
+    NAIVE_QUIC_CC=""
     CLASH_ENABLED=""
     SINGBOX_AUTO_RESTART=""
     CONFIG_VERSION=""
@@ -113,6 +115,7 @@ load_config_with_defaults() {
     CERT_SHA256=""
     HB_ENABLED=""
     HB_INTERVAL=""
+    LE_EMAIL=""
     if [ -f "$CONFIG_FILE" ]; then
         if ! read_config_whitelist; then
             echo -e "${RED}[错误] 配置文件包含无法安全解析的内容：${CONFIG_FILE}${RESET}" >&2
@@ -149,12 +152,15 @@ load_config_with_defaults() {
     TU5_HOP_PORTS="${TU5_HOP_PORTS:-}"
     AN_ENABLED="${AN_ENABLED:-false}"
     AN_PORT="${AN_PORT:-0}"
-    # NAIVE-SUPPORT：NaiveProxy（HTTP/2+padding 伪装，需真证书）
+    # NAIVE-SUPPORT：HTTP/2(TCP) + HTTP/3(QUIC) 双栈，需真证书。
     NAIVE_ENABLED="${NAIVE_ENABLED:-false}"
     NAIVE_PORT="${NAIVE_PORT:-443}"
     NAIVE_USER="${NAIVE_USER:-}"
     NAIVE_PASS="${NAIVE_PASS:-}"
     NAIVE_DOMAIN="${NAIVE_DOMAIN:-}"
+    # 旧用户缺少此字段时保持 7.0 的 H2/TCP 行为；新开启向导默认双栈。
+    NAIVE_MODE="${NAIVE_MODE:-h2}"
+    NAIVE_QUIC_CC="${NAIVE_QUIC_CC:-bbr}"
     CLASH_ENABLED="${CLASH_ENABLED:-true}"
     SINGBOX_AUTO_RESTART="${SINGBOX_AUTO_RESTART:-true}"
     CONFIG_VERSION="${CONFIG_VERSION:-1}"
@@ -210,6 +216,12 @@ load_config_with_defaults() {
     is_valid_hop_spec "$TU5_HOP_PORTS" || TU5_HOP_PORTS=""
     is_valid_hop_interval "$HY2_HOP_INTERVAL" || HY2_HOP_INTERVAL="30s"
     case "$SINGBOX_AUTO_RESTART" in true|false) ;; *) SINGBOX_AUTO_RESTART=true ;; esac
+    case "$NAIVE_MODE" in h2|h3|both) ;; *) NAIVE_MODE=both ;; esac
+    case "$NAIVE_QUIC_CC" in
+        new_reno) NAIVE_QUIC_CC=reno ;; # 7.1 RC 兼容：sing-box 官方字段名是 reno
+        cubic|reno|bbr) ;;
+        *) NAIVE_QUIC_CC=bbr ;;
+    esac
     case "$HB_ENABLED" in true|false) ;; *) HB_ENABLED=false ;; esac
     case "$INSTALL_COMPLETE" in true|false) ;; *) INSTALL_COMPLETE=false ;; esac
     [ "$config_read_ok" = true ]
@@ -220,7 +232,8 @@ any_node_protocol_enabled() {
     [ "${VL_ENABLED:-false}" = "true" ] || \
     [ "${HY2_ENABLED:-false}" = "true" ] || \
     [ "${TU5_ENABLED:-false}" = "true" ] || \
-    [ "${AN_ENABLED:-false}" = "true" ]
+    [ "${AN_ENABLED:-false}" = "true" ] || \
+    [ "${NAIVE_ENABLED:-false}" = "true" ]
 }
 
 migrate_config_schema() {
@@ -263,6 +276,13 @@ TU5_PORT|$TU5_PORT
 TU5_HOP_PORTS|$TU5_HOP_PORTS
 AN_ENABLED|$AN_ENABLED
 AN_PORT|$AN_PORT
+NAIVE_ENABLED|$NAIVE_ENABLED
+NAIVE_PORT|$NAIVE_PORT
+NAIVE_USER|$NAIVE_USER
+NAIVE_PASS|$NAIVE_PASS
+NAIVE_DOMAIN|$NAIVE_DOMAIN
+NAIVE_MODE|$NAIVE_MODE
+NAIVE_QUIC_CC|$NAIVE_QUIC_CC
 CLASH_ENABLED|$CLASH_ENABLED
 SINGBOX_AUTO_RESTART|$SINGBOX_AUTO_RESTART
 INSTALL_COMPLETE|$INSTALL_COMPLETE
