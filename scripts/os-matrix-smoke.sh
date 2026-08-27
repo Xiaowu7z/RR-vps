@@ -4,7 +4,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
-expected_version=$(tr -d '[:space:]' < version)
+expected_version=$(sed -n '1s/^RR-vps //p' version | tr -d '[:space:]')
 case "$expected_version" in
     ''|*[!0-9A-Za-z.-]*) echo "Invalid repository version: $expected_version" >&2; exit 1 ;;
 esac
