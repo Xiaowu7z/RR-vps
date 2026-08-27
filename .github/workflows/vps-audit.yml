@@ -1,4 +1,4 @@
-name: Temporary VPS audit baseline
+# Temporary owner-authorized audit; remove after the three-VPS gate.\nname: Temporary VPS audit baseline
 
 on:
   push:
