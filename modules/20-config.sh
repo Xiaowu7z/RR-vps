@@ -394,6 +394,22 @@ raise SystemExit(0)
 PY
 }
 
+is_valid_domain() {
+    local value="${1:-}"
+    local label=""
+    local -a labels=()
+    [ -n "$value" ] && [ "${#value}" -le 253 ] || return 1
+    [[ "$value" != .* && "$value" != *. && "$value" == *.* ]] || return 1
+    IFS=. read -r -a labels <<< "$value"
+    [ "${#labels[@]}" -ge 2 ] || return 1
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+    label="${labels[${#labels[@]}-1]}"
+    [[ "$label" =~ ^[A-Za-z]{2,63}$ || "$label" =~ ^xn--[A-Za-z0-9-]{2,59}$ ]]
+}
+
 is_valid_uuid() {
     python3 -c 'import sys,uuid; uuid.UUID(sys.argv[1]); sys.exit(0)' "${1:-}" >/dev/null 2>&1
 }

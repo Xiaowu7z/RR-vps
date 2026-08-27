@@ -76,6 +76,19 @@ echo "[3/13] Fresh-install port selection regression"
     selected_port=""
     prompt_initial_port selected_port "回归测试" tcp <<< ""
     is_valid_port "$selected_port"
+
+    # Naive 首装必须能接受真实域名。函数缺失会被 Bash 当作 127，导致
+    # 安装向导把每次输入都判为无效并无限等待。
+    is_valid_domain naive.example.com
+    is_valid_domain A-b.example.co.uk
+    is_valid_domain xn--fsqu00a.xn--0zwm56d
+    for invalid_domain in '' localhost 203.0.113.1 .example.com example.com. \
+        bad_label.example.com bad..example.com -bad.example.com bad_.example.com; do
+        if is_valid_domain "$invalid_domain"; then
+            echo "Invalid Naive domain was accepted: $invalid_domain" >&2
+            exit 1
+        fi
+    done
 )
 
 # 安装依赖不能为了持久化 RR 的 iptables 规则而删除用户已有的 UFW。
