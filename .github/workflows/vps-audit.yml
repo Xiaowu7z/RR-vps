@@ -113,7 +113,9 @@ jobs:
             test -x /usr/local/bin/rr
             test -x /usr/local/sbin/rr-update-recover
             test -s /usr/local/lib/rr/manifest.sha256
-            (cd /usr/local/lib/rr && sha256sum -c manifest.sha256 >/dev/null)
+            expected_rr=$(awk '$2 == "rr" {print $1}' /usr/local/lib/rr/manifest.sha256)
+            test "$(sha256sum /usr/local/bin/rr | awk '{print $1}')" = "$expected_rr"
+            (cd /usr/local/lib/rr && sha256sum -c <(awk '$2 != "rr"' manifest.sha256) >/dev/null)
             test "$(stat -c %a /var/lib/rr-update)" = 700
             test ! -L /usr/local/lib/rr
           }
