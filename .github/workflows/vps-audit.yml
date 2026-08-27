@@ -1,5 +1,5 @@
-# Temporary owner-authorized audit status probe; remove after the three-VPS gate.
-name: Temporary VPS gate status probe
+# Temporary owner-authorized redacted gate diagnostics; remove after audit.
+name: Temporary VPS component gate diagnostics
 
 on:
   push:
@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  report:
-    name: "${{ matrix.role }} · publish redacted gate status"
+  diagnose:
+    name: "${{ matrix.role }} · component status"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -31,7 +31,7 @@ jobs:
       RR_B_PASS: ${{ secrets.RR_B_PASS }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Read only non-secret release gates
+      - name: Publish allowlisted component checks
         shell: bash
         run: |
           set -euo pipefail
@@ -41,61 +41,89 @@ jobs:
             A)
               host="$RR_A_HOST"
               export SSHPASS="$RR_A_PASS"
-              remote_args=(A "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN")
+              args=(A "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN")
+              checks=(runtime config services database panel-cert naive-cert panel-health)
               ;;
             B)
               host="$RR_B_HOST"
               export SSHPASS="$RR_B_PASS"
-              remote_args=(B '' '')
+              args=(B '' '')
+              checks=(runtime config services database stage device subscription)
               ;;
             *) exit 2 ;;
           esac
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
           known_hosts="$RUNNER_TEMP/known-hosts-$role"
-          state=failure
-          description="${role} gate incomplete"
-          if sshpass -e ssh \
+          result_file="$RUNNER_TEMP/result-$role"
+          : > "$result_file"
+          if ! sshpass -e ssh \
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2 \
             -o LogLevel=ERROR -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile="$known_hosts" \
-            "root@$host" bash -s -- "${remote_args[@]}" <<'REMOTE'
-          set -euo pipefail
+            "root@$host" bash -s -- "${args[@]}" > "$result_file" <<'REMOTE'
+          set -u
           role="$1"
           panel_domain="$2"
           naive_domain="$3"
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.1' >/dev/null
-          test "$(grep -c '^INSTALL_COMPLETE=true$' /etc/argo_vmess.conf)" -eq 1
-          systemctl is-active --quiet sing-box
-          systemctl is-active --quiet rr-nexus
-          systemctl is-active --quiet nginx
-          test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
+          runtime=no
+          /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.1' && runtime=yes
+          config=no
+          grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf 2>/dev/null && config=yes
+          services=no
+          if systemctl is-active --quiet sing-box 2>/dev/null && \
+             systemctl is-active --quiet rr-nexus 2>/dev/null && \
+             systemctl is-active --quiet nginx 2>/dev/null; then
+            services=yes
+          fi
+          database=no
+          [ "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;' 2>/dev/null)" = ok ] && database=yes
+          printf 'runtime=%s\nconfig=%s\nservices=%s\ndatabase=%s\n' \
+            "$runtime" "$config" "$services" "$database"
           if [ "$role" = A ]; then
-            test -s "/etc/letsencrypt/live/${panel_domain}/fullchain.pem"
-            test -s "/etc/letsencrypt/live/${naive_domain}/fullchain.pem"
+            panel_cert=no
+            naive_cert=no
+            panel_health=no
+            [ -s "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" ] && panel_cert=yes
+            [ -s "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" ] && naive_cert=yes
             curl -fsS --resolve "${panel_domain}:8443:127.0.0.1" \
-              --connect-timeout 5 --max-time 15 "https://${panel_domain}:8443/healthz" >/dev/null
+              --connect-timeout 5 --max-time 15 "https://${panel_domain}:8443/healthz" \
+              >/dev/null 2>&1 && panel_health=yes
+            printf 'panel-cert=%s\nnaive-cert=%s\npanel-health=%s\n' \
+              "$panel_cert" "$naive_cert" "$panel_health"
           else
-            test "$(cat /root/rr-audit-stage 2>/dev/null)" = second-upgrade-complete
-            sqlite3 /var/lib/rr-nexus/nexus.db \
-              "SELECT id FROM devices WHERE id='dev_a1b2c3d4e5f6';" \
-              | grep -qx dev_a1b2c3d4e5f6
-            test -s /run/rr-vps-subscription.pid
-            kill -0 "$(cat /run/rr-vps-subscription.pid)"
+            stage=$(head -n 1 /root/rr-audit-stage 2>/dev/null || true)
+            case "$stage" in
+              preclean-complete|old-state-built|first-upgrade-complete|manual-rollback-complete|second-upgrade-complete) ;;
+              *) stage=unknown ;;
+            esac
+            [ "$stage" = second-upgrade-complete ] && stage_state=yes || stage_state=no
+            printf 'stage=%s\n' "$stage_state"
+            device=no
+            [ "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              "SELECT id FROM devices WHERE id='dev_a1b2c3d4e5f6';" 2>/dev/null)" = dev_a1b2c3d4e5f6 ] && device=yes
+            subscription=no
+            if [ -s /run/rr-vps-subscription.pid ]; then
+              sub_pid=$(head -n 1 /run/rr-vps-subscription.pid 2>/dev/null || true)
+              [[ "$sub_pid" =~ ^[0-9]+$ ]] && kill -0 "$sub_pid" 2>/dev/null && subscription=yes
+            fi
+            printf 'device=%s\nsubscription=%s\n' "$device" "$subscription"
           fi
           REMOTE
           then
-            state=success
-            description="${role} real VPS gate passed"
+            : > "$result_file"
           fi
-          payload=$(jq -nc --arg state "$state" --arg context "rr-vps/audit-${role}" \
-            --arg description "$description" \
-            '{state:$state,context:$context,description:$description}')
-          curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
-            -X POST -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
-            -d "$payload" >/dev/null
-          test "$state" = success
+          chmod 600 "$result_file"
+          for check in "${checks[@]}"; do
+            value=$(awk -F= -v key="$check" '$1 == key && ($2 == "yes" || $2 == "no") {print $2; exit}' "$result_file")
+            [ "$value" = yes ] && state=success || state=failure
+            payload=$(jq -nc --arg state "$state" --arg context "rr-vps/${role}-${check}" \
+              '{state:$state,context:$context}')
+            curl -fsS --retry 3 --connect-timeout 10 --max-time 30 \
+              -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+              -d "$payload" >/dev/null
+          done
