@@ -1071,6 +1071,10 @@ prepare_naive_acme_webroot() {
     fi
 
     mkdir -p "$webroot/.well-known/acme-challenge" "$(dirname "$site")" "$(dirname "$enabled")" || return 1
+    # 某些 VPS 模板以 root umask 077 预建 /var/www（700）。即使 Webroot
+    # 本身是 755，Nginx 也无法穿过父目录并会把 try_files 的 EACCES 表现
+    # 成 404。仅增加父目录 execute 位（可穿越），不开放目录读取/列表。
+    chmod a+x "$(dirname "$webroot")" || return 1
     chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge" || return 1
     [ ! -L "$site" ] || {
         echo -e "${RED}[拒绝] NaiveProxy Nginx 站点文件是符号链接，未覆盖。${RESET}" >&2

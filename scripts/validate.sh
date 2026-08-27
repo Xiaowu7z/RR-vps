@@ -163,6 +163,7 @@ echo "[3/13] Fresh-install port selection regression"
     grep -Fq "root $RR_NAIVE_ACME_WEBROOT;" "$RR_NAIVE_ACME_NGINX_SITE"
     grep -Fq 'systemctl:enable --now nginx' "$call_log"
     grep -Fq 'firewall:80:tcp' "$call_log"
+    [ $(( 8#$(stat -c %a "$(dirname "$RR_NAIVE_ACME_WEBROOT")") & 1 )) -eq 1 ]
     certbot_line=$(grep -n '^certbot$' "$call_log" | cut -d: -f1)
     firewall_line=$(grep -n '^firewall:80:tcp$' "$call_log" | cut -d: -f1)
     [ "$firewall_line" -lt "$certbot_line" ]
