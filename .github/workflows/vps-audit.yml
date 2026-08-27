@@ -42,7 +42,7 @@ jobs:
               host="$RR_A_HOST"
               export SSHPASS="$RR_A_PASS"
               args=(A "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN")
-              checks=(runtime config database singbox nexus nginx singbox-check local-health panel-cert naive-cert panel-health)
+              checks=(runtime config database singbox nexus nginx singbox-check local-health panel-cert naive-cert panel-health nexus-app nexus-import nexus-enabled port7900 address-in-use import-error permission-error restart-nexus)
               ;;
             B)
               host="$RR_B_HOST"
@@ -87,6 +87,14 @@ jobs:
             nginx=no
             singbox_check=no
             local_health=no
+            nexus_app=no
+            nexus_import=no
+            nexus_enabled=no
+            port7900=no
+            address_in_use=no
+            import_error=no
+            permission_error=no
+            restart_nexus=no
             panel_cert=no
             naive_cert=no
             panel_health=no
@@ -95,6 +103,21 @@ jobs:
             systemctl is-active --quiet nginx 2>/dev/null && nginx=yes
             /usr/local/bin/sing-box check -c /etc/sing-box/config.json \
               >/dev/null 2>&1 && singbox_check=yes
+            [ -s /usr/local/lib/rr/nexus/rr_nexus.py ] && nexus_app=yes
+            (cd /usr/local/lib/rr/nexus && python3 -c 'import rr_nexus') \
+              >/dev/null 2>&1 && nexus_import=yes
+            systemctl is-enabled --quiet rr-nexus 2>/dev/null && nexus_enabled=yes
+            ss -H -ltn 'sport = :7900' 2>/dev/null | grep -q . && port7900=yes
+            journalctl -u rr-nexus --no-pager -n 120 2>/dev/null \
+              | grep -Eqi 'address already in use|Errno 98' && address_in_use=yes
+            journalctl -u rr-nexus --no-pager -n 120 2>/dev/null \
+              | grep -Eqi 'ModuleNotFoundError|ImportError' && import_error=yes
+            journalctl -u rr-nexus --no-pager -n 120 2>/dev/null \
+              | grep -Eqi 'Permission denied|Errno 13' && permission_error=yes
+            systemctl reset-failed rr-nexus >/dev/null 2>&1 || true
+            systemctl restart rr-nexus >/dev/null 2>&1 || true
+            sleep 3
+            systemctl is-active --quiet rr-nexus 2>/dev/null && restart_nexus=yes
             curl -fsS --connect-timeout 5 --max-time 15 \
               http://127.0.0.1:7900/healthz >/dev/null 2>&1 && local_health=yes
             [ -s "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" ] && panel_cert=yes
@@ -104,6 +127,10 @@ jobs:
               >/dev/null 2>&1 && panel_health=yes
             printf 'singbox=%s\nnexus=%s\nnginx=%s\nsingbox-check=%s\nlocal-health=%s\n' \
               "$singbox" "$nexus" "$nginx" "$singbox_check" "$local_health"
+            printf 'nexus-app=%s\nnexus-import=%s\nnexus-enabled=%s\nport7900=%s\n' \
+              "$nexus_app" "$nexus_import" "$nexus_enabled" "$port7900"
+            printf 'address-in-use=%s\nimport-error=%s\npermission-error=%s\nrestart-nexus=%s\n' \
+              "$address_in_use" "$import_error" "$permission_error" "$restart_nexus"
             printf 'panel-cert=%s\nnaive-cert=%s\npanel-health=%s\n' \
               "$panel_cert" "$naive_cert" "$panel_health"
           else
