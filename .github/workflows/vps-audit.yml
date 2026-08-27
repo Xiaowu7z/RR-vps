@@ -42,7 +42,7 @@ jobs:
               host="$RR_A_HOST"
               export SSHPASS="$RR_A_PASS"
               args=(A "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN")
-              checks=(runtime config services database panel-cert naive-cert panel-health)
+              checks=(runtime config database singbox nexus nginx singbox-check local-health panel-cert naive-cert panel-health)
               ;;
             B)
               host="$RR_B_HOST"
@@ -82,14 +82,28 @@ jobs:
           printf 'runtime=%s\nconfig=%s\nservices=%s\ndatabase=%s\n' \
             "$runtime" "$config" "$services" "$database"
           if [ "$role" = A ]; then
+            singbox=no
+            nexus=no
+            nginx=no
+            singbox_check=no
+            local_health=no
             panel_cert=no
             naive_cert=no
             panel_health=no
+            systemctl is-active --quiet sing-box 2>/dev/null && singbox=yes
+            systemctl is-active --quiet rr-nexus 2>/dev/null && nexus=yes
+            systemctl is-active --quiet nginx 2>/dev/null && nginx=yes
+            /usr/local/bin/sing-box check -c /etc/sing-box/config.json \
+              >/dev/null 2>&1 && singbox_check=yes
+            curl -fsS --connect-timeout 5 --max-time 15 \
+              http://127.0.0.1:7900/healthz >/dev/null 2>&1 && local_health=yes
             [ -s "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" ] && panel_cert=yes
             [ -s "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" ] && naive_cert=yes
             curl -fsS --resolve "${panel_domain}:8443:127.0.0.1" \
               --connect-timeout 5 --max-time 15 "https://${panel_domain}:8443/healthz" \
               >/dev/null 2>&1 && panel_health=yes
+            printf 'singbox=%s\nnexus=%s\nnginx=%s\nsingbox-check=%s\nlocal-health=%s\n' \
+              "$singbox" "$nexus" "$nginx" "$singbox_check" "$local_health"
             printf 'panel-cert=%s\nnaive-cert=%s\npanel-health=%s\n' \
               "$panel_cert" "$naive_cert" "$panel_health"
           else
