@@ -261,13 +261,7 @@ uninstall_all() {
             systemctl restart fail2ban >/dev/null 2>&1 || true
     fi
 
-    if [ -f "$SUB_PID_FILE" ]; then
-        local uninstall_sub_pid=""
-        uninstall_sub_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
-        is_subscription_pid "$uninstall_sub_pid" && kill "$uninstall_sub_pid" 2>/dev/null || true
-        rm -f "$SUB_PID_FILE"
-    fi
-    rm -f "$SUB_BIND_STATE_FILE"
+    stop_subscription_servers >/dev/null 2>&1 || true
 
     # 可疑的 /tmp 订阅根绝不以 root 身份递归删除；保留现场并提示人工检查。
     if ensure_subscription_root; then

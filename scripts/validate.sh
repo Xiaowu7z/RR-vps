@@ -183,6 +183,38 @@ echo "[3/13] Fresh-install port selection regression"
     [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
 )
 
+# 更新/回滚后的订阅 worker 可能没有 PID 文件。进程回收必须依靠命令行
+# 与 RR 订阅根 cwd 双重身份，而不是广泛 pkill 或仅信任状态文件。
+(
+    load_modules_for_tests
+    subscription_test_root=$(mktemp -d)
+    trap 'rm -rf "$subscription_test_root"' EXIT
+    RR_PROC_ROOT="$subscription_test_root/proc"
+    SUB_ROOT="$subscription_test_root/sub-root"
+    mkdir -p "$RR_PROC_ROOT/1234" "$RR_PROC_ROOT/5678" "$SUB_ROOT" "$subscription_test_root/other-root"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/1234/cmdline"
+    ln -s "$SUB_ROOT" "$RR_PROC_ROOT/1234/cwd"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/5678/cmdline"
+    ln -s "$subscription_test_root/other-root" "$RR_PROC_ROOT/5678/cwd"
+    [ "$(managed_subscription_pids)" = 1234 ]
+    subscription_server_running
+    SUB_PID_FILE="$subscription_test_root/current.pid"
+    SUB_BIND_STATE_FILE="$subscription_test_root/current.bind"
+    : > "$SUB_PID_FILE"
+    : > "$SUB_BIND_STATE_FILE"
+    : > "$subscription_test_root/killed"
+    kill() {
+        printf '%s\n' "$1" >> "$subscription_test_root/killed"
+        rm -rf "$RR_PROC_ROOT/$1"
+    }
+    sleep() { :; }
+    stop_subscription_servers
+    [ "$(cat "$subscription_test_root/killed")" = 1234 ]
+    [ -d "$RR_PROC_ROOT/5678" ]
+    [ ! -e "$SUB_PID_FILE" ]
+    [ ! -e "$SUB_BIND_STATE_FILE" ]
+)
+
 # Nexus 公网 IP 安装后的健康检查必须使用真实存在的地址构造函数，且
 # IPv6 URL 必须带方括号。
 (
@@ -238,6 +270,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 1; }
     systemctl() { return 1; }
     pgrep() { return 1; }
 
@@ -264,6 +297,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 0; }
     systemctl() { return 0; }
     pgrep() { return 0; }
 
@@ -289,6 +323,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 1; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 1; }
     systemctl() { return 1; }
     pgrep() { return 1; }
 
@@ -323,7 +358,7 @@ rollback_function=$(awk '
     RUNTIME_REPLACED=false
     ROLLBACK_FAILED=false
     systemctl() { return 0; }
-    pkill() { return 0; }
+    rr_stop_subscription_servers() { return 0; }
     rr_error() { return 0; }
     rr_restore_file() { return 0; }
     rr_restore_dir() { return 0; }
@@ -499,7 +534,7 @@ post_update_function=$(awk '
     load_config_with_defaults() { INSTALL_COMPLETE=false; return 0; }
     any_node_protocol_enabled() { return 1; }
     systemctl() { return 0; }
-    pkill() { return 0; }
+    stop_subscription_servers() { return 0; }
     sleep() { :; }
     post_update_migrate
     rm -f "$CONFIG_FILE"
@@ -1678,6 +1713,13 @@ grep -Fq 'rr_bundle_tree_is_valid "$PAYLOAD_DIR"' install.sh
 grep -Fq 'rr_verify_restored_state || failed=true' scripts/update-recover.sh
 grep -Fq 'systemctl restart --no-block sing-box' scripts/update-recover.sh
 grep -Fq 'systemctl start --no-block argo-rr-health.service' scripts/update-recover.sh
+grep -Fq 'rr_subscription_running' scripts/install-core.sh
+grep -Fq 'rr_stop_subscription_servers' scripts/install-core.sh scripts/update-recover.sh
+grep -Fq 'managed_subscription_pids' modules/10-system.sh
+if grep -Rq --exclude=validate.sh 'subscription_server\.py' scripts modules; then
+    echo "Update or rollback still searches for the nonexistent subscription_server.py process." >&2
+    exit 1
+fi
 grep -Fq 'NAIVE_QUIC_CC=reno' modules/70-protocols.sh
 grep -Fxq 'rr_check_system || exit 1' install.sh
 grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh

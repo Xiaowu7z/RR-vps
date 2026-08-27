@@ -418,6 +418,57 @@ is_subscription_pid() {
     [ "$process_cwd" = "$expected_cwd" ]
 }
 
+managed_subscription_pids() {
+    # 状态文件可能因跨版本更新/回滚位于 /run 或旧版 /tmp，甚至已经丢失。
+    # 按“受支持命令行 + RR 订阅根 cwd”双重条件扫描 /proc，避免仅凭名称
+    # pkill 误伤用户进程，也确保无 PID 文件的 RR 孤儿 worker 仍可回收。
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local expected_cwd=""
+    local process_dir=""
+    local pid=""
+    local cmdline=""
+    local process_cwd=""
+    expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 0
+    for process_dir in "$proc_root"/[0-9]*; do
+        [ -r "$process_dir/cmdline" ] || continue
+        pid="${process_dir##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
+        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
+        [ "$process_cwd" = "$expected_cwd" ] || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+subscription_server_running() {
+    local pid=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && return 0
+    done < <(managed_subscription_pids)
+    return 1
+}
+
+stop_subscription_servers() {
+    local pid=""
+    local stopped=true
+    local attempt=0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        # 进程可能在扫描和 kill 之间自行退出；最终是否仍存在才决定失败。
+        kill "$pid" 2>/dev/null || true
+    done < <(managed_subscription_pids)
+    while [ "$attempt" -lt 20 ] && subscription_server_running; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    subscription_server_running && stopped=false
+    rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE" \
+        /run/rr-vps-subscription.pid /run/rr-vps-subscription.bind \
+        /tmp/sub_server.pid /tmp/sub_server.bind
+    [ "$stopped" = true ]
+}
+
 # ==========================================
 # IPv4 / IPv6 模式与兼容性辅助函数
 

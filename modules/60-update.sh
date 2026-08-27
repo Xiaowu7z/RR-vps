@@ -203,7 +203,7 @@ post_update_migrate() {
     systemctl stop sing-box 2>/dev/null || true
     systemctl stop rr-subscription 2>/dev/null || true
     systemctl stop rr-nexus 2>/dev/null || true
-    pkill -f "subscription_server.py" 2>/dev/null || true
+    stop_subscription_servers || return 1
     sleep 1
     migrate_config_schema || return 1
     load_config_with_defaults || return 1

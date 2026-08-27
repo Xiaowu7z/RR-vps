@@ -589,7 +589,7 @@ PY
     rr_backup_capture_crontab "$rollback/crontab.txt" || { rm -rf "$stage"; return 1; }
     systemctl is-active --quiet sing-box 2>/dev/null && : > "$rollback/singbox_was_running"
     systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$rollback/nexus_was_running"
-    pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && : > "$rollback/subscription_was_running"
+    subscription_server_running && : > "$rollback/subscription_was_running"
     pgrep -f 'cloudflared.*tunnel' >/dev/null 2>&1 && : > "$rollback/argo_was_running"
     systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && : > "$rollback/health_timer_was_enabled"
     if [ -s "$stage/payload/rootfs/etc/rr-cloudflared/token" ] && \
