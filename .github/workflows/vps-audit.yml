@@ -1,5 +1,5 @@
-# Temporary owner-authorized destructive audit; remove after the three-VPS gate.
-name: Temporary VPS full install and upgrade audit
+# Temporary owner-authorized audit diagnostics; remove after the three-VPS gate.
+name: Temporary VPS redacted failure diagnostics
 
 on:
   push:
@@ -10,377 +10,103 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: temporary-vps-audit
-  cancel-in-progress: false
-
-env:
-  CANDIDATE_SHA: a4024e9951f68302db05f18188da24b7fd595f34
-
 jobs:
-  debian-full:
-    name: A · Debian 12 · all protocols and public HTTPS
+  diagnose:
+    name: "${{ matrix.role }} · redacted diagnostics"
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: A
+            expected_id: debian
+            expected_version: "12"
+          - role: B
+            expected_id: ubuntu
+            expected_version: "22.04"
     env:
       RR_A_HOST: ${{ secrets.RR_A_HOST }}
       RR_A_PASS: ${{ secrets.RR_A_PASS }}
-      RR_A_NAIVE_DOMAIN: ${{ secrets.RR_A_NAIVE_DOMAIN }}
-    steps:
-      - name: Check out exact candidate
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: a4024e9951f68302db05f18188da24b7fd595f34
-          persist-credentials: false
-      - name: Prepare SSH client
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          python3 scripts/rebuild-bundle.py --check
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
-      - name: Install all protocols and domain panel
-        shell: bash
-        run: |
-          set -euo pipefail
-          set +x
-          export SSHPASS="$RR_A_PASS"
-          host="$RR_A_HOST"
-          known_hosts="$RUNNER_TEMP/known-hosts-A"
-          ssh_opts=(
-            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
-            -o LogLevel=ERROR -o PreferredAuthentications=password
-            -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new
-            -o UserKnownHostsFile="$known_hosts"
-          )
-          sshpass -e ssh "${ssh_opts[@]}" "root@$host" \
-            'install -d -m 700 /root/rr-audit-candidate'
-          sshpass -e scp "${ssh_opts[@]}" -q \
-            rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
-            "root@$host:/root/rr-audit-candidate/"
-          sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
-            "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN" <<'REMOTE'
-          set -euo pipefail
-          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-          panel_domain="$1"
-          naive_domain="$2"
-          test "$(id -u)" -eq 0
-          # shellcheck disable=SC1091
-          . /etc/os-release
-          test "$ID" = debian
-          test "$VERSION_ID" = 12
-          test "$(ps -p 1 -o comm= | tr -d '[:space:]')" = systemd
-          test ! -e /etc/argo_vmess.conf
-          stage=/root/rr-audit-candidate
-          chmod 700 "$stage"
-          chmod 600 "$stage"/*
-          RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" \
-          RR_GUARD_FILE="$stage/update-guard.sh" \
-            bash "$stage/install-core.sh" --upgrade >/root/rr-audit-core.log 2>&1
-
-          # Real regression for the Debian failure found in this audit: retain
-          # an active UFW installation and an unrelated pre-existing rule.
-          DEBIAN_FRONTEND=noninteractive apt-get install -y ufw \
-            >/root/rr-audit-ufw-prepare.log 2>&1
-          ufw allow 22/tcp comment 'RR audit SSH safety' >/dev/null
-          ufw allow 61234/tcp comment 'RR audit preservation marker' >/dev/null
-          ufw --force enable >/dev/null
-          bash -c '
-              set -eo pipefail
-              for module_file in /usr/local/lib/rr/modules/*.sh; do
-                # shellcheck disable=SC1090
-                source "$module_file"
-              done
-              install_deps </dev/null
-            ' >/root/rr-audit-deps.log 2>&1
-          dpkg-query -W -f='${db:Status-Status}\n' ufw | grep -qx installed
-          ufw status | head -n 1 | grep -qi active
-          ufw status | grep -Eq '^61234/tcp[[:space:]]+ALLOW'
-
-          install_log=/root/rr-audit-install.log
-          : > "$install_log"
-          chmod 600 "$install_log"
-          if ! printf '%s\n' \
-            7 1 24443 18080 21443 22443 3 443 "$naive_domain" \
-            23443 25443 y 30000:30010 30s '' \
-            | bash -c '
-                set -eo pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                install_deps() { return 0; }
-                install_main
-              ' >>"$install_log" 2>&1; then
-            echo 'A full protocol install failed; root-only log retained on VPS.' >&2
-            exit 1
-          fi
-
-          panel_pass=$(openssl rand -hex 20)
-          test "${#panel_pass}" -ge 12
-          (umask 077; printf '%s\n' "$panel_pass" > /root/rr-audit-panel-pass)
-          panel_log=/root/rr-audit-nexus.log
-          : > "$panel_log"
-          chmod 600 "$panel_log"
-          if ! printf '%s\n' 2 8443 "$panel_domain" "admin@$panel_domain" \
-            auditadmin "$panel_pass" "$panel_pass" '' \
-            | bash -c '
-                set -eo pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                nexus_install
-              ' >>"$panel_log" 2>&1; then
-            echo 'A Nexus domain install failed; root-only log retained on VPS.' >&2
-            exit 1
-          fi
-          unset panel_pass
-
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.1' >/dev/null
-          test "$(grep -c '^INSTALL_COMPLETE=true$' /etc/argo_vmess.conf)" -eq 1
-          test "$(stat -c %a /etc/argo_vmess.conf)" = 600
-          test "$(stat -c %a /etc/sing-box/config.json)" = 600
-          test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
-          test "$(stat -c %a /etc/rr-nexus/nexus.json)" = 600
-          test "$(stat -c %a /root/rr-audit-panel-pass)" = 600
-          systemctl is-active --quiet sing-box
-          systemctl is-active --quiet rr-nexus
-          systemctl is-active --quiet nginx
-          systemctl is-enabled --quiet sing-box
-          systemctl is-enabled --quiet rr-nexus
-          /usr/local/bin/sing-box check -c /etc/sing-box/config.json
-          curl -fsS --connect-timeout 5 --max-time 15 http://127.0.0.1:7900/healthz >/dev/null
-          curl -fsS --resolve "${panel_domain}:8443:127.0.0.1" \
-            --connect-timeout 5 --max-time 20 "https://${panel_domain}:8443/healthz" >/dev/null
-          test -s "/etc/letsencrypt/live/${panel_domain}/fullchain.pem"
-          test -s "/etc/letsencrypt/live/${naive_domain}/fullchain.pem"
-          test -s /etc/rr-naive/fullchain.pem
-          openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
-            "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" >/dev/null
-          openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
-            "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" >/dev/null
-          ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])24443$'
-          ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])21443$'
-          ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])22443$'
-          ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])443$'
-          ss -H -lnu | awk '{print $5}' | grep -Eq '(:|\])23443$'
-          ss -H -lnu | awk '{print $5}' | grep -Eq '(:|\])25443$'
-          ss -H -lnu | awk '{print $5}' | grep -Eq '(:|\])443$'
-          test -d /tmp/sub_server
-          test "$(stat -c %a /tmp/sub_server)" = 700
-          test ! -L /tmp/sub_server
-          test -s /run/rr-vps-subscription.pid
-          test -s /run/rr-vps-subscription.bind
-          ! journalctl -u rr-nexus --no-pager 2>/dev/null | grep -Eq '/api/subscription/|/sub/'
-          printf 'RR_AUDIT_FULL_COMPLETE role=A os=%s version=%s protocols=all panel=domain\n' "$ID" "$VERSION_ID"
-          REMOTE
-          curl -fsS --connect-timeout 5 --max-time 20 \
-            "https://${host}:8443/healthz" >/dev/null
-
-  ubuntu-upgrade:
-    name: B · Ubuntu 22.04 · v7.1.0 data upgrade and rollback
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
       RR_B_HOST: ${{ secrets.RR_B_HOST }}
       RR_B_PASS: ${{ secrets.RR_B_PASS }}
     steps:
-      - name: Check out exact candidate
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: a4024e9951f68302db05f18188da24b7fd595f34
-          persist-credentials: false
-      - name: Prepare SSH client
+      - name: Install SSH password client
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
-          python3 scripts/rebuild-bundle.py --check
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Build old state, update, rollback, update again
+      - name: Print only redacted error evidence
         shell: bash
+        env:
+          ROLE: ${{ matrix.role }}
+          EXPECTED_ID: ${{ matrix.expected_id }}
+          EXPECTED_VERSION: ${{ matrix.expected_version }}
         run: |
           set -euo pipefail
           set +x
-          export SSHPASS="$RR_B_PASS"
-          host="$RR_B_HOST"
-          known_hosts="$RUNNER_TEMP/known-hosts-B"
-          ssh_opts=(
-            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
-            -o LogLevel=ERROR -o PreferredAuthentications=password
-            -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new
-            -o UserKnownHostsFile="$known_hosts"
-          )
-          sshpass -e ssh "${ssh_opts[@]}" "root@$host" \
-            'install -d -m 700 /root/rr-audit-candidate /root/rr-audit-old'
-          sshpass -e scp "${ssh_opts[@]}" -q \
-            rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
-            "root@$host:/root/rr-audit-candidate/"
-          sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s <<'REMOTE'
+          case "$ROLE" in
+            A) host="$RR_A_HOST"; export SSHPASS="$RR_A_PASS" ;;
+            B) host="$RR_B_HOST"; export SSHPASS="$RR_B_PASS" ;;
+            *) exit 2 ;;
+          esac
+          known_hosts="$RUNNER_TEMP/known-hosts-$ROLE"
+          sshpass -e ssh \
+            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2 \
+            -o LogLevel=ERROR -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$known_hosts" \
+            "root@$host" bash -s -- "$ROLE" "$EXPECTED_ID" "$EXPECTED_VERSION" <<'REMOTE'
           set -euo pipefail
-          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-          test "$(id -u)" -eq 0
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8
+          role="$1"
+          expected_id="$2"
+          expected_version="$3"
           # shellcheck disable=SC1091
           . /etc/os-release
-          test "$ID" = ubuntu
-          test "$VERSION_ID" = 22.04
-          test "$(ps -p 1 -o comm= | tr -d '[:space:]')" = systemd
-          test ! -e /etc/argo_vmess.conf
-          old=/root/rr-audit-old
-          candidate=/root/rr-audit-candidate
-          chmod 700 "$old" "$candidate"
-
-          # Stage 1 intentionally left a candidate runtime on this disposable
-          # host.  Use the product's own full uninstaller before constructing
-          # the exact 7.1.0 baseline; the downgrade guard must stay enabled.
+          test "$ID" = "$expected_id"
+          test "$VERSION_ID" = "$expected_version"
+          printf 'RR_AUDIT_DIAG role=%s runtime=' "$role"
           if [ -x /usr/local/bin/rr ]; then
-            if ! printf '%s\n' y | bash -c '
-                set -eo pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                uninstall_all
-              ' >/root/rr-audit-preclean.log 2>&1; then
-              echo 'B pre-clean failed; root-only log retained on VPS.' >&2
-              exit 1
+            /usr/local/bin/rr --version | head -1
+          else
+            printf 'missing\n'
+          fi
+          printf 'config=%s install_complete=%s active_tx=%s\n' \
+            "$([ -f /etc/argo_vmess.conf ] && printf present || printf absent)" \
+            "$(grep -q '^INSTALL_COMPLETE=true$' /etc/argo_vmess.conf 2>/dev/null && printf yes || printf no)" \
+            "$([ -e /var/lib/rr-update/active ] && printf yes || printf no)"
+          for unit in sing-box rr-nexus nginx; do
+            printf 'service_%s=%s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
+          done
+          if [ "$role" = A ]; then
+            printf 'ufw_package=%s ufw_state=%s marker_rule=%s\n' \
+              "$(dpkg-query -W -f='${db:Status-Status}' ufw 2>/dev/null || printf absent)" \
+              "$(ufw status 2>/dev/null | head -n 1 | tr ' ' '_' || true)" \
+              "$(ufw status 2>/dev/null | awk '$1 == "61234/tcp" {print $2; exit}' || true)"
+          fi
+          for log in \
+            /root/rr-audit-core.log /root/rr-audit-install.log /root/rr-audit-nexus.log \
+            /root/rr-audit-ufw-prepare.log /root/rr-audit-deps.log \
+            /root/rr-audit-preclean.log /root/rr-audit-old-deps.log \
+            /root/rr-audit-old-core.log /root/rr-audit-old-install.log /root/rr-audit-old-nexus.log \
+            /root/rr-audit-upgrade.log /root/rr-audit-manual-rollback.log; do
+            [ -r "$log" ] || continue
+            printf 'error_log=%s\n' "$(basename "$log")"
+            grep -Ei '\[失败\]|\[错误\]|failed|failure|error|invalid|refus|无法|拒绝|证书' "$log" 2>/dev/null \
+              | tail -n 12 \
+              | sed -E \
+                  -e 's#(UUID|PASS|PASSWORD|TOKEN|SECRET|RECOVERY)([=: ]+)[^ ]+#\1\2[redacted]#Ig' \
+                  -e 's#[A-Fa-f0-9]{32,}#[redacted]#g' \
+                  -e 's#[A-Za-z0-9_-]{40,}#[redacted]#g' \
+              || true
+            if [ ! -f /etc/argo_vmess.conf ]; then
+              printf 'redacted_tail=%s\n' "$(basename "$log")"
+              tail -n 60 "$log" \
+                | sed -E \
+                    -e 's#(UUID|PASS|PASSWORD|TOKEN|SECRET|RECOVERY)([=: ]+)[^ ]+#\1\2[redacted]#Ig' \
+                    -e 's#[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,36}#[redacted]#g' \
+                    -e 's#[A-Za-z0-9_+/=-]{20,}#[redacted]#g'
             fi
-          fi
-          test ! -e /usr/local/bin/rr
-          test ! -e /usr/local/lib/rr
-
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-            -o "$old/rr-bundle.tar.gz" \
-            https://github.com/Xiaowu7z/RR-vps/releases/download/v7.1.0/rr-bundle.tar.gz
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-            -o "$old/install-core.sh" \
-            https://raw.githubusercontent.com/Xiaowu7z/RR-vps/c1c1bc4e0a84dc35cb220066bc8315bfc03a89e9/scripts/install-core.sh
-          curl -fsSL --retry 3 --connect-timeout 10 --max-time 180 \
-            -o "$old/update-guard.sh" \
-            https://raw.githubusercontent.com/Xiaowu7z/RR-vps/c1c1bc4e0a84dc35cb220066bc8315bfc03a89e9/scripts/update-guard.sh
-          printf '%s  %s\n' \
-            f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d "$old/rr-bundle.tar.gz" \
-            e7ae1cfde8da5db8d25c5118b096e07f5e33821b4575249d5e3413b39f2d313c "$old/install-core.sh" \
-            9b2ca7d908ae0e0c47da25d8bdf371fee9ee4353e9fed494cb0f728933a35b13 "$old/update-guard.sh" \
-            | sha256sum -c - >/dev/null
-          chmod 600 "$old"/* "$candidate"/*
-          RR_BUNDLE_FILE="$old/rr-bundle.tar.gz" RR_GUARD_FILE="$old/update-guard.sh" \
-            bash "$old/install-core.sh" --upgrade >/root/rr-audit-old-core.log 2>&1
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.0' >/dev/null
-
-          bash -c '
-              set -eo pipefail
-              for module_file in /usr/local/lib/rr/modules/*.sh; do
-                # shellcheck disable=SC1090
-                source "$module_file"
-              done
-              install_deps </dev/null
-            ' >/root/rr-audit-old-deps.log 2>&1
-
-          old_install_log=/root/rr-audit-old-install.log
-          : > "$old_install_log"
-          chmod 600 "$old_install_log"
-          if ! printf '%s\n' '1,2,3,4,5' 24444 18081 21444 22444 23444 25444 n '' \
-            | bash -c '
-                set -eo pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                install_deps() { return 0; }
-                install_main
-              ' >>"$old_install_log" 2>&1; then
-            echo 'B old-version protocol install failed; root-only log retained on VPS.' >&2
-            exit 1
-          fi
-
-          panel_pass=$(openssl rand -hex 20)
-          test "${#panel_pass}" -ge 12
-          (umask 077; printf '%s\n' "$panel_pass" > /root/rr-audit-panel-pass)
-          old_panel_log=/root/rr-audit-old-nexus.log
-          : > "$old_panel_log"
-          chmod 600 "$old_panel_log"
-          if ! printf '%s\n' 3 10443 auditadmin "$panel_pass" "$panel_pass" '' \
-            | bash -c '
-                set -eo pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                nexus_install
-              ' >>"$old_panel_log" 2>&1; then
-            echo 'B old-version Nexus install failed; root-only log retained on VPS.' >&2
-            exit 1
-          fi
-          unset panel_pass
-
-          systemctl is-active --quiet sing-box
-          systemctl is-active --quiet rr-nexus
-          systemctl is-active --quiet nginx
-          legacy_credential=$(cat /proc/sys/kernel/random/uuid)
-          legacy_token=$(openssl rand -hex 24)
-          sqlite3 /var/lib/rr-nexus/nexus.db <<SQL
-          INSERT INTO devices(
-            id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,
-            uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,
-            next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at
-          ) VALUES(
-            'dev_audit001','legacy-phone','$legacy_credential',
-            '$legacy_token',1,10737418240,1234567,456789,777778,
-            '2026-08-27T00:00:00+00:00',NULL,'2027-08-27','2026-09-27',27,12,3,
-            '2026-08-01T00:00:00+00:00','2026-08-27T00:00:00+00:00'
-          );
-          SQL
-          unset legacy_credential legacy_token
-          systemctl restart rr-nexus
-          sleep 2
-          sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA wal_checkpoint(FULL);' >/dev/null
-          cp -p /etc/argo_vmess.conf /root/rr-audit-before.conf
-          cp -p /etc/rr-nexus/nexus.json /root/rr-audit-before-nexus.json
-          sqlite3 /var/lib/rr-nexus/nexus.db \
-            "SELECT id||'|'||name||'|'||credential||'|'||enabled||'|'||quota_bytes||'|'||used_bytes||'|'||reset_count FROM devices WHERE id='dev_audit001';" \
-            > /root/rr-audit-before-device.txt
-          chmod 600 /root/rr-audit-before.* /root/rr-audit-before-device.txt
-
-          install_candidate() {
-            RR_BUNDLE_FILE="$candidate/rr-bundle.tar.gz" \
-            RR_GUARD_FILE="$candidate/update-guard.sh" \
-              bash "$candidate/install-core.sh" --upgrade
-          }
-          assert_data() {
-            /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null
-            systemctl is-active --quiet sing-box
-            systemctl is-active --quiet rr-nexus
-            systemctl is-active --quiet nginx
-            test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
-            current=$(sqlite3 /var/lib/rr-nexus/nexus.db \
-              "SELECT id||'|'||name||'|'||credential||'|'||enabled||'|'||quota_bytes||'|'||used_bytes||'|'||reset_count FROM devices WHERE id='dev_audit001';")
-            test "$current" = "$(cat /root/rr-audit-before-device.txt)"
-            for key in UUID PORT SUB_PORT VL_PORT HY2_PORT TU5_PORT AN_PORT PRIVATE_KEY PUBLIC_KEY SHORT_ID; do
-              before=$(grep -m1 "^${key}=" /root/rr-audit-before.conf)
-              after=$(grep -m1 "^${key}=" /etc/argo_vmess.conf)
-              test "$before" = "$after"
-            done
-            test "$(jq -r '.mode,.port,.ssh_host' /etc/rr-nexus/nexus.json)" = \
-              "$(jq -r '.mode,.port,.ssh_host' /root/rr-audit-before-nexus.json)"
-            panel_port=$(jq -r '.public_port' /etc/rr-nexus/nexus.json)
-            curl -kfsS --connect-timeout 5 --max-time 15 \
-              "https://127.0.0.1:${panel_port}/healthz" >/dev/null
-          }
-
-          install_candidate >/root/rr-audit-upgrade.log 2>&1
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.1' >/dev/null
-          assert_data
-          /usr/local/sbin/rr-update-recover rollback >/root/rr-audit-manual-rollback.log 2>&1
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.0' >/dev/null
-          assert_data
-          install_candidate >>/root/rr-audit-upgrade.log 2>&1
-          /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.1' >/dev/null
-          assert_data
-          test "$(stat -c %a /etc/argo_vmess.conf)" = 600
-          test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
-          printf 'RR_AUDIT_UPGRADE_COMPLETE role=B os=%s version=%s old=7.1.0 new=7.1.1 rollback=ok data=preserved\n' "$ID" "$VERSION_ID"
+          done
+          printf 'RR_AUDIT_DIAG_COMPLETE role=%s\n' "$role"
           REMOTE
-          curl -kfsS --connect-timeout 5 --max-time 20 \
-            "https://${host}:10443/healthz" >/dev/null
