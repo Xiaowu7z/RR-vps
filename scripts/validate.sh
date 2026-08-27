@@ -1222,7 +1222,7 @@ assert policy_traffic.calls == 2
 PY
 rm -rf "$argon2_stub"
 
-if rg -n 'proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for' modules/85-nexus.sh; then
+if grep -En 'proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for' modules/85-nexus.sh; then
     echo "Nginx still appends an attacker-controlled X-Forwarded-For value." >&2
     exit 1
 fi

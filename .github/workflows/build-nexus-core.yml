@@ -4,19 +4,33 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
-  push:
-    paths:
-      - ".github/workflows/build-nexus-core.yml"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: rr-nexus-core
   cancel-in-progress: false
 
 jobs:
+  verify-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main and a green CI run for this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          runs=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed&per_page=20")
+          jq -e '.workflow_runs | any(.conclusion == "success")' <<<"$runs" >/dev/null
+
   version:
+    needs: verify-ci
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}

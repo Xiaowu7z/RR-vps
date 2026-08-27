@@ -4,6 +4,10 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
+expected_version=$(tr -d '[:space:]' < version)
+case "$expected_version" in
+    ''|*[!0-9A-Za-z.-]*) echo "Invalid repository version: $expected_version" >&2; exit 1 ;;
+esac
 
 python3 scripts/rebuild-bundle.py --check
 bash scripts/validate.sh
@@ -29,7 +33,7 @@ export PATH="$mock_bin:$PATH"
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 test -x /usr/local/sbin/rr-update-recover
 test -s /usr/local/lib/rr/modules/61-update-guard.sh
 test -x /usr/local/lib/rr/scripts/naive-cert-hook.sh
@@ -58,7 +62,7 @@ if RR_TEST_FAULTS=1 RR_TEST_FAIL_PHASE=old_runtime_moved \
     echo "catchable old-runtime-moved fault unexpectedly succeeded" >&2
     exit 1
 fi
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 test "$(sha256sum /usr/local/lib/rr/manifest.sha256 | awk '{print $1}')" = "$first_manifest"
 test ! -e /var/lib/rr-update/active
 
@@ -71,7 +75,7 @@ if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=old_runtime_moved \
     exit 1
 fi
 /usr/local/sbin/rr-update-recover recover
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
@@ -87,7 +91,7 @@ if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=runtime_swapped \
     exit 1
 fi
 /usr/local/sbin/rr-update-recover recover
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
@@ -96,7 +100,7 @@ RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
 # The previous committed transaction is deliberately retained.  Prove the
 # one-command manual rollback works and leaves a loadable runtime.
 /usr/local/sbin/rr-update-recover rollback
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 # Exercise the user-facing complete uninstall in the disposable container.
 printf 'y\n' | bash -c '
