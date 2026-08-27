@@ -8,17 +8,17 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.1.0** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.1.1** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### 7.1.0 新功能：自愈更新、体检迁移、安全与主动告警
+### 7.1.1：安全与发布门禁维护版
 
-7.1.0 把热更新改造成可跨进程、跨重启恢复的持久事务：升级前预检和快照，下载包、启动器与守卫脚本多层 SHA256 锁定，原子切换后执行配置、数据库与服务健康门禁；中途断电或进程被杀会在下次启动自动恢复，失败自动回滚，也可运行 `rr update --rollback` 回到上一版。
+7.1.1 集中修复订阅鉴权、SSRF、代理来源伪造、备份恢复注入、临时目录符号链接、慢客户端资源耗尽和更新回滚问题。Stable 更新只消费 CI 全绿后生成的 GitHub Release，并固定到同版本 Tag；Beta 与 Stable 分离。
 
-本版同时加入 `rr doctor` 一键体检与脱敏报告、加密 `.rrbak` 备份迁移、Telegram / HTTPS Webhook 告警、TOTP 与 Passkey、24 小时 / 7 天 / 30 天历史图表、设备分组模板和批量管理、Stable / Beta 更新通道，以及 NaiveProxy HTTP/3 / QUIC 模式。旧配置迁移默认保留原 HTTP/2 行为，不会静默改变现有节点。
+原有 `rr doctor`、加密 `.rrbak`、告警、TOTP/Passkey、历史图表、批量管理和 NaiveProxy HTTP/3 功能保持兼容；完整变更见 Changelog。
 
 ## 一键安装
 
-支持系统（2026-08 全量矩阵实测通过）：
+目标支持系统（每个正式版本均以 CI 与真实 VPS 发布门禁复核）：
 
 | 系统 | 支持度 | 说明 |
 | --- | --- | --- |
@@ -37,13 +37,13 @@ sudo -i
 使用 curl 安装（推荐）：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(curl -fsSL "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 没有 curl 时使用 wget：
 
 ```bash
-bash <(wget -qO- "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(wget -qO- "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 安装后打开管理面板：

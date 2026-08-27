@@ -4,30 +4,44 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
-  push:
-    paths:
-      - ".github/workflows/build-nexus-core.yml"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: rr-nexus-core
   cancel-in-progress: false
 
 jobs:
+  verify-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main and a green CI run for this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          runs=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed&per_page=20")
+          jq -e '.workflow_runs | any(.conclusion == "success")' <<<"$runs" >/dev/null
+
   version:
+    needs: verify-ci
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
       needed: ${{ steps.release.outputs.needed }}
     steps:
       - name: Resolve latest stable sing-box release
         id: release
         shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           release_json=$(curl -fsSL --retry 3 \
@@ -37,30 +51,36 @@ jobs:
           tag=$(jq -r '.tag_name // empty' <<<"$release_json")
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
           version=${tag#v}
+          source_sha=$(git ls-remote https://github.com/SagerNet/sing-box.git \
+            "refs/tags/${tag}" "refs/tags/${tag}^{}" | \
+            awk '/\^\{\}$/ {print $1; found=1} !first {first=$1} END {if (!found) print first}' | tail -n 1)
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
+          release_tag="rr-nexus-core-${tag}"
+          current_json=$(curl -fsSL --retry 2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: RR-vps-builder' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" \
+            2>/dev/null || printf '{}')
           needed=true
-          if [ "$EVENT_NAME" = schedule ]; then
-            current_json=$(curl -fsSL --retry 2 \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'User-Agent: RR-vps-builder' \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/rr-nexus-core" \
-              2>/dev/null || printf '{}')
-            info_url=$(jq -r '.assets[]? | select(.name == "BUILD_INFO") | .browser_download_url' \
-              <<<"$current_json" | head -n 1)
-            current_version=""
-            if [[ "$info_url" == https://github.com/${GITHUB_REPOSITORY}/releases/download/rr-nexus-core/* ]]; then
-              current_version=$(curl -fsSL --retry 2 "$info_url" 2>/dev/null | \
-                awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' || true)
-            fi
+          if [ "$(jq -r '.tag_name // empty' <<<"$current_json")" = "$release_tag" ]; then
+            complete=true
             for asset in \
               "rr-sing-box-${version}-linux-amd64.tar.gz" \
               "rr-sing-box-${version}-linux-arm64.tar.gz" SHA256SUMS BUILD_INFO; do
               jq -e --arg name "$asset" '.assets[]? | select(.name == $name)' \
-                <<<"$current_json" >/dev/null || current_version=""
+                <<<"$current_json" >/dev/null || complete=false
             done
-            [ "$current_version" = "$version" ] && needed=false
+            if [ "$complete" = true ]; then
+              needed=false
+            else
+              echo "Incomplete immutable release ${release_tag}; refusing to overwrite it." >&2
+              exit 1
+            fi
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           echo "needed=$needed" >> "$GITHUB_OUTPUT"
 
   build:
@@ -82,9 +102,10 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "${{ needs.version.outputs.tag }}" \
             https://github.com/SagerNet/sing-box.git sing-box
+          test "$(git -C sing-box rev-parse HEAD)" = "${{ needs.version.outputs.source_sha }}"
 
       - name: Set up Go from upstream go.mod
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: sing-box/go.mod
           cache-dependency-path: sing-box/go.sum
@@ -113,7 +134,7 @@ jobs:
             "sing-box-${VERSION}-linux-${GOARCH}"
 
       - name: Upload architecture artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rr-sing-box-${{ matrix.arch }}
           path: dist/rr-sing-box-*.tar.gz
@@ -128,7 +149,7 @@ jobs:
       contents: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: rr-sing-box-*
           path: release-assets
@@ -143,6 +164,7 @@ jobs:
           printf '%s\n' \
             "SING_BOX_VERSION=${{ needs.version.outputs.version }}" \
             "SING_BOX_TAG=${{ needs.version.outputs.tag }}" \
+            "SOURCE_COMMIT=${{ needs.version.outputs.source_sha }}" \
             "BUILD_TAG=with_v2ray_api" \
             "SOURCE=https://github.com/SagerNet/sing-box/tree/${{ needs.version.outputs.tag }}" \
             > BUILD_INFO
@@ -153,34 +175,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=rr-nexus-core
+          tag="${{ needs.version.outputs.release_tag }}"
           title="RR Nexus traffic core · sing-box ${{ needs.version.outputs.version }}"
-          notes="Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand."
+          notes="Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This prerelease is consumed only by its immutable versioned tag."
 
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "$title" --notes "$notes"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Immutable core release already exists: $tag" >&2
+            exit 1
           fi
-
-          # Upload versioned binaries first. Existing assets and metadata remain
-          # downloadable if a build or upload fails midway.
-          gh release upload "$tag" release-assets/rr-sing-box-*.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          # Switch the verified metadata only after both binaries are present.
-          gh release upload "$tag" release-assets/SHA256SUMS release-assets/BUILD_INFO \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "$title" --notes "$notes"
-
-          current_amd64="rr-sing-box-${{ needs.version.outputs.version }}-linux-amd64.tar.gz"
-          current_arm64="rr-sing-box-${{ needs.version.outputs.version }}-linux-arm64.tar.gz"
-          while IFS= read -r asset; do
-            case "$asset" in
-              "$current_amd64"|"$current_arm64"|SHA256SUMS|BUILD_INFO) continue ;;
-              rr-sing-box-*-linux-*.tar.gz)
-                gh release delete-asset "$tag" "$asset" \
-                  --repo "$GITHUB_REPOSITORY" --yes
-                ;;
-            esac
-          done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name')
+          gh release create "$tag" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$title" --notes "$notes" \
+            --prerelease --latest=false

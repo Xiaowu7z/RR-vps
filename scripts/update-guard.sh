@@ -29,6 +29,7 @@ rr_update_guard_download() {
     local relative_path=""
     local repository="${RR_REPOSITORY:-Xiaowu7z/RR-vps}"
     local branch="${RR_BRANCH:-main}"
+    local channel="${RR_UPDATE_CHANNEL:-stable}"
     local raw_base="${RR_RAW_BASE:-https://raw.githubusercontent.com/${repository}/refs/heads/${branch}}"
     local api_base="${RR_API_BASE:-https://api.github.com/repos/${repository}/contents}"
     local cdn_base="${RR_CDN_BASE:-https://cdn.jsdelivr.net/gh/${repository}@${branch}}"
@@ -38,21 +39,13 @@ rr_update_guard_download() {
         "${raw_base}/"*) relative_path="${source_url#"${raw_base}/"}" ;;
     esac
 
-    if [ -n "${RR_GITHUB_MIRROR:-}" ]; then
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
-                "${RR_GITHUB_MIRROR}${source_url}" -o "$target_file" 2>/dev/null && return 0
-        elif command -v wget >/dev/null 2>&1; then
-            wget -q --timeout="$timeout_seconds" --tries=2 \
-                -O "$target_file" "${RR_GITHUB_MIRROR}${source_url}" 2>/dev/null && return 0
-        fi
-    fi
-
+    # manifest/bootstrap 都会影响随后执行的 root 代码。它们只允许从 GitHub
+    # 官方 TLS 端点取得，用户镜像不能成为更新信任根。
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 3 --retry-delay 2 --connect-timeout "$timeout_seconds" --max-time 180 \
             -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
             "${source_url}?t=${cache_buster}" -o "$target_file" 2>/dev/null && return 0
-        if [ -n "$relative_path" ]; then
+        if [ "$channel" = beta ] && [ -n "$relative_path" ]; then
             curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 180 \
                 -H "Accept: application/vnd.github.raw+json" \
                 "${api_base}/${relative_path}?ref=${branch}&t=${cache_buster}" \
@@ -64,7 +57,7 @@ rr_update_guard_download() {
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout="$timeout_seconds" --tries=3 \
             -O "$target_file" "${source_url}?t=${cache_buster}" && return 0
-        if [ -n "$relative_path" ]; then
+        if [ "$channel" = beta ] && [ -n "$relative_path" ]; then
             wget -q --timeout="$timeout_seconds" --tries=2 \
                 --header="Accept: application/vnd.github.raw+json" \
                 -O "$target_file" \

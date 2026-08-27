@@ -390,9 +390,9 @@
 
   <dialog id="password-dialog" class="modal"><form id="password-form" method="dialog" class="stack-form" autocomplete="off">
     <div class="modal-head"><div><span class="eyebrow">SECURITY</span><h2>修改密码</h2></div><button type="button" class="close-button" data-close-dialog>&times;</button></div>
-    <label>旧密码<input name="old_password" type="password" required></label>
-    <label>新密码<input name="new_password" type="password" required></label>
-    <label>确认新密码<input name="password_again" type="password" required></label>
+    <label>旧密码<input name="old_password" type="password" maxlength="512" required></label>
+    <label>新密码<input name="new_password" type="password" minlength="12" maxlength="512" required></label>
+    <label>确认新密码<input name="password_again" type="password" minlength="12" maxlength="512" required></label>
     <div id="password-form-error" class="form-error hidden"></div>
     <button type="submit" class="button primary wide">更新密码</button>
   </form></dialog>

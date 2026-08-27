@@ -68,6 +68,9 @@ EXEC_MEMBERS = {
 BUNDLE_HASH_PATTERN = re.compile(r'\[ "\$actual" = "([0-9a-f]{64})" \]')
 CORE_PIN_PATTERN = re.compile(r'^RR_CORE_SHA256="([0-9a-f]{64})"$', re.MULTILINE)
 GUARD_PIN_PATTERN = re.compile(r'^RR_GUARD_SHA256="([0-9a-f]{64})"$', re.MULTILINE)
+RELEASE_TAG_PATTERN = re.compile(
+    r'^RR_RELEASE_TAG="v([0-9]+\.[0-9]+\.[0-9]+)"$', re.MULTILINE
+)
 VERSION_PATTERN = re.compile(r"^(\d+\.\d+\.\d+)$")
 
 
@@ -107,6 +110,15 @@ def sync_version(version: str) -> None:
     if count != 1:
         raise ValueError("modules/00-runtime.sh 中 SCRIPT_VERSION 不唯一或不存在")
     write_text_lf(RUNTIME_FILE, updated)
+
+    for path in (INSTALL_SH, INSTALL_CORE):
+        source = path.read_text(encoding="utf-8")
+        source, tag_count = RELEASE_TAG_PATTERN.subn(
+            f'RR_RELEASE_TAG="v{version}"', source, count=1
+        )
+        if tag_count != 1:
+            raise ValueError(f"{path.name} 中 RR_RELEASE_TAG 不唯一或不存在")
+        write_text_lf(path, source)
 
 
 def expected_manifest() -> bytes:
@@ -226,6 +238,12 @@ def check() -> int:
         raise ValueError(
             f"版本不同步：version={version}, SCRIPT_VERSION={runtime_versions or '缺失'}"
         )
+    for path in (INSTALL_SH, INSTALL_CORE):
+        tags = RELEASE_TAG_PATTERN.findall(path.read_text(encoding="utf-8"))
+        if tags != [version]:
+            raise ValueError(
+                f"发布 Tag 不同步：{path.name}={tags or '缺失'}, version={version}"
+            )
 
     manifest_raw = expected_manifest()
     if not MANIFEST.is_file() or MANIFEST.read_bytes() != manifest_raw:

@@ -76,6 +76,162 @@ echo "[3/13] Fresh-install port selection regression"
     selected_port=""
     prompt_initial_port selected_port "回归测试" tcp <<< ""
     is_valid_port "$selected_port"
+
+    # Naive 首装必须能接受真实域名。函数缺失会被 Bash 当作 127，导致
+    # 安装向导把每次输入都判为无效并无限等待。
+    is_valid_domain naive.example.com
+    is_valid_domain A-b.example.co.uk
+    is_valid_domain xn--fsqu00a.xn--0zwm56d
+    for invalid_domain in '' localhost 203.0.113.1 .example.com example.com. \
+        bad_label.example.com bad..example.com -bad.example.com bad_.example.com; do
+        if is_valid_domain "$invalid_domain"; then
+            echo "Invalid Naive domain was accepted: $invalid_domain" >&2
+            exit 1
+        fi
+    done
+)
+
+# 安装依赖不能为了持久化 RR 的 iptables 规则而删除用户已有的 UFW。
+# 用模拟 apt 验证两个分支，避免测试本身改动 CI 主机的软件包。
+(
+    load_modules_for_tests
+    apt_log=$(mktemp)
+    trap 'rm -f "$apt_log"' EXIT
+    apt-get() { printf '%s\n' "$*" >> "$apt_log"; }
+    debconf-set-selections() { :; }
+    systemctl() { :; }
+    vnstat() { :; }
+    modprobe() { :; }
+    sysctl() {
+        [ "${1:-}" = -n ] && printf '%s\n' cubic
+        return 0
+    }
+
+    rr_ufw_installed() { return 0; }
+    install_deps >/dev/null
+    if grep -q 'iptables-persistent' "$apt_log"; then
+        echo "Existing UFW would be replaced by iptables-persistent." >&2
+        exit 1
+    fi
+
+    : > "$apt_log"
+    rr_ufw_installed() { return 1; }
+    install_deps >/dev/null
+    grep -q 'install -y iptables-persistent' "$apt_log" || {
+        echo "No firewall persistence backend was installed without UFW." >&2
+        exit 1
+    }
+)
+
+# Naive 首装证书必须先真正启动 ACME Webroot，再调用 certbot；同时不得
+# 为签证书强杀占用 80 端口的其他服务。
+(
+    load_modules_for_tests
+    naive_root=$(mktemp -d)
+    trap 'rm -rf "$naive_root"' EXIT
+    RR_NAIVE_ACME_WEBROOT="$naive_root/webroot"
+    RR_NAIVE_ACME_NGINX_SITE="$naive_root/sites-available/rr-naive-acme.conf"
+    RR_NAIVE_ACME_NGINX_ENABLED="$naive_root/sites-enabled/rr-naive-acme.conf"
+    RR_LE_LIVE_ROOT="$naive_root/letsencrypt/live"
+    RR_NAIVE_CERT_DIR="$naive_root/certs"
+    call_log="$naive_root/calls"
+    : > "$call_log"
+
+    tcp_port_in_use() { return 1; }
+    nginx() {
+        [ "${1:-}" = -t ] || return 1
+        printf '%s\n' nginx-test >> "$call_log"
+    }
+    certbot() {
+        printf '%s\n' certbot >> "$call_log"
+        mkdir -p "$RR_LE_LIVE_ROOT/naive.example.com"
+        printf '%s\n' certificate > "$RR_LE_LIVE_ROOT/naive.example.com/fullchain.pem"
+        printf '%s\n' private-key > "$RR_LE_LIVE_ROOT/naive.example.com/privkey.pem"
+    }
+    systemctl() {
+        if [ "${1:-}" = is-active ]; then
+            return 1
+        fi
+        printf 'systemctl:%s\n' "$*" >> "$call_log"
+    }
+    open_protocol_firewall() { printf 'firewall:%s:%s\n' "$1" "$2" >> "$call_log"; }
+    deploy_naive_cert_hook() { printf '%s\n' deploy-hook >> "$call_log"; }
+
+    ensure_naive_certificate naive.example.com ""
+    [ -L "$RR_NAIVE_ACME_NGINX_ENABLED" ]
+    grep -Fq 'server_name naive.example.com;' "$RR_NAIVE_ACME_NGINX_SITE"
+    grep -Fq "root $RR_NAIVE_ACME_WEBROOT;" "$RR_NAIVE_ACME_NGINX_SITE"
+    grep -Fq 'systemctl:enable --now nginx' "$call_log"
+    grep -Fq 'firewall:80:tcp' "$call_log"
+    [ $(( 8#$(stat -c %a "$(dirname "$RR_NAIVE_ACME_WEBROOT")") & 1 )) -eq 1 ]
+    certbot_line=$(grep -n '^certbot$' "$call_log" | cut -d: -f1)
+    firewall_line=$(grep -n '^firewall:80:tcp$' "$call_log" | cut -d: -f1)
+    [ "$firewall_line" -lt "$certbot_line" ]
+    [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/fullchain.pem")" = 600 ]
+    [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/privkey.pem")" = 600 ]
+
+    conflict_root="$naive_root/conflict"
+    RR_NAIVE_ACME_WEBROOT="$conflict_root/webroot"
+    RR_NAIVE_ACME_NGINX_SITE="$conflict_root/sites-available/rr-naive-acme.conf"
+    RR_NAIVE_ACME_NGINX_ENABLED="$conflict_root/sites-enabled/rr-naive-acme.conf"
+    tcp_port_in_use() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 511 0.0.0.0:80 users:(("apache2",pid=1,fd=3))'; }
+    if prepare_naive_acme_webroot naive.example.com; then
+        echo "Naive ACME setup accepted port 80 owned by a non-Nginx service." >&2
+        exit 1
+    fi
+    [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
+)
+
+# 更新/回滚后的订阅 worker 可能没有 PID 文件。进程回收必须依靠命令行
+# 与 RR 订阅根 cwd 双重身份，而不是广泛 pkill 或仅信任状态文件。
+(
+    load_modules_for_tests
+    subscription_test_root=$(mktemp -d)
+    trap 'rm -rf "$subscription_test_root"' EXIT
+    RR_PROC_ROOT="$subscription_test_root/proc"
+    SUB_ROOT="$subscription_test_root/sub-root"
+    mkdir -p "$RR_PROC_ROOT/1234" "$RR_PROC_ROOT/5678" "$SUB_ROOT" "$subscription_test_root/other-root"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/1234/cmdline"
+    ln -s "$SUB_ROOT" "$RR_PROC_ROOT/1234/cwd"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/5678/cmdline"
+    ln -s "$subscription_test_root/other-root" "$RR_PROC_ROOT/5678/cwd"
+    [ "$(managed_subscription_pids)" = 1234 ]
+    subscription_server_running
+    SUB_PID_FILE="$subscription_test_root/current.pid"
+    SUB_BIND_STATE_FILE="$subscription_test_root/current.bind"
+    : > "$SUB_PID_FILE"
+    : > "$SUB_BIND_STATE_FILE"
+    : > "$subscription_test_root/killed"
+    kill() {
+        printf '%s\n' "$1" >> "$subscription_test_root/killed"
+        rm -rf "$RR_PROC_ROOT/$1"
+    }
+    sleep() { :; }
+    stop_subscription_servers
+    [ "$(cat "$subscription_test_root/killed")" = 1234 ]
+    [ -d "$RR_PROC_ROOT/5678" ]
+    [ ! -e "$SUB_PID_FILE" ]
+    [ ! -e "$SUB_BIND_STATE_FILE" ]
+)
+
+# Nexus 公网 IP 安装后的健康检查必须使用真实存在的地址构造函数，且
+# IPv6 URL 必须带方括号。
+(
+    load_modules_for_tests
+    nexus_url_root=$(mktemp -d)
+    trap 'rm -rf "$nexus_url_root"' EXIT
+    NEXUS_CONFIG_FILE="$nexus_url_root/nexus.json"
+    printf '%s\n' '{"mode":"public","domain":"203.0.113.8","ssh_host":"203.0.113.8","public_port":10443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://203.0.113.8:10443' ]
+    printf '%s\n' '{"mode":"public","domain":"2001:db8::8","ssh_host":"2001:db8::8","public_port":10443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://[2001:db8::8]:10443' ]
+    printf '%s\n' '{"mode":"public","domain":"panel.example.com","ssh_host":"203.0.113.8","public_port":443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://panel.example.com' ]
+    if grep -q 'nexus_access_url' modules/85-nexus.sh; then
+        echo "Nexus install still calls the nonexistent nexus_access_url helper." >&2
+        exit 1
+    fi
 )
 
 echo "[4/13] Fresh-install snapshot regression"
@@ -114,6 +270,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 1; }
     systemctl() { return 1; }
     pgrep() { return 1; }
 
@@ -140,6 +297,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 0; }
     systemctl() { return 0; }
     pgrep() { return 0; }
 
@@ -165,6 +323,7 @@ snapshot_function=$(awk '
     rr_backup_file() { return 1; }
     rr_backup_dir() { return 0; }
     rr_backup_sqlite() { return 0; }
+    rr_subscription_running() { return 1; }
     systemctl() { return 1; }
     pgrep() { return 1; }
 
@@ -173,6 +332,43 @@ snapshot_function=$(awk '
         exit 1
     fi
     rm -rf "$RR_TX_ROOT"
+)
+
+# A normal (catchable) failure after the old runtime was moved but before the
+# replacement became live must restore the old directory.  Relying only on the
+# RUNTIME_REPLACED flag loses both copies during EXIT cleanup.
+rollback_function=$(awk '
+    /^rr_rollback\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^}$/ { exit }
+' scripts/install-core.sh)
+(
+    eval "$rollback_function"
+    rollback_root=$(mktemp -d)
+    RR_LIB_DIR="$rollback_root/live-runtime"
+    OLD_RUNTIME="$rollback_root/transaction/old-runtime"
+    BACKUP_DIR="$rollback_root/transaction/backup"
+    RR_LAUNCHER="$rollback_root/rr"
+    RR_ACTIVE_TX="$rollback_root/active"
+    RR_TX_ROOT="$rollback_root/update-root"
+    TX_DIR="$rollback_root/transaction"
+    mkdir -p "$OLD_RUNTIME/modules" "$BACKUP_DIR"
+    printf '%s\n' old-runtime > "$OLD_RUNTIME/modules/sentinel"
+    TRANSACTION_ACTIVE=true
+    RUNTIME_REPLACED=false
+    ROLLBACK_FAILED=false
+    systemctl() { return 0; }
+    rr_stop_subscription_servers() { return 0; }
+    rr_error() { return 0; }
+    rr_restore_file() { return 0; }
+    rr_restore_dir() { return 0; }
+    rr_restore_sqlite() { return 0; }
+    rr_write_phase() { return 0; }
+
+    rr_rollback
+    [ -f "$RR_LIB_DIR/modules/sentinel" ]
+    [ ! -e "$OLD_RUNTIME" ]
+    rm -rf "$rollback_root"
 )
 
 echo "[5/13] Fresh-install crypto material regression"
@@ -212,6 +408,37 @@ echo "[5/13] Fresh-install crypto material regression"
         exit 1
     }
     rm -f "$CONFIG_FILE"
+)
+
+# Portable restores must never accept executable cron/unit payloads.  Those
+# files are regenerated from the manifest-verified runtime after data restore.
+(
+    load_modules_for_tests
+    backup_guard_tmp=$(mktemp -d)
+    trap 'rm -rf "$backup_guard_tmp"' EXIT
+    malicious_cron="$backup_guard_tmp/malicious-cron"
+    printf '%s\n' '* * * * * /bin/sh -c id # auto_update_sub.py' > "$malicious_cron"
+    crontab() {
+        if [ "${1:-}" = "-l" ]; then
+            return 1
+        fi
+        cp "$1" "$backup_guard_tmp/installed-cron"
+    }
+    if rr_restore_crontab "$malicious_cron"; then
+        echo "A backup-supplied cron command was accepted." >&2
+        exit 1
+    fi
+    rr_auto_update_cron_line > "$backup_guard_tmp/safe-cron"
+    rr_restore_crontab "$backup_guard_tmp/safe-cron"
+    cmp -s "$backup_guard_tmp/safe-cron" "$backup_guard_tmp/installed-cron"
+
+    mkdir -p "$backup_guard_tmp/tree/rootfs/etc/systemd/system"
+    printf '%s\n' '[Service]' 'ExecStart=/bin/sh -c id' > \
+        "$backup_guard_tmp/tree/rootfs/etc/systemd/system/rr-nexus.service"
+    if rr_restore_apply_tree "$backup_guard_tmp/tree"; then
+        echo "A backup-supplied systemd unit was accepted." >&2
+        exit 1
+    fi
 )
 
 # T10/A10：无 schema 旧配置不得默认视为已安装活节点（INSTALL_COMPLETE 保守为 false）。
@@ -307,7 +534,7 @@ post_update_function=$(awk '
     load_config_with_defaults() { INSTALL_COMPLETE=false; return 0; }
     any_node_protocol_enabled() { return 1; }
     systemctl() { return 0; }
-    pkill() { return 0; }
+    stop_subscription_servers() { return 0; }
     sleep() { :; }
     post_update_migrate
     rm -f "$CONFIG_FILE"
@@ -327,6 +554,36 @@ post_update_function=$(awk '
 echo "[6/13] Subscription URL control-character regression"
 (
     load_modules_for_tests
+    rr_security_tmp=$(mktemp -d)
+    mkdir "$rr_security_tmp/victim" "$rr_security_tmp/backup"
+    printf '%s\n' protected > "$rr_security_tmp/victim/marker"
+    ln -s "$rr_security_tmp/victim" "$rr_security_tmp/sub-root"
+    SUB_ROOT="$rr_security_tmp/sub-root"
+    if ensure_subscription_root >/dev/null 2>&1; then
+        echo "Symlink subscription root was accepted." >&2
+        exit 1
+    fi
+    [ "$(cat "$rr_security_tmp/victim/marker")" = protected ]
+    [ -z "$(find "$rr_security_tmp/victim" -mindepth 1 ! -name marker -print -quit)" ]
+    # 事务备份同样必须在读取目录内容前拒绝符号链接。
+    rr_backup_dir_function=$(awk '
+        /^rr_backup_dir\(\) \{/ { capture = 1 }
+        capture { print }
+        capture && /^}$/ { exit }
+    ' scripts/install-core.sh)
+    eval "$rr_backup_dir_function"
+    BACKUP_DIR="$rr_security_tmp/backup"
+    rr_error() { :; }
+    if rr_backup_dir "$SUB_ROOT" subscription; then
+        echo "Updater backed up a symlink subscription root." >&2
+        exit 1
+    fi
+    rm -rf "$rr_security_tmp"
+    [ "$SUB_PID_FILE" = /run/rr-vps-subscription.pid ]
+    [ "$SUB_BIND_STATE_FILE" = /run/rr-vps-subscription.bind ]
+    [ "$ARGO_PID_FILE" = /run/rr-vps-argo-cloudflared.pid ]
+    grep -Fq 'root_stat = os.lstat(SUB_ROOT)' modules/90-auto-update.sh
+
     # 常驻订阅进程必须在 sub_server.py 内容变化时重启。旧实现只比较
     # 端口和监听地址，导致热更新文件已替换但进程仍执行旧代码。
     rr_restart_tmp=$(mktemp -d)
@@ -337,6 +594,7 @@ echo "[6/13] Subscription URL control-character regression"
     SUB_PORT=39291
     SUB_BIND_ADDRESS=127.0.0.1
     mkdir -p "$RR_LIB_DIR/nexus" "$SUB_ROOT"
+    ensure_subscription_root() { return 0; }
     printf '%s\n' 'print("old")' > "$RR_LIB_DIR/nexus/sub_server.py"
     rr_old_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
     printf '%s\n' 4242 > "$SUB_PID_FILE"
@@ -472,6 +730,124 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
+# 超限请求体必须在读取前以 413 拒绝，不能只读一个前缀后把它当成完整
+# JSON，也不能在缺少 Content-Length 时阻塞等客户端主动断开。
+import io
+
+body_handler = object.__new__(module.Handler)
+body_handler.rfile = io.BytesIO(b"{}")
+body_handler.headers = {"Content-Length": str(module.MAX_BODY + 1)}
+try:
+    body_handler.read_json()
+except module.RequestBodyTooLarge:
+    pass
+else:
+    raise AssertionError("oversized normal API body was not rejected")
+body_handler.headers = {"Content-Length": str(module.MAX_JSON_BODY_BYTES + 1)}
+try:
+    body_handler.read_json_body()
+except module.RequestBodyTooLarge:
+    pass
+else:
+    raise AssertionError("oversized remote/firewall API body was not rejected")
+body_handler.headers = {}
+assert body_handler.read_json() is None
+
+# 反向代理来源地址只能接受 Nginx 覆盖写入的单个合法 IP。客户端构造的
+# X-Forwarded-For 列表不能改变登录限速、远程钥匙限速或审计身份。
+from types import SimpleNamespace
+
+module.STATE = SimpleNamespace(config=SimpleNamespace(mode="public"))
+ip_handler = object.__new__(module.Handler)
+ip_handler.client_address = ("127.0.0.1", 12345)
+ip_handler.headers = {"X-Forwarded-For": "8.8.8.8"}
+assert ip_handler.remote_ip == "8.8.8.8"
+ip_handler.headers = {"X-Forwarded-For": "198.51.100.10, 8.8.8.8"}
+assert ip_handler.remote_ip == "127.0.0.1"
+ip_handler.headers = {"X-Forwarded-For": "not-an-ip"}
+assert ip_handler.remote_ip == "127.0.0.1"
+
+# Webhook 与多服务器管理共用公开 HTTPS 出站门禁：阻止内网、回环、
+# 链路本地和混合 DNS；连接必须钉在已校验 IP，且 3xx 不自动跟随。
+from rr_nexus_lib import http_security
+
+for unsafe_url in (
+    "https://127.0.0.1/hook",
+    "https://[::1]/hook",
+    "https://169.254.169.254/latest/meta-data/",
+    "https://10.0.0.1/hook",
+    "https://user@example.com/hook",
+    "http://8.8.8.8/hook",
+):
+    try:
+        http_security.public_https_target(unsafe_url)
+    except http_security.UnsafeTargetError:
+        pass
+    else:
+        raise AssertionError(f"unsafe outbound target accepted: {unsafe_url}")
+
+def fake_public_resolver(host, port, **kwargs):
+    assert host == "hooks.example.com" and port == 9443
+    return [(2, 1, 6, "", ("8.8.8.8", port))]
+
+target = http_security.public_https_target(
+    "https://hooks.example.com:9443/a/b?event=test", resolver=fake_public_resolver
+)
+assert target.addresses == ("8.8.8.8",)
+assert target.request_target == "/a/b?event=test"
+
+def fake_mixed_resolver(host, port, **kwargs):
+    return [
+        (2, 1, 6, "", ("8.8.8.8", port)),
+        (2, 1, 6, "", ("127.0.0.1", port)),
+    ]
+
+try:
+    http_security.public_https_target(
+        "https://hooks.example.com:9443/hook", resolver=fake_mixed_resolver
+    )
+except http_security.UnsafeTargetError:
+    pass
+else:
+    raise AssertionError("mixed public/private DNS answers were accepted")
+
+connections = []
+class FakeResponse:
+    status = 302
+    def getheader(self, name):
+        return None
+    def read(self, size):
+        return b"redirect not followed"
+
+class FakePinnedConnection:
+    def __init__(self, host, port, connect_ip, timeout):
+        connections.append((host, port, connect_ip, timeout))
+    def request(self, method, path, body, headers):
+        assert (method, path, body) == ("POST", "/hook", b"{}")
+    def getresponse(self):
+        return FakeResponse()
+    def close(self):
+        pass
+
+real_pinned_connection = http_security._PinnedHTTPSConnection
+http_security._PinnedHTTPSConnection = FakePinnedConnection
+try:
+    status, response_body = http_security.https_post(
+        "https://hooks.example.com:9443/hook",
+        b"{}",
+        {"Content-Type": "application/json"},
+        resolver=fake_public_resolver,
+    )
+finally:
+    http_security._PinnedHTTPSConnection = real_pinned_connection
+assert status == 302 and response_body == b"redirect not followed"
+assert connections == [("hooks.example.com", 9443, "8.8.8.8", 10)]
+
+status, remote_error = module.Handler.remote_http_call(
+    "127.0.0.1", 443, "invalid", "GET", "/api/overview", None
+)
+assert status == 0 and remote_error["error"] == "unsafe_remote_target"
+
 def field(number, wire, value):
     return module.encode_varint((number << 3) | wire) + value
 
@@ -586,6 +962,7 @@ assert all(":9443/sub/" not in item["url"] for item in ip_urls)
 # 公网 IP/本地模式的地址必须能被真实的静态订阅服务逐一下载，且内容
 # 与刚发布的文件完全一致（覆盖 NekoBox 的 Base64 地址）。
 import functools
+import http.client
 import threading
 import urllib.request
 
@@ -717,6 +1094,32 @@ try:
     with urllib.request.urlopen(live_ip_primary, timeout=2) as response:
         assert response.status == 200 and response.read() == b""
         assert "total=1000" in response.headers["Subscription-Userinfo"]
+
+    # SimpleHTTPRequestHandler 会在文件访问前折叠 dot-segment。授权判断必须对
+    # 规范化路径 fail-closed，否则停用/到期/额度用尽的订阅可用 ../ 绕过。
+    for bypass_path in (
+        f"/x/../nexus/{device['subscription_token']}.txt",
+        f"/x/%2e%2e/nexus/{device['subscription_token']}.txt",
+    ):
+        connection = http.client.HTTPConnection("127.0.0.1", static_server.server_port, timeout=2)
+        connection.request("GET", bypass_path)
+        bypass_response = connection.getresponse()
+        bypass_body = bypass_response.read()
+        connection.close()
+        assert bypass_response.status == 404 and b"vless://" not in bypass_body, (
+            bypass_path, bypass_response.status, bypass_body[:120]
+        )
+
+    # 配置或数据库暂时缺失时，个人订阅必须拒绝服务，不能退回静态文件。
+    config_backup = config_path.read_bytes()
+    config_path.write_text(json.dumps({"database": str(config_path.parent / "missing.db")}), encoding="utf-8")
+    connection = http.client.HTTPConnection("127.0.0.1", static_server.server_port, timeout=2)
+    connection.request("GET", urllib.parse.urlsplit(live_ip_primary).path)
+    missing_db_response = connection.getresponse()
+    missing_db_body = missing_db_response.read()
+    connection.close()
+    assert missing_db_response.status == 503 and b"vless://" not in missing_db_body
+    config_path.write_bytes(config_backup)
     with sqlite3.connect(sys.argv[1]) as connection:
         connection.execute("UPDATE devices SET used_bytes=579 WHERE id=?", (device["id"],))
 finally:
@@ -978,6 +1381,11 @@ assert policy_traffic.calls == 2
 PY
 rm -rf "$argon2_stub"
 
+if grep -En 'proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for' modules/85-nexus.sh; then
+    echo "Nginx still appends an attacker-controlled X-Forwarded-For value." >&2
+    exit 1
+fi
+
 echo "[8/13] RR Nexus per-device traffic helpers"
 (
     load_modules_for_tests
@@ -1021,12 +1429,17 @@ PY
     [ "$(jq -r '.stats_port' "$NEXUS_CONFIG_FILE")" = "39091" ]
     [ "$(jq -r '.ssh_host' "$NEXUS_CONFIG_FILE")" = "45.192.205.71" ]
     [ "$(jq -r '.published_subscription_root' "$NEXUS_CONFIG_FILE")" = "/tmp/sub_server/nexus" ]
+    [ "$(jq -r '.listen' "$NEXUS_CONFIG_FILE")" = "127.0.0.1" ]
+    [ "$(jq -r '.port' "$NEXUS_CONFIG_FILE")" = "7900" ]
+    [ "$(jq -r '.database' "$NEXUS_CONFIG_FILE")" = "/var/lib/rr-nexus/nexus.db" ]
+    [ "$(jq -r '.subscription_root' "$NEXUS_CONFIG_FILE")" = "/var/lib/rr-nexus/subscriptions" ]
     rm -rf "$nexus_tmp"
 )
 
 echo "[9/13] RR Nexus personal subscription compatibility"
 (
     load_modules_for_tests
+    ensure_subscription_root() { return 0; }
     sub_tmp=$(mktemp -d)
     trap 'rm -rf "$sub_tmp"' EXIT
     NEXUS_DB_FILE="$sub_tmp/nexus.db"
@@ -1116,6 +1529,12 @@ PY
     jq -e '.outbounds | map(.type) | index("vmess") != null and index("vless") != null and index("hysteria2") != null and index("tuic") != null and index("anytls") != null and index("naive") != null' \
         "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
     jq -e '.outbounds[] | select(.type == "selector" and .tag == "proxy") | .outbounds | index("naive-h2-RR-012345AB") != null and index("naive-h3-RR-012345AB") != null' \
+        "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
+    # 固定 Argo/Naive 的 server 是域名。default_domain_resolver 若指向经
+    # proxy detour 的 remote DoH，会在代理尚未建立时形成 DNS 自举闭环。
+    jq -e '.dns.final == "remote" and
+           (.dns.servers[] | select(.tag == "remote") | .detour == "proxy") and
+           .route.default_domain_resolver == "local"' \
         "$NEXUS_SUB_ROOT/${device_id}.json" >/dev/null
     grep -Fq 'obfs: salamander' "$NEXUS_SUB_ROOT/${device_id}.yaml"
     grep -Fq 'obfs-password: "e219c8c7-b669-4c75-b33b-a9e5227a8a24"' "$NEXUS_SUB_ROOT/${device_id}.yaml"
@@ -1275,9 +1694,20 @@ grep -Fq 'PATH=/usr/local/bin:/usr/bin:/bin' modules/90-auto-update.sh
 # 更新链路必须在 GitHub Raw 不可达时回退到官方 Contents API 和 CDN；
 # bundle 高速更新也必须复用同一下载函数，不能另写仅支持 Raw 的 curl。
 grep -Fq 'RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"' modules/00-runtime.sh install.sh
-grep -Fq 'RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"' modules/00-runtime.sh install.sh
+grep -Fq 'RR_RAW_BASE="https://github.com/${RR_REPOSITORY}/releases/latest/download"' modules/00-runtime.sh
+grep -Fq 'RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"' install.sh scripts/install-core.sh
 grep -Fq 'Accept: application/vnd.github.raw+json' modules/60-update.sh install.sh
 grep -Fq 'rr_download_file "$bundle_url" "$bundle_tmp" 10' modules/60-update.sh
+grep -Fq 'rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true' modules/60-update.sh
+grep -Fq 'rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true' scripts/install-core.sh
+grep -Fq 'RR_RELEASE_TAG="v' install.sh scripts/install-core.sh
+grep -Fq 'gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS' .github/workflows/release.yml
+grep -Fq -- '--notes-file release-notes.md \' .github/workflows/release.yml
+grep -Fq -- '--latest' .github/workflows/release.yml
+if grep -Fq 'RR_GITHUB_MIRROR' scripts/update-guard.sh; then
+    echo "Update guard still allows a user mirror to provide executable trust anchors." >&2
+    exit 1
+fi
 grep -Fq 'UPDATE_CHECK_ERROR="远程 manifest.sha256 格式无效"' modules/60-update.sh
 grep -Fq 'rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"' modules/60-update.sh
 grep -Fq 'RR_BUNDLE_FILE="$bundle_tmp" bash "$bootstrap_tmp" --upgrade' modules/60-update.sh
@@ -1285,6 +1715,13 @@ grep -Fq 'rr_bundle_tree_is_valid "$PAYLOAD_DIR"' install.sh
 grep -Fq 'rr_verify_restored_state || failed=true' scripts/update-recover.sh
 grep -Fq 'systemctl restart --no-block sing-box' scripts/update-recover.sh
 grep -Fq 'systemctl start --no-block argo-rr-health.service' scripts/update-recover.sh
+grep -Fq 'rr_subscription_running' scripts/install-core.sh
+grep -Fq 'rr_stop_subscription_servers' scripts/install-core.sh scripts/update-recover.sh
+grep -Fq 'managed_subscription_pids' modules/10-system.sh
+if grep -Rq --exclude=validate.sh 'subscription_server\.py' scripts modules; then
+    echo "Update or rollback still searches for the nonexistent subscription_server.py process." >&2
+    exit 1
+fi
 grep -Fq 'NAIVE_QUIC_CC=reno' modules/70-protocols.sh
 grep -Fxq 'rr_check_system || exit 1' install.sh
 grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh
@@ -1295,6 +1732,19 @@ grep -Fq 'command -v timeout >/dev/null 2>&1' modules/60-update.sh
 grep -Fq 'declare -F sync_nexus_devices >/dev/null 2>&1' modules/60-update.sh
 grep -Fq 'nexus_download_traffic_core "$rr_core_dir"' modules/30-singbox.sh
 grep -Fq 'archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"' modules/85-nexus.sh
+grep -Fq 'release_tag="rr-nexus-core-${upstream_tag}"' modules/85-nexus.sh
+grep -Fq 'release_tag="rr-nexus-core-${tag}"' .github/workflows/build-nexus-core.yml
+grep -Fq 'SOURCE_COMMIT=${{ needs.version.outputs.source_sha }}' .github/workflows/build-nexus-core.yml
+grep -Fq -- '--prerelease --latest=false' .github/workflows/build-nexus-core.yml
+if grep -Fq 'Latest release, refreshed' .github/workflows/build-nexus-core.yml; then
+    echo "Versioned Nexus core is still advertised as the repository latest release." >&2
+    exit 1
+fi
+if grep -Eq 'gh release (upload|edit|delete-asset).*\brr-nexus-core|--clobber' \
+    .github/workflows/build-nexus-core.yml; then
+    echo "RR Nexus core workflow still mutates an existing release." >&2
+    exit 1
+fi
 grep -Fq '/usr/local/bin/rr --update-now' nexus/rr_nexus.py
 grep -Fq 'MAX_JSON_BODY_BYTES = 1024 * 1024' nexus/rr_nexus.py
 if grep -Eq 'fuser[[:space:]]+-k|gh release delete[[:space:]]+rr-nexus-core|#skip[[:space:]]*\|\|' \

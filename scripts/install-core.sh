@@ -3,11 +3,16 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
+RR_RELEASE_TAG="v7.1.1"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
-RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
+RR_SOURCE_REF="$RR_RELEASE_TAG"
+[ "$RR_BRANCH" = beta ] && RR_SOURCE_REF=beta
+RR_REF_KIND=tags
+[ "$RR_BRANCH" = beta ] && RR_REF_KIND=heads
+RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/${RR_REF_KIND}/${RR_SOURCE_REF}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
-RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
+RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LAUNCHER="/usr/local/bin/rr"
@@ -34,6 +39,53 @@ rr_error() {
     echo "[RR-vps] $*" >&2
 }
 
+rr_managed_subscription_pids() {
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local subscription_root="${RR_SUB_ROOT:-/tmp/sub_server}"
+    local expected_cwd=""
+    local process_dir=""
+    local pid=""
+    local cmdline=""
+    local process_cwd=""
+    expected_cwd=$(readlink -f "$subscription_root" 2>/dev/null) || return 0
+    for process_dir in "$proc_root"/[0-9]*; do
+        [ -r "$process_dir/cmdline" ] || continue
+        pid="${process_dir##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
+        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
+        [ "$process_cwd" = "$expected_cwd" ] || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+rr_subscription_running() {
+    local pid=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && return 0
+    done < <(rr_managed_subscription_pids)
+    return 1
+}
+
+rr_stop_subscription_servers() {
+    local pid=""
+    local stopped=true
+    local attempt=0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done < <(rr_managed_subscription_pids)
+    while [ "$attempt" -lt 20 ] && rr_subscription_running; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    rr_subscription_running && stopped=false
+    rm -f /run/rr-vps-subscription.pid /run/rr-vps-subscription.bind \
+        /tmp/sub_server.pid /tmp/sub_server.bind
+    [ "$stopped" = true ]
+}
+
 rr_test_fault() {
     # CI-only fault injection.  Two explicit gates prevent an accidental user
     # environment variable from ever interrupting a real update.
@@ -50,13 +102,14 @@ rr_download() {
     local target_file="$2"
     local cache_buster=""
     local relative_path=""
+    local official_manifest="${3:-false}"
 
     cache_buster=$(date +%s)
     case "$source_url" in
         "${RR_RAW_BASE}/"*) relative_path="${source_url#"${RR_RAW_BASE}/"}" ;;
     esac
 
-    if [ -n "$RR_GITHUB_MIRROR" ]; then
+    if [ "$official_manifest" != true ] && [ -n "$RR_GITHUB_MIRROR" ]; then
         if command -v curl >/dev/null 2>&1; then
             curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
                 "${RR_GITHUB_MIRROR}${source_url}" -o "$target_file" 2>/dev/null && return 0
@@ -73,7 +126,7 @@ rr_download() {
         if [ -n "$relative_path" ]; then
             curl -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
                 -H "Accept: application/vnd.github.raw+json" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" \
                 -o "$target_file" 2>/dev/null && return 0
             curl -4 -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
                 "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" \
@@ -86,7 +139,7 @@ rr_download() {
             wget -q --timeout=15 --tries=2 \
                 --header="Accept: application/vnd.github.raw+json" \
                 -O "$target_file" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" && return 0
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" && return 0
             wget -4 -q --timeout=15 --tries=2 \
                 -O "$target_file" "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" && return 0
         fi
@@ -232,7 +285,17 @@ rr_backup_file() {
 rr_backup_dir() {
     local source_dir="$1"
     local backup_name="$2"
+    local source_uid=""
+    if [ -L "$source_dir" ]; then
+        rr_error "拒绝备份符号链接目录：${source_dir}"
+        return 1
+    fi
     if [ -d "$source_dir" ]; then
+        source_uid=$(stat -c '%u' -- "$source_dir" 2>/dev/null) || return 1
+        if [ "$source_uid" != 0 ]; then
+            rr_error "拒绝备份非 root 所有的运行目录：${source_dir}"
+            return 1
+        fi
         cp -a "$source_dir" "$BACKUP_DIR/$backup_name" || return 1
         : > "$BACKUP_DIR/had_${backup_name}"
     fi
@@ -292,6 +355,10 @@ rr_restore_dir() {
     local target_dir="$2"
     rm -rf "$target_dir" || return 1
     if [ -f "$BACKUP_DIR/had_${backup_name}" ]; then
+        if [ -L "$BACKUP_DIR/$backup_name" ] || [ ! -d "$BACKUP_DIR/$backup_name" ]; then
+            rr_error "拒绝恢复不安全的目录备份：${backup_name}"
+            return 1
+        fi
         mkdir -p "$(dirname "$target_dir")" || return 1
         cp -a "$BACKUP_DIR/$backup_name" "$target_dir" || return 1
     fi
@@ -408,7 +475,7 @@ rr_snapshot_runtime() {
 
     systemctl is-active --quiet sing-box 2>/dev/null && : > "$BACKUP_DIR/singbox_was_running"
     systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$BACKUP_DIR/nexus_was_running"
-    pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && \
+    rr_subscription_running && \
         : > "$BACKUP_DIR/subscription_was_running"
     pgrep -f 'cloudflared.*tunnel' >/dev/null 2>&1 && : > "$BACKUP_DIR/argo_was_running"
     systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
@@ -428,21 +495,23 @@ rr_rollback() {
     rr_error "新版本校验失败，正在恢复升级前状态……"
 
     systemctl stop sing-box rr-nexus >/dev/null 2>&1 || true
-    pkill -f 'subscription_server\.py' >/dev/null 2>&1 || true
+    rr_stop_subscription_servers || rollback_failed=true
 
-    if [ "$RUNTIME_REPLACED" = true ]; then
-        if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
-            rm -rf "$RR_LIB_DIR"
-            if mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
-                OLD_RUNTIME=""
-            else
-                rollback_failed=true
-            fi
+    # OLD_RUNTIME becomes authoritative as soon as the live directory is moved.
+    # A catchable failure can occur before RUNTIME_REPLACED flips to true (for
+    # example a failed candidate move), so keying restoration only on that flag
+    # would discard the sole old runtime during cleanup.
+    if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
+        if { [ ! -e "$RR_LIB_DIR" ] || rm -rf "$RR_LIB_DIR"; } && \
+           mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
+            OLD_RUNTIME=""
         else
-            rm -rf "$RR_LIB_DIR" || rollback_failed=true
+            rollback_failed=true
         fi
-        RUNTIME_REPLACED=false
+    elif [ "$RUNTIME_REPLACED" = true ]; then
+        rm -rf "$RR_LIB_DIR" || rollback_failed=true
     fi
+    RUNTIME_REPLACED=false
 
     rr_restore_file rr_launcher "$RR_LAUNCHER" || rollback_failed=true
     rr_restore_file argo_vmess.conf /etc/argo_vmess.conf || rollback_failed=true
@@ -537,7 +606,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d" ] && \
+        if [ "$actual" = "dc690d1c7dc7ba22a07a7bed21f32064e099f016e6602c4efc679e32e0583f90" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -552,7 +621,9 @@ rr_fetch_release() {
     echo "[RR-vps] ⚡ 高速模式未命中，切换逐文件下载……"
     rm -rf "$PAYLOAD_DIR"
     mkdir -p "$PAYLOAD_DIR/modules"
-    rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
+    # manifest 是逐文件下载的信任锚；镜像只能搬运随后按官方哈希校验的文件，
+    # 不能提供或替换这份锚点。
+    rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true || return 1
     rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || {
         rr_error "远程发布清单格式无效。"
         return 1
@@ -574,7 +645,7 @@ rr_fetch_release() {
         sleep 10
         rm -rf "$PAYLOAD_DIR"
         mkdir -p "$PAYLOAD_DIR"
-        rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
+        rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true || return 1
         rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || { rr_error "远程发布清单格式无效。"; return 1; }
         while read -r _ relative_path; do
             mkdir -p "$PAYLOAD_DIR/$(dirname "$relative_path")"

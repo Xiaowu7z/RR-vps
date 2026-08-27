@@ -7,10 +7,10 @@ import hmac
 import json
 import re
 import sqlite3
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any
+
+from rr_nexus_lib.http_security import UnsafeTargetError, https_post, public_https_target
 
 
 HTTPS_URL_RE = re.compile(r"^https://[^\s\x00-\x1f]{3,2048}$")
@@ -48,6 +48,9 @@ class NotificationManager:
 
     def update(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.settings(masked=False)
+        webhook_supplied = "webhook_url" in payload and not str(
+            payload.get("webhook_url", "") or ""
+        ).endswith("/••••")
         enabled = bool(payload.get("enabled", current.get("enabled", False)))
         token = str(payload.get("telegram_token", "") or "").strip()
         chat_id = str(payload.get("telegram_chat_id", current.get("telegram_chat_id", "")) or "").strip()
@@ -65,6 +68,11 @@ class NotificationManager:
             raise ValueError("invalid_telegram_chat_id")
         if webhook and not HTTPS_URL_RE.fullmatch(webhook):
             raise ValueError("invalid_webhook_url")
+        if webhook and webhook_supplied:
+            try:
+                public_https_target(webhook)
+            except UnsafeTargetError as exc:
+                raise ValueError("invalid_webhook_url") from exc
         events = payload.get("events", current.get("events", []))
         allowed = {
             "service_down", "disk_high", "traffic_threshold", "certificate_expiry",
@@ -140,6 +148,7 @@ class NotificationManager:
                     "ON CONFLICT(event_key) DO UPDATE SET sent_at=excluded.sent_at",
                     (dedupe_key[:160], now_epoch),
                 )
+        self.store.prune_history()
         return ok, detail
 
     @staticmethod
@@ -163,16 +172,12 @@ class NotificationManager:
     @staticmethod
     def _request(url: str, body: bytes, headers: dict[str, str]) -> tuple[bool, str]:
         try:
-            request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(request, timeout=10) as response:
-                if 200 <= response.status < 300:
-                    return True, "ok"
-                return False, f"http_{response.status}"
-        except urllib.error.HTTPError as exc:
-            return False, f"http_{exc.code}"
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", None)
-            return False, f"network_{type(reason).__name__ if reason is not None else 'error'}"
+            status, _ = https_post(url, body, headers, timeout=10)
+            if 200 <= status < 300:
+                return True, "ok"
+            return False, f"http_{status}"
+        except UnsafeTargetError:
+            return False, "unsafe_target"
         except TimeoutError:
             return False, "network_timeout"
         except OSError as exc:

@@ -14,6 +14,53 @@ rr_recover_log() {
     logger -t rr-update-recovery "$*" 2>/dev/null || true
 }
 
+rr_managed_subscription_pids() {
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local subscription_root="${RR_SUB_ROOT:-/tmp/sub_server}"
+    local expected_cwd=""
+    local process_dir=""
+    local pid=""
+    local cmdline=""
+    local process_cwd=""
+    expected_cwd=$(readlink -f "$subscription_root" 2>/dev/null) || return 0
+    for process_dir in "$proc_root"/[0-9]*; do
+        [ -r "$process_dir/cmdline" ] || continue
+        pid="${process_dir##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
+        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
+        [ "$process_cwd" = "$expected_cwd" ] || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+rr_subscription_running() {
+    local pid=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && return 0
+    done < <(rr_managed_subscription_pids)
+    return 1
+}
+
+rr_stop_subscription_servers() {
+    local pid=""
+    local stopped=true
+    local attempt=0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done < <(rr_managed_subscription_pids)
+    while [ "$attempt" -lt 20 ] && rr_subscription_running; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    rr_subscription_running && stopped=false
+    rm -f /run/rr-vps-subscription.pid /run/rr-vps-subscription.bind \
+        /tmp/sub_server.pid /tmp/sub_server.bind
+    [ "$stopped" = true ]
+}
+
 rr_transaction_path() {
     local tx=""
     [ -r "$RR_ACTIVE_TX" ] || return 1
@@ -40,6 +87,10 @@ rr_restore_dir() {
     local backup="$1" target="$2"
     rm -rf -- "$target" || return 1
     if [ -f "$RR_BACKUP/had_${backup}" ]; then
+        if [ -L "$RR_BACKUP/$backup" ] || [ ! -d "$RR_BACKUP/$backup" ]; then
+            rr_recover_log "refusing unsafe directory backup: ${backup}"
+            return 1
+        fi
         mkdir -p "$(dirname "$target")" || return 1
         cp -a "$RR_BACKUP/$backup" "$target"
     fi
@@ -81,13 +132,13 @@ PY
 }
 
 rr_restore_transaction() {
-    local tx="$1" reason="${2:-automatic recovery}" failed_runtime=""
+    local tx="$1" reason="${2:-automatic recovery}" failed_runtime="" subscription_stop_failed=false
     RR_BACKUP="$tx/backup"
     [ -d "$RR_BACKUP" ] || { rr_recover_log "transaction backup is missing: $tx"; return 1; }
 
     rr_recover_log "$reason; restoring transaction $(basename "$tx")"
     systemctl stop sing-box rr-nexus >/dev/null 2>&1 || true
-    pkill -f 'subscription_server\.py' >/dev/null 2>&1 || true
+    rr_stop_subscription_servers || subscription_stop_failed=true
 
     if [ -d "$tx/old-runtime" ]; then
         if [ -e "$RR_LIB_DIR" ]; then
@@ -102,7 +153,7 @@ rr_restore_transaction() {
         rm -rf -- "$RR_LIB_DIR" || return 1
     fi
 
-    local failed=false
+    local failed="$subscription_stop_failed"
     rr_restore_file rr_launcher "$RR_LAUNCHER" || failed=true
     rr_restore_file argo_vmess.conf /etc/argo_vmess.conf || failed=true
     rr_restore_file singbox_config.json /etc/sing-box/config.json || failed=true
