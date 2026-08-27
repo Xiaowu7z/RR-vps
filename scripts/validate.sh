@@ -440,17 +440,18 @@ class InvalidHash(Exception):
 class VerifyMismatchError(Exception):
     pass
 PY
-PYTHONPATH="$argon2_stub" python3 nexus/rr_nexus.py --help >/dev/null
+nexus_pythonpath="$argon2_stub:$PWD/nexus"
+PYTHONPATH="$nexus_pythonpath" python3 nexus/rr_nexus.py --help >/dev/null
 argon2_config="$argon2_stub/nexus.json"
 argon2_db="$argon2_stub/nexus.db"
 jq -n --arg database "$argon2_db" --arg subscriptions "$argon2_stub/subscriptions" \
     '{mode:"local",listen:"127.0.0.1",port:7900,domain:"",database:$database,subscription_root:$subscriptions}' \
     > "$argon2_config"
 init_output=$(printf '%s\n' 'StrongPassword123!' | \
-    PYTHONPATH="$argon2_stub" RR_NEXUS_CONFIG="$argon2_config" \
+    PYTHONPATH="$nexus_pythonpath" RR_NEXUS_CONFIG="$argon2_config" \
     python3 nexus/rr_nexus.py --init-admin tester)
 [[ "$init_output" == RR_NEXUS_RECOVERY_CODES=* ]]
-PYTHONPATH="$argon2_stub" RR_NEXUS_CONFIG="$argon2_config" python3 - "$argon2_db" <<'PY'
+PYTHONPATH="$nexus_pythonpath" RR_NEXUS_CONFIG="$argon2_config" python3 - "$argon2_db" <<'PY'
 import base64
 import importlib.util
 import json
