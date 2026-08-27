@@ -1702,6 +1702,8 @@ grep -Fq 'rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true' modules/6
 grep -Fq 'rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true' scripts/install-core.sh
 grep -Fq 'RR_RELEASE_TAG="v' install.sh scripts/install-core.sh
 grep -Fq 'gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS' .github/workflows/release.yml
+grep -Fq -- '--notes-file release-notes.md \' .github/workflows/release.yml
+grep -Fq -- '--latest' .github/workflows/release.yml
 if grep -Fq 'RR_GITHUB_MIRROR' scripts/update-guard.sh; then
     echo "Update guard still allows a user mirror to provide executable trust anchors." >&2
     exit 1
@@ -1733,6 +1735,11 @@ grep -Fq 'archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"' module
 grep -Fq 'release_tag="rr-nexus-core-${upstream_tag}"' modules/85-nexus.sh
 grep -Fq 'release_tag="rr-nexus-core-${tag}"' .github/workflows/build-nexus-core.yml
 grep -Fq 'SOURCE_COMMIT=${{ needs.version.outputs.source_sha }}' .github/workflows/build-nexus-core.yml
+grep -Fq -- '--prerelease --latest=false' .github/workflows/build-nexus-core.yml
+if grep -Fq 'Latest release, refreshed' .github/workflows/build-nexus-core.yml; then
+    echo "Versioned Nexus core is still advertised as the repository latest release." >&2
+    exit 1
+fi
 if grep -Eq 'gh release (upload|edit|delete-asset).*\brr-nexus-core|--clobber' \
     .github/workflows/build-nexus-core.yml; then
     echo "RR Nexus core workflow still mutates an existing release." >&2

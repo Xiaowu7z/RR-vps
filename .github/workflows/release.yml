@@ -100,4 +100,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "${{ steps.release.outputs.sha }}" \
             --title "RR-vps ${VERSION} 正式版" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            --latest

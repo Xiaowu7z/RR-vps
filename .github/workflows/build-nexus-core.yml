@@ -177,7 +177,7 @@ jobs:
           set -euo pipefail
           tag="${{ needs.version.outputs.release_tag }}"
           title="RR Nexus traffic core · sing-box ${{ needs.version.outputs.version }}"
-          notes="Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand."
+          notes="Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This prerelease is consumed only by its immutable versioned tag."
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Immutable core release already exists: $tag" >&2
@@ -185,4 +185,5 @@ jobs:
           fi
           gh release create "$tag" release-assets/* \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "$title" --notes "$notes"
+            --title "$title" --notes "$notes" \
+            --prerelease --latest=false

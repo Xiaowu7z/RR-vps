@@ -17,6 +17,7 @@
 - Bootstrap 与核心安装器固定到同版本 Tag；用户镜像只能搬运由官方 manifest/内置摘要校验的内容，不能提供可执行信任锚
 - GitHub Actions 使用固定提交摘要与最小 Token 权限；Release 只接受同一 main 提交的完整 CI 成功结果
 - RR Nexus 核心构建仅允许在 `main` 上手动或定时运行，并要求目标提交已有成功 CI；审计分支改动不再触发提前发布
+- RR Nexus 核心资产固定发布为按版本 Tag 消费的 Prerelease 且禁止争抢 Latest；只有包含完整安装资产的 RR-vps 正式版可成为仓库 Latest，避免 Stable 安装与热更新链接被核心 Release 劫持成 404
 - 自建流量统计 Sing-box 改用按上游版本隔离的不可变 Release，严格校验上游 Tag、Commit、两架构摘要与解压后的普通文件/硬链接数
 
 ### 正确性与恢复
