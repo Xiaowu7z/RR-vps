@@ -1,0 +1,151 @@
+name: Temporary VPS audit baseline
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/vps-audit.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-vps-audit
+  cancel-in-progress: false
+
+jobs:
+  baseline:
+    name: "${{ matrix.role }} · ${{ matrix.os_name }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: A
+            os_name: Debian 12
+            expected_id: debian
+            expected_version: "12"
+          - role: B
+            os_name: Ubuntu 22.04
+            expected_id: ubuntu
+            expected_version: "22.04"
+          - role: C
+            os_name: Ubuntu 24.04
+            expected_id: ubuntu
+            expected_version: "24.04"
+    env:
+      RR_A_HOST: ${{ secrets.RR_A_HOST }}
+      RR_A_PASS: ${{ secrets.RR_A_PASS }}
+      RR_A_NAIVE_DOMAIN: ${{ secrets.RR_A_NAIVE_DOMAIN }}
+      RR_B_HOST: ${{ secrets.RR_B_HOST }}
+      RR_B_PASS: ${{ secrets.RR_B_PASS }}
+      RR_C_HOST: ${{ secrets.RR_C_HOST }}
+      RR_C_PASS: ${{ secrets.RR_C_PASS }}
+    steps:
+      - name: Validate temporary secret map
+        shell: bash
+        env:
+          ROLE: ${{ matrix.role }}
+        run: |
+          set -euo pipefail
+          set +x
+          case "$ROLE" in
+            A)
+              test -n "$RR_A_HOST"
+              test -n "$RR_A_PASS"
+              test -n "$RR_A_NAIVE_DOMAIN"
+              ;;
+            B)
+              test -n "$RR_B_HOST"
+              test -n "$RR_B_PASS"
+              ;;
+            C)
+              test -n "$RR_C_HOST"
+              test -n "$RR_C_PASS"
+              ;;
+            *) exit 2 ;;
+          esac
+
+      - name: Install SSH password client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Capture read-only VPS baseline
+        shell: bash
+        env:
+          ROLE: ${{ matrix.role }}
+          EXPECTED_ID: ${{ matrix.expected_id }}
+          EXPECTED_VERSION: ${{ matrix.expected_version }}
+        run: |
+          set -euo pipefail
+          set +x
+          case "$ROLE" in
+            A) host="$RR_A_HOST"; export SSHPASS="$RR_A_PASS" ;;
+            B) host="$RR_B_HOST"; export SSHPASS="$RR_B_PASS" ;;
+            C) host="$RR_C_HOST"; export SSHPASS="$RR_C_PASS" ;;
+            *) exit 2 ;;
+          esac
+          known_hosts="$RUNNER_TEMP/known_hosts-$ROLE"
+          sshpass -e ssh             -o BatchMode=no             -o ConnectTimeout=20             -o ConnectionAttempts=2             -o LogLevel=ERROR             -o PreferredAuthentications=password             -o PubkeyAuthentication=no             -o StrictHostKeyChecking=accept-new             -o UserKnownHostsFile="$known_hosts"             "root@$host" bash -s -- "$ROLE" "$EXPECTED_ID" "$EXPECTED_VERSION" <<'REMOTE'
+          set -euo pipefail
+          export LANG=C LC_ALL=C
+          role="$1"
+          expected_id="$2"
+          expected_version="$3"
+          test "$(id -u)" -eq 0
+          test -r /etc/os-release
+          # shellcheck disable=SC1091
+          . /etc/os-release
+          test "${ID,,}" = "$expected_id"
+          test "$VERSION_ID" = "$expected_version"
+          arch=$(uname -m)
+          case "$arch" in x86_64|amd64) ;; *) exit 1 ;; esac
+          test "$(ps -p 1 -o comm= | tr -d '[:space:]')" = systemd
+
+          printf 'RR_AUDIT_BASELINE role=%s os=%s version=%s arch=%s\n'             "$role" "$ID" "$VERSION_ID" "$arch"
+          printf 'kernel=%s virtualization=%s uptime_seconds=%s\n'             "$(uname -r)" "$(systemd-detect-virt 2>/dev/null || printf unknown)"             "$(cut -d. -f1 /proc/uptime)"
+          printf 'cpu_count=%s mem_total_kib=%s\n'             "$(nproc)" "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+          df -PT / | awk 'NR == 2 {
+            printf "root_fs_type=%s root_kib=%s root_used_kib=%s root_available_kib=%s root_use_percent=%s\n",
+                   $2, $3, $4, $5, $6
+          }'
+          df -Pi / | awk 'NR == 2 {
+            printf "root_inodes=%s root_iused=%s root_ifree=%s root_iuse_percent=%s\n",
+                   $2, $3, $4, $5
+          }'
+          getent ahostsv4 github.com >/dev/null
+          printf 'dns_github=ok\n'
+          curl -fsSIL --connect-timeout 10 --max-time 30 https://github.com/             >/dev/null
+          printf 'https_github=ok\n'
+          curl -fsSL --connect-timeout 10 --max-time 30             https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/manifest.sha256             | awk 'NF != 2 {exit 1} END {if (NR < 10) exit 1}'
+          printf 'raw_manifest=ok\n'
+          printf 'systemd_state=%s time_sync=%s\n'             "$(systemctl is-system-running 2>/dev/null || true)"             "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || printf unknown)"
+          tcp_ports=$(ss -H -lnt 2>/dev/null | awk '{
+            address=$4; sub(/^.*:/, "", address); if (address ~ /^[0-9]+$/) print address
+          }' | sort -nu | paste -sd, -)
+          udp_ports=$(ss -H -lnu 2>/dev/null | awk '{
+            address=$5; sub(/^.*:/, "", address); if (address ~ /^[0-9]+$/) print address
+          }' | sort -nu | paste -sd, -)
+          printf 'listening_tcp_ports=%s\nlistening_udp_ports=%s\n'             "${tcp_ports:-none}" "${udp_ports:-none}"
+          if command -v ufw >/dev/null 2>&1; then
+            printf 'ufw=%s\n' "$(ufw status 2>/dev/null | sed -n '1s/^Status: //p')"
+          else
+            printf 'ufw=not-installed\n'
+          fi
+          if command -v nft >/dev/null 2>&1; then
+            printf 'nftables=installed\n'
+          else
+            printf 'nftables=not-installed\n'
+          fi
+          for unit in sing-box rr-nexus rr-subscription cloudflared nginx; do
+            printf 'service_%s_active=%s enabled=%s\n' "$unit"               "$(systemctl is-active "$unit" 2>/dev/null || true)"               "$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+          done
+          for path in             /usr/local/bin/rr /usr/local/lib/rr /etc/argo_vmess.conf             /etc/rr-nexus/nexus.json /var/lib/rr-nexus/nexus.db             /etc/rr-nexus/remote.key; do
+            if [ -e "$path" ]; then
+              stat -c 'existing_path mode=%a uid=%u gid=%g path=%n' "$path"
+            fi
+          done
+          printf 'RR_AUDIT_BASELINE_COMPLETE role=%s\n' "$role"
+          REMOTE
