@@ -14,7 +14,10 @@ cat > "$mock_bin/systemctl" <<'EOF'
 #!/bin/sh
 # Container CI has no PID-1 systemd.  Service semantics are covered by the
 # regression suite; the OS matrix exercises filesystem transactions.
-exit 0
+case "${1:-}" in
+    is-active|is-enabled) exit 1 ;;
+    *) exit 0 ;;
+esac
 EOF
 chmod 755 "$mock_bin/systemctl"
 export PATH="$mock_bin:$PATH"
