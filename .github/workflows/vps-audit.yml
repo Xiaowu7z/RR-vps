@@ -42,7 +42,7 @@ jobs:
               host="$RR_A_HOST"
               export SSHPASS="$RR_A_PASS"
               args=(A "$RR_A_HOST" "$RR_A_NAIVE_DOMAIN")
-              checks=(runtime config database singbox nexus nginx singbox-check local-health panel-cert naive-cert panel-health nexus-app nexus-import nexus-enabled port7900 address-in-use import-error permission-error restart-nexus)
+              checks=(runtime config database singbox nexus nginx singbox-check local-health panel-cert naive-cert panel-health nexus-app nexus-import nexus-enabled port7900 address-in-use import-error permission-error restart-nexus log-core-download log-core-config log-core-start log-admin-init log-nexus-start log-traffic-success log-admin-success)
               ;;
             B)
               host="$RR_B_HOST"
@@ -95,6 +95,13 @@ jobs:
             import_error=no
             permission_error=no
             restart_nexus=no
+            log_core_download=no
+            log_core_config=no
+            log_core_start=no
+            log_admin_init=no
+            log_nexus_start=no
+            log_traffic_success=no
+            log_admin_success=no
             panel_cert=no
             naive_cert=no
             panel_health=no
@@ -114,6 +121,13 @@ jobs:
               | grep -Eqi 'ModuleNotFoundError|ImportError' && import_error=yes
             journalctl -u rr-nexus --no-pager -n 120 2>/dev/null \
               | grep -Eqi 'Permission denied|Errno 13' && permission_error=yes
+            grep -Fq '无法下载或校验 RR Nexus 统计内核' /root/rr-audit-nexus.log 2>/dev/null && log_core_download=yes
+            grep -Fq '实时流量统计配置未通过' /root/rr-audit-nexus.log 2>/dev/null && log_core_config=yes
+            grep -Fq '统计内核启动失败' /root/rr-audit-nexus.log 2>/dev/null && log_core_start=yes
+            grep -Fq '管理员初始化失败' /root/rr-audit-nexus.log 2>/dev/null && log_admin_init=yes
+            grep -Fq 'Nexus 启动失败' /root/rr-audit-nexus.log 2>/dev/null && log_nexus_start=yes
+            grep -Fq '单独用户实时流量统计已启用' /root/rr-audit-nexus.log 2>/dev/null && log_traffic_success=yes
+            grep -Fq '管理员账号已创建' /root/rr-audit-nexus.log 2>/dev/null && log_admin_success=yes
             systemctl reset-failed rr-nexus >/dev/null 2>&1 || true
             systemctl restart rr-nexus >/dev/null 2>&1 || true
             sleep 3
@@ -131,6 +145,10 @@ jobs:
               "$nexus_app" "$nexus_import" "$nexus_enabled" "$port7900"
             printf 'address-in-use=%s\nimport-error=%s\npermission-error=%s\nrestart-nexus=%s\n' \
               "$address_in_use" "$import_error" "$permission_error" "$restart_nexus"
+            printf 'log-core-download=%s\nlog-core-config=%s\nlog-core-start=%s\nlog-admin-init=%s\n' \
+              "$log_core_download" "$log_core_config" "$log_core_start" "$log_admin_init"
+            printf 'log-nexus-start=%s\nlog-traffic-success=%s\nlog-admin-success=%s\n' \
+              "$log_nexus_start" "$log_traffic_success" "$log_admin_success"
             printf 'panel-cert=%s\nnaive-cert=%s\npanel-health=%s\n' \
               "$panel_cert" "$naive_cert" "$panel_health"
           else
