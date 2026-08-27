@@ -117,27 +117,27 @@ jobs:
               "$([ -n "$tx" ] && [ -f "$tx/backup/had_nexus.db" ] && printf yes || printf no)" \
               "$([ -n "$tx" ] && [ -f "$tx/backup/nexus.db" ] && printf yes || printf no)"
             python3 - /var/lib/rr-nexus/nexus.db "${tx:+$tx/backup/nexus.db}" <<'PY'
-import pathlib
-import re
-import sqlite3
-import sys
+          import pathlib
+          import re
+          import sqlite3
+          import sys
 
-pattern = re.compile(r"^dev_[a-f0-9]{12}$")
-for label, raw in (("live", sys.argv[1]), ("backup", sys.argv[2])):
-    path = pathlib.Path(raw) if raw else None
-    if path is None or not path.is_file():
-        print(f"device_id_summary_{label}=missing")
-        continue
-    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-    try:
-        rows = db.execute("SELECT id, enabled FROM devices").fetchall()
-    finally:
-        db.close()
-    invalid = sum(1 for device_id, _ in rows if not pattern.fullmatch(str(device_id)))
-    enabled_invalid = sum(1 for device_id, enabled in rows if enabled and not pattern.fullmatch(str(device_id)))
-    lengths = ",".join(map(str, sorted({len(str(device_id)) for device_id, _ in rows}))) or "none"
-    print(f"device_id_summary_{label}=rows:{len(rows)},invalid:{invalid},enabled_invalid:{enabled_invalid},lengths:{lengths}")
-PY
+          pattern = re.compile(r"^dev_[a-f0-9]{12}$")
+          for label, raw in (("live", sys.argv[1]), ("backup", sys.argv[2])):
+              path = pathlib.Path(raw) if raw else None
+              if path is None or not path.is_file():
+                  print(f"device_id_summary_{label}=missing")
+                  continue
+              db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+              try:
+                  rows = db.execute("SELECT id, enabled FROM devices").fetchall()
+              finally:
+                  db.close()
+              invalid = sum(1 for device_id, _ in rows if not pattern.fullmatch(str(device_id)))
+              enabled_invalid = sum(1 for device_id, enabled in rows if enabled and not pattern.fullmatch(str(device_id)))
+              lengths = ",".join(map(str, sorted({len(str(device_id)) for device_id, _ in rows}))) or "none"
+              print(f"device_id_summary_{label}=rows:{len(rows)},invalid:{invalid},enabled_invalid:{enabled_invalid},lengths:{lengths}")
+          PY
           fi
           for log in \
             /root/rr-audit-core.log /root/rr-audit-install.log /root/rr-audit-nexus.log \
