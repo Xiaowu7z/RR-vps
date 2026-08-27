@@ -1011,42 +1011,181 @@ sync_runtime_state() {
 }
 
 # NAIVE-SUPPORT：Let’s Encrypt 真证书申请与续签（NaiveProxy 专用）
+naive_acme_port_80_is_safe() {
+    # 未占用可直接启动 Nginx；已占用时只接受确实由 Nginx 监听的情形。
+    # 不能仅用 pgrep 判断，因为 Nginx 可能只监听其他端口，而 80 实际由
+    # Apache/Caddy 等用户服务占用。
+    ! tcp_port_in_use 80 && return 0
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -ltnp 'sport = :80' 2>/dev/null | grep -q '"nginx"'
+}
+
+restore_naive_acme_nginx_state() {
+    local site="$1"
+    local enabled="$2"
+    local site_backup="$3"
+    local had_site="$4"
+    local had_enabled="$5"
+    local old_enabled_target="$6"
+    if [ "$had_site" = true ]; then
+        cp -p "$site_backup" "$site" || return 1
+    else
+        rm -f "$site"
+    fi
+    if [ "$had_enabled" = true ]; then
+        ln -sfn "$old_enabled_target" "$enabled" || return 1
+    else
+        rm -f "$enabled"
+    fi
+    if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+prepare_naive_acme_webroot() {
+    local naive_domain="$1"
+    local webroot="${RR_NAIVE_ACME_WEBROOT:-/var/www/rr-nexus-certbot}"
+    local site="${RR_NAIVE_ACME_NGINX_SITE:-/etc/nginx/sites-available/rr-naive-acme.conf}"
+    local enabled="${RR_NAIVE_ACME_NGINX_ENABLED:-/etc/nginx/sites-enabled/rr-naive-acme.conf}"
+    local site_tmp=""
+    local site_backup=""
+    local old_enabled_target=""
+    local had_site=false
+    local had_enabled=false
+
+    is_valid_domain "$naive_domain" || {
+        echo -e "${RED}[失败] NaiveProxy 域名格式无效。${RESET}" >&2
+        return 1
+    }
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
+        apt-get install -y nginx certbot >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 或 certbot 安装失败。${RESET}" >&2
+            return 1
+        }
+    fi
+    if ! naive_acme_port_80_is_safe; then
+        echo -e "${RED}[拒绝] 80 端口已被非 Nginx 程序占用；未终止该程序，也未覆盖其配置。${RESET}" >&2
+        return 1
+    fi
+
+    mkdir -p "$webroot/.well-known/acme-challenge" "$(dirname "$site")" "$(dirname "$enabled")" || return 1
+    chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge" || return 1
+    [ ! -L "$site" ] || {
+        echo -e "${RED}[拒绝] NaiveProxy Nginx 站点文件是符号链接，未覆盖。${RESET}" >&2
+        return 1
+    }
+    if [ -e "$enabled" ] && [ ! -L "$enabled" ]; then
+        echo -e "${RED}[拒绝] NaiveProxy Nginx 启用项不是符号链接，未覆盖。${RESET}" >&2
+        return 1
+    fi
+    if [ -f "$site" ]; then
+        had_site=true
+        site_backup=$(mktemp /tmp/rr-naive-acme-site.XXXXXX) || return 1
+        cp -p "$site" "$site_backup" || { rm -f "$site_backup"; return 1; }
+    fi
+    if [ -L "$enabled" ]; then
+        had_enabled=true
+        old_enabled_target=$(readlink "$enabled") || { rm -f "$site_backup"; return 1; }
+    fi
+
+    site_tmp=$(mktemp "$(dirname "$site")/.rr-naive-acme.XXXXXX") || { rm -f "$site_backup"; return 1; }
+    if ! cat > "$site_tmp" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${naive_domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${webroot};
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+    then
+        rm -f "$site_tmp" "$site_backup"
+        return 1
+    fi
+    chmod 644 "$site_tmp" || { rm -f "$site_tmp" "$site_backup"; return 1; }
+    mv -f "$site_tmp" "$site" || { rm -f "$site_tmp" "$site_backup"; return 1; }
+    if ! ln -sfn "$site" "$enabled"; then
+        restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+            "$had_site" "$had_enabled" "$old_enabled_target" || true
+        rm -f "$site_backup"
+        return 1
+    fi
+
+    if ! nginx -t >/dev/null 2>&1; then
+        restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+            "$had_site" "$had_enabled" "$old_enabled_target" || true
+        rm -f "$site_backup"
+        echo -e "${RED}[失败] Nginx 配置检查失败，NaiveProxy ACME 站点已回滚。${RESET}" >&2
+        return 1
+    fi
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 无法重新加载 NaiveProxy ACME 站点。${RESET}" >&2
+            restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+                "$had_site" "$had_enabled" "$old_enabled_target" || true
+            rm -f "$site_backup"
+            return 1
+        }
+    else
+        systemctl enable --now nginx >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 无法启动，不能进行 NaiveProxy 域名验证。${RESET}" >&2
+            restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+                "$had_site" "$had_enabled" "$old_enabled_target" || true
+            rm -f "$site_backup"
+            return 1
+        }
+    fi
+    rm -f "$site_backup"
+    open_protocol_firewall 80 tcp || return 1
+    return 0
+}
+
 ensure_naive_certificate() {
     # 返回 0=证书就绪；非 0=失败。真证书，不允许自签。
     local naive_domain="${1:-$NAIVE_DOMAIN}"
     local le_email="${2:-${LE_EMAIL:-}}"
-    # LE 拒绝 example.com 邮箱；未配置时从域名派生合法邮箱
-    [ -n "$le_email" ] || le_email="admin@${naive_domain}"
+    local le_live_root="${RR_LE_LIVE_ROOT:-/etc/letsencrypt/live}"
+    local naive_cert_dir="${RR_NAIVE_CERT_DIR:-/etc/rr-naive}"
+    local webroot="${RR_NAIVE_ACME_WEBROOT:-/var/www/rr-nexus-certbot}"
     [ -n "$naive_domain" ] || { echo -e "${RED}[失败] 未设置 NaiveProxy 域名。${RESET}" >&2; return 1; }
-    mkdir -p /etc/rr-naive
+    is_valid_domain "$naive_domain" || { echo -e "${RED}[失败] NaiveProxy 域名格式无效。${RESET}" >&2; return 1; }
+    # LE 拒绝 example.com 邮箱；未配置时从已校验域名派生合法邮箱。
+    [ -n "$le_email" ] || le_email="admin@${naive_domain}"
+    mkdir -p "$naive_cert_dir"
+
+    # Webroot 模式不仅需要目录，还必须在签发及续签时有真实 HTTP 服务。
+    # 首装阶段 Sing-box/Nexus 尚未启动，因此先安全配置 Nginx 并放行 80。
+    prepare_naive_acme_webroot "$naive_domain" || return 1
 
     # 已存在 LE 证书则直接同步（幂等）
-    if [ -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" ]; then
-        cp -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" /etc/rr-naive/fullchain.pem || return 1
-        cp -f "/etc/letsencrypt/live/${naive_domain}/privkey.pem" /etc/rr-naive/privkey.pem || return 1
-        chmod 600 /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem
+    if [ -f "${le_live_root}/${naive_domain}/fullchain.pem" ]; then
+        cp -f "${le_live_root}/${naive_domain}/fullchain.pem" "$naive_cert_dir/fullchain.pem" || return 1
+        cp -f "${le_live_root}/${naive_domain}/privkey.pem" "$naive_cert_dir/privkey.pem" || return 1
+        chmod 600 "$naive_cert_dir/fullchain.pem" "$naive_cert_dir/privkey.pem"
         deploy_naive_cert_hook
         return 0
     fi
 
-    # certbot webroot 申请（域名必须已解析到本机）
-    if ! command -v certbot >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 certbot（Let’s Encrypt 官方客户端）……${RESET}"
-        apt-get install -y certbot >/dev/null 2>&1 || { echo -e "${RED}[失败] certbot 安装失败。${RESET}" >&2; return 1; }
-    fi
     # 6.6.15：root umask 077（DMIT 模板等）会让目录 700/文件 600，
     # nginx(www-data) 读不了挑战文件 → LE 403。显式 chmod + umask 022。
-    mkdir -p /var/www/rr-nexus-certbot/.well-known/acme-challenge
-    chmod 755 /var/www/rr-nexus-certbot /var/www/rr-nexus-certbot/.well-known /var/www/rr-nexus-certbot/.well-known/acme-challenge
     echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let’s Encrypt 真证书……${RESET}"
-    if ! (umask 022 && certbot certonly --webroot -w /var/www/rr-nexus-certbot -d "$naive_domain" \
+    if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$naive_domain" \
         -m "$le_email" --agree-tos --non-interactive --quiet 2>/dev/null); then
         echo -e "${RED}[失败] 证书申请失败：请确认 ${naive_domain} 已解析到本机公网 IP、80 端口可访问；如日志提示邮箱被拒（invalid email），请在 /etc/argo_vmess.conf 添加 LE_EMAIL=你的邮箱 后重试。${RESET}" >&2
         return 1
     fi
-    cp -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" /etc/rr-naive/fullchain.pem || return 1
-    cp -f "/etc/letsencrypt/live/${naive_domain}/privkey.pem" /etc/rr-naive/privkey.pem || return 1
-    chmod 600 /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem
+    cp -f "${le_live_root}/${naive_domain}/fullchain.pem" "$naive_cert_dir/fullchain.pem" || return 1
+    cp -f "${le_live_root}/${naive_domain}/privkey.pem" "$naive_cert_dir/privkey.pem" || return 1
+    chmod 600 "$naive_cert_dir/fullchain.pem" "$naive_cert_dir/privkey.pem"
     deploy_naive_cert_hook
     echo -e "${GREEN}[成功] NaiveProxy Let’s Encrypt 真证书已就绪（/etc/rr-naive/）。${RESET}"
     return 0

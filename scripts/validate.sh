@@ -123,6 +123,65 @@ echo "[3/13] Fresh-install port selection regression"
     }
 )
 
+# Naive 首装证书必须先真正启动 ACME Webroot，再调用 certbot；同时不得
+# 为签证书强杀占用 80 端口的其他服务。
+(
+    load_modules_for_tests
+    naive_root=$(mktemp -d)
+    trap 'rm -rf "$naive_root"' EXIT
+    RR_NAIVE_ACME_WEBROOT="$naive_root/webroot"
+    RR_NAIVE_ACME_NGINX_SITE="$naive_root/sites-available/rr-naive-acme.conf"
+    RR_NAIVE_ACME_NGINX_ENABLED="$naive_root/sites-enabled/rr-naive-acme.conf"
+    RR_LE_LIVE_ROOT="$naive_root/letsencrypt/live"
+    RR_NAIVE_CERT_DIR="$naive_root/certs"
+    call_log="$naive_root/calls"
+    : > "$call_log"
+
+    tcp_port_in_use() { return 1; }
+    nginx() {
+        [ "${1:-}" = -t ] || return 1
+        printf '%s\n' nginx-test >> "$call_log"
+    }
+    certbot() {
+        printf '%s\n' certbot >> "$call_log"
+        mkdir -p "$RR_LE_LIVE_ROOT/naive.example.com"
+        printf '%s\n' certificate > "$RR_LE_LIVE_ROOT/naive.example.com/fullchain.pem"
+        printf '%s\n' private-key > "$RR_LE_LIVE_ROOT/naive.example.com/privkey.pem"
+    }
+    systemctl() {
+        if [ "${1:-}" = is-active ]; then
+            return 1
+        fi
+        printf 'systemctl:%s\n' "$*" >> "$call_log"
+    }
+    open_protocol_firewall() { printf 'firewall:%s:%s\n' "$1" "$2" >> "$call_log"; }
+    deploy_naive_cert_hook() { printf '%s\n' deploy-hook >> "$call_log"; }
+
+    ensure_naive_certificate naive.example.com ""
+    [ -L "$RR_NAIVE_ACME_NGINX_ENABLED" ]
+    grep -Fq 'server_name naive.example.com;' "$RR_NAIVE_ACME_NGINX_SITE"
+    grep -Fq "root $RR_NAIVE_ACME_WEBROOT;" "$RR_NAIVE_ACME_NGINX_SITE"
+    grep -Fq 'systemctl:enable --now nginx' "$call_log"
+    grep -Fq 'firewall:80:tcp' "$call_log"
+    certbot_line=$(grep -n '^certbot$' "$call_log" | cut -d: -f1)
+    firewall_line=$(grep -n '^firewall:80:tcp$' "$call_log" | cut -d: -f1)
+    [ "$firewall_line" -lt "$certbot_line" ]
+    [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/fullchain.pem")" = 600 ]
+    [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/privkey.pem")" = 600 ]
+
+    conflict_root="$naive_root/conflict"
+    RR_NAIVE_ACME_WEBROOT="$conflict_root/webroot"
+    RR_NAIVE_ACME_NGINX_SITE="$conflict_root/sites-available/rr-naive-acme.conf"
+    RR_NAIVE_ACME_NGINX_ENABLED="$conflict_root/sites-enabled/rr-naive-acme.conf"
+    tcp_port_in_use() { return 0; }
+    ss() { printf '%s\n' 'LISTEN 0 511 0.0.0.0:80 users:(("apache2",pid=1,fd=3))'; }
+    if prepare_naive_acme_webroot naive.example.com; then
+        echo "Naive ACME setup accepted port 80 owned by a non-Nginx service." >&2
+        exit 1
+    fi
+    [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
+)
+
 echo "[4/13] Fresh-install snapshot regression"
 version_function=$(awk '
     /^rr_version_ge\(\) \{/ { capture = 1 }

@@ -251,6 +251,10 @@ uninstall_all() {
     fi
     rm -f /usr/local/bin/auto_update_sub.py
     rm -f /etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh
+    rm -f /etc/nginx/sites-enabled/rr-naive-acme.conf /etc/nginx/sites-available/rr-naive-acme.conf
+    if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
     if [ -f /etc/fail2ban/jail.d/argo-rr-sshd.local ]; then
         rm -f /etc/fail2ban/jail.d/argo-rr-sshd.local
         fail2ban-client -t >/dev/null 2>&1 && \
@@ -272,7 +276,7 @@ uninstall_all() {
         echo -e "${YELLOW}[警告] ${SUB_ROOT} 未通过安全检查，卸载未删除该路径。${RESET}" >&2
     fi
     rm -rf /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
-        /etc/rr-update /var/lib/rr-nexus /var/lib/rr-update /var/lib/rr-backup \
+        /etc/rr-update /var/lib/rr-nexus /var/lib/rr-update /var/lib/rr-backup /var/www/rr-nexus-certbot \
         "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
     rm -f /etc/sysctl.d/99-argo-rr.conf "$ARGO_PID_FILE" "$ARGO_LOG_FILE" \
         /tmp/sub_server.pid /tmp/sub_server.bind /tmp/argo_rr_cloudflared.pid /tmp/argo.log
