@@ -182,6 +182,25 @@ echo "[3/13] Fresh-install port selection regression"
     [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
 )
 
+# Nexus 公网 IP 安装后的健康检查必须使用真实存在的地址构造函数，且
+# IPv6 URL 必须带方括号。
+(
+    load_modules_for_tests
+    nexus_url_root=$(mktemp -d)
+    trap 'rm -rf "$nexus_url_root"' EXIT
+    NEXUS_CONFIG_FILE="$nexus_url_root/nexus.json"
+    printf '%s\n' '{"mode":"public","domain":"203.0.113.8","ssh_host":"203.0.113.8","public_port":10443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://203.0.113.8:10443' ]
+    printf '%s\n' '{"mode":"public","domain":"2001:db8::8","ssh_host":"2001:db8::8","public_port":10443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://[2001:db8::8]:10443' ]
+    printf '%s\n' '{"mode":"public","domain":"panel.example.com","ssh_host":"203.0.113.8","public_port":443}' > "$NEXUS_CONFIG_FILE"
+    [ "$(nexus_panel_url)" = 'https://panel.example.com' ]
+    if grep -q 'nexus_access_url' modules/85-nexus.sh; then
+        echo "Nexus install still calls the nonexistent nexus_access_url helper." >&2
+        exit 1
+    fi
+)
+
 echo "[4/13] Fresh-install snapshot regression"
 version_function=$(awk '
     /^rr_version_ge\(\) \{/ { capture = 1 }

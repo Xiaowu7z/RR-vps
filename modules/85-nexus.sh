@@ -27,6 +27,7 @@ nexus_panel_url() {
     local domain=""
     local public_port=""
     local ssh_host=""
+    local domain_is_ip=false
     mode=$(jq -r '.mode // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     domain=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     public_port=$(jq -r '.public_port // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
@@ -36,8 +37,10 @@ nexus_panel_url() {
         return 0
     fi
     [ "$mode" = "public" ] || return 1
+    is_ip_version "$domain" 4 && domain_is_ip=true
+    is_ip_version "$domain" 6 && domain_is_ip=true
     # 域名模式（真证书）；IP 直连（自签证书）
-    if [ -n "$domain" ] && [ "$domain" != "ip" ] && ! printf '%s' "$domain" | grep -qE '^[0-9.]+$'; then
+    if [ -n "$domain" ] && [ "$domain" != "ip" ] && [ "$domain_is_ip" = false ]; then
         if [ "${public_port:-443}" = "443" ]; then
             printf 'https://%s' "$domain"
         else
@@ -47,6 +50,9 @@ nexus_panel_url() {
         local host=""
         host="${ssh_host:-$domain}"
         [ -n "$host" ] || return 1
+        host="${host#[}"
+        host="${host%]}"
+        is_ip_version "$host" 6 && host="[$host]"
         printf 'https://%s:%s' "$host" "${public_port:-7900}"
     fi
 }
@@ -1473,7 +1479,7 @@ PY
             ;;
         3)
             echo -e "${CYAN}正在检测公网 IP 入口……${RESET}"
-            test_url=$(nexus_access_url)
+            test_url=$(nexus_panel_url)
             # 仅自签 IP 模式允许跳过 CA 校验；域名模式必须通过完整 TLS 校验。
             curl --fail --silent --show-error --insecure --connect-timeout 5 --max-time 10 \
                 "${test_url%/}/healthz" >/dev/null 2>&1 && reachability_ok=true
