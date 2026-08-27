@@ -831,6 +831,8 @@ restore_config_transaction_snapshot() {
     local restart_required="$4"
     local restore_failed=false
 
+    ensure_subscription_root || return 1
+
     cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE" || return 1
     if [ -f "$tx_dir/had_runtime_config" ]; then
         cp -p "$tx_dir/config.json" /etc/sing-box/config.json || return 1
@@ -891,6 +893,7 @@ apply_config_transaction() {
         rm -rf "$tx_dir"
         return 1
     fi
+    ensure_subscription_root || { rm -rf "$tx_dir"; return 1; }
     old_uuid="$UUID"
     if [ -f /etc/sing-box/config.json ]; then
         cp -p /etc/sing-box/config.json "$tx_dir/config.json" || { rm -rf "$tx_dir"; return 1; }

@@ -662,11 +662,26 @@ start_subscription_server() {
     local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|${server_signature}"
     local current_state=""
     local old_pid=""
+    local used_legacy_pid=false
+
+    ensure_subscription_root || return 1
 
     [ -f "$SUB_BIND_STATE_FILE" ] && current_state=$(cat "$SUB_BIND_STATE_FILE" 2>/dev/null)
     [ -f "$SUB_PID_FILE" ] && old_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
+    # 从 7.1.0 及更早版本热更新时接管旧 /tmp PID；身份核验仍由
+    # is_subscription_pid 完成，伪造数字不会导致误杀其他进程。
+    if [ -z "$old_pid" ] && [ -f /tmp/sub_server.pid ]; then
+        old_pid=$(cat /tmp/sub_server.pid 2>/dev/null)
+        [ -f /tmp/sub_server.bind ] && current_state=$(cat /tmp/sub_server.bind 2>/dev/null)
+        used_legacy_pid=true
+    fi
 
     if is_subscription_pid "$old_pid" && [ "$current_state" = "$desired_state" ]; then
+        if [ "$used_legacy_pid" = true ]; then
+            printf '%s\n' "$old_pid" > "$SUB_PID_FILE" || return 1
+            printf '%s\n' "$current_state" > "$SUB_BIND_STATE_FILE" || return 1
+            rm -f /tmp/sub_server.pid /tmp/sub_server.bind
+        fi
         return 0
     fi
 
@@ -675,9 +690,8 @@ start_subscription_server() {
         sleep 1
     fi
 
-    rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE"
+    rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE" /tmp/sub_server.pid /tmp/sub_server.bind
 
-    mkdir -p "$SUB_ROOT"
     (
         cd "$SUB_ROOT" || exit 1
         if [ -s "$sub_server_app" ]; then

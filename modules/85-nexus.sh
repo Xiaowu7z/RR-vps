@@ -8,7 +8,8 @@ NEXUS_SUB_ROOT="${NEXUS_DATA_DIR}/subscriptions"
 NEXUS_SERVICE_FILE="/etc/systemd/system/rr-nexus.service"
 NEXUS_NGINX_SITE="/etc/nginx/sites-available/rr-nexus.conf"
 NEXUS_APP="${RR_LIB_DIR}/nexus/rr_nexus.py"
-NEXUS_CORE_RELEASE_API="https://api.github.com/repos/${RR_REPOSITORY}/releases/tags/rr-nexus-core"
+NEXUS_CORE_UPSTREAM_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+NEXUS_CORE_RELEASE_API="https://api.github.com/repos/${RR_REPOSITORY}/releases/tags"
 
 nexus_is_installed() {
     [ -f "$NEXUS_CONFIG_FILE" ] && [ -f "$NEXUS_SERVICE_FILE" ] && [ -f "$NEXUS_APP" ]
@@ -75,6 +76,25 @@ nexus_show_local_tutorial() {
 nexus_core_supports_traffic() {
     [ -x "$SINGBOX_BIN" ] || return 1
     "$SINGBOX_BIN" version 2>/dev/null | grep -qw 'with_v2ray_api'
+}
+
+nexus_fetch_traffic_core_release() {
+    local target_file="$1"
+    local upstream_file="${target_file}.upstream"
+    local upstream_tag=""
+    local release_tag=""
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
+        -o "$upstream_file" "$NEXUS_CORE_UPSTREAM_API" || return 1
+    upstream_tag=$(jq -r '.tag_name // empty' "$upstream_file")
+    [[ "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    release_tag="rr-nexus-core-${upstream_tag}"
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
+        -o "$target_file" "${NEXUS_CORE_RELEASE_API}/${release_tag}" || return 1
+    jq -e --arg tag "$release_tag" \
+        '.tag_name == $tag and .draft == false and .prerelease == false' \
+        "$target_file" >/dev/null || return 1
 }
 
 nexus_stats_port() {
@@ -148,15 +168,15 @@ nexus_traffic_core_version() {
     work_dir=$(mktemp -d /tmp/rr-nexus-version.XXXXXX) || return 1
     release_json="$work_dir/release.json"
     build_info="$work_dir/BUILD_INFO"
-    if ! curl -fsSL --retry 2 --connect-timeout 8 --max-time 30 \
-        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
-        -o "$release_json" "$NEXUS_CORE_RELEASE_API"; then
+    if ! nexus_fetch_traffic_core_release "$release_json"; then
         rm -rf "$work_dir"
         return 1
     fi
+    local release_tag=""
+    release_tag=$(jq -r '.tag_name // empty' "$release_json")
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
-    if [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
+    if [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ] || \
        ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
            -o "$build_info" "$info_url"; then
         rm -rf "$work_dir"
@@ -180,34 +200,49 @@ nexus_download_traffic_core() {
     local expected=""
     local actual=""
     local version=""
+    local source_tag=""
     local extracted=""
 
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
-        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
-        -o "$release_json" "$NEXUS_CORE_RELEASE_API" || return 1
+    nexus_fetch_traffic_core_release "$release_json" || return 1
+    local release_tag=""
+    release_tag=$(jq -r '.tag_name // empty' "$release_json")
     checksum_url=$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url' \
         "$release_json" | head -n 1)
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
-    if [[ ! "$checksum_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
-       [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]]; then
+    if [ "$checksum_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/SHA256SUMS" ] || \
+       [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ]; then
         return 1
     fi
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$checksums" "$checksum_url" || return 1
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$build_info" "$info_url" || return 1
     version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
+    source_tag=$(awk -F= '$1 == "SING_BOX_TAG" {print $2; exit}' "$build_info")
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    [ "$source_tag" = "v${version}" ] || return 1
+    [ "$release_tag" = "rr-nexus-core-${source_tag}" ] || return 1
+    grep -Eq '^SOURCE_COMMIT=[0-9a-f]{40}$' "$build_info" || return 1
+    awk '
+        NF != 2 || $1 !~ /^[0-9a-f]{64}$/ ||
+        $2 !~ /^rr-sing-box-[0-9A-Za-z.-]+-linux-(amd64|arm64)\.tar\.gz$/ { exit 1 }
+        seen[$2]++ { exit 1 }
+        END { if (NR != 2) exit 1 }
+    ' "$checksums" || return 1
     archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
     archive_url=$(jq -r --arg name "$archive_name" \
         '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
-    [[ "$archive_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || return 1
-    curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "$work_dir/$archive_name" "$archive_url" || return 1
+    [ "$archive_url" = "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}" ] || return 1
+    curl -fL --retry 3 --connect-timeout 10 --max-time 240 --max-filesize 104857600 \
+        -o "$work_dir/$archive_name" "$archive_url" || return 1
+    [ "$(stat -c %s "$work_dir/$archive_name" 2>/dev/null || echo 0)" -le 104857600 ] || return 1
     expected=$(awk -v name="$archive_name" '$2 == name {print $1; exit}' "$checksums")
     actual=$(sha256sum "$work_dir/$archive_name" | awk '{print $1}')
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] || return 1
     extracted="sing-box-${version}-linux-${SYS_ARCH}/sing-box"
     tar -tzf "$work_dir/$archive_name" "$extracted" >/dev/null 2>&1 || return 1
     tar --no-same-owner -xzf "$work_dir/$archive_name" -C "$work_dir" "$extracted" 2>/dev/null || return 1
+    [ -f "$work_dir/$extracted" ] && [ ! -L "$work_dir/$extracted" ] && \
+        [ "$(stat -c %h "$work_dir/$extracted" 2>/dev/null || echo 0)" -eq 1 ] || return 1
     install -m 755 "$work_dir/$extracted" "$work_dir/sing-box" || return 1
     "$work_dir/sing-box" version 2>/dev/null | grep -qw 'with_v2ray_api' || return 1
     version_ge "$(get_singbox_version "$work_dir/sing-box")" "$MIN_SINGBOX_VERSION" || return 1
@@ -325,6 +360,7 @@ PY
 generate_nexus_device_subscriptions() {
     [ -f "$NEXUS_DB_FILE" ] || return 0
     load_config_with_defaults || return 1
+    ensure_subscription_root || return 1
     validate_subscription_crypto_material || return 1
     select_entry_ip || return 1
     # 面板进程会在每次打开「链接与二维码」时重读这两个值。这样入口 IP、
@@ -745,7 +781,11 @@ nexus_migrate_runtime_config() {
     tmp=$(mktemp /tmp/rr-nexus-migrate.XXXXXX) || return 1
     if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" --argjson sub_port "$sub_url_port" \
         --arg published_subscription_root "${SUB_ROOT}/nexus" \
-        '.stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port | .published_subscription_root=$published_subscription_root' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+        '.listen="127.0.0.1" | .port=7900 | .database="/var/lib/rr-nexus/nexus.db" |
+         .subscription_root="/var/lib/rr-nexus/subscriptions" |
+         .stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port |
+         .published_subscription_root=$published_subscription_root' \
+        "$NEXUS_CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -823,12 +863,15 @@ nexus_prompt_admin() {
     local init_output=""
     while true; do
         read -rp "管理员账号: " username
-        [ -n "$username" ] && break
-        echo -e "${RED}账号不能为空。${RESET}"
+        [[ "$username" =~ ^[A-Za-z][A-Za-z0-9_.-]{2,31}$ ]] && break
+        echo -e "${RED}账号需以字母开头，仅含字母、数字、点、下划线或连字符（3–32 位）。${RESET}"
     done
     while true; do
         read -rsp "管理员密码: " password; echo
-        [ -n "$password" ] || { echo -e "${RED}密码不能为空。${RESET}"; continue; }
+        [ "${#password}" -ge 12 ] && [ "${#password}" -le 512 ] || {
+            echo -e "${RED}密码需为 12–512 个字符。${RESET}"
+            continue
+        }
         read -rsp "再次输入密码: " password_again; echo
         [ "$password" = "$password_again" ] && break
         echo -e "${RED}两次密码不一致。${RESET}"
@@ -1242,7 +1285,7 @@ server {
         proxy_pass http://127.0.0.1:7900;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
 }
@@ -1286,7 +1329,11 @@ NGXEOF
                 [ -z "$(nginx -V 2>&1 | grep stream_module)" ] && apt-get install -y libnginx-mod-stream >/dev/null 2>&1 || true
                 sed -i '/^stream {/,/^}/d' /etc/nginx/nginx.conf 2>/dev/null || true
                 sed -i '/^load_module.*stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-                cat > /tmp/rr-nexus-stream.conf <<NGXEOF
+                local stream_tmp=""
+                local nginx_conf_tmp=""
+                stream_tmp=$(mktemp /tmp/rr-nexus-stream.XXXXXX) || return 1
+                nginx_conf_tmp=$(mktemp /etc/nginx/.nginx.conf.XXXXXX) || { rm -f "$stream_tmp"; return 1; }
+                cat > "$stream_tmp" <<NGXEOF
 stream {
     map \$ssl_preread_server_name \$backend {
         ${ENTRY_IP_RAW}  nexus_panel;
@@ -1308,8 +1355,12 @@ stream {
     }
 }
 NGXEOF
-                python3 -c "
-lines=open('/etc/nginx/nginx.conf').readlines()
+                if ! python3 - "$stream_tmp" /etc/nginx/nginx.conf "$nginx_conf_tmp" <<'PY'; then
+import pathlib
+import sys
+
+stream_path, nginx_path, output_path = map(pathlib.Path, sys.argv[1:])
+lines = nginx_path.read_text(encoding="utf-8").splitlines(keepends=True)
 # Prepend load_module if not present
 if not any('load_module' in l and 'stream' in l for l in lines):
     lines.insert(0,'load_module modules/ngx_stream_module.so;\n')
@@ -1317,11 +1368,19 @@ if not any('load_module' in l and 'stream' in l for l in lines):
 for i in range(len(lines)-1,-1,-1):
     if '}' in lines[i] and not lines[i].strip().startswith('#'):
         lines.insert(i+1,'\n')
-        lines.insert(i+1,open('/tmp/rr-nexus-stream.conf').read())
+        lines.insert(i+1, stream_path.read_text(encoding="utf-8"))
         break
-open('/etc/nginx/nginx.conf','w').write(''.join(lines))
-"
-                rm -f /tmp/rr-nexus-stream.conf
+else:
+    raise SystemExit("nginx.conf has no insertion point")
+with output_path.open("w", encoding="utf-8") as output:
+    output.write(''.join(lines))
+PY
+                    rm -f "$stream_tmp" "$nginx_conf_tmp"
+                    return 1
+                fi
+                chmod --reference=/etc/nginx/nginx.conf "$nginx_conf_tmp" || { rm -f "$stream_tmp" "$nginx_conf_tmp"; return 1; }
+                mv -f "$nginx_conf_tmp" /etc/nginx/nginx.conf || { rm -f "$stream_tmp" "$nginx_conf_tmp"; return 1; }
+                rm -f "$stream_tmp"
 
                 echo -e "${CYAN}SNI 分流：面板 IP → Nexus，其他域名 → sing-box${RESET}"
             else

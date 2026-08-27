@@ -454,7 +454,8 @@ launch_quick_argo_tunnel() {
     for old_pid in "${old_pids[@]}"; do
         [ "$old_pid" = "$new_pid" ] || kill -TERM "$old_pid" 2>/dev/null || true
     done
-    cp -f "$log_file" /tmp/argo.log 2>/dev/null || true
+    cp -f "$log_file" "$ARGO_LOG_FILE" 2>/dev/null || true
+    chmod 600 "$ARGO_LOG_FILE" 2>/dev/null || true
     rm -f "$log_file"
     echo -e "${GREEN}[成功] Argo 临时隧道已切换：${new_domain}${RESET}"
     if [ -n "$old_domain" ] && [ "$old_domain" != "$new_domain" ]; then

@@ -48,6 +48,20 @@ RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade
 
 first_manifest=$(sha256sum /usr/local/lib/rr/manifest.sha256 | awk '{print $1}')
+# Exercise the catchable failure window after the old runtime was moved but
+# before the candidate became live.  This is distinct from SIGKILL recovery:
+# the installer's EXIT rollback itself must restore the only old copy.
+if RR_TEST_FAULTS=1 RR_TEST_FAIL_PHASE=old_runtime_moved \
+   RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
+   RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
+   bash scripts/install-core.sh --upgrade; then
+    echo "catchable old-runtime-moved fault unexpectedly succeeded" >&2
+    exit 1
+fi
+/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+test "$(sha256sum /usr/local/lib/rr/manifest.sha256 | awk '{print $1}')" = "$first_manifest"
+test ! -e /var/lib/rr-update/active
+
 # Simulate an uncatchable power-loss window after the old runtime was moved.
 if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=old_runtime_moved \
    RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \

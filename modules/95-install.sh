@@ -265,10 +265,17 @@ uninstall_all() {
     fi
     rm -f "$SUB_BIND_STATE_FILE"
 
-    rm -rf "$SUB_ROOT" /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
+    # 可疑的 /tmp 订阅根绝不以 root 身份递归删除；保留现场并提示人工检查。
+    if ensure_subscription_root; then
+        rm -rf -- "$SUB_ROOT"
+    else
+        echo -e "${YELLOW}[警告] ${SUB_ROOT} 未通过安全检查，卸载未删除该路径。${RESET}" >&2
+    fi
+    rm -rf /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
         /etc/rr-update /var/lib/rr-nexus /var/lib/rr-update /var/lib/rr-backup \
         "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
-    rm -f /etc/sysctl.d/99-argo-rr.conf "$ARGO_PID_FILE" /tmp/argo.log
+    rm -f /etc/sysctl.d/99-argo-rr.conf "$ARGO_PID_FILE" "$ARGO_LOG_FILE" \
+        /tmp/sub_server.pid /tmp/sub_server.bind /tmp/argo_rr_cloudflared.pid /tmp/argo.log
     echo -e "${GREEN}清理完毕，欢迎随时再次使用 RR-vps！${RESET}"
     echo -e "${CYAN}项目地址 / Project:${RESET} ${project_url}"
     echo -e "${YELLOW}重新安装 / Reinstall:${RESET}"

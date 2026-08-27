@@ -2,6 +2,27 @@
 
 > RR-vps 自 6.6.9 起作为新的公开稳定版本基线（RR-vps public stable history starts from 6.6.9）。此前版本仅视为开发阶段，不再作为项目公开正式历史保留。
 
+## 7.1.1 - 安全与发布门禁维护版（2026-08-27）
+
+### 安全修复
+- 修复个人订阅路径归一化绕过、Nginx 代理来源伪造、Webhook/远程管理 SSRF、请求体无限读取、远程状态 XSS、恶意 `.rrbak` 注入 root cron/systemd 单元等问题
+- 订阅发布根必须是 root 所有的真实目录；PID/状态文件迁至 `/run`，拒绝 `/tmp` 符号链接抢占、非 root 目录和不安全事务备份
+- 面板与订阅 HTTP 服务限制为 64 个并发请求并设置 15 秒慢客户端超时；订阅 token 不再进入 request-line 日志
+- 管理员密码最低长度提高到 12 位；修改密码后撤销其他 Session；API 分别执行 32 KiB/1 MiB 请求体上限
+- 审计、通知、系统与流量历史加入保留期和硬上限；健康及自动订阅日志限制增长并使用 600 权限
+
+### 更新、Release 与供应链
+- Stable 只从 CI 完成后生成的 GitHub `latest Release` 读取 `install.sh`、manifest 和 bundle；Beta 才跟随独立 `beta` 分支
+- Release 同时发布 `install.sh`、`manifest.sha256`、确定性 bundle、`RELEASE_INFO` 与 `SHA256SUMS`，并拒绝覆盖或修补同名既有资产
+- Bootstrap 与核心安装器固定到同版本 Tag；用户镜像只能搬运由官方 manifest/内置摘要校验的内容，不能提供可执行信任锚
+- GitHub Actions 使用固定提交摘要与最小 Token 权限；Release 只接受同一 main 提交的完整 CI 成功结果
+- 自建流量统计 Sing-box 改用按上游版本隔离的不可变 Release，严格校验上游 Tag、Commit、两架构摘要与解压后的普通文件/硬链接数
+
+### 正确性与恢复
+- 修复出站域名 DNS 自举闭环、更新在旧运行目录已移动后失败却丢失回滚源，以及设备仅改备注仍可能触发不必要重启的问题
+- 恢复流程仅接受 RR 白名单数据；Nexus 服务、健康单元和自动更新 worker 均由已校验本机运行时重新生成
+- 新增上述安全问题、慢客户端资源上限、历史清理、恶意归档、更新故障阶段与 Ubuntu 22.04 Python 兼容回归测试
+
 ## 7.1.0 - 正式版：可恢复热更新、体检迁移、安全告警与 Naive H3（2026-08-27）
 
 ### 持久事务式热更新

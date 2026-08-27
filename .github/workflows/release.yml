@@ -4,10 +4,9 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event.workflow_run.head_sha }}
@@ -16,17 +15,19 @@ concurrency:
 jobs:
   publish:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: ShellCheck
         run: |
@@ -46,7 +47,15 @@ jobs:
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          sha256sum rr-bundle.tar.gz
+          grep -Fxq "RR_RELEASE_TAG=\"v${version}\"" install.sh
+          grep -Fxq "RR_RELEASE_TAG=\"v${version}\"" scripts/install-core.sh
+          cat > RELEASE_INFO <<EOF
+          VERSION=${version}
+          TAG=v${version}
+          COMMIT=$(git rev-parse HEAD)
+          EOF
+          sha256sum install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO > SHA256SUMS
+          sha256sum -c SHA256SUMS
 
           awk -v prefix="## ${version} " '
             index($0, prefix) == 1 { capture = 1 }
@@ -64,10 +73,30 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "$TAG already exists; keeping the immutable published version."
+            tag_sha=$(git rev-list -n 1 "$TAG^{commit}" 2>/dev/null || true)
+            if [ "$tag_sha" != "${{ steps.release.outputs.sha }}" ]; then
+              echo "$TAG already exists at $tag_sha, expected ${{ steps.release.outputs.sha }}" >&2
+              exit 1
+            fi
+            existing_dir=$(mktemp -d)
+            trap 'rm -rf "$existing_dir"' EXIT
+            for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$asset" --dir "$existing_dir"
+              cmp -s "$asset" "$existing_dir/$asset" || {
+                echo "$TAG asset $asset differs from the CI-verified release" >&2
+                exit 1
+              }
+            done
+            (cd "$existing_dir" && sha256sum -c SHA256SUMS)
+            echo "$TAG already exists and matches the verified commit and bundle."
             exit 0
           fi
-          gh release create "$TAG" rr-bundle.tar.gz \
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG exists without a matching GitHub Release; refusing to overwrite it." >&2
+            exit 1
+          fi
+          gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "${{ steps.release.outputs.sha }}" \
             --title "RR-vps ${VERSION} 正式版" \

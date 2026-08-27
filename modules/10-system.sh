@@ -360,6 +360,33 @@ duration_to_seconds() {
     esac
 }
 
+ensure_subscription_root() {
+    local root_uid=""
+    # /tmp 使用 sticky bit 只能保护已经由 root 创建的目录；首次创建前仍可能被
+    # 普通用户抢占为目录或符号链接。绝不跟随或接管这类对象，也不自动删除，
+    # 以免把攻击者选择的目标变成 root 的递归删除对象。
+    if [ -L "$SUB_ROOT" ] || { [ -e "$SUB_ROOT" ] && [ ! -d "$SUB_ROOT" ]; }; then
+        echo -e "${RED}[安全拒绝] 订阅目录不是普通目录：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    if [ ! -d "$SUB_ROOT" ]; then
+        mkdir -m 700 -- "$SUB_ROOT" 2>/dev/null || true
+    fi
+    if [ -L "$SUB_ROOT" ] || [ ! -d "$SUB_ROOT" ]; then
+        echo -e "${RED}[安全拒绝] 无法安全创建订阅目录：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    root_uid=$(stat -c '%u' -- "$SUB_ROOT" 2>/dev/null) || return 1
+    if [ "$root_uid" != 0 ]; then
+        echo -e "${RED}[安全拒绝] 订阅目录不属于 root：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    chmod 700 -- "$SUB_ROOT" || return 1
+    # chmod 后再次检查，防止检查与使用之间对象发生变化。
+    [ ! -L "$SUB_ROOT" ] && [ -d "$SUB_ROOT" ] && \
+        [ "$(stat -c '%u' -- "$SUB_ROOT" 2>/dev/null)" = 0 ]
+}
+
 is_subscription_pid() {
     local pid="${1:-}"
     local cmdline=""

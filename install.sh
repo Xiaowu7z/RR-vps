@@ -7,15 +7,20 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="2"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
+RR_RELEASE_TAG="v7.1.1"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
-RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
+RR_SOURCE_REF="$RR_RELEASE_TAG"
+[ "$RR_BRANCH" = beta ] && RR_SOURCE_REF=beta
+RR_REF_KIND=tags
+[ "$RR_BRANCH" = beta ] && RR_REF_KIND=heads
+RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/${RR_REF_KIND}/${RR_SOURCE_REF}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
-RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
+RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"
 RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"
-RR_CORE_SHA256="e7ae1cfde8da5db8d25c5118b096e07f5e33821b4575249d5e3413b39f2d313c"
-RR_GUARD_SHA256="9b2ca7d908ae0e0c47da25d8bdf371fee9ee4353e9fed494cb0f728933a35b13"
+RR_CORE_SHA256="c570093e842372ea60074eecf296586dd2433891015ac07a4534b333cb485fa3"
+RR_GUARD_SHA256="07978192d9ea24891cf0914def41d67437e21841c4a7344c6c16c353bd67c7f0"
 RR_MODE="${1:-install}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 
@@ -55,7 +60,7 @@ rr_download_bootstrap_file() {
         if [ -n "$relative_path" ]; then
             curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 180 \
                 -H "Accept: application/vnd.github.raw+json" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" \
                 -o "$target_file" 2>/dev/null && return 0
             curl -4 -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 180 \
                 "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" \
@@ -68,7 +73,7 @@ rr_download_bootstrap_file() {
             wget -q --timeout="$timeout_seconds" --tries=2 \
                 --header="Accept: application/vnd.github.raw+json" \
                 -O "$target_file" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" && return 0
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" && return 0
             wget -4 -q --timeout="$timeout_seconds" --tries=2 \
                 -O "$target_file" "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" && return 0
         fi
@@ -219,7 +224,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d" ]
+# [ "$actual" = "205f72e4f9aa454a605c74ac714bb356014f54497406f793b3fac27939bd14a7" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

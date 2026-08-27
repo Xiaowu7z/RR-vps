@@ -8,17 +8,17 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.1.0** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.1.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### New in 7.1.0: recoverable updates, diagnostics, migration, security, and alerts
+### 7.1.1: security and release-gate maintenance
 
-7.1.0 turns hot updates into durable transactions that survive process termination and reboot. Every update runs preflight checks and a runtime/database snapshot, validates the bundle, launcher, and guard with pinned SHA256 values, switches atomically, then gates the commit on configuration, database, process, and HTTP health. Interrupted work is recovered automatically on boot; failed work rolls back, and `rr update --rollback` restores the previous committed release.
+7.1.1 fixes subscription authorization, SSRF, proxy-source spoofing, backup/restore injection, predictable temporary paths, slow-client resource exhaustion, and rollback failures. Stable now consumes only a CI-verified GitHub Release pinned to the matching version tag; Beta remains isolated on its own branch.
 
-This release also adds `rr doctor` with redacted reports, encrypted `.rrbak` migration backups, Telegram/HTTPS-webhook alerts, TOTP and Passkeys, 24-hour/7-day/30-day charts, device groups/templates/batch actions, Stable/Beta channels, and NaiveProxy HTTP/3 over QUIC. Existing installations retain HTTP/2 for NaiveProxy during migration unless the administrator opts into H3.
+Existing diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 features remain compatible. See the changelog for the complete list.
 
 ## One-command installation
 
-Supported systems (full test matrix passed, 2026-08):
+Target systems (revalidated by CI and real-VPS release gates for every release):
 
 | System | Support | Notes |
 | --- | --- | --- |
@@ -37,13 +37,13 @@ sudo -i
 Install with curl (recommended):
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(curl -fsSL "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 Or use wget:
 
 ```bash
-bash <(wget -qO- "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(wget -qO- "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 Open the control panel:

@@ -40,6 +40,10 @@ rr_restore_dir() {
     local backup="$1" target="$2"
     rm -rf -- "$target" || return 1
     if [ -f "$RR_BACKUP/had_${backup}" ]; then
+        if [ -L "$RR_BACKUP/$backup" ] || [ ! -d "$RR_BACKUP/$backup" ]; then
+            rr_recover_log "refusing unsafe directory backup: ${backup}"
+            return 1
+        fi
         mkdir -p "$(dirname "$target")" || return 1
         cp -a "$RR_BACKUP/$backup" "$target"
     fi

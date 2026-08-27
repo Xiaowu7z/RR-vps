@@ -90,6 +90,7 @@ validate_node_port() {
 # ==========================================
 generate_node_and_sub() {
     load_config_with_defaults || return 1
+    ensure_subscription_root || return 1
     # T9：证书缺失时自动重建（保持节点可起、订阅可再生成），失败则拒绝继续。
     ensure_tls_certificates || return 1
     validate_subscription_crypto_material || return 1
@@ -102,7 +103,7 @@ generate_node_and_sub() {
     local SERVER_IP="$ENTRY_IP_URI"
     local SERVER_IP_RAW="$ENTRY_IP_RAW"
     local SUB_PATH_DIR="${SUB_ROOT}/${UUID}"
-    mkdir -p "$SUB_PATH_DIR"
+    mkdir -p -- "$SUB_PATH_DIR"
     chmod 700 "$SUB_ROOT" "$SUB_PATH_DIR" 2>/dev/null || true
 
     local all_links=""
@@ -529,7 +530,11 @@ generate_client_json() {
         client_final="direct"
         remote_dns_detour='"detour":"direct"'
     fi
-    local full_json='{"dns":{"servers":[{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","tls":{"enabled":true,"server_name":"cloudflare-dns.com"},'"$remote_dns_detour"'},{"type":"udp","tag":"local","server":"223.5.5.5"}],"final":"remote"},"inbounds":[{"type":"tun","tag":"tun-in","address":["172.19.0.1/30","fd00::1/126"],"auto_route":true,"strict_route":true}],'"$outbounds_json"',"route":{"rules":[{"inbound":"tun-in","action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"domain_suffix":['$RR_CN_DOMAINS'],"action":"route","outbound":"direct"},{"ip_is_private":true,"action":"route","outbound":"direct"}],"default_domain_resolver":"remote","final":"'"$client_final"'"}}'
+    # 代理服务器地址可能是域名（固定 Argo/Naive）。若这里使用经 proxy
+    # detour 的 remote DoH，会形成“先连代理才能解析代理域名”的自举闭环。
+    # 客户端普通 DNS 仍由 dns.final=remote 处理；这里只让出站服务器域名的
+    # 首次解析使用 local，符合 sing-box shared dial fields 的语义。
+    local full_json='{"dns":{"servers":[{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","tls":{"enabled":true,"server_name":"cloudflare-dns.com"},'"$remote_dns_detour"'},{"type":"udp","tag":"local","server":"223.5.5.5"}],"final":"remote"},"inbounds":[{"type":"tun","tag":"tun-in","address":["172.19.0.1/30","fd00::1/126"],"auto_route":true,"strict_route":true}],'"$outbounds_json"',"route":{"rules":[{"inbound":"tun-in","action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"domain_suffix":['$RR_CN_DOMAINS'],"action":"route","outbound":"direct"},{"ip_is_private":true,"action":"route","outbound":"direct"}],"default_domain_resolver":"local","final":"'"$client_final"'"}}'
 
     local SUB_PATH_DIR="${RR_SUB_OUTPUT_DIR:-${SUB_ROOT}/${uuid_val}}"
     mkdir -p "$SUB_PATH_DIR"

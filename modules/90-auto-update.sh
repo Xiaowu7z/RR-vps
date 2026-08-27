@@ -16,17 +16,53 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import uuid as uuidlib
 
 CONFIG_FILE = "/etc/argo_vmess.conf"
 LOG_FILE = "/var/log/auto_update_sub.log"
+SUB_ROOT = "/tmp/sub_server"
+MAX_LOG_BYTES = 1024 * 1024
 
 
 def log(msg):
+    try:
+        if os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+            temporary = f"{LOG_FILE}.{os.getpid()}.tmp"
+            with open(LOG_FILE, "rb") as current:
+                current.seek(-MAX_LOG_BYTES // 2, os.SEEK_END)
+                tail = current.read()
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as trimmed:
+                trimmed.write(tail)
+                trimmed.flush()
+                os.fsync(trimmed.fileno())
+            os.replace(temporary, LOG_FILE)
+    except (FileNotFoundError, OSError):
+        try:
+            os.unlink(temporary)
+        except (NameError, FileNotFoundError, OSError):
+            pass
     with open(LOG_FILE, "a", encoding="utf-8") as log_file:
         log_file.write(msg + "\n")
+    os.chmod(LOG_FILE, 0o600)
+
+
+def ensure_subscription_root():
+    """Atomically create or verify the root-owned, non-symlink publish root."""
+    try:
+        os.mkdir(SUB_ROOT, mode=0o700)
+    except FileExistsError:
+        pass
+    root_stat = os.lstat(SUB_ROOT)
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != 0:
+        raise RuntimeError("unsafe subscription root")
+    os.chmod(SUB_ROOT, 0o700)
+    root_stat = os.lstat(SUB_ROOT)
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != 0:
+        raise RuntimeError("subscription root changed during validation")
 
 
 try:
@@ -44,6 +80,12 @@ try:
                 env[key] = parsed[0] if parsed else ""
 except Exception as exc:
     log(f"Config read error: {exc}")
+    sys.exit(1)
+
+try:
+    ensure_subscription_root()
+except Exception as exc:
+    log(f"Subscription root error: {exc}")
     sys.exit(1)
 
 
@@ -136,7 +178,7 @@ else:
 if not server_ip_raw:
     log(
         f"No inbound address available for ENTRY_IP_MODE={entry_mode}; "
-        f"ipv6_source={ipv6_source}, ipv6_egress={ipv6_egress}, local_ula={local_ipv6_ula}"
+        f"ipv6_source={ipv6_source}"
     )
     sys.exit(1)
 
@@ -244,7 +286,7 @@ if vm_enabled:
                 preferred_addrs.append(cname)
 
     # 优选结果落盘，供面板设备订阅生成 Argo 优选副节点（设备凭据版）
-    preferred_file = "/tmp/sub_server/preferred_cnames.txt"
+    preferred_file = os.path.join(SUB_ROOT, "preferred_cnames.txt")
     try:
         if preferred_addrs:
             with open(preferred_file, "w", encoding="utf-8") as preferred_handle:
@@ -316,7 +358,7 @@ if naive_enabled and naive_port != "0" and naive_user and naive_pass and naive_d
 sub_content = "\n".join(all_links)
 final_b64 = base64.b64encode(sub_content.encode("utf-8")).decode("utf-8")
 
-target_dir = f"/tmp/sub_server/{uuid}"
+target_dir = os.path.join(SUB_ROOT, uuid)
 os.makedirs(target_dir, mode=0o700, exist_ok=True)
 for filename, content in (("jhsub.txt", sub_content), ("jhsub_encoded.txt", final_b64)):
     temp_path = os.path.join(target_dir, f".{filename}.{os.getpid()}.tmp")
@@ -338,7 +380,7 @@ for filename in ("client-v2rayn.txt", "client-v2rayng.txt", "client-sr.txt", "cl
 
 log(
     f"Updated subscription with {len(all_links)} nodes; "
-    f"entry={entry_mode}:{server_ip_raw}; ipv6_source={ipv6_source}"
+    f"entry_mode={entry_mode}; ipv6_source={ipv6_source}"
 )
 
 # 主订阅更新后同步面板设备订阅（含 Argo 优选副节点与最新 Argo 域名）

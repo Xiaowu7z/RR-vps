@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -19,12 +20,12 @@ import sqlite3
 import platform
 import socket
 import subprocess
-import urllib.request
-import urllib.error
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from rr_nexus_lib.notifications import NotificationManager
+from rr_nexus_lib.http_security import UnsafeTargetError, https_post
 from rr_nexus_lib.security import (
     b64url_decode,
     b64url_encode,
@@ -91,10 +93,15 @@ TRAFFIC_BUCKET_SECONDS = 5 * 60
 TRAFFIC_RETENTION_SECONDS = 30 * 24 * 3600
 SYSTEM_SAMPLE_SECONDS = 60
 SYSTEM_RETENTION_SECONDS = 30 * 24 * 3600
+AUDIT_RETENTION_SECONDS = 180 * 24 * 3600
+NOTIFICATION_RETENTION_SECONDS = 90 * 24 * 3600
+MAX_AUDIT_ROWS = 100_000
+MAX_NOTIFICATION_ROWS = 20_000
 MAX_AUTO_RESET_COUNT = 120
 MAX_SERVER_TRAFFIC_GB = 1024 * 1024
 SERVER_TRAFFIC_MODES = {"both", "tx", "rx"}
 MAX_JSON_BODY_BYTES = 1024 * 1024
+MIN_ADMIN_PASSWORD_LENGTH = 12
 V2RAY_QUERY_METHOD = "/v2ray.core.app.stats.command.StatsService/QueryStats"
 
 # ---- 多服务器远程管理（6.6.0）----
@@ -106,6 +113,10 @@ REMOTE_FAIL_DELAY = 0.5               # 验证失败基础延迟
 REMOTE_HTTP_TIMEOUT = 15              # 主面板调副面板超时（秒）
 REMOTE_MAX_SERVERS = 500              # 主面板可管理的服务器上限（无上限语义）
 REMOTE_CRED_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
+
+
+class RequestBodyTooLarge(ValueError):
+    """Stop request dispatch after enforcing the endpoint body limit."""
 
 # 远程升级任务（副面板侧，6.6.3）：任务状态文件 + 异步执行升级。
 # 统一调用 rr --update-now：复用模块内 GitHub Raw/API/CDN 回退、bundle 双层校验、
@@ -221,6 +232,8 @@ def remote_cred_issue(name: str, cfg: "NexusConfig") -> tuple[str | None, str]:
 
 def remote_cred_parse(cred: str) -> dict | None:
     """只解析 payload（供主面板读地址/端口），不验证签名。"""
+    if not isinstance(cred, str) or len(cred) > 4096:
+        return None
     parts = cred.split(".")
     if len(parts) != 3 or parts[0] != REMOTE_CRED_PREFIX:
         return None
@@ -230,8 +243,29 @@ def remote_cred_parse(cred: str) -> dict | None:
         payload = json.loads(raw)
     except Exception:
         return None
-    if not isinstance(payload, dict) or not payload.get("a") or not payload.get("p") or not payload.get("t"):
+    if not isinstance(payload, dict):
         return None
+    addr = payload.get("a")
+    token = payload.get("t")
+    try:
+        port_text = str(payload.get("p", ""))
+        if len(port_text) > 5 or not port_text.isdigit():
+            return None
+        port = int(port_text)
+    except (TypeError, ValueError):
+        return None
+    if (
+        payload.get("v") != 1
+        or not isinstance(addr, str)
+        or not 1 <= len(addr) <= 253
+        or any(ord(char) < 33 or ord(char) == 127 for char in addr)
+        or any(char in addr for char in "/@?#[]:")
+        or not 1 <= port <= 65535
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", token)
+    ):
+        return None
+    payload["p"] = port
     return payload
 
 
@@ -265,6 +299,22 @@ def utc_now() -> str:
 
 def epoch_now() -> int:
     return int(time.time())
+
+
+def bounded_remote_number(value: Any, maximum: float, *, integer: bool = False) -> int | float:
+    """Parse an untrusted remote metric without expensive huge-number conversion."""
+    if isinstance(value, bool):
+        number = float(int(value))
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and len(value) <= 32 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        number = float(value)
+    else:
+        return 0
+    if not math.isfinite(number):
+        return 0
+    number = max(0.0, min(float(maximum), number))
+    return int(number) if integer else number
 
 
 def parse_date(value: str) -> date | None:
@@ -668,6 +718,14 @@ class NexusConfig:
             or len(ssh_host) > 255
             or any(ord(char) < 33 or ord(char) == 127 for char in ssh_host)
             or traffic_mode not in {"both", "upload"}
+            or (
+                CONFIG_PATH == Path("/etc/rr-nexus/nexus.json")
+                and (
+                    database != Path("/var/lib/rr-nexus/nexus.db")
+                    or subscription_root != Path("/var/lib/rr-nexus/subscriptions")
+                    or published_subscription_root != Path("/tmp/sub_server/nexus")
+                )
+            )
         ):
             raise ValueError("invalid RR Nexus config")
         return cls(
@@ -698,9 +756,12 @@ class StoreCorruptionError(RuntimeError):
 class Store:
     def __init__(self, path: Path):
         self.path = path
+        self._history_cleanup_lock = threading.Lock()
+        self._last_history_cleanup = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.verify_integrity()
         self.initialize()
+        self.prune_history(force=True)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1004,6 +1065,53 @@ class Store:
                 "INSERT INTO audit_log(created_at,actor,action,target,remote_ip,detail) VALUES(?,?,?,?,?,?)",
                 (utc_now(), actor[:64], action[:64], target[:128], remote_ip[:64], detail[:512]),
             )
+        self.prune_history()
+
+    def prune_history(self, *, force: bool = False) -> None:
+        """Hourly retention and hard row caps for long-running installations."""
+        now = epoch_now()
+        if not force and now - self._last_history_cleanup < 3600:
+            return
+        if not self._history_cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            if not force and now - self._last_history_cleanup < 3600:
+                return
+            audit_cutoff = datetime.fromtimestamp(
+                now - AUDIT_RETENTION_SECONDS, timezone.utc
+            ).replace(microsecond=0).isoformat()
+            notification_cutoff = datetime.fromtimestamp(
+                now - NOTIFICATION_RETENTION_SECONDS, timezone.utc
+            ).replace(microsecond=0).isoformat()
+            with self.connect() as db:
+                db.execute("DELETE FROM audit_log WHERE created_at<?", (audit_cutoff,))
+                db.execute(
+                    "DELETE FROM audit_log WHERE id NOT IN "
+                    "(SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)",
+                    (MAX_AUDIT_ROWS,),
+                )
+                db.execute(
+                    "DELETE FROM notification_log WHERE created_at<?",
+                    (notification_cutoff,),
+                )
+                db.execute(
+                    "DELETE FROM notification_log WHERE id NOT IN "
+                    "(SELECT id FROM notification_log ORDER BY id DESC LIMIT ?)",
+                    (MAX_NOTIFICATION_ROWS,),
+                )
+                db.execute(
+                    "DELETE FROM notification_dedup WHERE sent_at<?",
+                    (now - NOTIFICATION_RETENTION_SECONDS,),
+                )
+                db.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
+                db.execute("DELETE FROM webauthn_challenges WHERE expires_at<=?", (now,))
+                db.execute(
+                    "DELETE FROM remote_failures WHERE failed_at<?",
+                    (now - REMOTE_FAIL_WINDOW,),
+                )
+            self._last_history_cleanup = now
+        finally:
+            self._history_cleanup_lock.release()
 
 
 def network_interfaces() -> list[str]:
@@ -2113,19 +2221,70 @@ def _url_host(value: str) -> str:
     return "[{}]".format(host) if ":" in host else host
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with finite concurrency and slow-client deadlines."""
+
+    daemon_threads = True
+    request_queue_size = 64
+    max_active_requests = 64
+    request_timeout_seconds = 15
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._request_slots = threading.BoundedSemaphore(self.max_active_requests)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):  # type: ignore[no-untyped-def]
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout_seconds)
+        return request, address
+
+    def process_request(self, request, client_address):  # type: ignore[no-untyped-def]
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):  # type: ignore[no-untyped-def]
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RR-Nexus"
     sys_version = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+        # BaseHTTPRequestHandler 默认记录完整 request line；公开订阅路径含长期
+        # token，写进 journal 即构成凭据泄漏。只记录错误状态与来源，不记录 URL。
+        try:
+            status = int(args[1]) if len(args) >= 2 else 0
+        except (TypeError, ValueError):
+            status = 0
+        if status >= 400:
+            sys.stderr.write(
+                "{} {} HTTP {}\n".format(
+                    self.log_date_time_string(), self.client_address[0], status
+                )
+            )
 
     @property
     def remote_ip(self) -> str:
         if STATE.config.mode == "public" and self.client_address[0] in {"127.0.0.1", "::1"}:
-            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-            if forwarded and len(forwarded) <= 64:
-                return forwarded
+            forwarded = self.headers.get("X-Forwarded-For", "").strip()
+            # Nginx is configured to replace, not append, this header.  Reject
+            # lists and malformed values so an Internet client cannot choose
+            # the rate-limit/audit identity by supplying its own XFF value.
+            if forwarded and "," not in forwarded and len(forwarded) <= 64:
+                try:
+                    return str(ipaddress.ip_address(forwarded))
+                except ValueError:
+                    pass
         return self.client_address[0]
 
     def security_headers(self, content_type: str) -> None:
@@ -2145,11 +2304,16 @@ class Handler(BaseHTTPRequestHandler):
     def read_json_body(self) -> dict:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
-            if content_length < 0 or content_length > MAX_JSON_BODY_BYTES:
+            if content_length > MAX_JSON_BODY_BYTES:
+                raise RequestBodyTooLarge(MAX_JSON_BODY_BYTES)
+            if content_length <= 0:
                 return {}
-            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except RequestBodyTooLarge:
+            raise
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError):
             return {}
 
     def _run_rr_json(self, argv: list[str]) -> dict:
@@ -2212,15 +2376,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            length = 0
-        if length <= 0 or length > MAX_BODY:
-            try:
-                raw = self.rfile.read(MAX_BODY)
-                if not raw: return None
-                payload = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError, OSError):
-                return None
-            return payload if isinstance(payload, dict) else None
+            return None
+        if length > MAX_BODY:
+            raise RequestBodyTooLarge(MAX_BODY)
+        if length <= 0:
+            return None
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2400,6 +2560,15 @@ class Handler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._dispatch_post()
+        except RequestBodyTooLarge as exc:
+            self.send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "request_body_too_large", "limit": int(exc.args[0])},
+            )
+
+    def _dispatch_post(self) -> None:
         path, segments, _ = self.parse_path()
         if path == "/api/login":
             self.handle_login()
@@ -2577,6 +2746,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_PATCH(self) -> None:  # noqa: N802
+        try:
+            self._dispatch_patch()
+        except RequestBodyTooLarge as exc:
+            self.send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "request_body_too_large", "limit": int(exc.args[0])},
+            )
+
+    def _dispatch_patch(self) -> None:
         path, segments, _ = self.parse_path()
         if path == "/api/server/traffic-policy":
             session = self.require_session(csrf=True)
@@ -3114,26 +3292,24 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def remote_http_call(addr: str, port: int, cred: str, method: str, path: str, body: dict | None, timeout: int = REMOTE_HTTP_TIMEOUT) -> tuple[int, dict]:
-        url = "https://{}:{}/api/remote/call".format(addr, int(port))
+        url = "https://{}:{}/api/remote/call".format(_url_host(addr), int(port))
         data = json_compact({"cred": cred, "method": method, "path": path, "body": body or {}})
-        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "rr-nexus-remote/6.6"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
-                raw = resp.read() or b"{}"
-                try:
-                    payload = json.loads(raw)
-                except Exception:
-                    payload = {"_raw": raw[:200].decode("utf-8", "replace")}
-                return resp.status, payload
-        except urllib.error.HTTPError as exc:
-            raw = exc.read() or b"{}"
+            status, raw = https_post(
+                url,
+                data,
+                {"Content-Type": "application/json", "User-Agent": "rr-nexus-remote/7.1"},
+                timeout=timeout,
+            )
             try:
                 payload = json.loads(raw)
             except Exception:
-                payload = {}
-            return exc.code, payload
+                payload = {"_raw": raw[:200].decode("utf-8", "replace")}
+            return status, payload
+        except UnsafeTargetError:
+            return 0, {"error": "unsafe_remote_target", "message": "远程地址必须解析到公开网络"}
         except Exception as exc:
-            return 0, {"error": "unreachable", "message": str(exc)[:200]}
+            return 0, {"error": "unreachable", "message": type(exc).__name__}
 
     def handle_remote_servers_list(self, session: sqlite3.Row | dict) -> None:
         with STATE.store.connect() as db:
@@ -3150,6 +3326,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not name:
             name = str(payload.get("n", "") or "远程服务器")
+        if not REMOTE_CRED_NAME_RE.fullmatch(name):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_name", "message": "备注名需为 1-64 个可显示字符"})
+            return
         addr = str(payload.get("a", "") or "")
         port = int(payload.get("p", 0) or 0)
         with STATE.store.connect() as db:
@@ -3204,6 +3383,9 @@ class Handler(BaseHTTPRequestHandler):
         servers = [dict(r) for r in rows]
 
         def probe_one(server: dict) -> dict:
+            def count_value(value: Any) -> int:
+                return int(bounded_remote_number(value, MAX_DEVICES, integer=True))
+
             result = {"id": server["id"], "name": server["name"], "addr": server["addr"], "online": False}
             started = time.monotonic()
             status, body = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/overview", None)
@@ -3211,22 +3393,41 @@ class Handler(BaseHTTPRequestHandler):
             result["ping"] = ping_ms
             if status == 200 and isinstance(body, dict) and not body.get("error"):
                 result["online"] = True
-                result["devices"] = (body.get("devices") or {}).get("total", 0)
-                result["enabled"] = (body.get("devices") or {}).get("enabled", 0)
-                result["active_devices"] = (body.get("devices") or {}).get("active", 0)
-                used = int((body.get("devices") or {}).get("used", 0) or 0)
+                device_summary = body.get("devices")
+                if not isinstance(device_summary, dict):
+                    device_summary = {}
+                result["devices"] = count_value(device_summary.get("total", 0))
+                result["enabled"] = count_value(device_summary.get("enabled", 0))
+                result["active_devices"] = count_value(device_summary.get("active", 0))
+                used = int(bounded_remote_number(
+                    device_summary.get("used", 0),
+                    MAX_SERVER_TRAFFIC_GB * 1024**3,
+                    integer=True,
+                ))
                 result["used_gb"] = round(used / 1024 ** 3, 2)
-                result["services"] = body.get("services") or {}
+                services = body.get("services")
+                result["services"] = {
+                    "sing-box": "active"
+                    if isinstance(services, dict) and services.get("sing-box") == "active"
+                    else "inactive"
+                }
                 # 服务器实时指标（字段适配：cpu 是 dict{percent,...}，memory 是 dict{percent,...}）
                 s2, b2 = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/server/stats", None)
                 if s2 == 200 and isinstance(b2, dict):
                     cpu_val = b2.get("cpu")
                     mem_val = b2.get("memory")
-                    result["cpu"] = cpu_val.get("percent", 0) if isinstance(cpu_val, dict) else (cpu_val or 0)
-                    result["mem"] = mem_val.get("percent", 0) if isinstance(mem_val, dict) else (mem_val or 0)
+                    result["cpu"] = bounded_remote_number(
+                        cpu_val.get("percent", 0) if isinstance(cpu_val, dict) else cpu_val,
+                        100,
+                    )
+                    result["mem"] = bounded_remote_number(
+                        mem_val.get("percent", 0) if isinstance(mem_val, dict) else mem_val,
+                        100,
+                    )
                 s3, b3 = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/server/info", None)
                 if s3 == 200 and isinstance(b3, dict):
-                    result["ver"] = b3.get("script_version") or ""
+                    version = str(b3.get("script_version") or "")
+                    result["ver"] = version if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) else ""
                 result["state"] = "online"
             else:
                 err_code = (body or {}).get("error") if isinstance(body, dict) else ""
@@ -4243,15 +4444,21 @@ class Handler(BaseHTTPRequestHandler):
         return values, ""
 
     
-    def handle_change_password(self, session: dict[str, str]) -> None:
+    def handle_change_password(self, session: sqlite3.Row | dict) -> None:
         try:
-            cl = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(cl) if cl > 0 else b"{}"
-            body = json.loads(raw.decode("utf-8"))
+            body = self.read_json()
+            if body is None:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
             op = str(body.get("old_password", ""))
             np = str(body.get("new_password", ""))
             if not op or not np:
                 return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "密码不能为空"})
+            if len(op) > 512 or not MIN_ADMIN_PASSWORD_LENGTH <= len(np) <= 512:
+                return self.send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_new_password", "message": "新密码需为 12–512 个字符"},
+                )
             un = session["username"]
             for attempt in range(3):
                 try:
@@ -4268,7 +4475,14 @@ class Handler(BaseHTTPRequestHandler):
                         if not password_ok:
                             outcome = "bad_password"
                             break
-                        db.execute("UPDATE admins SET password_hash=? WHERE username=?", (STATE.password_hasher.hash(np), un))
+                        db.execute(
+                            "UPDATE admins SET password_hash=?,updated_at=? WHERE username=?",
+                            (STATE.password_hasher.hash(np), utc_now(), un),
+                        )
+                        db.execute(
+                            "DELETE FROM sessions WHERE admin_id=? AND token_hash<>?",
+                            (session["admin_id"], sha256_text(self.cookie_token())),
+                        )
                         outcome = "ok"
                     # 事务已提交，审计用独立连接（避免事务内嵌套连接死锁）
                     if outcome == "ok":
@@ -4736,16 +4950,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def initialize_admin(config: NexusConfig, username: str) -> int:
-    if not username or not username.strip():
-        print("管理员账号不能为空。", file=sys.stderr)
-        return 2
     username = username.strip()
-    if len(username) > 64:
-        print("管理员账号不能超过 64 个字符。", file=sys.stderr)
+    if not USERNAME_RE.fullmatch(username):
+        print("管理员账号需以字母开头，仅含字母、数字、点、下划线或连字符（3–32 位）。", file=sys.stderr)
         return 2
     password = sys.stdin.readline().rstrip("\n")
-    if not password:
-        print("管理员密码不能为空。", file=sys.stderr)
+    if not MIN_ADMIN_PASSWORD_LENGTH <= len(password) <= 512:
+        print("管理员密码需为 12–512 个字符。", file=sys.stderr)
         return 2
     state = NexusState(config)
     password_hash = state.password_hasher.hash(password)
@@ -4804,9 +5015,7 @@ def main() -> int:
             print(detail, file=sys.stderr)
             return 1
         return 0
-    server = ThreadingHTTPServer((config.listen, config.port), Handler)
-    server.daemon_threads = True
-    server.request_queue_size = 64
+    server = BoundedThreadingHTTPServer((config.listen, config.port), Handler)
     STATE.traffic.start()
     try:
         server.serve_forever(poll_interval=0.5)

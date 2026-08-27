@@ -373,6 +373,27 @@ rr_backup_fixed_argo_token() {
     (umask 077; printf '%s\n' "$token" > "$target")
 }
 
+rr_auto_update_cron_line() {
+    printf '%s\n' '0 * * * * PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin /usr/bin/python3 /usr/local/bin/auto_update_sub.py >> /var/log/auto_update_sub.log 2>&1'
+}
+
+rr_backup_capture_crontab() {
+    local destination="$1"
+    local expected=""
+    local rr_lines=""
+    expected=$(rr_auto_update_cron_line)
+    rr_lines=$(crontab -l 2>/dev/null | grep 'auto_update_sub\.py' || true)
+    if [ -n "$rr_lines" ] && [ "$rr_lines" != "$expected" ]; then
+        printf '检测到非标准 RR 自动更新 cron，已拒绝把可执行命令写入备份。\n' >&2
+        return 1
+    fi
+    if [ -n "$rr_lines" ]; then
+        printf '%s\n' "$expected" > "$destination"
+    else
+        : > "$destination"
+    fi
+}
+
 rr_backup_create() {
     local output="${1:-}" stage="" archive="" relative="" sha="" now=""
     rr_ensure_resilience_dependencies || { printf '无法安装加密备份所需组件。\n' >&2; return 1; }
@@ -393,11 +414,9 @@ rr_backup_create() {
     rr_backup_copy_path /etc/rr-update "$stage" || { rm -rf "$stage"; return 1; }
     rr_backup_fixed_argo_token "$stage" || { rm -rf "$stage"; return 1; }
     rr_backup_copy_path /var/lib/rr-nexus/remote.key "$stage" || { rm -rf "$stage"; return 1; }
-    rr_backup_copy_path /usr/local/bin/auto_update_sub.py "$stage" || { rm -rf "$stage"; return 1; }
-    rr_backup_copy_path /etc/systemd/system/rr-nexus.service "$stage" || { rm -rf "$stage"; return 1; }
-    rr_backup_copy_path /etc/systemd/system/sing-box.service "$stage" || { rm -rf "$stage"; return 1; }
-    rr_backup_copy_path /etc/systemd/system/argo-rr-health.service "$stage" || { rm -rf "$stage"; return 1; }
-    rr_backup_copy_path /etc/systemd/system/argo-rr-health.timer "$stage" || { rm -rf "$stage"; return 1; }
+    # Executable workers and systemd units are regenerated from the installed,
+    # manifest-verified runtime after restore. They are never accepted from a
+    # portable backup, otherwise importing an untrusted archive is root RCE.
     # cloudflared.service may be owned by another application. RR migrates its
     # tunnel settings, but deliberately never backs up or overwrites that global unit.
     rr_backup_sqlite_consistent /var/lib/rr-nexus/nexus.db "$stage/rootfs/var/lib/rr-nexus/nexus.db" || { rm -rf "$stage"; return 1; }
@@ -409,7 +428,7 @@ rr_backup_create() {
         rm -rf "$stage"
         return 1
     fi
-    crontab -l 2>/dev/null | grep 'auto_update_sub\.py' > "$stage/payload/crontab.txt" || : > "$stage/payload/crontab.txt"
+    rr_backup_capture_crontab "$stage/payload/crontab.txt" || { rm -rf "$stage"; return 1; }
     (
         cd "$stage/payload" || exit 1
         find rootfs -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > manifest.sha256
@@ -439,9 +458,7 @@ rr_restore_apply_tree() {
         relative="${source#"$root/rootfs/"}"
         case "$relative" in
             etc/argo_vmess.conf|etc/sing-box/*|etc/rr-nexus/*|etc/rr-naive/*|etc/rr-update/*|etc/rr-cloudflared/*|\
-            etc/systemd/system/rr-nexus.service|etc/systemd/system/sing-box.service|\
-            etc/systemd/system/argo-rr-health.service|etc/systemd/system/argo-rr-health.timer|\
-            var/lib/rr-nexus/*|usr/local/bin/auto_update_sub.py) ;;
+            var/lib/rr-nexus/*) ;;
             *) printf '拒绝恢复不受支持路径：%s\n' "$relative" >&2; return 1 ;;
         esac
         target="/$relative"
@@ -469,16 +486,31 @@ rr_restore_clear_managed_tree() {
 }
 
 rr_restore_crontab() {
-    local rr_entries="$1" temporary=""
+    local rr_entries="$1" temporary="" expected="" restored=""
+    expected=$(rr_auto_update_cron_line)
+    restored=$(cat "$rr_entries" 2>/dev/null || true)
+    if [ -n "$restored" ] && [ "$restored" != "$expected" ]; then
+        printf '拒绝恢复非标准 RR cron 命令。\n' >&2
+        return 1
+    fi
     temporary=$(mktemp /tmp/rr-crontab-restore.XXXXXX) || return 1
     crontab -l 2>/dev/null | grep -v 'auto_update_sub\.py' > "$temporary" || true
-    [ -s "$rr_entries" ] && cat "$rr_entries" >> "$temporary"
+    [ -n "$restored" ] && printf '%s\n' "$expected" >> "$temporary"
     if [ -s "$temporary" ]; then
         crontab "$temporary"
     else
         crontab -r >/dev/null 2>&1 || true
     fi
     rm -f "$temporary"
+}
+
+rr_restore_regenerate_runtime_files() {
+    # Portable backups contain data/config only. Recreate privileged units and
+    # executable workers from the already verified local RR runtime.
+    if [ -r "$NEXUS_CONFIG_FILE" ]; then
+        nexus_write_service || return 1
+    fi
+    return 0
 }
 
 rr_restore_backup() {
@@ -548,15 +580,13 @@ PY
 
     mkdir -p "$rollback/rootfs"
     for target in /etc/argo_vmess.conf /etc/sing-box /etc/rr-nexus /etc/rr-naive /etc/rr-update /etc/rr-cloudflared \
-        /var/lib/rr-nexus/remote.key /usr/local/bin/auto_update_sub.py \
-        /etc/systemd/system/rr-nexus.service /etc/systemd/system/sing-box.service \
-        /etc/systemd/system/argo-rr-health.service /etc/systemd/system/argo-rr-health.timer; do
+        /var/lib/rr-nexus/remote.key; do
         [ -e "$target" ] || continue
         mkdir -p "$rollback/rootfs$(dirname "$target")"
         cp -a -- "$target" "$rollback/rootfs$target" || { rm -rf "$stage"; return 1; }
     done
     rr_backup_sqlite_consistent /var/lib/rr-nexus/nexus.db "$rollback/rootfs/var/lib/rr-nexus/nexus.db" || { rm -rf "$stage"; return 1; }
-    crontab -l 2>/dev/null | grep 'auto_update_sub\.py' > "$rollback/crontab.txt" || : > "$rollback/crontab.txt"
+    rr_backup_capture_crontab "$rollback/crontab.txt" || { rm -rf "$stage"; return 1; }
     systemctl is-active --quiet sing-box 2>/dev/null && : > "$rollback/singbox_was_running"
     systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$rollback/nexus_was_running"
     pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && : > "$rollback/subscription_was_running"
@@ -580,6 +610,7 @@ PY
     rr_restore_clear_managed_tree
     if [ "$argo_prepare_ok" = true ] && rr_restore_apply_tree "$stage/payload" && \
        rr_restore_crontab "$stage/payload/crontab.txt" && \
+       rr_restore_regenerate_runtime_files && \
        post_update_migrate; then
         result=0
         printf '恢复完成：已根据新服务器 IP、端口和系统环境重新生成运行配置。\n'
@@ -593,6 +624,7 @@ PY
         rr_restore_clear_managed_tree
         rr_restore_apply_tree "$rollback" || true
         rr_restore_crontab "$rollback/crontab.txt" || true
+        rr_restore_regenerate_runtime_files || true
         RR_UPDATE_TRANSACTION=1 \
         RR_UPDATE_SINGBOX_WAS_RUNNING="$([ -f "$rollback/singbox_was_running" ] && printf true || printf false)" \
         RR_UPDATE_NEXUS_WAS_RUNNING="$([ -f "$rollback/nexus_was_running" ] && printf true || printf false)" \
