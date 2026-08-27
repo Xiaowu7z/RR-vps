@@ -78,6 +78,38 @@ echo "[3/13] Fresh-install port selection regression"
     is_valid_port "$selected_port"
 )
 
+# 安装依赖不能为了持久化 RR 的 iptables 规则而删除用户已有的 UFW。
+# 用模拟 apt 验证两个分支，避免测试本身改动 CI 主机的软件包。
+(
+    load_modules_for_tests
+    apt_log=$(mktemp)
+    trap 'rm -f "$apt_log"' EXIT
+    apt-get() { printf '%s\n' "$*" >> "$apt_log"; }
+    debconf-set-selections() { :; }
+    systemctl() { :; }
+    vnstat() { :; }
+    modprobe() { :; }
+    sysctl() {
+        [ "${1:-}" = -n ] && printf '%s\n' cubic
+        return 0
+    }
+
+    rr_ufw_installed() { return 0; }
+    install_deps >/dev/null
+    if grep -q 'iptables-persistent' "$apt_log"; then
+        echo "Existing UFW would be replaced by iptables-persistent." >&2
+        exit 1
+    fi
+
+    : > "$apt_log"
+    rr_ufw_installed() { return 1; }
+    install_deps >/dev/null
+    grep -q 'install -y iptables-persistent' "$apt_log" || {
+        echo "No firewall persistence backend was installed without UFW." >&2
+        exit 1
+    }
+)
+
 echo "[4/13] Fresh-install snapshot regression"
 version_function=$(awk '
     /^rr_version_ge\(\) \{/ { capture = 1 }

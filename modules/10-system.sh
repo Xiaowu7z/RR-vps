@@ -44,14 +44,29 @@ check_supported_os() {
     echo -e "${GREEN}[系统] ${os_name:-$os_id $os_version} 已通过兼容性检查。${RESET}"
 }
 
+rr_ufw_installed() {
+    command -v ufw >/dev/null 2>&1 || \
+        dpkg-query -W -f='${db:Status-Status}\n' ufw 2>/dev/null | grep -qx installed
+}
+
 install_deps() {
     echo -e "\n${YELLOW}正在更新系统源并安装必要组件 ...${RESET}"
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y \
         ca-certificates curl wget jq python3 python3-cryptography sqlite3 openssl iproute2 qrencode dnsutils cron \
-        iptables iptables-persistent procps tar gzip coreutils util-linux || return 1
+        iptables procps tar gzip coreutils util-linux || return 1
+
+    # Debian/Ubuntu 上 iptables-persistent 可能与已有 UFW 互斥并触发 apt
+    # 卸载 UFW。保留用户选择的防火墙及其既有规则；UFW 自身负责规则持久化。
+    # 只有系统没有 UFW 时才安装 netfilter-persistent 后端。
+    if rr_ufw_installed; then
+        echo -e "${GREEN}[防火墙] 检测到 UFW，已保留现有 UFW 配置。${RESET}"
+    else
+        echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null
+        echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y \
+            iptables-persistent || return 1
+    fi
 
     if ! command -v vnstat &> /dev/null; then
         DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y vnstat || return 1
