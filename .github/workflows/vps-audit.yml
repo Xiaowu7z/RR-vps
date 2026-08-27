@@ -28,6 +28,7 @@ jobs:
     env:
       RR_A_HOST: ${{ secrets.RR_A_HOST }}
       RR_A_PASS: ${{ secrets.RR_A_PASS }}
+      RR_A_NAIVE_DOMAIN: ${{ secrets.RR_A_NAIVE_DOMAIN }}
       RR_B_HOST: ${{ secrets.RR_B_HOST }}
       RR_B_PASS: ${{ secrets.RR_B_PASS }}
     steps:
@@ -45,7 +46,7 @@ jobs:
           set -euo pipefail
           set +x
           case "$ROLE" in
-            A) host="$RR_A_HOST"; export SSHPASS="$RR_A_PASS" ;;
+            A) host="$RR_A_HOST"; naive_domain="$RR_A_NAIVE_DOMAIN"; export SSHPASS="$RR_A_PASS" ;;
             B) host="$RR_B_HOST"; export SSHPASS="$RR_B_PASS" ;;
             *) exit 2 ;;
           esac
@@ -55,12 +56,13 @@ jobs:
             -o LogLevel=ERROR -o PreferredAuthentications=password \
             -o PubkeyAuthentication=no -o StrictHostKeyChecking=accept-new \
             -o UserKnownHostsFile="$known_hosts" \
-            "root@$host" bash -s -- "$ROLE" "$EXPECTED_ID" "$EXPECTED_VERSION" <<'REMOTE'
+            "root@$host" bash -s -- "$ROLE" "$EXPECTED_ID" "$EXPECTED_VERSION" "${naive_domain:-}" <<'REMOTE'
           set -euo pipefail
           export LANG=C.UTF-8 LC_ALL=C.UTF-8
           role="$1"
           expected_id="$2"
           expected_version="$3"
+          naive_domain="${4:-}"
           # shellcheck disable=SC1091
           . /etc/os-release
           test "$ID" = "$expected_id"
@@ -83,6 +85,59 @@ jobs:
               "$(dpkg-query -W -f='${db:Status-Status}' ufw 2>/dev/null || printf absent)" \
               "$(ufw status 2>/dev/null | head -n 1 | tr ' ' '_' || true)" \
               "$(ufw status 2>/dev/null | awk '$1 == "61234/tcp" {print $2; exit}' || true)"
+            probe_root=/var/www/rr-nexus-certbot/.well-known/acme-challenge
+            mkdir -p "$probe_root"
+            printf '%s\n' rr-audit-acme-ok > "$probe_root/rr-audit-probe"
+            chmod 755 /var/www/rr-nexus-certbot /var/www/rr-nexus-certbot/.well-known "$probe_root"
+            chmod 644 "$probe_root/rr-audit-probe"
+            local_probe=no
+            [ "$(curl -fsS -H "Host: $naive_domain" http://127.0.0.1/.well-known/acme-challenge/rr-audit-probe 2>/dev/null || true)" = rr-audit-acme-ok ] && local_probe=yes
+            printf 'naive_acme_site=%s enabled_link=%s nginx_config=%s local_probe=%s\n' \
+              "$([ -f /etc/nginx/sites-available/rr-naive-acme.conf ] && printf yes || printf no)" \
+              "$([ -L /etc/nginx/sites-enabled/rr-naive-acme.conf ] && printf yes || printf no)" \
+              "$(nginx -t >/dev/null 2>&1 && printf ok || printf failed)" "$local_probe"
+            if [ -r /var/log/letsencrypt/letsencrypt.log ]; then
+              printf 'letsencrypt_error_evidence\n'
+              grep -Ei 'unauthorized|detail|error|problem|rate|timeout|connection|invalid response|challenge failed' \
+                /var/log/letsencrypt/letsencrypt.log | tail -n 18 \
+                | sed -E \
+                    -e 's#(^|[[:space:]])[A-Fa-f0-9]{10}([[:space:]]|$)#\1[redacted-recovery-code]\2#g' \
+                    -e 's#[A-Fa-f0-9]{32,}#[redacted]#g' \
+                    -e 's#[A-Za-z0-9_+/=-]{20,}#[redacted]#g' \
+                || true
+            fi
+          else
+            tx=""
+            [ -r /var/lib/rr-update/active ] && tx=$(head -n 1 /var/lib/rr-update/active 2>/dev/null || true)
+            case "$tx" in /var/lib/rr-update/transactions/*) ;; *) tx="" ;; esac
+            printf 'transaction_phase=%s backup_config_marker=%s backup_config_file=%s backup_db_marker=%s backup_db_file=%s\n' \
+              "$([ -n "$tx" ] && head -n 1 "$tx/phase" 2>/dev/null || printf none)" \
+              "$([ -n "$tx" ] && [ -f "$tx/backup/had_argo_vmess.conf" ] && printf yes || printf no)" \
+              "$([ -n "$tx" ] && [ -f "$tx/backup/argo_vmess.conf" ] && printf yes || printf no)" \
+              "$([ -n "$tx" ] && [ -f "$tx/backup/had_nexus.db" ] && printf yes || printf no)" \
+              "$([ -n "$tx" ] && [ -f "$tx/backup/nexus.db" ] && printf yes || printf no)"
+            python3 - /var/lib/rr-nexus/nexus.db "${tx:+$tx/backup/nexus.db}" <<'PY'
+import pathlib
+import re
+import sqlite3
+import sys
+
+pattern = re.compile(r"^dev_[a-f0-9]{12}$")
+for label, raw in (("live", sys.argv[1]), ("backup", sys.argv[2])):
+    path = pathlib.Path(raw) if raw else None
+    if path is None or not path.is_file():
+        print(f"device_id_summary_{label}=missing")
+        continue
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        rows = db.execute("SELECT id, enabled FROM devices").fetchall()
+    finally:
+        db.close()
+    invalid = sum(1 for device_id, _ in rows if not pattern.fullmatch(str(device_id)))
+    enabled_invalid = sum(1 for device_id, enabled in rows if enabled and not pattern.fullmatch(str(device_id)))
+    lengths = ",".join(map(str, sorted({len(str(device_id)) for device_id, _ in rows}))) or "none"
+    print(f"device_id_summary_{label}=rows:{len(rows)},invalid:{invalid},enabled_invalid:{enabled_invalid},lengths:{lengths}")
+PY
           fi
           for log in \
             /root/rr-audit-core.log /root/rr-audit-install.log /root/rr-audit-nexus.log \
@@ -110,3 +165,10 @@ jobs:
           done
           printf 'RR_AUDIT_DIAG_COMPLETE role=%s\n' "$role"
           REMOTE
+          if [ "$ROLE" = A ]; then
+            v4_count=$(getent ahostsv4 "$naive_domain" 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+            v6_count=$(getent ahostsv6 "$naive_domain" 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+            external_probe=no
+            [ "$(curl -fsS --connect-timeout 8 --max-time 15 "http://${naive_domain}/.well-known/acme-challenge/rr-audit-probe" 2>/dev/null || true)" = rr-audit-acme-ok ] && external_probe=yes
+            printf 'runner_dns_v4=%s runner_dns_v6=%s external_probe=%s\n' "$v4_count" "$v6_count" "$external_probe"
+          fi
