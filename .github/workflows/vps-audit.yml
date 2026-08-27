@@ -91,6 +91,14 @@ jobs:
                   -e 's#[A-Fa-f0-9]{32,}#[redacted]#g' \
                   -e 's#[A-Za-z0-9_-]{40,}#[redacted]#g' \
               || true
+            if [ ! -f /etc/argo_vmess.conf ]; then
+              printf 'redacted_tail=%s\n' "$(basename "$log")"
+              tail -n 60 "$log" \
+                | sed -E \
+                    -e 's#(UUID|PASS|PASSWORD|TOKEN|SECRET|RECOVERY)([=: ]+)[^ ]+#\1\2[redacted]#Ig' \
+                    -e 's#[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,36}#[redacted]#g' \
+                    -e 's#[A-Za-z0-9_+/=-]{20,}#[redacted]#g'
+            fi
           done
           printf 'RR_AUDIT_DIAG_COMPLETE role=%s\n' "$role"
           REMOTE
