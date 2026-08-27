@@ -96,6 +96,24 @@ jobs:
               "$([ -f /etc/nginx/sites-available/rr-naive-acme.conf ] && printf yes || printf no)" \
               "$([ -L /etc/nginx/sites-enabled/rr-naive-acme.conf ] && printf yes || printf no)" \
               "$(nginx -t >/dev/null 2>&1 && printf ok || printf failed)" "$local_probe"
+            printf 'naive_enabled_target=%s probe_mode=%s probe_owner=%s\n' \
+              "$(readlink /etc/nginx/sites-enabled/rr-naive-acme.conf 2>/dev/null | xargs -r basename || printf missing)" \
+              "$(stat -c %a "$probe_root/rr-audit-probe" 2>/dev/null || printf missing)" \
+              "$(stat -c %U:%G "$probe_root/rr-audit-probe" 2>/dev/null || printf missing)"
+            printf 'nginx_acme_effective_config\n'
+            nginx -T 2>&1 \
+              | sed "s/${naive_domain//\//\\/}/[redacted-domain]/g" \
+              | awk '
+                  /^# configuration file/ {file=$0}
+                  /listen (\[::\]:)?80|server_name|acme-challenge|root \/var\/www\/rr-nexus-certbot|try_files/ {
+                      print file " :: " $0
+                  }
+                ' \
+              | tail -n 40
+            systemctl reload nginx >/dev/null 2>&1 || true
+            local_probe_after_reload=no
+            [ "$(curl -fsS -H "Host: $naive_domain" http://127.0.0.1/.well-known/acme-challenge/rr-audit-probe 2>/dev/null || true)" = rr-audit-acme-ok ] && local_probe_after_reload=yes
+            printf 'local_probe_after_reload=%s\n' "$local_probe_after_reload"
             if [ -r /var/log/letsencrypt/letsencrypt.log ]; then
               printf 'letsencrypt_error_evidence\n'
               grep -Ei 'unauthorized|detail|error|problem|rate|timeout|connection|invalid response|challenge failed' \
@@ -138,6 +156,24 @@ jobs:
               lengths = ",".join(map(str, sorted({len(str(device_id)) for device_id, _ in rows}))) or "none"
               print(f"device_id_summary_{label}=rows:{len(rows)},invalid:{invalid},enabled_invalid:{enabled_invalid},lengths:{lengths}")
           PY
+            for port_spec in 24444/tcp 18081/tcp 21444/tcp 22444/tcp 23444/udp 25444/udp; do
+              port="${port_spec%/*}"
+              proto="${port_spec#*/}"
+              occupied=no
+              if [ "$proto" = tcp ]; then
+                ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && occupied=yes
+              else
+                ss -H -lun "sport = :${port}" 2>/dev/null | grep -q . && occupied=yes
+              fi
+              printf 'audit_port_%s_%s=%s\n' "$port" "$proto" "$occupied"
+            done
+            for stage_log in rr-audit-old-core.log rr-audit-old-deps.log rr-audit-old-install.log rr-audit-old-nexus.log rr-audit-upgrade.log; do
+              if [ -e "/root/$stage_log" ]; then
+                printf 'log_mtime_%s=%s\n' "$stage_log" "$(stat -c %Y "/root/$stage_log")"
+              else
+                printf 'log_mtime_%s=missing\n' "$stage_log"
+              fi
+            done
           fi
           for log in \
             /root/rr-audit-core.log /root/rr-audit-install.log /root/rr-audit-nexus.log \
