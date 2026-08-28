@@ -87,6 +87,7 @@ jobs:
             case "${test_script##*/}" in
               test-backup-archive.sh|\
               test-cloudflared-supply-chain.sh|\
+              test-firewall-transaction.sh|\
               test-health-transaction-lock.sh|\
               test-nexus-sync.sh|\
               test-restore-watchdog.sh|\
