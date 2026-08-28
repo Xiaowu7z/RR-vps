@@ -285,6 +285,7 @@ printf '%s\n' '[6/8] restore rollback replaces candidate RR rules exactly'
     trap 'rm -rf "$MOCK_NETFILTER_ROOT" "$MOCK_UFW_ROOT" "$transaction_root"' EXIT
     RR_BACKUP_WORK_DIR="$transaction_root"
     RR_RESTORE_ACTIVE="$transaction_root/active"
+    RR_RESTORE_RUNTIME_READY="$transaction_root/runtime-ready"
     stage="$transaction_root/restore.exact"
     rollback="$stage/rollback"
     mkdir -p "$rollback/rootfs"
