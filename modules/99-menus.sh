@@ -168,6 +168,10 @@ sb_control_menu() {
 # ==========================================
 set_subscription_bind_address() {
     local state_bind=""
+    if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        SUB_BIND_ADDRESS="127.0.0.1"
+        return 0
+    fi
     if [ -f "$SUB_BIND_STATE_FILE" ]; then
         state_bind=$(awk -F'|' 'NF >= 2 {print $2; exit}' "$SUB_BIND_STATE_FILE" 2>/dev/null)
     fi
@@ -233,8 +237,14 @@ apply_subscription_ports() {
         return 1
     fi
     if [ "$new_local_port" != "$old_local_port" ]; then
-        close_protocol_firewall "$old_local_port" tcp
-        open_protocol_firewall "$new_local_port" tcp
+        close_protocol_firewall "$old_local_port" tcp || return 1
+        if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+            open_protocol_firewall "$new_local_port" tcp || return 1
+        else
+            # Secure local mode must remain unreachable off-host even after a
+            # port change or an upgrade from the legacy public HTTP listener.
+            close_protocol_firewall "$new_local_port" tcp || return 1
+        fi
     fi
 
     echo -e "${GREEN}[同步] 订阅服务、订阅地址与全部配置文件已使用新端口。${RESET}"
@@ -259,9 +269,16 @@ subscription_port_menu() {
         echo -e "${CYAN}=================================================================================${RESET}"
         echo -e "${PURPLE}              订阅端口独立管理${RESET}"
         echo -e "${CYAN}=================================================================================${RESET}"
-        echo -e " 本地 HTTP 监听端口：${YELLOW}${SUB_PORT}/TCP${RESET}"
-        echo -e " IPv4 订阅公网端口：${YELLOW}${SUB_PUBLIC_PORT_IPV4}/TCP${RESET}"
-        echo -e " IPv6 订阅公网端口：${YELLOW}${SUB_PUBLIC_PORT_IPV6}/TCP${RESET}"
+        if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+            echo -e " 访问模式：${GREEN}可信域名 HTTPS（${SUB_DOMAIN}）${RESET}"
+            echo -e " 本地 HTTPS 监听端口：${YELLOW}${SUB_PORT}/TCP${RESET}"
+            echo -e " IPv4 订阅公网端口：${YELLOW}${SUB_PUBLIC_PORT_IPV4}/TCP${RESET}"
+            echo -e " IPv6 订阅公网端口：${YELLOW}${SUB_PUBLIC_PORT_IPV6}/TCP${RESET}"
+        else
+            echo -e " 访问模式：${YELLOW}仅本机 HTTP + SSH 隧道（不开放公网）${RESET}"
+            echo -e " 回环监听端口：${YELLOW}${SUB_PORT}/TCP${RESET}"
+            echo -e " 使用方式：${WHITE}ssh -N -L ${SUB_PORT}:127.0.0.1:${SUB_PORT} root@服务器${RESET}"
+        fi
         if [ "$SUB_PORT" != "$SUB_PUBLIC_PORT_IPV4" ]; then
             echo -e " 当前 IPv4 NAT 映射：${GREEN}公网 ${SUB_PUBLIC_PORT_IPV4} → 本地 ${SUB_PORT}${RESET}"
         fi

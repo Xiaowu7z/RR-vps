@@ -489,6 +489,8 @@ rotate_quick_argo_origin_port() {
 }
 
 rr_cloudflared_service_token() {
+    # Legacy migration only.  Current RR units pass a root-only credential file
+    # path and never place the token itself in the unit or process command line.
     systemctl cat cloudflared 2>/dev/null | awk '
         /^[[:space:]]*ExecStart=/ {
             for (i=1; i<=NF; i++) {
@@ -499,19 +501,83 @@ rr_cloudflared_service_token() {
     '
 }
 
+rr_write_fixed_argo_service() {
+    local token_file="${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}"
+    local cloudflared_bin=""
+    local service_file="${RR_CLOUDFLARED_SERVICE_FILE:-/etc/systemd/system/cloudflared.service}"
+    local service_tmp=""
+    cloudflared_token_file_supported || return 1
+    cloudflared_bin="${RR_CLOUDFLARED_BIN:-}"
+    [ -n "$cloudflared_bin" ] || cloudflared_bin=$(command -v cloudflared 2>/dev/null) || return 1
+    cloudflared_bin=$(readlink -f -- "$cloudflared_bin" 2>/dev/null) || return 1
+    [[ "$cloudflared_bin" = /* && "$cloudflared_bin" != *[[:space:]]* ]] || return 1
+    [ -r "$token_file" ] && [ ! -L "$token_file" ] || return 1
+    [ "$(stat -c '%u:%a' "$token_file" 2>/dev/null)" = "0:600" ] || return 1
+
+    install -d -m 755 "$(dirname "$service_file")" || return 1
+    service_tmp=$(mktemp "$(dirname "$service_file")/.cloudflared.service.XXXXXX") || return 1
+    if ! cat > "$service_tmp" <<EOF
+[Unit]
+Description=RR-vps Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty=${token_file}
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=rr-tunnel-token:${token_file}
+ExecStart=${cloudflared_bin} --no-autoupdate tunnel run --token-file %d/rr-tunnel-token
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    then
+        rm -f "$service_tmp"
+        return 1
+    fi
+    chmod 644 "$service_tmp" || { rm -f "$service_tmp"; return 1; }
+    mv -f "$service_tmp" "$service_file" || { rm -f "$service_tmp"; return 1; }
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
+
 ensure_fixed_argo_service() {
     local token_file="${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}"
     local desired_token=""
-    if systemctl cat cloudflared >/dev/null 2>&1; then
-        systemctl enable --now cloudflared >/dev/null 2>&1 || return 1
-        systemctl is-active --quiet cloudflared
-        return $?
-    else
-        [ -r "$token_file" ] || return 1
-        IFS= read -r desired_token < "$token_file" || return 1
-        [ -n "$desired_token" ] && [[ "$desired_token" != *[[:space:]]* ]] || return 1
-        cloudflared service install "$desired_token" >/dev/null 2>&1 || return 1
+    if [ ! -r "$token_file" ]; then
+        # One-time migration from RR 7.1.0 and earlier.  Refuse to overwrite an
+        # unrelated service unless it contains the exact legacy --token shape.
+        desired_token=$(rr_cloudflared_service_token) || return 1
+        [ -n "$desired_token" ] && [ "${#desired_token}" -le 4096 ] && \
+            [[ "$desired_token" != *[[:space:]]* ]] || return 1
+        install -d -m 700 "$(dirname "$token_file")" || return 1
+        (umask 077; printf '%s\n' "$desired_token" > "${token_file}.tmp") || return 1
+        mv -f "${token_file}.tmp" "$token_file" || { rm -f "${token_file}.tmp"; return 1; }
     fi
+    IFS= read -r desired_token < "$token_file" || return 1
+    [ -n "$desired_token" ] && [ "${#desired_token}" -le 4096 ] && \
+        [[ "$desired_token" != *[[:space:]]* ]] || return 1
+    chmod 600 "$token_file" || return 1
+    rr_write_fixed_argo_service || return 1
     systemctl enable --now cloudflared >/dev/null 2>&1 || return 1
     systemctl is-active --quiet cloudflared
 }

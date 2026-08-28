@@ -21,6 +21,7 @@ allowed_keys = {
     "PORT", "ARGO_EDGE_PORT", "SUB_PORT", "UUID", "CDN_IP", "ARGO_DOMAIN", "TUNNEL_MODE",
     "ENTRY_IP_MODE", "OUTBOUND_IP_MODE", "SUB_PUBLIC_PORT", "SUB_PUBLIC_PORT_IPV4",
     "SUB_PUBLIC_PORT_IPV6", "ENTRY_IPV4_ADDRESS", "ENTRY_IPV6_ADDRESS", "VM_TLS_ENABLED",
+    "SUB_ACCESS_MODE", "SUB_DOMAIN", "SUB_TOKEN",
     "VM_PREVIOUS_PORT", "VM_ENABLED", "VL_ENABLED", "VL_PORT", "HY2_ENABLED", "HY2_PORT",
     "HY2_HOP_PORTS", "HY2_HOP_INTERVAL", "TU5_ENABLED", "TU5_PORT", "TU5_HOP_PORTS",
     "AN_ENABLED", "AN_PORT", "NAIVE_ENABLED", "NAIVE_PORT", "NAIVE_USER", "NAIVE_PASS", "NAIVE_DOMAIN", "NAIVE_MODE", "NAIVE_QUIC_CC", "CLASH_ENABLED", "SINGBOX_AUTO_RESTART", "CONFIG_VERSION",
@@ -53,6 +54,7 @@ PY
             PORT|ARGO_EDGE_PORT|SUB_PORT|UUID|CDN_IP|ARGO_DOMAIN|TUNNEL_MODE|\
             ENTRY_IP_MODE|OUTBOUND_IP_MODE|SUB_PUBLIC_PORT|SUB_PUBLIC_PORT_IPV4|\
             SUB_PUBLIC_PORT_IPV6|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|\
+            SUB_ACCESS_MODE|SUB_DOMAIN|SUB_TOKEN|\
             VM_TLS_ENABLED|VM_PREVIOUS_PORT|VM_ENABLED|VL_ENABLED|VL_PORT|\
             HY2_ENABLED|HY2_PORT|HY2_HOP_PORTS|HY2_HOP_INTERVAL|\
             TU5_ENABLED|TU5_PORT|TU5_HOP_PORTS|AN_ENABLED|AN_PORT|\
@@ -81,6 +83,9 @@ load_config_with_defaults() {
     SUB_PUBLIC_PORT=""
     SUB_PUBLIC_PORT_IPV4=""
     SUB_PUBLIC_PORT_IPV6=""
+    SUB_ACCESS_MODE=""
+    SUB_DOMAIN=""
+    SUB_TOKEN=""
     ENTRY_IPV4_ADDRESS=""
     ENTRY_IPV6_ADDRESS=""
     VM_TLS_ENABLED=""
@@ -138,6 +143,9 @@ load_config_with_defaults() {
     # SUB_PUBLIC_PORT 是早期测试版字段，仅作为 IPv4 NAT 端口的兼容回退读取。
     SUB_PUBLIC_PORT_IPV4="${SUB_PUBLIC_PORT_IPV4:-${SUB_PUBLIC_PORT:-${SUB_PORT:-}}}"
     SUB_PUBLIC_PORT_IPV6="${SUB_PUBLIC_PORT_IPV6:-${SUB_PORT:-}}"
+    SUB_ACCESS_MODE="${SUB_ACCESS_MODE:-local}"
+    SUB_DOMAIN="${SUB_DOMAIN:-}"
+    SUB_TOKEN="${SUB_TOKEN:-}"
     VM_TLS_ENABLED="${VM_TLS_ENABLED:-false}"
     VM_PREVIOUS_PORT="${VM_PREVIOUS_PORT:-}"
     VM_ENABLED="${VM_ENABLED:-true}"
@@ -203,6 +211,16 @@ load_config_with_defaults() {
     if ! is_valid_port "$SUB_PUBLIC_PORT_IPV6"; then
         SUB_PUBLIC_PORT_IPV6="$SUB_PORT"
     fi
+    case "$SUB_ACCESS_MODE" in
+        local) SUB_DOMAIN="" ;;
+        https)
+            is_valid_domain "$SUB_DOMAIN" || {
+                SUB_ACCESS_MODE=local
+                SUB_DOMAIN=""
+            }
+            ;;
+        *) SUB_ACCESS_MODE=local; SUB_DOMAIN="" ;;
+    esac
     if [ "$VM_ENABLED" = "false" ] && [ "$PORT" = "0" ]; then
         : # 新安装可不启用 VMess；0 仅表示未分配端口，不会创建监听。
     else
@@ -258,6 +276,9 @@ migrate_config_schema() {
 ARGO_EDGE_PORT|$ARGO_EDGE_PORT
 SUB_PUBLIC_PORT_IPV4|$SUB_PUBLIC_PORT_IPV4
 SUB_PUBLIC_PORT_IPV6|$SUB_PUBLIC_PORT_IPV6
+SUB_ACCESS_MODE|$SUB_ACCESS_MODE
+SUB_DOMAIN|$SUB_DOMAIN
+SUB_TOKEN|$SUB_TOKEN
 ENTRY_IP_MODE|$ENTRY_IP_MODE
 OUTBOUND_IP_MODE|$OUTBOUND_IP_MODE
 ENTRY_IPV4_ADDRESS|$ENTRY_IPV4_ADDRESS
@@ -434,6 +455,7 @@ is_masked_credential() {
 ensure_credential_integrity() {
     local changed=false
     local new_uuid=""
+    local new_sub_token=""
 
     # UUID：主凭据（vmess/vless/hy2/tuic/anytls 共用）
     if [ -z "${UUID:-}" ] || is_masked_credential "$UUID" || ! is_valid_uuid "$UUID"; then
@@ -443,6 +465,16 @@ ensure_credential_integrity() {
             UUID="$new_uuid"
             [ -f "$CONFIG_FILE" ] && safe_sed "UUID" "$UUID" || true
             changed=true
+        fi
+    fi
+    if [[ ! "${SUB_TOKEN:-}" =~ ^[A-Za-z0-9_-]{32}$ ]]; then
+        new_sub_token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))' 2>/dev/null || true)
+        if [[ "$new_sub_token" =~ ^[A-Za-z0-9_-]{32}$ ]]; then
+            SUB_TOKEN="$new_sub_token"
+            [ -f "$CONFIG_FILE" ] && safe_sed "SUB_TOKEN" "$SUB_TOKEN" || true
+            changed=true
+        else
+            return 1
         fi
     fi
     # NaiveProxy 凭据（用户名/密码，仅 NAIVE_ENABLED 时参与配置生成）
@@ -645,6 +677,10 @@ select_entry_ip() {
         SUB_URL_PORT="$SUB_PUBLIC_PORT_IPV4"
         ENTRY_IP_SOURCE="$IPV4_ENTRY_SOURCE"
     fi
+    if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        SUB_BIND_ADDRESS="127.0.0.1"
+        SUB_URL_PORT="$SUB_PORT"
+    fi
 }
 
 entry_mode_label() {
@@ -665,17 +701,131 @@ outbound_mode_label() {
     esac
 }
 
+certificate_identity_matches() {
+    local certificate="$1" identity="$2"
+    [ -s "$certificate" ] && [ -n "$identity" ] || return 1
+    python3 - "$certificate" "$identity" >/dev/null 2>&1 <<'PY'
+import ssl
+import sys
+import ipaddress
+
+decoded = ssl._ssl._test_decode_cert(sys.argv[1])
+identity = sys.argv[2].strip()
+try:
+    expected_ip = ipaddress.ip_address(identity.strip("[]"))
+except ValueError:
+    expected_ip = None
+matched = False
+for kind, value in decoded.get("subjectAltName", ()):
+    if expected_ip is None and kind == "DNS" and value.lower() == identity.lower():
+        matched = True
+    elif expected_ip is not None and kind == "IP Address":
+        try:
+            matched = ipaddress.ip_address(value) == expected_ip
+        except ValueError:
+            matched = False
+    if matched:
+        break
+raise SystemExit(0 if matched else 1)
+PY
+}
+
+certificate_private_key_matches() {
+    local certificate="$1" private_key="$2" cert_public="" key_public=""
+    [ -s "$certificate" ] && [ -s "$private_key" ] || return 1
+    cert_public=$(openssl x509 -in "$certificate" -pubkey -noout 2>/dev/null | sha256sum | awk '{print $1}') || return 1
+    key_public=$(openssl pkey -in "$private_key" -pubout 2>/dev/null | sha256sum | awk '{print $1}') || return 1
+    [[ "$cert_public" =~ ^[0-9a-f]{64}$ ]] && [ "$cert_public" = "$key_public" ]
+}
+
+certificate_chain_is_trusted() {
+    local certificate="$1"
+    local ca_bundle="${RR_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+    [ -s "$certificate" ] && [ -s "$ca_bundle" ] || return 1
+    # fullchain.pem contains the leaf followed by its intermediates.  Supply it
+    # as both the target and untrusted chain while anchoring validation in the
+    # operating system CA bundle; this also checks notBefore/notAfter and the
+    # TLS-server purpose instead of accepting a matching self-signed leaf.
+    openssl verify -purpose sslserver -CAfile "$ca_bundle" \
+        -untrusted "$certificate" "$certificate" >/dev/null 2>&1
+}
+
+subscription_certificate_pair_valid() {
+    local certificate="$1" private_key="$2" domain="$3"
+    [ -s "$certificate" ] && [ -s "$private_key" ] || return 1
+    is_valid_domain "$domain" || return 1
+    certificate_identity_matches "$certificate" "$domain" || return 1
+    openssl x509 -in "$certificate" -noout -checkend 604800 >/dev/null 2>&1 || return 1
+    certificate_private_key_matches "$certificate" "$private_key" || return 1
+    certificate_chain_is_trusted "$certificate"
+}
+
+deploy_subscription_cert_hook() {
+    [ "${SUB_ACCESS_MODE:-local}" = https ] || return 0
+    is_valid_domain "${SUB_DOMAIN:-}" || return 1
+    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+    local hook_source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
+    local hook_file="${hook_dir}/rr-certificates.sh"
+    [ -s "$hook_source" ] && bash -n "$hook_source" || return 1
+    install -d -m 700 "$hook_dir" || return 1
+    install -m 700 "$hook_source" "$hook_file" || return 1
+    # 7.1.0 only managed NaiveProxy and installed this older hook name.  The
+    # generic hook above safely handles both NaiveProxy and subscription TLS.
+    rm -f "${hook_dir}/rr-naive-cert.sh"
+}
+
 start_subscription_server() {
     local sub_server_app="${RR_LIB_DIR}/nexus/sub_server.py"
-    local server_signature="builtin-http"
-    if [ -s "$sub_server_app" ]; then
-        server_signature=$(sha256sum "$sub_server_app" 2>/dev/null | awk '{print $1}') || return 1
-        [[ "$server_signature" =~ ^[a-f0-9]{64}$ ]] || return 1
-    fi
+    local server_signature=""
+    local access_mode="${SUB_ACCESS_MODE:-local}"
+    local cert_file="" key_file="" cert_signature="local-http"
+    local le_live_root="${RR_LE_LIVE_ROOT:-/etc/letsencrypt/live}"
+    local -a tls_args=()
+    [ -s "$sub_server_app" ] || {
+        echo -e "${RED}[安全拒绝] 订阅服务程序缺失，拒绝回退到无保护的通用 HTTP 服务。${RESET}" >&2
+        return 1
+    }
+    is_valid_port "${SUB_PORT:-}" || return 1
+    server_signature=$(sha256sum "$sub_server_app" 2>/dev/null | awk '{print $1}') || return 1
+    [[ "$server_signature" =~ ^[a-f0-9]{64}$ ]] || return 1
+
+    case "$access_mode" in
+        local)
+            SUB_BIND_ADDRESS="127.0.0.1"
+            SUB_DOMAIN=""
+            ;;
+        https)
+            is_valid_domain "${SUB_DOMAIN:-}" || {
+                echo -e "${RED}[安全拒绝] 公网订阅缺少有效可信域名。${RESET}" >&2
+                return 1
+            }
+            case "${SUB_BIND_ADDRESS:-}" in
+                0.0.0.0|::) ;;
+                *)
+                    echo -e "${RED}[安全拒绝] 公网订阅监听地址无效。${RESET}" >&2
+                    return 1
+                    ;;
+            esac
+            cert_file="${le_live_root}/${SUB_DOMAIN}/fullchain.pem"
+            key_file="${le_live_root}/${SUB_DOMAIN}/privkey.pem"
+            subscription_certificate_pair_valid "$cert_file" "$key_file" "$SUB_DOMAIN" || {
+                echo -e "${RED}[安全拒绝] 订阅 HTTPS 证书缺失、即将过期、域名不符或私钥不匹配。${RESET}" >&2
+                return 1
+            }
+            cert_signature=$(sha256sum "$cert_file" 2>/dev/null | awk '{print $1}') || return 1
+            [[ "$cert_signature" =~ ^[a-f0-9]{64}$ ]] || return 1
+            tls_args=(--certfile "$cert_file" --keyfile "$key_file")
+            deploy_subscription_cert_hook || return 1
+            ;;
+        *)
+            echo -e "${RED}[安全拒绝] 未知订阅访问模式。${RESET}" >&2
+            return 1
+            ;;
+    esac
     # 订阅服务是常驻 Python 进程。仅比较端口/监听地址会导致热更新虽然
     # 替换了 sub_server.py，旧进程却继续返回旧正文。把程序哈希写入状态，
     # 文件内容一变就安全重启；端口和代码都没变时仍保持无扰动幂等。
-    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|${server_signature}"
+    local desired_state="${SUB_PORT}|${SUB_BIND_ADDRESS}|${access_mode}|${SUB_DOMAIN:-}|${server_signature}|${cert_signature}"
     local current_state=""
     local old_pid=""
     local used_legacy_pid=false
@@ -710,12 +860,8 @@ start_subscription_server() {
 
     (
         cd "$SUB_ROOT" || exit 1
-        if [ -s "$sub_server_app" ]; then
-            nohup python3 "$sub_server_app" "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" \
-                --directory "$SUB_ROOT" >/dev/null 2>&1 &
-        else
-            nohup python3 -m http.server "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" >/dev/null 2>&1 &
-        fi
+        nohup python3 "$sub_server_app" "$SUB_PORT" --bind "$SUB_BIND_ADDRESS" \
+            --directory "$SUB_ROOT" "${tls_args[@]}" >/dev/null 2>&1 &
         echo $! > "$SUB_PID_FILE"
     ) || return 1
     sleep 1
@@ -725,5 +871,5 @@ start_subscription_server() {
         echo -e "${RED}[错误] 订阅服务启动失败（监听 ${SUB_BIND_ADDRESS}:${SUB_PORT}）。${RESET}" >&2
         return 1
     fi
-    echo "$desired_state" > "$SUB_BIND_STATE_FILE"
+    (umask 077; printf '%s\n' "$desired_state" > "$SUB_BIND_STATE_FILE") || return 1
 }

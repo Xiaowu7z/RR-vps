@@ -223,7 +223,25 @@ uninstall_all() {
     systemctl disable --now rr-nexus >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/rr-nexus.service
     systemctl disable --now rr-update-recovery.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/rr-update-recovery.service /usr/local/sbin/rr-update-recover
+    systemctl disable --now rr-restore-recovery.service >/dev/null 2>&1 || true
+    systemctl disable --now rr-restore-watchdog.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/rr-update-recovery.service \
+        /etc/systemd/system/rr-restore-recovery.service \
+        /etc/systemd/system/rr-restore-watchdog.service \
+        /usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state
+    local restore_gate_unit=""
+    for restore_gate_unit in sing-box.service rr-nexus.service rr-subscription.service \
+        cloudflared.service nginx.service argo-rr-health.service; do
+        rm -f "/etc/systemd/system/${restore_gate_unit}.d/40-rr-restore-gate.conf"
+        rmdir "/etc/systemd/system/${restore_gate_unit}.d" >/dev/null 2>&1 || true
+    done
+    rm -f /run/rr-vps/restore-live /run/rr-vps/restore-watch-request \
+        /run/rr-vps/update-maintenance \
+        /run/rr-vps/locks/restore-live.lock /run/rr-vps/locks/update.lock \
+        /run/rr-vps/locks/nexus-sync.lock /run/rr-vps/locks/nexus-security.lock \
+        /run/lock/rr-restore-live.lock /run/lock/rr-update.lock \
+        /run/lock/rr-vps-nexus-sync.lock /run/lock/rr-nexus-security.lock
+    rmdir /run/rr-vps/locks /run/rr-vps >/dev/null 2>&1 || true
     declare -F nexus_remove_public_proxy >/dev/null 2>&1 && nexus_remove_public_proxy
     stop_singbox_instances >/dev/null 2>&1 || true
     systemctl disable sing-box 2>/dev/null
@@ -603,6 +621,14 @@ install_main() {
     if [ "$INSTALL_HY2_ENABLED" = true ]; then prompt_initial_hy2_hop || return 1; fi
     SUB_PUBLIC_PORT_IPV4="$SUB_PORT"
     SUB_PUBLIC_PORT_IPV6="$SUB_PORT"
+    SUB_ACCESS_MODE=local
+    SUB_DOMAIN=""
+    if [ "$INSTALL_NAIVE_ENABLED" = true ]; then
+        SUB_ACCESS_MODE=https
+        SUB_DOMAIN="$NAIVE_DOMAIN"
+    fi
+    SUB_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))') || return 1
+    [[ "$SUB_TOKEN" =~ ^[A-Za-z0-9_-]{32}$ ]] || return 1
 
 _install_prompt_identity || return 1
 
@@ -621,6 +647,9 @@ _install_prompt_identity || return 1
     safe_sed SUB_PORT "$SUB_PORT" || config_write_ok=false
     safe_sed SUB_PUBLIC_PORT_IPV4 "$SUB_PUBLIC_PORT_IPV4" || config_write_ok=false
     safe_sed SUB_PUBLIC_PORT_IPV6 "$SUB_PUBLIC_PORT_IPV6" || config_write_ok=false
+    safe_sed SUB_ACCESS_MODE "$SUB_ACCESS_MODE" || config_write_ok=false
+    safe_sed SUB_DOMAIN "$SUB_DOMAIN" || config_write_ok=false
+    safe_sed SUB_TOKEN "$SUB_TOKEN" || config_write_ok=false
     safe_sed UUID "$UUID" || config_write_ok=false
     safe_sed CDN_IP "$CDN_IP" || config_write_ok=false
     safe_sed ARGO_DOMAIN "" || config_write_ok=false
@@ -737,12 +766,11 @@ _install_prompt_identity || return 1
         (umask 077; printf '%s\n' "$CF_TOKEN" > "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}.tmp") || return 1
         mv -f "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}.tmp" \
             "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" || return 1
-        if ! cloudflared service install "$CF_TOKEN" >/dev/null 2>&1; then
+        if ! ensure_fixed_argo_service >/dev/null 2>&1; then
             rm -f "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}"
             echo -e "${RED}固定隧道服务安装失败。${RESET}"
             return 1
         fi
-        systemctl enable --now cloudflared >/dev/null 2>&1 || return 1
         safe_sed ARGO_DOMAIN "$ARGO_DOMAIN" || return 1
         echo -e "${YELLOW}请确认 Cloudflare 面板服务地址为 http://localhost:${PORT}。${RESET}"
         else
