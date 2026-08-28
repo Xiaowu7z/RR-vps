@@ -81,6 +81,13 @@ setup_netfilter_mock() {
     }
     iptables() { mock_netfilter iptables "$@"; }
     ip6tables() { mock_netfilter ip6tables "$@"; }
+    rr_ufw_backend_state() { return 1; }
+    rr_netfilter_backend_state() {
+        case "$1" in
+            iptables|ip6tables) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
 }
 
 setup_ufw_mock() {
@@ -133,6 +140,18 @@ setup_ufw_mock() {
             END { if (!removed) exit 1 }
         ' "$MOCK_UFW_RULES" > "$temporary" || { rm -f "$temporary"; return 1; }
         mv -f "$temporary" "$MOCK_UFW_RULES"
+    }
+    rr_ufw_backend_state() {
+        [ "$MOCK_UFW_ACTIVE" = true ]
+    }
+    rr_netfilter_backend_state() {
+        case "$1" in
+            iptables|ip6tables)
+                [ -n "${MOCK_NETFILTER_ROOT:-}" ] && \
+                    [ -d "$MOCK_NETFILTER_ROOT" ]
+                ;;
+            *) return 1 ;;
+        esac
     }
 }
 
