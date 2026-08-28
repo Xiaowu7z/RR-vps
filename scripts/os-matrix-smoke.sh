@@ -35,8 +35,10 @@ RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 test -x /usr/local/sbin/rr-update-recover
+test -x /usr/local/sbin/rr-update-external-state
 test -s /usr/local/lib/rr/modules/61-update-guard.sh
 test -x /usr/local/lib/rr/scripts/naive-cert-hook.sh
+test -x /usr/local/lib/rr/scripts/update-external-state.py
 test -s /usr/local/lib/rr/nexus/rr_nexus_lib/security.py
 test -s /usr/local/lib/rr/nexus/static/admin.js
 
@@ -46,6 +48,7 @@ test -s /usr/local/lib/rr/nexus/static/admin.js
 test ! -e /usr/local/bin/rr
 test ! -e /usr/local/lib/rr
 test ! -e /usr/local/sbin/rr-update-recover
+test ! -e /usr/local/sbin/rr-update-external-state
 test ! -e /var/lib/rr-update
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
@@ -113,5 +116,6 @@ printf 'y\n' | bash -c '
 test ! -e /usr/local/bin/rr
 test ! -e /usr/local/lib/rr
 test ! -e /usr/local/sbin/rr-update-recover
+test ! -e /usr/local/sbin/rr-update-external-state
 
 echo "OS matrix smoke passed: $(. /etc/os-release; printf '%s %s' "$ID" "$VERSION_ID")"

@@ -23,6 +23,7 @@ load_modules_for_tests() {
 echo "[1/13] Bash and Python syntax"
 bash -n install.sh rr modules/*.sh scripts/*.sh
 find nexus -type f -name '*.py' -print0 | xargs -0 python3 -m py_compile
+python3 -m py_compile scripts/rebuild-bundle.py scripts/update-external-state.py
 if command -v node >/dev/null 2>&1; then
     node --check nexus/static/app.js
     node --check nexus/static/admin.js
@@ -36,7 +37,7 @@ bash -c '
     done
     for required_function in \
         main_menu install_main do_update post_update_migrate \
-        ensure_runtime_health generate_node_and_sub protocol_menu uninstall_all \
+        ensure_runtime_health rr_run_health_check generate_node_and_sub protocol_menu uninstall_all \
         nexus_menu sync_nexus_devices nexus_protocol_users; do
         declare -F "$required_function" >/dev/null || {
             echo "Missing function: $required_function" >&2
@@ -148,6 +149,16 @@ echo "[3/13] Fresh-install port selection regression"
         printf '%s\n' certificate > "$RR_LE_LIVE_ROOT/naive.example.com/fullchain.pem"
         printf '%s\n' private-key > "$RR_LE_LIVE_ROOT/naive.example.com/privkey.pem"
     }
+    openssl() {
+        case "$*" in
+            *'-checkend '*) return 0 ;;
+            *'-pubkey -noout'*) printf '%s\n' 'PUBLIC KEY' ;;
+            *'pkey '*' -pubout'*) printf '%s\n' 'PUBLIC KEY' ;;
+            *) return 1 ;;
+        esac
+    }
+    certificate_identity_matches() { return 0; }
+    certificate_private_key_matches() { return 0; }
     systemctl() {
         if [ "${1:-}" = is-active ]; then
             return 1
@@ -182,6 +193,135 @@ echo "[3/13] Fresh-install port selection regression"
     fi
     [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
 )
+
+# IP 直连模式只能切换 RR 自己的 Nginx 站点。发行版 default 和用户站点
+# 必须原样保留；nginx -t 失败时还必须恢复旧 RR 配置及 unit 状态。
+run_nexus_ip_nginx_case() (
+    local case_name="$1"
+    local nginx_test_rc="$2"
+    local expect_success="$3"
+    load_modules_for_tests
+    nexus_nginx_tmp=$(mktemp -d)
+    trap 'rm -rf "$nexus_nginx_tmp"' EXIT
+    NEXUS_NGINX_AVAILABLE_DIR="$nexus_nginx_tmp/sites-available"
+    NEXUS_NGINX_ENABLED_DIR="$nexus_nginx_tmp/sites-enabled"
+    NEXUS_CERT_DIR="$nexus_nginx_tmp/certs"
+    NEXUS_NGINX_SITE="$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus.conf"
+    mkdir -p "$NEXUS_NGINX_AVAILABLE_DIR" "$NEXUS_NGINX_ENABLED_DIR" \
+        "$NEXUS_CERT_DIR" "$nexus_nginx_tmp/before"
+
+    printf '%s\n' 'distro default' > "$NEXUS_NGINX_AVAILABLE_DIR/default"
+    printf '%s\n' 'user site' > "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf"
+    printf '%s\n' 'old domain site' > "$NEXUS_NGINX_SITE"
+    printf '%s\n' 'old custom-port site' > "${NEXUS_NGINX_SITE}.port"
+    printf '%s\n' "old ip site $case_name" > "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+    printf '%s\n' "old certificate $case_name" > "$NEXUS_CERT_DIR/ip.crt"
+    printf '%s\n' "old private key $case_name" > "$NEXUS_CERT_DIR/ip.key"
+    chmod 644 "$NEXUS_CERT_DIR/ip.crt"
+    chmod 600 "$NEXUS_CERT_DIR/ip.key"
+    ln -s "$NEXUS_NGINX_AVAILABLE_DIR/default" "$NEXUS_NGINX_ENABLED_DIR/default"
+    ln -s "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf" \
+        "$NEXUS_NGINX_ENABLED_DIR/unrelated.conf"
+    ln -s "$NEXUS_NGINX_SITE" "$NEXUS_NGINX_ENABLED_DIR/rr-nexus.conf"
+    ln -s "${NEXUS_NGINX_SITE}.port" "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-port.conf"
+    ln -s "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf" \
+        "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-ip.conf"
+    cp -a "$NEXUS_NGINX_AVAILABLE_DIR/default" \
+        "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf" "$NEXUS_NGINX_SITE" \
+        "${NEXUS_NGINX_SITE}.port" "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf" \
+        "$NEXUS_CERT_DIR/ip.crt" "$NEXUS_CERT_DIR/ip.key" "$nexus_nginx_tmp/before/"
+
+    nginx_active=true
+    nginx_enabled=false
+    [ "$expect_success" = true ] && nginx_active=false
+    apt-get() { :; }
+    openssl() {
+        local output=""
+        local key_output=""
+        if [ "${1:-}" = x509 ]; then
+            # Force the transaction to replace the old certificate as well as
+            # the site, so rollback proves both artifacts are restored.
+            return 1
+        fi
+        [ "${1:-}" = req ] || return 1
+        shift
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -out) output="$2"; shift 2 ;;
+                -keyout) key_output="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf '%s\n' 'new certificate' > "$output"
+        printf '%s\n' 'new private key' > "$key_output"
+    }
+    nginx() {
+        [ "${1:-}" = -t ] || return 1
+        return "$nginx_test_rc"
+    }
+    systemctl() {
+        case "${1:-}" in
+            is-active) [ "$nginx_active" = true ] ;;
+            is-enabled) [ "$nginx_enabled" = true ] ;;
+            enable)
+                nginx_enabled=true
+                if [ "${2:-}" = --now ]; then
+                    nginx_active=true
+                fi
+                ;;
+            disable) nginx_enabled=false ;;
+            start|restart) nginx_active=true ;;
+            stop) nginx_active=false ;;
+            reload) [ "$nginx_active" = true ] ;;
+            *) return 1 ;;
+        esac
+    }
+    open_protocol_firewall() { :; }
+
+    if [ "$expect_success" = true ]; then
+        nexus_enable_public_ip_https 192.0.2.10 18443
+        [ "$nginx_active" = true ] && [ "$nginx_enabled" = true ]
+        [ ! -e "$NEXUS_NGINX_ENABLED_DIR/rr-nexus.conf" ]
+        [ ! -e "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-port.conf" ]
+        [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-ip.conf")" = \
+            "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf" ]
+        grep -Fq 'listen 18443 ssl;' "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+        grep -Fq 'location ^~ /sub/' "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+        grep -Fq 'location ~ ^/api/(devices/[^/]+/qr|remote/qr)/?$' \
+            "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+        [ "$(grep -Fc 'error_log /dev/null crit;' \
+            "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf")" -ge 3 ]
+    else
+        if nexus_enable_public_ip_https 192.0.2.10 18443; then
+            echo "A failed Nginx validation was reported as a successful Nexus switch." >&2
+            exit 1
+        fi
+        [ "$nginx_active" = true ] && [ "$nginx_enabled" = false ]
+        cmp -s "$nexus_nginx_tmp/before/rr-nexus-ip.conf" \
+            "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+        cmp -s "$nexus_nginx_tmp/before/ip.crt" "$NEXUS_CERT_DIR/ip.crt"
+        cmp -s "$nexus_nginx_tmp/before/ip.key" "$NEXUS_CERT_DIR/ip.key"
+        [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/rr-nexus.conf")" = "$NEXUS_NGINX_SITE" ]
+        [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-port.conf")" = \
+            "${NEXUS_NGINX_SITE}.port" ]
+        [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-ip.conf")" = \
+            "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf" ]
+    fi
+
+    # These are deliberately outside the RR namespace and must be byte- and
+    # link-identical on both commit and rollback paths.
+    cmp -s "$nexus_nginx_tmp/before/default" "$NEXUS_NGINX_AVAILABLE_DIR/default"
+    cmp -s "$nexus_nginx_tmp/before/unrelated.conf" \
+        "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf"
+    cmp -s "$nexus_nginx_tmp/before/rr-nexus.conf" "$NEXUS_NGINX_SITE"
+    cmp -s "$nexus_nginx_tmp/before/rr-nexus.conf.port" "${NEXUS_NGINX_SITE}.port"
+    [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/default")" = \
+        "$NEXUS_NGINX_AVAILABLE_DIR/default" ]
+    [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/unrelated.conf")" = \
+        "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf" ]
+)
+run_nexus_ip_nginx_case success 0 true
+run_nexus_ip_nginx_case nginx-test-failure 1 false
 
 # 更新/回滚后的订阅 worker 可能没有 PID 文件。进程回收必须依靠命令行
 # 与 RR 订阅根 cwd 双重身份，而不是广泛 pkill 或仅信任状态文件。
@@ -254,8 +394,48 @@ snapshot_function=$(awk '
     capture { print }
     capture && /^}$/ { exit }
 ' scripts/install-core.sh)
+install_snapshot_test_stubs() {
+    rr_write_transaction_format() { printf '2\n' > "$TX_DIR/transaction-format"; }
+    rr_capture_update_writer_state() {
+        RR_SINGBOX_WAS_ACTIVE=false
+        RR_SINGBOX_WAS_ENABLED=false
+        RR_NEXUS_WAS_ACTIVE=false
+        RR_NEXUS_WAS_ENABLED=false
+        RR_SUBSCRIPTION_WAS_ACTIVE=false
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        RR_HEALTH_TIMER_WAS_ACTIVE=false
+        RR_HEALTH_SERVICE_WAS_ACTIVE=false
+        systemctl is-active --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ACTIVE=true
+        systemctl is-enabled --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ENABLED=true
+        systemctl is-active --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ACTIVE=true
+        systemctl is-enabled --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ENABLED=true
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && RR_HEALTH_TIMER_WAS_ENABLED=true
+        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && RR_HEALTH_TIMER_WAS_ACTIVE=true
+        systemctl is-active --quiet argo-rr-health.service 2>/dev/null && RR_HEALTH_SERVICE_WAS_ACTIVE=true
+        rr_subscription_running && RR_SUBSCRIPTION_WAS_ACTIVE=true
+        RR_HEALTH_STATE_CAPTURED=true
+    }
+    rr_persist_update_writer_state() {
+        [ "$RR_SINGBOX_WAS_ACTIVE" = true ] && : > "$BACKUP_DIR/singbox_was_running"
+        [ "$RR_SINGBOX_WAS_ENABLED" = true ] && : > "$BACKUP_DIR/singbox_was_enabled"
+        [ "$RR_NEXUS_WAS_ACTIVE" = true ] && : > "$BACKUP_DIR/nexus_was_running"
+        [ "$RR_NEXUS_WAS_ENABLED" = true ] && : > "$BACKUP_DIR/nexus_was_enabled"
+        [ "$RR_SUBSCRIPTION_WAS_ACTIVE" = true ] && : > "$BACKUP_DIR/subscription_was_running"
+        [ "$RR_HEALTH_TIMER_WAS_ENABLED" = true ] && : > "$BACKUP_DIR/health_timer_was_enabled"
+        [ "$RR_HEALTH_TIMER_WAS_ACTIVE" = true ] && : > "$BACKUP_DIR/health_timer_was_running"
+        [ "$RR_HEALTH_SERVICE_WAS_ACTIVE" = true ] && : > "$BACKUP_DIR/health_service_was_running"
+        : > "$BACKUP_DIR/writer_state_complete"
+    }
+    rr_create_update_maintenance_marker() { RR_UPDATE_MAINTENANCE_ACTIVE=true; }
+    rr_freeze_update_writers() {
+        RR_HEALTH_MONITOR_FROZEN=true
+        RR_UPDATE_WRITERS_FROZEN=true
+    }
+    rr_snapshot_external_state() { return 0; }
+}
 (
     eval "$snapshot_function"
+    install_snapshot_test_stubs
     RR_TX_ROOT=$(mktemp -d)
     RR_ACTIVE_TX="$RR_TX_ROOT/active"
     mkdir -p "$RR_TX_ROOT/transactions"
@@ -266,6 +446,11 @@ snapshot_function=$(awk '
     rr_prepare_recovery_runtime() { return 0; }
     rr_discard_previous_transaction() { return 0; }
     rr_prune_stale_transactions() { return 0; }
+    rr_freeze_health_monitor() {
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && RR_HEALTH_TIMER_WAS_ENABLED=true
+        RR_HEALTH_MONITOR_FROZEN=true
+    }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
@@ -283,6 +468,7 @@ snapshot_function=$(awk '
 )
 (
     eval "$snapshot_function"
+    install_snapshot_test_stubs
     RR_TX_ROOT=$(mktemp -d)
     RR_ACTIVE_TX="$RR_TX_ROOT/active"
     mkdir -p "$RR_TX_ROOT/transactions"
@@ -293,6 +479,11 @@ snapshot_function=$(awk '
     rr_prepare_recovery_runtime() { return 0; }
     rr_discard_previous_transaction() { return 0; }
     rr_prune_stale_transactions() { return 0; }
+    rr_freeze_health_monitor() {
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && RR_HEALTH_TIMER_WAS_ENABLED=true
+        RR_HEALTH_MONITOR_FROZEN=true
+    }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 0; }
     rr_backup_dir() { return 0; }
@@ -309,6 +500,7 @@ snapshot_function=$(awk '
 )
 (
     eval "$snapshot_function"
+    install_snapshot_test_stubs
     RR_TX_ROOT=$(mktemp -d)
     RR_ACTIVE_TX="$RR_TX_ROOT/active"
     mkdir -p "$RR_TX_ROOT/transactions"
@@ -319,6 +511,11 @@ snapshot_function=$(awk '
     rr_prepare_recovery_runtime() { return 0; }
     rr_discard_previous_transaction() { return 0; }
     rr_prune_stale_transactions() { return 0; }
+    rr_freeze_health_monitor() {
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && RR_HEALTH_TIMER_WAS_ENABLED=true
+        RR_HEALTH_MONITOR_FROZEN=true
+    }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
     rr_backup_file() { return 1; }
     rr_backup_dir() { return 0; }
@@ -363,6 +560,7 @@ rollback_function=$(awk '
     rr_restore_file() { return 0; }
     rr_restore_dir() { return 0; }
     rr_restore_sqlite() { return 0; }
+    rr_install_restore_external_state_if_required() { return 0; }
     rr_write_phase() { return 0; }
 
     rr_rollback
@@ -432,6 +630,28 @@ echo "[5/13] Fresh-install crypto material regression"
     rr_restore_crontab "$backup_guard_tmp/safe-cron"
     cmp -s "$backup_guard_tmp/safe-cron" "$backup_guard_tmp/installed-cron"
 
+    crontab() {
+        [ "${1:-}" = -l ] && return 1
+        return 42
+    }
+    if rr_restore_crontab "$backup_guard_tmp/safe-cron"; then
+        echo "A failed crontab install was reported as restored." >&2
+        exit 1
+    fi
+    : > "$backup_guard_tmp/empty-cron"
+    crontab() {
+        if [ "${1:-}" = -l ]; then
+            rr_auto_update_cron_line
+            return 0
+        fi
+        [ "${1:-}" = -r ] && return 42
+        return 0
+    }
+    if rr_restore_crontab "$backup_guard_tmp/empty-cron"; then
+        echo "A failed crontab removal was reported as restored." >&2
+        exit 1
+    fi
+
     mkdir -p "$backup_guard_tmp/tree/rootfs/etc/systemd/system"
     printf '%s\n' '[Service]' 'ExecStart=/bin/sh -c id' > \
         "$backup_guard_tmp/tree/rootfs/etc/systemd/system/rr-nexus.service"
@@ -439,6 +659,551 @@ echo "[5/13] Fresh-install crypto material regression"
         echo "A backup-supplied systemd unit was accepted." >&2
         exit 1
     fi
+
+    # A portable manifest must use canonical relative names and cover every
+    # restored data file.  `sha256sum -c` alone accepts absolute paths and can
+    # be redirected to devices such as /dev/zero.
+    mkdir -p "$backup_guard_tmp/payload/rootfs/etc"
+    printf '%s\n' safe > "$backup_guard_tmp/payload/rootfs/etc/argo_vmess.conf"
+    : > "$backup_guard_tmp/payload/crontab.txt"
+    (
+        cd "$backup_guard_tmp/payload"
+        sha256sum rootfs/etc/argo_vmess.conf crontab.txt > manifest.sha256
+    )
+    rr_restore_verify_manifest "$backup_guard_tmp/payload" 2
+    cp "$backup_guard_tmp/payload/manifest.sha256" "$backup_guard_tmp/good-manifest"
+    rm -f "$backup_guard_tmp/payload/crontab.txt"
+    if rr_restore_verify_manifest "$backup_guard_tmp/payload" 2 2>/dev/null; then
+        echo "A format 2 restore accepted a missing authenticated crontab." >&2
+        exit 1
+    fi
+    : > "$backup_guard_tmp/payload/crontab.txt"
+    grep -v '  crontab.txt$' "$backup_guard_tmp/good-manifest" > \
+        "$backup_guard_tmp/payload/manifest.sha256"
+    if rr_restore_verify_manifest "$backup_guard_tmp/payload" 2 2>/dev/null; then
+        echo "A format 2 manifest omitted the authenticated crontab entry." >&2
+        exit 1
+    fi
+    cp "$backup_guard_tmp/good-manifest" "$backup_guard_tmp/payload/manifest.sha256"
+    printf '%s\n' changed > "$backup_guard_tmp/payload/crontab.txt"
+    if rr_restore_verify_manifest "$backup_guard_tmp/payload" 2 2>/dev/null; then
+        echo "A changed format 2 crontab passed its manifest digest." >&2
+        exit 1
+    fi
+    : > "$backup_guard_tmp/payload/crontab.txt"
+    printf '%064d  /etc/os-release\n' 0 > "$backup_guard_tmp/payload/manifest.sha256"
+    if rr_restore_verify_manifest "$backup_guard_tmp/payload" 2 2>/dev/null; then
+        echo "A restore manifest accepted an absolute path." >&2
+        exit 1
+    fi
+    cp "$backup_guard_tmp/good-manifest" "$backup_guard_tmp/payload/manifest.sha256"
+    printf '%s\n' unlisted > "$backup_guard_tmp/payload/rootfs/etc/unlisted.conf"
+    if rr_restore_verify_manifest "$backup_guard_tmp/payload" 2 2>/dev/null; then
+        echo "A restore manifest failed to reject an unlisted payload file." >&2
+        exit 1
+    fi
+    rm -f "$backup_guard_tmp/payload/rootfs/etc/unlisted.conf"
+
+    # Format 1 backups are still portable: their authenticated crontab was not
+    # listed historically, while every rootfs file must remain covered.
+    (
+        cd "$backup_guard_tmp/payload"
+        sha256sum rootfs/etc/argo_vmess.conf > manifest.sha256
+    )
+    rr_restore_verify_manifest "$backup_guard_tmp/payload" 1
+
+    mkdir -p "$backup_guard_tmp/private-tree/rootfs/etc/rr-naive"
+    printf '%s\n' private > "$backup_guard_tmp/private-tree/rootfs/etc/rr-naive/privkey.pem"
+    install() {
+        [ "$1" = -m ] && [ "$2" = 600 ] || {
+            echo "A restored private key was not forced to mode 600." >&2
+            return 1
+        }
+    }
+    mkdir() { return 0; }
+    mv() { return 0; }
+    rr_restore_apply_tree "$backup_guard_tmp/private-tree"
+)
+
+# Portable Nexus restore keeps the destination access plane.  A public source
+# must neither expose a blank target nor replace a local target's access
+# settings, and a newly restored Nexus must remain enabled after reboot.
+(
+    load_modules_for_tests
+    nexus_restore_tmp=$(mktemp -d)
+    trap 'rm -rf "$nexus_restore_tmp"' EXIT
+    payload="$nexus_restore_tmp/payload"
+    blank_rollback="$nexus_restore_tmp/blank-rollback"
+    local_rollback="$nexus_restore_tmp/local-rollback"
+    live_dir="$nexus_restore_tmp/live"
+    systemctl_log="$nexus_restore_tmp/systemctl.log"
+    mkdir -p "$payload/rootfs/etc/rr-nexus/certs" "$blank_rollback/rootfs" \
+        "$local_rollback/rootfs/etc/rr-nexus" "$live_dir"
+    NEXUS_CONFIG_FILE="$live_dir/nexus.json"
+    NEXUS_SERVICE_FILE="$live_dir/rr-nexus.service"
+
+    jq -n '{
+        mode:"public", listen:"127.0.0.1", port:7900,
+        domain:"source-panel.example.com",
+        database:"/var/lib/rr-nexus/nexus.db",
+        subscription_root:"/var/lib/rr-nexus/subscriptions",
+        published_subscription_root:"/tmp/sub_server/nexus",
+        stats_port:39091, ssh_host:"198.51.100.9", public_port:443,
+        sub_port:8443, traffic_mode:"upload",
+        acme_email:"source-acme@example.com"
+    }' > "$payload/rootfs/etc/rr-nexus/nexus.json"
+    printf '%s\n' source-certificate > "$payload/rootfs/etc/rr-nexus/certs/ip.crt"
+
+    nexus_enabled=false
+    systemctl_enable_works=true
+    systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        case "${1:-}" in
+            enable)
+                [ "$systemctl_enable_works" = true ] && nexus_enabled=true
+                return 0
+                ;;
+            disable) nexus_enabled=false; return 0 ;;
+            is-enabled) [ "$nexus_enabled" = true ] ;;
+            *) return 0 ;;
+        esac
+    }
+
+    # The generic portable tree application must not install the source
+    # nexus.json or its source-machine certificate files at all.
+    (
+        install() {
+            echo "Portable tree attempted to install source Nexus access state: $*" >&2
+            return 97
+        }
+        rr_restore_apply_tree "$payload" portable
+    )
+
+    rr_restore_capture_target_nexus_state "$blank_rollback"
+    [ ! -e "$blank_rollback/target_nexus_was_present" ]
+    rr_restore_apply_target_nexus_state "$blank_rollback" "$payload"
+    jq -e '
+        .mode == "local" and .domain == "" and .public_port == 7900 and
+        (has("acme_email") | not) and .traffic_mode == "upload"
+    ' "$NEXUS_CONFIG_FILE" >/dev/null || {
+        echo "A public Nexus source exposed or replaced a blank target access plane." >&2
+        exit 1
+    }
+    if cmp -s "$payload/rootfs/etc/rr-nexus/nexus.json" "$NEXUS_CONFIG_FILE"; then
+        echo "The source nexus.json was installed verbatim on a blank target." >&2
+        exit 1
+    fi
+    proxy_was_removed=false
+    nexus_remove_public_proxy() { proxy_was_removed=true; }
+    nexus_enable_public_https() {
+        echo "Blank-target restore attempted to create a public Nexus proxy." >&2
+        return 1
+    }
+    nexus_enable_public_ip_https() {
+        echo "Blank-target restore attempted to create a public Nexus IP proxy." >&2
+        return 1
+    }
+    nexus_reconcile_public_proxy
+    [ "$proxy_was_removed" = true ] || {
+        echo "Blank-target restore did not reconcile Nexus to local-only access." >&2
+        exit 1
+    }
+
+    : > "$NEXUS_SERVICE_FILE"
+    rr_restore_finalize_nexus_enablement "$blank_rollback"
+    [ "$nexus_enabled" = true ]
+    grep -Fxq 'enable rr-nexus' "$systemctl_log"
+    grep -Fxq 'is-enabled --quiet rr-nexus' "$systemctl_log"
+    # Simulate the boot decision: an enabled restored unit is selected again
+    # after all transient running state is lost.
+    nexus_running=false
+    if systemctl is-enabled --quiet rr-nexus; then
+        nexus_running=true
+    fi
+    [ "$nexus_running" = true ] || {
+        echo "A blank-target Nexus restore would disappear after reboot." >&2
+        exit 1
+    }
+
+    # Repeat with an existing local target.  Only the four access-plane fields
+    # come from the target; portable data such as traffic_mode still comes from
+    # the authenticated source config.
+    jq -n '{
+        mode:"local", listen:"127.0.0.1", port:7900, domain:"",
+        database:"/var/lib/rr-nexus/nexus.db",
+        subscription_root:"/var/lib/rr-nexus/subscriptions",
+        published_subscription_root:"/tmp/sub_server/nexus",
+        stats_port:39092, ssh_host:"203.0.113.8", public_port:24888,
+        sub_port:9443, traffic_mode:"both",
+        acme_email:"target-acme@example.net"
+    }' > "$NEXUS_CONFIG_FILE"
+    nexus_enabled=false
+    rr_restore_capture_target_nexus_state "$local_rollback"
+    cp "$NEXUS_CONFIG_FILE" "$local_rollback/rootfs/etc/rr-nexus/nexus.json"
+    rm -f "$NEXUS_CONFIG_FILE"
+    rr_restore_apply_target_nexus_state "$local_rollback" "$payload"
+    jq -e '
+        .mode == "local" and .domain == "" and .public_port == 24888 and
+        .acme_email == "target-acme@example.net" and .traffic_mode == "upload"
+    ' "$NEXUS_CONFIG_FILE" >/dev/null || {
+        echo "A public Nexus source replaced the local target access plane." >&2
+        exit 1
+    }
+    rr_restore_finalize_nexus_enablement "$local_rollback"
+    [ "$nexus_enabled" = false ] || {
+        echo "Restore changed an existing target's disabled Nexus state." >&2
+        exit 1
+    }
+
+    # Rollback restores both possible original enable states exactly, and an
+    # enable operation that does not survive is rejected by the is-enabled
+    # verification gate.
+    nexus_enabled=true
+    rr_restore_restore_nexus_enablement "$local_rollback"
+    [ "$nexus_enabled" = false ]
+    : > "$local_rollback/nexus_was_enabled"
+    rr_restore_restore_nexus_enablement "$local_rollback"
+    [ "$nexus_enabled" = true ]
+    systemctl_enable_works=false
+    nexus_enabled=false
+    if rr_restore_set_nexus_enablement true; then
+        echo "A failed rr-nexus enable verification was accepted." >&2
+        exit 1
+    fi
+
+    # Exercise the rollback orchestration with an exact local config snapshot,
+    # not merely the enablement helper in isolation.
+    rollback_stage="$nexus_restore_tmp/restore.exact"
+    rollback_tree="$rollback_stage/rollback"
+    install -d -m 700 "$rollback_stage"
+    mkdir -p "$rollback_tree/rootfs/etc/rr-nexus"
+    cp "$local_rollback/rootfs/etc/rr-nexus/nexus.json" \
+        "$rollback_tree/rootfs/etc/rr-nexus/nexus.json"
+    : > "$rollback_tree/complete"
+    chmod 600 "$rollback_tree/complete"
+    printf '%s\n' candidate > "$NEXUS_CONFIG_FILE"
+    nexus_enabled=true
+    systemctl_enable_works=true
+    RR_BACKUP_WORK_DIR="$nexus_restore_tmp"
+    RR_RESTORE_ACTIVE="$nexus_restore_tmp/active"
+    RR_RESTORE_RUNTIME_READY="$nexus_restore_tmp/runtime-ready"
+    rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$rollback_stage"
+    rr_restore_stop_managed_runtime() { return 0; }
+    rr_restore_remove_managed_fixed_tunnel() { return 0; }
+    rr_restore_clear_derived_state() { return 0; }
+    rr_restore_clear_managed_tree() { return 0; }
+    rr_restore_apply_tree() {
+        cp "$1/rootfs/etc/rr-nexus/nexus.json" "$NEXUS_CONFIG_FILE"
+    }
+    rr_refresh_update_channel_constants() { return 0; }
+    rr_restore_crontab() { return 0; }
+    rr_restore_regenerate_runtime_files() { return 0; }
+    rr_restore_restore_nginx() { return 0; }
+    rr_restore_apply_cloudflared_snapshot() { return 0; }
+    rr_restore_migrate_with_original_state() { return 0; }
+    rr_restore_rollback_stage "$rollback_stage"
+    cmp -s "$rollback_tree/rootfs/etc/rr-nexus/nexus.json" "$NEXUS_CONFIG_FILE" || {
+        echo "Nexus rollback did not restore the exact original config." >&2
+        exit 1
+    }
+    [ "$nexus_enabled" = false ] || {
+        echo "Nexus rollback did not restore the original disabled state." >&2
+        exit 1
+    }
+)
+
+# The durable restore marker must cover the service-freeze window as well as
+# file replacement.  An interruption before mutation restarts the untouched
+# original runtime; an interruption after mutation enters full rollback.
+(
+    load_modules_for_tests
+    recovery_tmp=$(mktemp -d)
+    trap 'rm -rf "$recovery_tmp"' EXIT
+    RR_BACKUP_WORK_DIR="$recovery_tmp"
+    RR_RESTORE_ACTIVE="$recovery_tmp/active"
+    RR_RESTORE_LOCK_HELD=1
+    recovery_log="$recovery_tmp/recovery.log"
+    rr_restore_resume_frozen_writers() {
+        local rollback="$1"
+        printf '%s,%s,%s,%s,%s\n' \
+            "$([ -f "$rollback/singbox_was_running" ] && printf true || printf false)" \
+            "$([ -f "$rollback/nexus_was_running" ] && printf true || printf false)" \
+            "$([ -f "$rollback/subscription_was_running" ] && printf true || printf false)" \
+            "$([ -f "$rollback/argo_was_running" ] && printf true || printf false)" \
+            "$([ -f "$rollback/health_timer_was_enabled" ] && printf true || printf false)" \
+            >> "$recovery_log"
+    }
+
+    phase_index=0
+    for phase in freezing frozen prepared pre_recovery_failed; do
+        phase_index=$((phase_index + 1))
+        stage="$recovery_tmp/restore.p${phase_index}"
+        install -d -m 700 "$stage"
+        mkdir -p "$stage/rollback"
+        : > "$stage/rollback/singbox_was_running"
+        : > "$stage/rollback/subscription_was_running"
+        : > "$stage/rollback/health_timer_was_enabled"
+        rr_restore_write_phase "$stage" "$phase"
+        rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$stage"
+        rr_restore_recover_active
+        [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -e "$stage" ] || {
+            echo "Pre-mutation restore recovery did not clean phase $phase." >&2
+            exit 1
+        }
+    done
+    [ "$(wc -l < "$recovery_log")" -eq 4 ]
+    if grep -Fvxq 'true,false,true,false,true' "$recovery_log"; then
+        echo "Pre-mutation restore recovery changed the original service state." >&2
+        exit 1
+    fi
+
+    # A failed early resume must remain in the early-resume branch.  Treating
+    # it as a full rollback could clear the live tree and apply a partial
+    # snapshot created before the freeze completed.
+    retry_stage="$recovery_tmp/restore.retry"
+    install -d -m 700 "$retry_stage"
+    mkdir -p "$retry_stage/rollback"
+    rr_restore_write_phase "$retry_stage" frozen
+    rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$retry_stage"
+    resume_should_fail=true
+    rr_restore_resume_frozen_writers() { [ "$resume_should_fail" != true ]; }
+    if rr_restore_recover_active 2>/dev/null; then
+        echo "A failed pre-mutation service resume was reported as recovered." >&2
+        exit 1
+    fi
+    [ "$(cat "$retry_stage/phase")" = pre_recovery_failed ]
+    [ -e "$RR_RESTORE_ACTIVE" ] && [ -d "$retry_stage" ]
+    resume_should_fail=false
+    rr_restore_recover_active
+    [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -e "$retry_stage" ]
+
+    # Corrupt transaction pointers/phases fail closed and preserve evidence.
+    victim="$recovery_tmp/victim"
+    mkdir -p "$victim"
+    install -d -m 700 "$recovery_tmp/restore.good"
+    printf '%s\n' keep > "$victim/sentinel"
+    for invalid_pointer in '' \
+        "$recovery_tmp/restore.good/../victim" \
+        "$recovery_tmp/restore.missing"; do
+        printf '%s\n' "$invalid_pointer" > "$RR_RESTORE_ACTIVE"
+        chmod 600 "$RR_RESTORE_ACTIVE"
+        if rr_restore_recover_active 2>/dev/null; then
+            echo "An invalid active restore pointer was accepted: $invalid_pointer" >&2
+            exit 1
+        fi
+        [ -f "$victim/sentinel" ] && [ -e "$RR_RESTORE_ACTIVE" ]
+    done
+    rm -f "$RR_RESTORE_ACTIVE"
+    printf '%s\n' "$recovery_tmp/restore.good" > "$recovery_tmp/active-target"
+    chmod 600 "$recovery_tmp/active-target"
+    ln -s "$recovery_tmp/active-target" "$RR_RESTORE_ACTIVE"
+    if rr_restore_recover_active 2>/dev/null; then
+        echo "A symlink active restore pointer was accepted." >&2
+        exit 1
+    fi
+    rm -f "$RR_RESTORE_ACTIVE" "$recovery_tmp/active-target"
+
+    for bad_phase in '' unknown; do
+        phase_stage="$recovery_tmp/restore.phase"
+        install -d -m 700 "$phase_stage"
+        rr_restore_write_phase "$phase_stage" "$bad_phase"
+        rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$phase_stage"
+        if rr_restore_recover_active 2>/dev/null; then
+            echo "An unsafe restore phase was accepted: ${bad_phase:-empty}" >&2
+            exit 1
+        fi
+        [ -d "$phase_stage" ] && [ -e "$RR_RESTORE_ACTIVE" ]
+        rm -f "$RR_RESTORE_ACTIVE"
+        rm -rf "$phase_stage"
+    done
+
+    partial_stage="$recovery_tmp/restore.partial"
+    install -d -m 700 "$partial_stage"
+    mkdir -p "$partial_stage/rollback/rootfs"
+    if rr_restore_rollback_stage "$partial_stage" 2>/dev/null; then
+        echo "A partial rollback snapshot was accepted." >&2
+        exit 1
+    fi
+    rm -rf "$partial_stage"
+
+    for terminal_phase in committed rolled_back aborted; do
+        terminal_stage="$recovery_tmp/restore.terminal"
+        install -d -m 700 "$terminal_stage"
+        rr_restore_write_phase "$terminal_stage" "$terminal_phase"
+        rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$terminal_stage"
+        rr_restore_recover_active
+        [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -e "$terminal_stage" ]
+    done
+
+    rollback_log="$recovery_tmp/rollback.log"
+    rollback_should_fail=true
+    rr_restore_rollback_stage() {
+        printf '%s\n' "$1" >> "$rollback_log"
+        [ "$rollback_should_fail" != true ] || return 1
+        rm -f "$RR_RESTORE_ACTIVE"
+    }
+    retry_stage="$recovery_tmp/restore.rollbackretry"
+    install -d -m 700 "$retry_stage"
+    rr_restore_write_phase "$retry_stage" mutating
+    rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$retry_stage"
+    if rr_restore_recover_active; then
+        echo "A failed full rollback was reported as recovered." >&2
+        exit 1
+    fi
+    [ -d "$retry_stage" ] && [ -e "$RR_RESTORE_ACTIVE" ]
+    rollback_should_fail=false
+    rr_restore_recover_active
+    [ ! -e "$retry_stage" ] && [ ! -e "$RR_RESTORE_ACTIVE" ]
+
+    phase_index=0
+    for phase in mutating cleared applied migrating rolling_back recovery_failed; do
+        phase_index=$((phase_index + 1))
+        stage="$recovery_tmp/restore.r${phase_index}"
+        install -d -m 700 "$stage"
+        rr_restore_write_phase "$stage" "$phase"
+        rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$stage"
+        rr_restore_recover_active
+        [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -e "$stage" ] || {
+            echo "Post-mutation restore recovery did not roll back phase $phase." >&2
+            exit 1
+        }
+    done
+    [ "$(wc -l < "$rollback_log")" -eq 8 ]
+)
+
+# Nexus core release metadata, BUILD_INFO, and checksum files form one
+# provenance chain.  Exercise it with the default mawk used by Debian 12 and
+# Ubuntu 22.04, including malformed files that could otherwise mix versions.
+(
+    load_modules_for_tests
+    checksum_tmp=$(mktemp -d)
+    trap 'rm -rf "$checksum_tmp"' EXIT
+    command -v mawk >/dev/null 2>&1 || {
+        echo "mawk is required for the Nexus checksum portability regression." >&2
+        exit 1
+    }
+    digest_a=$(printf 'a%.0s' {1..64})
+    digest_b=$(printf 'b%.0s' {1..64})
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n%s  rr-sing-box-1.2.3-linux-arm64.tar.gz\n' \
+        "$digest_a" "$digest_b" > "$checksum_tmp/good"
+    RR_AWK_BIN=mawk nexus_validate_core_checksums "$checksum_tmp/good" 1.2.3
+
+    : > "$checksum_tmp/empty"
+    head -n 1 "$checksum_tmp/good" > "$checksum_tmp/one"
+    cp "$checksum_tmp/good" "$checksum_tmp/blank"
+    printf '\n' >> "$checksum_tmp/blank"
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\r\n%s  rr-sing-box-1.2.3-linux-arm64.tar.gz\r\n' \
+        "$digest_a" "$digest_b" > "$checksum_tmp/crlf"
+    printf '%s\trr-sing-box-1.2.3-linux-amd64.tar.gz\n%s\trr-sing-box-1.2.3-linux-arm64.tar.gz\n' \
+        "$digest_a" "$digest_b" > "$checksum_tmp/tab"
+    digest_upper=$(printf 'A%.0s' {1..64})
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n%s  rr-sing-box-1.2.3-linux-arm64.tar.gz\n' \
+        "$digest_upper" "$digest_b" > "$checksum_tmp/uppercase"
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n' \
+        "$digest_a" "$digest_b" > "$checksum_tmp/same-arch"
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n%s  rr-sing-box-1.2.4-linux-arm64.tar.gz\n' \
+        "$digest_a" "$digest_b" > "$checksum_tmp/mixed-version"
+    cp "$checksum_tmp/good" "$checksum_tmp/short"
+    cp "$checksum_tmp/good" "$checksum_tmp/long"
+    cp "$checksum_tmp/good" "$checksum_tmp/nonhex"
+    cp "$checksum_tmp/good" "$checksum_tmp/extra"
+    sed -i '1s/^a//' "$checksum_tmp/short"
+    sed -i '1s/^/a/' "$checksum_tmp/long"
+    sed -i '1s/^a/g/' "$checksum_tmp/nonhex"
+    printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n' "$digest_a" >> "$checksum_tmp/extra"
+    for bad in empty one blank crlf tab uppercase same-arch mixed-version short long nonhex extra; do
+        if RR_AWK_BIN=mawk nexus_validate_core_checksums "$checksum_tmp/$bad" 1.2.3; then
+            echo "Invalid Nexus core checksum list was accepted: $bad" >&2
+            exit 1
+        fi
+    done
+    if RR_AWK_BIN=mawk nexus_validate_core_checksums "$checksum_tmp/good" 1.2.4; then
+        echo "Nexus checksum validator accepted the wrong expected version." >&2
+        exit 1
+    fi
+
+    version=1.2.3
+    upstream_tag="v${version}"
+    release_tag="rr-nexus-core-${upstream_tag}-r1"
+    builder_commit=$(printf 'c%.0s' {1..40})
+    source_commit=$(printf 'd%.0s' {1..40})
+    asset_base="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/"
+    jq -n --arg tag "$release_tag" --arg target "$builder_commit" --arg base "$asset_base" \
+        --arg version "$version" '{
+            tag_name: $tag,
+            target_commitish: $target,
+            draft: false,
+            prerelease: false,
+            immutable: true,
+            assets: [
+                "BUILD_INFO", "SHA256SUMS",
+                "rr-sing-box-\($version)-linux-amd64.tar.gz",
+                "rr-sing-box-\($version)-linux-arm64.tar.gz"
+            ] | map({name: ., browser_download_url: ($base + .)})
+        }' > "$checksum_tmp/release.good"
+    nexus_validate_traffic_core_release "$checksum_tmp/release.good" "$upstream_tag"
+
+    assert_bad_core_release() {
+        local fixture="$1"
+        if nexus_validate_traffic_core_release "$fixture" "$upstream_tag"; then
+            echo "Invalid Nexus core release metadata was accepted: ${fixture##*.}" >&2
+            exit 1
+        fi
+    }
+    jq '.tag_name = "rr-nexus-core-v1.2.4-r1"' "$checksum_tmp/release.good" > "$checksum_tmp/release.tag"
+    jq '.target_commitish = "main"' "$checksum_tmp/release.good" > "$checksum_tmp/release.target"
+    jq '.draft = true' "$checksum_tmp/release.good" > "$checksum_tmp/release.draft"
+    jq '.prerelease = true' "$checksum_tmp/release.good" > "$checksum_tmp/release.prerelease"
+    jq '.immutable = false' "$checksum_tmp/release.good" > "$checksum_tmp/release.mutable"
+    jq '.assets = .assets[:-1]' "$checksum_tmp/release.good" > "$checksum_tmp/release.missing"
+    jq '.assets += [{name:"unexpected", browser_download_url:"https://example.invalid/unexpected"}]' \
+        "$checksum_tmp/release.good" > "$checksum_tmp/release.extra"
+    jq '.assets[3] = .assets[2]' "$checksum_tmp/release.good" > "$checksum_tmp/release.duplicate"
+    jq '.assets[0].browser_download_url = "https://example.invalid/BUILD_INFO"' \
+        "$checksum_tmp/release.good" > "$checksum_tmp/release.url"
+    for bad in tag target draft prerelease mutable missing extra duplicate url; do
+        assert_bad_core_release "$checksum_tmp/release.$bad"
+    done
+
+    cat > "$checksum_tmp/BUILD_INFO.good" <<EOF
+SING_BOX_VERSION=${version}
+SING_BOX_TAG=${upstream_tag}
+SOURCE_COMMIT=${source_commit}
+RR_BUILDER_COMMIT=${builder_commit}
+RR_CORE_RELEASE=${release_tag}
+BUILD_TAG=with_v2ray_api
+SOURCE=https://github.com/SagerNet/sing-box/tree/${upstream_tag}
+EOF
+    nexus_validate_core_build_info \
+        "$checksum_tmp/BUILD_INFO.good" "$version" "$release_tag" "$builder_commit"
+    assert_bad_build_info() {
+        local fixture="$1"
+        if nexus_validate_core_build_info \
+            "$fixture" "$version" "$release_tag" "$builder_commit"; then
+            echo "Invalid Nexus BUILD_INFO was accepted: ${fixture##*.}" >&2
+            exit 1
+        fi
+    }
+    sed 's/^SING_BOX_VERSION=.*/SING_BOX_VERSION=1.2.4/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.version"
+    sed 's/^SING_BOX_TAG=.*/SING_BOX_TAG=v1.2.4/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.tag"
+    sed 's/^SOURCE_COMMIT=.*/SOURCE_COMMIT=not-a-commit/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.source-commit"
+    sed 's/^RR_BUILDER_COMMIT=.*/RR_BUILDER_COMMIT=0000000000000000000000000000000000000000/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.builder"
+    sed 's/^RR_CORE_RELEASE=.*/RR_CORE_RELEASE=rr-nexus-core-v1.2.4-r1/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.release"
+    sed 's/^BUILD_TAG=.*/BUILD_TAG=with_quic/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.build-tag"
+    sed 's#^SOURCE=.*#SOURCE=https://example.invalid/source#' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.source"
+    cp "$checksum_tmp/BUILD_INFO.good" "$checksum_tmp/BUILD_INFO.duplicate"
+    printf 'SING_BOX_TAG=%s\n' "$upstream_tag" >> "$checksum_tmp/BUILD_INFO.duplicate"
+    sed 's/$/\r/' "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.crlf"
+    for bad in version tag source-commit builder release build-tag source duplicate crlf; do
+        assert_bad_build_info "$checksum_tmp/BUILD_INFO.$bad"
+    done
 )
 
 # T10/A10：无 schema 旧配置不得默认视为已安装活节点（INSTALL_COMPLETE 保守为 false）。
@@ -593,12 +1358,15 @@ echo "[6/13] Subscription URL control-character regression"
     SUB_BIND_STATE_FILE="$rr_restart_tmp/sub.bind"
     SUB_PORT=39291
     SUB_BIND_ADDRESS=127.0.0.1
+    SUB_ACCESS_MODE=local
+    SUB_DOMAIN=""
+    SUB_TOKEN=0123456789abcdefghijklmnopqrstuv
     mkdir -p "$RR_LIB_DIR/nexus" "$SUB_ROOT"
     ensure_subscription_root() { return 0; }
     printf '%s\n' 'print("old")' > "$RR_LIB_DIR/nexus/sub_server.py"
     rr_old_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
     printf '%s\n' 4242 > "$SUB_PID_FILE"
-    printf '%s\n' "${SUB_PORT}|${SUB_BIND_ADDRESS}|${rr_old_signature}" > "$SUB_BIND_STATE_FILE"
+    printf '%s\n' "${SUB_PORT}|${SUB_BIND_ADDRESS}|local||${rr_old_signature}|local-http" > "$SUB_BIND_STATE_FILE"
     printf '%s\n' 'print("new")' > "$RR_LIB_DIR/nexus/sub_server.py"
     kill() { printf '%s\n' "$1" > "$rr_restart_tmp/killed"; }
     sleep() { :; }
@@ -608,12 +1376,13 @@ echo "[6/13] Subscription URL control-character regression"
     rr_new_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
     [ "$(cat "$rr_restart_tmp/killed")" = 4242 ]
     [ -f "$rr_restart_tmp/launched" ]
-    [ "$(cat "$SUB_BIND_STATE_FILE")" = "${SUB_PORT}|${SUB_BIND_ADDRESS}|${rr_new_signature}" ]
+    [ "$(cat "$SUB_BIND_STATE_FILE")" = "${SUB_PORT}|${SUB_BIND_ADDRESS}|local||${rr_new_signature}|local-http" ]
     rm -rf "$rr_restart_tmp"
 
     test_uuid="e219c8c7-b669-4c75-b33b-a9e5227a8a24"
+    UUID="$test_uuid"
     url=$(build_subscription_url "45.192.205.71" 39291 "$test_uuid" jhsub_encoded.txt)
-    [ "$url" = "http://45.192.205.71:39291/${test_uuid}/jhsub_encoded.txt" ]
+    [ "$url" = "http://127.0.0.1:39291/${test_uuid}/jhsub_encoded.txt" ]
     encoded_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" encoded)
     raw_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" raw)
     client_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" client)
@@ -621,16 +1390,27 @@ echo "[6/13] Subscription URL control-character regression"
     mihomo_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" mihomo)
     verge_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" clash-verge)
     flclash_short_url=$(build_short_subscription_url "45.192.205.71" 39291 "$test_uuid" flclash)
-    [[ "$encoded_short_url" =~ ^http://45\.192\.205\.71:39291/s/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$raw_short_url" =~ ^http://45\.192\.205\.71:39291/r/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$client_short_url" =~ ^http://45\.192\.205\.71:39291/c/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$clash_short_url" =~ ^http://45\.192\.205\.71:39291/m/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$mihomo_short_url" =~ ^http://45\.192\.205\.71:39291/mm/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$verge_short_url" =~ ^http://45\.192\.205\.71:39291/vg/[A-Za-z0-9_-]{12}$ ]]
-    [[ "$flclash_short_url" =~ ^http://45\.192\.205\.71:39291/fc/[A-Za-z0-9_-]{12}$ ]]
+    [ "$encoded_short_url" = "http://127.0.0.1:39291/s/${SUB_TOKEN}" ]
+    [ "$raw_short_url" = "http://127.0.0.1:39291/r/${SUB_TOKEN}" ]
+    [ "$client_short_url" = "http://127.0.0.1:39291/c/${SUB_TOKEN}" ]
+    [ "$clash_short_url" = "http://127.0.0.1:39291/m/${SUB_TOKEN}" ]
+    [ "$mihomo_short_url" = "http://127.0.0.1:39291/mm/${SUB_TOKEN}" ]
+    [ "$verge_short_url" = "http://127.0.0.1:39291/vg/${SUB_TOKEN}" ]
+    [ "$flclash_short_url" = "http://127.0.0.1:39291/fc/${SUB_TOKEN}" ]
     [ "${#encoded_short_url}" -lt "${#url}" ]
+    SUB_ACCESS_MODE=https
+    SUB_DOMAIN=sub.example.com
+    [ "$(build_short_subscription_url '45.192.205.71' 443 "$test_uuid" raw)" = \
+        "https://sub.example.com:443/r/${SUB_TOKEN}" ]
+    [ "$(build_subscription_url '45.192.205.71' 443 "$test_uuid" jhsub.txt)" = \
+        "https://sub.example.com:443/${test_uuid}/jhsub.txt" ]
+    SUB_DOMAIN=""
+    if build_short_subscription_url '45.192.205.71' 443 "$test_uuid" raw >/dev/null 2>&1; then
+        echo "HTTPS subscription URL was emitted without a trusted domain." >&2
+        exit 1
+    fi
+    SUB_ACCESS_MODE=local
     SUB_ROOT=$(mktemp -d)
-    UUID="$test_uuid"
     mkdir -p "$SUB_ROOT/$UUID"
     printf '%s' 'dGVzdA==' > "$SUB_ROOT/$UUID/jhsub_encoded.txt"
     printf '%s\n' 'vless://test' > "$SUB_ROOT/$UUID/jhsub.txt"
@@ -660,6 +1440,64 @@ echo "[6/13] Subscription URL control-character regression"
         echo "Control character in subscription host was accepted." >&2
         exit 1
     fi
+    cert_test_root=$(mktemp -d)
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+        -subj '/CN=RR test root' \
+        -keyout "$cert_test_root/ca.key" -out "$cert_test_root/ca.crt" \
+        >/dev/null 2>&1
+    RR_CA_BUNDLE="$cert_test_root/ca.crt"
+    openssl req -newkey rsa:2048 -nodes -subj '/CN=sub.example.com' \
+        -addext 'subjectAltName=DNS:sub.example.com' \
+        -keyout "$cert_test_root/good.key" -out "$cert_test_root/good.csr" \
+        >/dev/null 2>&1
+    cat > "$cert_test_root/server.ext" <<'EOF'
+subjectAltName=DNS:sub.example.com
+extendedKeyUsage=serverAuth
+EOF
+    openssl x509 -req -days 30 -in "$cert_test_root/good.csr" \
+        -CA "$cert_test_root/ca.crt" -CAkey "$cert_test_root/ca.key" \
+        -CAcreateserial -extfile "$cert_test_root/server.ext" \
+        -out "$cert_test_root/good-leaf.crt" >/dev/null 2>&1
+    cat "$cert_test_root/good-leaf.crt" "$cert_test_root/ca.crt" \
+        > "$cert_test_root/good.crt"
+    subscription_certificate_pair_valid "$cert_test_root/good.crt" \
+        "$cert_test_root/good.key" sub.example.com
+    if subscription_certificate_pair_valid "$cert_test_root/good.crt" \
+        "$cert_test_root/good.key" wrong.example.com; then
+        echo "Subscription certificate with the wrong SAN was accepted." >&2
+        exit 1
+    fi
+    openssl req -newkey rsa:2048 -nodes -subj '/CN=sub.example.com' \
+        -keyout "$cert_test_root/short.key" -out "$cert_test_root/short.csr" \
+        >/dev/null 2>&1
+    openssl x509 -req -days 1 -in "$cert_test_root/short.csr" \
+        -CA "$cert_test_root/ca.crt" -CAkey "$cert_test_root/ca.key" \
+        -CAcreateserial -extfile "$cert_test_root/server.ext" \
+        -out "$cert_test_root/short-leaf.crt" >/dev/null 2>&1
+    cat "$cert_test_root/short-leaf.crt" "$cert_test_root/ca.crt" \
+        > "$cert_test_root/short.crt"
+    if subscription_certificate_pair_valid "$cert_test_root/short.crt" \
+        "$cert_test_root/short.key" sub.example.com; then
+        echo "Subscription certificate expiring within seven days was accepted." >&2
+        exit 1
+    fi
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+        -subj '/CN=sub.example.com' -addext 'subjectAltName=DNS:sub.example.com' \
+        -keyout "$cert_test_root/self.key" -out "$cert_test_root/self.crt" \
+        >/dev/null 2>&1
+    if subscription_certificate_pair_valid "$cert_test_root/self.crt" \
+        "$cert_test_root/self.key" sub.example.com; then
+        echo "Self-signed subscription certificate was accepted as publicly trusted." >&2
+        exit 1
+    fi
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+        -out "$cert_test_root/mismatch.key" >/dev/null 2>&1
+    if subscription_certificate_pair_valid "$cert_test_root/good.crt" \
+        "$cert_test_root/mismatch.key" sub.example.com; then
+        echo "Subscription certificate with a mismatched private key was accepted." >&2
+        exit 1
+    fi
+    rm -rf "$cert_test_root"
     qr_payload='vless://test@example.com:443?security=reality#RR-test'
     qrencode() {
         [ "$#" -eq 8 ] && [ "$1" = "-t" ] && [ "$2" = "ANSIUTF8" ] && \
@@ -709,6 +1547,12 @@ init_output=$(printf '%s\n' 'StrongPassword123!' | \
     PYTHONPATH="$nexus_pythonpath" RR_NEXUS_CONFIG="$argon2_config" \
     python3 nexus/rr_nexus.py --init-admin tester)
 [[ "$init_output" == RR_NEXUS_RECOVERY_CODES=* ]]
+recovery_payload="${init_output#RR_NEXUS_RECOVERY_CODES=}"
+IFS=',' read -r -a recovery_values <<< "$recovery_payload"
+[ "${#recovery_values[@]}" -eq 8 ]
+for recovery_value in "${recovery_values[@]}"; do
+    [[ "$recovery_value" =~ ^[A-F0-9]{32}$ ]]
+done
 PYTHONPATH="$nexus_pythonpath" RR_NEXUS_CONFIG="$argon2_config" python3 - "$argon2_db" <<'PY'
 import base64
 import importlib.util
@@ -729,6 +1573,125 @@ spec = importlib.util.spec_from_file_location("rr_nexus", "nexus/rr_nexus.py")
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
+
+# Argon2 uses 64 MiB per operation, so HTTP concurrency must not translate to
+# unbounded memory concurrency.  Exercise the active limit, timeout response,
+# and exception cleanup with a controllable fake hasher.
+import threading
+import time
+
+real_password_hasher = module.PasswordHasher
+
+class ControlledPasswordHasher:
+    def __init__(self, **kwargs):
+        self.active = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+        self.two_started = threading.Event()
+        self.release = threading.Event()
+
+    def _work(self):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.active == 2:
+                self.two_started.set()
+        try:
+            assert self.release.wait(2), "controlled password hash did not resume"
+            return True
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def hash(self, password):
+        self._work()
+        return "$argon2id$controlled"
+
+    def verify(self, password_hash, password):
+        return self._work()
+
+    def check_needs_rehash(self, password_hash):
+        return False
+
+module.PasswordHasher = ControlledPasswordHasher
+limited_hasher = module.BoundedPasswordHasher(
+    max_concurrent=2, max_waiters=1, wait_seconds=0.05
+)
+hash_errors = []
+
+def run_controlled_hash():
+    try:
+        limited_hasher.hash("test-password")
+    except BaseException as exc:
+        hash_errors.append(exc)
+
+hash_threads = [threading.Thread(target=run_controlled_hash) for _ in range(2)]
+for thread in hash_threads:
+    thread.start()
+assert limited_hasher._hasher.two_started.wait(1), "two Argon2 workers did not start"
+wait_started = time.monotonic()
+try:
+    limited_hasher.verify("$argon2id$controlled", "test-password")
+except module.PasswordHashBusy:
+    pass
+else:
+    raise AssertionError("Argon2 waiter did not time out")
+wait_elapsed = time.monotonic() - wait_started
+assert 0.04 <= wait_elapsed < 0.5, wait_elapsed
+limited_hasher._hasher.release.set()
+for thread in hash_threads:
+    thread.join(timeout=1)
+assert not hash_errors
+assert limited_hasher._hasher.peak == 2
+
+class RaisingPasswordHasher:
+    def __init__(self, **kwargs):
+        self.calls = 0
+
+    def hash(self, password):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("controlled hash failure")
+        return "$argon2id$recovered"
+
+    def verify(self, password_hash, password):
+        return True
+
+    def check_needs_rehash(self, password_hash):
+        return False
+
+module.PasswordHasher = RaisingPasswordHasher
+exception_hasher = module.BoundedPasswordHasher(
+    max_concurrent=1, max_waiters=0, wait_seconds=0.01
+)
+try:
+    exception_hasher.hash("first")
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("controlled hash failure was swallowed")
+assert exception_hasher.hash("second") == "$argon2id$recovered"
+module.PasswordHasher = real_password_hasher
+
+# Overload must not become an invalid-credentials response: callers receive
+# the same retryable 503 before any login-failure accounting or account branch.
+busy_handler = object.__new__(module.Handler)
+busy_handler._dispatch_post = lambda: (_ for _ in ()).throw(module.PasswordHashBusy())
+busy_responses = []
+busy_handler.send_json = lambda status, payload, headers=None: busy_responses.append(
+    (status, payload, headers)
+)
+busy_handler.do_POST()
+assert busy_responses == [
+    (
+        module.HTTPStatus.SERVICE_UNAVAILABLE,
+        {
+            "error": "authentication_temporarily_unavailable",
+            "message": "身份验证暂时繁忙，请稍后重试。",
+        },
+        {"Retry-After": "1"},
+    )
+]
 
 # 超限请求体必须在读取前以 413 拒绝，不能只读一个前缀后把它当成完整
 # JSON，也不能在缺少 Content-Length 时阻塞等客户端主动断开。
@@ -910,6 +1873,8 @@ base_config = {
     "stats_port": 39091,
     "public_port": 9443,
     "sub_port": 39291,
+    "subscription_access_mode": "local",
+    "subscription_domain": "",
 }
 device = {
     "id": "dev_012345abcdef",
@@ -942,13 +1907,13 @@ def write_config(**values):
 
 write_config(mode="local", domain="", ssh_host="2001:db8::99")
 local_primary, local_urls = handler._device_subscription_urls(device)
-assert local_primary == "http://[2001:db8::99]:39291/nexus/test_subscription_token_123456.txt"
+assert local_primary == "http://127.0.0.1:39291/nexus/test_subscription_token_123456.txt"
 assert len(local_urls) == 9
 assert [item["format"] for item in local_urls] == [
     "Sing-box 官方", "mihomo", "Clash Verge", "FlClash", "v2rayN",
     "v2rayNG", "Shadowrocket", "NekoBox", "通用链接",
 ]
-assert all(item["url"].startswith("http://[2001:db8::99]:39291/nexus/") for item in local_urls)
+assert all(item["url"].startswith("http://127.0.0.1:39291/nexus/") for item in local_urls)
 # 不存在的格式不能继续显示一个注定 404 的二维码。
 (published_root / f"{device['subscription_token']}.json").unlink()
 assert all(item["format"] != "Sing-box 官方" for item in handler._device_subscription_urls(device)[1])
@@ -956,13 +1921,30 @@ assert all(item["format"] != "Sing-box 官方" for item in handler._device_subsc
 
 write_config(mode="public", domain="45.192.205.71", ssh_host="45.192.205.71")
 ip_primary, ip_urls = handler._device_subscription_urls(device)
-assert ip_primary == "http://45.192.205.71:39291/nexus/test_subscription_token_123456.txt"
-assert all(":9443/sub/" not in item["url"] for item in ip_urls)
+assert ip_primary == "" and ip_urls == []
 
-# 公网 IP/本地模式的地址必须能被真实的静态订阅服务逐一下载，且内容
-# 与刚发布的文件完全一致（覆盖 NekoBox 的 Base64 地址）。
+write_config(
+    mode="public",
+    domain="45.192.205.71",
+    ssh_host="45.192.205.71",
+    subscription_access_mode="https",
+    subscription_domain="subscribe.example.com",
+)
+https_primary, https_urls = handler._device_subscription_urls(device)
+assert https_primary == (
+    "https://subscribe.example.com:39291/nexus/test_subscription_token_123456.txt"
+)
+assert all(item["url"].startswith("https://subscribe.example.com:39291/nexus/") for item in https_urls)
+
+# 本地模式地址必须能经 SSH 转发后的 127.0.0.1 端口逐一下载，且内容与
+# 刚发布的文件完全一致（覆盖 NekoBox 的 Base64 地址）。
 import functools
 import http.client
+import shutil
+import socket
+import ssl
+import subprocess
+import tempfile
 import threading
 import urllib.request
 
@@ -970,6 +1952,62 @@ sub_spec = importlib.util.spec_from_file_location("rr_sub_server", "nexus/sub_se
 sub_module = importlib.util.module_from_spec(sub_spec)
 sys.modules[sub_spec.name] = sub_module
 sub_spec.loader.exec_module(sub_module)
+
+# 真实 TLS 回归：服务端只能启用 TLS >=1.2；系统信任指定证书且 SNI/SAN
+# 正确时可下载，明文 HTTP 打到同一公网端口不能得到订阅正文。
+tls_root = Path(tempfile.mkdtemp(prefix="rr-sub-tls-"))
+tls_key = tls_root / "server.key"
+tls_cert = tls_root / "server.crt"
+subprocess.run(
+    [
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30",
+        "-subj", "/CN=sub.example.test", "-addext", "subjectAltName=DNS:sub.example.test",
+        "-keyout", str(tls_key), "-out", str(tls_cert),
+    ],
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+(tls_root / "index.html").write_text("tls-only", encoding="utf-8")
+tls_policy = sub_module.build_tls_context(str(tls_cert), str(tls_key))
+assert tls_policy.minimum_version == ssl.TLSVersion.TLSv1_2
+tls_handler = functools.partial(sub_module.SubscriptionHandler, directory=str(tls_root))
+tls_server = sub_module.BoundedThreadingHTTPServer(
+    ("127.0.0.1", 0), tls_handler, ssl_context=tls_policy
+)
+tls_server.config_path = config_path
+tls_thread = threading.Thread(target=tls_server.serve_forever, daemon=True)
+tls_thread.start()
+try:
+    client_policy = ssl.create_default_context(cafile=str(tls_cert))
+    with socket.create_connection(("127.0.0.1", tls_server.server_port), timeout=2) as raw:
+        with client_policy.wrap_socket(raw, server_hostname="sub.example.test") as secure:
+            assert secure.version() in {"TLSv1.2", "TLSv1.3"}
+            secure.sendall(
+                b"GET /index.html HTTP/1.1\r\nHost: sub.example.test\r\nConnection: close\r\n\r\n"
+            )
+            response = b""
+            while True:
+                chunk = secure.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+    assert b" 200 " in response.split(b"\r\n", 1)[0] and response.endswith(b"tls-only")
+    assert b"Cache-Control: no-store, private, max-age=0\r\n" in response
+    assert b"Pragma: no-cache\r\n" in response
+    with socket.create_connection(("127.0.0.1", tls_server.server_port), timeout=2) as plain:
+        plain.sendall(b"GET /index.html HTTP/1.0\r\n\r\n")
+        try:
+            cleartext_response = plain.recv(4096)
+        except (ConnectionResetError, socket.timeout):
+            cleartext_response = b""
+    assert b"tls-only" not in cleartext_response
+finally:
+    tls_server.shutdown()
+    tls_server.server_close()
+    tls_thread.join(timeout=2)
+    shutil.rmtree(tls_root)
+
 with sqlite3.connect(sys.argv[1]) as connection:
     now = module.utc_now()
     connection.execute(
@@ -987,9 +2025,36 @@ static_server.config_path = config_path
 static_thread = threading.Thread(target=static_server.serve_forever, daemon=True)
 static_thread.start()
 try:
+    # 主订阅、恢复订阅与 UUID 静态路由都经过 SimpleHTTPRequestHandler；
+    # no-store 必须由统一 end_headers 覆盖，包括条件请求产生的 304。
+    cache_probe = published_root.parent / "s" / "cache-probe.txt"
+    cache_probe.parent.mkdir(parents=True, exist_ok=True)
+    cache_probe.write_text("secret", encoding="utf-8")
+    cache_connection = http.client.HTTPConnection(
+        "127.0.0.1", static_server.server_port, timeout=2
+    )
+    cache_connection.request("GET", "/s/cache-probe.txt")
+    cache_response = cache_connection.getresponse()
+    assert cache_response.status == 200 and cache_response.read() == b"secret"
+    assert cache_response.getheader("Cache-Control") == "no-store, private, max-age=0"
+    assert cache_response.getheader("Pragma") == "no-cache"
+    cache_connection.close()
+    cache_connection = http.client.HTTPConnection(
+        "127.0.0.1", static_server.server_port, timeout=2
+    )
+    cache_connection.request(
+        "GET", "/s/cache-probe.txt",
+        headers={"If-Modified-Since": "Wed, 31 Dec 2099 23:59:59 GMT"},
+    )
+    cache_response = cache_connection.getresponse()
+    assert cache_response.status == 304 and cache_response.read() == b""
+    assert cache_response.getheader("Cache-Control") == "no-store, private, max-age=0"
+    assert cache_response.getheader("Pragma") == "no-cache"
+    cache_connection.close()
+
     write_config(
-        mode="public",
-        domain="127.0.0.1",
+        mode="local",
+        domain="",
         ssh_host="127.0.0.1",
         sub_port=static_server.server_port,
     )
@@ -1002,6 +2067,8 @@ try:
                 "upload=123; download=456; total=1000; expire=1896134399"
             )
             assert response.headers["Profile-Update-Interval"] == "1"
+            assert response.headers["Cache-Control"] == "no-store, private, max-age=0"
+            assert response.headers["Pragma"] == "no-cache"
 
     # 有效订阅应在响应时动态插入首位信息项，源文件保持不变。URI/Base64
     # 使用 127.0.0.1:9 的 VMess 标记，确保 NekoBox 开启按“地址+端口+类型”
@@ -1069,7 +2136,7 @@ try:
             (device["id"],),
         )
     write_config(
-        mode="public", domain="127.0.0.1", ssh_host="127.0.0.1",
+        mode="local", domain="", ssh_host="127.0.0.1",
         sub_port=static_server.server_port, traffic_mode="upload",
     )
     with urllib.request.urlopen(url_by_format["NekoBox"], timeout=2) as response:
@@ -1084,7 +2151,7 @@ try:
             (device["id"],),
         )
     write_config(
-        mode="public", domain="127.0.0.1", ssh_host="127.0.0.1",
+        mode="local", domain="", ssh_host="127.0.0.1",
         sub_port=static_server.server_port, traffic_mode="both",
     )
 
@@ -1174,10 +2241,12 @@ try:
         ({"mode": "public", "domain": "panel.example.com", "ssh_host": "45.192.205.71", "public_port": 443}, domain_urls),
     ):
         write_config(**config_values)
-        for item in mode_urls:
-            status, _ = handler._qr_png_bytes(device["id"], {"raw": [item["url"]]})
+        for sub_index, item in enumerate(mode_urls):
+            status, _ = handler._qr_png_bytes(device["id"], {"sub_index": [str(sub_index)]})
             assert status == module.HTTPStatus.OK
             assert captured[-1][0][-1] == item["url"]
+    assert handler._qr_png_bytes(device["id"], {"sub_index": ["-1"]})[0] == module.HTTPStatus.BAD_REQUEST
+    assert handler._qr_png_bytes(device["id"], {"sub_index": ["999"]})[0] == module.HTTPStatus.BAD_REQUEST
     assert handler._qr_png_bytes(device["id"], {"raw": ["https://invalid.example/sub"]})[0] == module.HTTPStatus.BAD_REQUEST
     assert handler._qr_png_bytes(device["id"], {"index": ["-1"]})[0] == module.HTTPStatus.BAD_REQUEST
 finally:
@@ -1620,6 +2689,7 @@ trap 'rm -f "$expected_paths" "$manifest_paths"' EXIT
     echo rr
     echo scripts/naive-cert-hook.sh
     echo scripts/update-recover.sh
+    echo scripts/update-external-state.py
     find modules -maxdepth 1 -type f -name '*.sh' -print
     find nexus -maxdepth 2 -type f \( -name '*.py' -o -name '*.html' -o -name '*.css' -o -name '*.js' \) -print
 } | LC_ALL=C sort > "$expected_paths"
@@ -1649,7 +2719,7 @@ grep -Eq 'id="ssh-command"' nexus/static/index.html
 grep -Fq '面板优选质量不能只看排名' nexus/static/index.html
 grep -Fq '适合移动、电信、联通三网优选' nexus/static/index.html
 grep -Fq '请把 TOP 20 放进真实客户端逐个测试' nexus/static/index.html
-grep -Fq '/optimizer.js?v=10' nexus/static/index.html
+grep -Fq '/optimizer.js?v=11' nexus/static/index.html
 grep -Eq '/api/devices' nexus/static/app.js
 grep -Eq '/api/traffic' nexus/static/app.js
 grep -Fq '/api/server/traffic-policy' nexus/static/app.js
@@ -1664,6 +2734,8 @@ grep -Fq 'enrich_subscription_content' nexus/rr_nexus.py nexus/sub_server.py
 grep -Fq 'name="reset_at"' nexus/static/index.html
 grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' nexus/static/app.js
 grep -Fq 'ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L' modules/85-nexus.sh
+! grep -Rq 'StrictHostKeyChecking=no\|UserKnownHostsFile=/dev/null' \
+    README.md README_EN.md modules nexus scripts
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/40-subscription.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/85-nexus.sh
 grep -Eq 'hysteria2://.*insecure=1.*pinSHA256=' modules/90-auto-update.sh
@@ -1675,14 +2747,21 @@ grep -Eq 'tuic://.*allow_insecure=1' modules/85-nexus.sh
 grep -Eq 'tuic://.*allow_insecure=1' modules/90-auto-update.sh
 grep -Fq 'generate_nexus_device_subscriptions || return 1' modules/40-subscription.sh
 grep -Fq '"client-nekobox.txt"' modules/90-auto-update.sh
-# D4：/nexus/ 目录枚举防护——发布目录必须生成空白 index.html
-grep -Fq 'nexus/index.html' modules/85-nexus.sh
+# D4：/nexus/ 目录枚举防护——原子发布的新一代目录也必须
+# 生成空白 index.html，不能仅依赖旧的 Shell 目录初始化。
+grep -Fq 'write(public_root / "index.html", b"")' modules/85-nexus.sh
 # D9：面板设备订阅文案必须标注全协议（曾误写「仅 VMess」）
 grep -Fq 'v2rayN（Windows）· 全协议' nexus/rr_nexus.py
 grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
 grep -Fq 'SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive' nexus/rr_nexus.py
 grep -Fq 'id="rename-dialog"' nexus/static/index.html
-grep -Fq '/app.js?v=23' nexus/static/index.html
+grep -Fq '/app.js?v=26' nexus/static/index.html
+grep -Fq '/admin.js?v=4' nexus/static/index.html
+if grep -Fq '?raw=' nexus/static/app.js || \
+   grep -Fq 'qr_query["raw"]' nexus/rr_nexus.py; then
+    echo "Nexus QR request still places a subscription token in the query string." >&2
+    exit 1
+fi
 grep -Fq 'sync": "not_required"' nexus/rr_nexus.py
 if grep -Eq 'read[[:space:]].*(-t|--timeout)|(^|[[:space:]])TMOUT=' rr modules/99-menus.sh; then
     echo "RR main menu contains an active input timeout and may drop an idle home page." >&2
@@ -1703,7 +2782,17 @@ grep -Fq 'rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true' scr
 grep -Fq 'RR_RELEASE_TAG="v' install.sh scripts/install-core.sh
 grep -Fq 'gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS' .github/workflows/release.yml
 grep -Fq -- '--notes-file release-notes.md \' .github/workflows/release.yml
-grep -Fq -- '--latest' .github/workflows/release.yml
+grep -Fq -- '--draft' .github/workflows/release.yml
+grep -Fq 'assert_latest_product' .github/workflows/release.yml
+grep -Fq 'assert_release_gate' .github/workflows/release.yml
+grep -Fq 'assert_immutable_releases_enabled' .github/workflows/release.yml
+grep -Fq 'assert_new_monotonic_version' .github/workflows/release.yml
+grep -Fq 'IMMUTABLE_RELEASES_READ_TOKEN' .github/workflows/release.yml
+grep -Fq 'X-GitHub-Api-Version: 2026-03-10' .github/workflows/release.yml
+grep -Fq 'group: rr-vps-publish-${{ github.repository }}' .github/workflows/release.yml
+grep -Fq -- '-F draft=false -f make_latest=true' .github/workflows/release.yml
+grep -Fq '.draft == false and .prerelease == false and .immutable == true' .github/workflows/release.yml
+grep -Fq '["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"]' .github/workflows/release.yml
 if grep -Fq 'RR_GITHUB_MIRROR' scripts/update-guard.sh; then
     echo "Update guard still allows a user mirror to provide executable trust anchors." >&2
     exit 1
@@ -1713,6 +2802,17 @@ grep -Fq 'rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"' modules/60-update.s
 grep -Fq 'RR_BUNDLE_FILE="$bundle_tmp" bash "$bootstrap_tmp" --upgrade' modules/60-update.sh
 grep -Fq 'rr_bundle_tree_is_valid "$PAYLOAD_DIR"' install.sh
 grep -Fq 'rr_verify_restored_state || failed=true' scripts/update-recover.sh
+grep -Fq 'RR_UPDATE_EXTERNAL_HELPER="${RR_UPDATE_EXTERNAL_HELPER:-/usr/local/sbin/rr-update-external-state}"' \
+    scripts/install-core.sh scripts/update-recover.sh
+grep -Fq 'rr_snapshot_external_state || return 1' scripts/install-core.sh
+grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"' \
+    scripts/install-core.sh
+grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"' \
+    scripts/install-core.sh
+grep -Fq 'rr_restore_external_state_if_required "$tx" "$RR_BACKUP" || failed=true' \
+    scripts/update-recover.sh
+grep -Fq '/usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state' \
+    modules/95-install.sh
 grep -Fq 'systemctl restart --no-block sing-box' scripts/update-recover.sh
 grep -Fq 'systemctl start --no-block argo-rr-health.service' scripts/update-recover.sh
 grep -Fq 'rr_subscription_running' scripts/install-core.sh
@@ -1729,13 +2829,33 @@ grep -Fq 'rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db' install.sh
 grep -Fq 'ROLLBACK_FAILED=true' install.sh
 grep -Fq 'rr_version_ge "$release_version" "$installed_version"' install.sh
 grep -Fq 'command -v timeout >/dev/null 2>&1' modules/60-update.sh
-grep -Fq 'declare -F sync_nexus_devices >/dev/null 2>&1' modules/60-update.sh
+grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-devices' modules/60-update.sh
+grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-subscriptions' modules/60-update.sh
 grep -Fq 'nexus_download_traffic_core "$rr_core_dir"' modules/30-singbox.sh
 grep -Fq 'archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"' modules/85-nexus.sh
-grep -Fq 'release_tag="rr-nexus-core-${upstream_tag}"' modules/85-nexus.sh
-grep -Fq 'release_tag="rr-nexus-core-${tag}"' .github/workflows/build-nexus-core.yml
-grep -Fq 'SOURCE_COMMIT=${{ needs.version.outputs.source_sha }}' .github/workflows/build-nexus-core.yml
-grep -Fq -- '--prerelease --latest=false' .github/workflows/build-nexus-core.yml
+grep -Fq 'NEXUS_CORE_RELEASE_REVISION=1' modules/85-nexus.sh
+grep -Fq 'release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"' modules/85-nexus.sh
+grep -Fq 'release_tag="rr-nexus-core-${tag}-r1"' .github/workflows/build-nexus-core.yml
+grep -Fq '.draft == false and .prerelease == false and .immutable == true' modules/85-nexus.sh
+grep -Fq 'nexus_validate_core_checksums "$checksums" "$version"' modules/85-nexus.sh
+grep -Fq 'nexus_validate_core_build_info' modules/85-nexus.sh
+grep -Fq 'SOURCE_COMMIT=${SOURCE_SHA}' .github/workflows/build-nexus-core.yml
+grep -Fq 'RR_BUILDER_COMMIT=${BUILDER_SHA}' .github/workflows/build-nexus-core.yml
+grep -Fq 'RR_CORE_RELEASE=${RELEASE_TAG}' .github/workflows/build-nexus-core.yml
+grep -Fq -- '--target "$BUILDER_SHA"' .github/workflows/build-nexus-core.yml
+grep -Fq -- '--draft' .github/workflows/build-nexus-core.yml
+grep -Fq -- '-F draft=false -f make_latest=false' .github/workflows/build-nexus-core.yml
+grep -Fq 'assert_immutable_releases_enabled' .github/workflows/build-nexus-core.yml
+grep -Fq 'IMMUTABLE_RELEASES_READ_TOKEN' .github/workflows/build-nexus-core.yml
+grep -Fq 'X-GitHub-Api-Version: 2026-03-10' .github/workflows/build-nexus-core.yml
+grep -Fq 'group: rr-vps-publish-${{ github.repository }}' .github/workflows/build-nexus-core.yml
+if grep -Fq -- '--prerelease' .github/workflows/build-nexus-core.yml; then
+    echo "Stable auxiliary core is still mislabeled as a prerelease." >&2
+    exit 1
+fi
+grep -Fq '$run.head_branch == "main" and $run.event == "push"' .github/workflows/build-nexus-core.yml
+grep -Fq '.draft == false and .prerelease == false' .github/workflows/build-nexus-core.yml
+grep -Fq 'SOURCE_COMMIT=${SOURCE_SHA}' .github/workflows/build-nexus-core.yml
 if grep -Fq 'Latest release, refreshed' .github/workflows/build-nexus-core.yml; then
     echo "Versioned Nexus core is still advertised as the repository latest release." >&2
     exit 1
@@ -1745,6 +2865,42 @@ if grep -Eq 'gh release (upload|edit|delete-asset).*\brr-nexus-core|--clobber' \
     echo "RR Nexus core workflow still mutates an existing release." >&2
     exit 1
 fi
+python3 - <<'PY'
+import pathlib
+import shlex
+
+commands = []
+for workflow in pathlib.Path(".github/workflows").glob("*.yml"):
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].lstrip()
+        if not stripped.startswith("gh release create "):
+            index += 1
+            continue
+        parts = [stripped]
+        while parts[-1].rstrip().endswith("\\"):
+            index += 1
+            if index >= len(lines):
+                raise SystemExit(f"{workflow}: unterminated gh release create command")
+            parts.append(lines[index].strip())
+        tokens = shlex.split(" ".join(part.rstrip().removesuffix("\\") for part in parts))
+        commands.append((workflow, tokens))
+        index += 1
+
+if len(commands) != 2:
+    raise SystemExit(f"expected exactly two gh release creators, found {len(commands)}")
+for workflow, tokens in commands:
+    for required in ("--draft", "--verify-tag", "--target"):
+        if tokens.count(required) != 1:
+            raise SystemExit(f"{workflow}: expected exactly one {required}")
+    forbidden = [
+        token for token in tokens
+        if token == "--latest" or token.startswith("--latest=") or token == "--prerelease"
+    ]
+    if forbidden:
+        raise SystemExit(f"{workflow}: draft creator has unsafe publication flags: {forbidden}")
+PY
 grep -Fq '/usr/local/bin/rr --update-now' nexus/rr_nexus.py
 grep -Fq 'MAX_JSON_BODY_BYTES = 1024 * 1024' nexus/rr_nexus.py
 if grep -Eq 'fuser[[:space:]]+-k|gh release delete[[:space:]]+rr-nexus-core|#skip[[:space:]]*\|\|' \
@@ -1759,9 +2915,11 @@ fi
 # 新安装必须按 manifest 复制全部 Nexus 静态资源，不能只固定复制 app 三件套。
 grep -Fq 'nexus/static/*.html|nexus/static/*.css|nexus/static/*.js)' install.sh
 grep -Fq '"$NEW_RUNTIME/$relative_path" || return 1' install.sh
-# D10：孤儿清理必须覆盖按客户端拆分的订阅文件（-vl/-v2rayn/-v2rayng/-sr/-nekobox）
-grep -Fq -- '${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt"' modules/85-nexus.sh
-grep -Fq -- '${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt"' modules/85-nexus.sh
+# D10：新实现每次只在空 staging tree 中生成当前有效设备，再原子
+# 交换整棵私有/公开订阅树。因此已删设备及其拆分格式不可残留。
+grep -Fq '"-v2rayng.txt", "-sr.txt", "-nekobox.txt",' modules/85-nexus.sh
+grep -Fq 'nexus_atomic_exchange_tree "$private_stage" "$private_target"' modules/85-nexus.sh
+grep -Fq 'nexus_atomic_exchange_tree "$published_stage" "$published_target"' modules/85-nexus.sh
 if grep -Eq 'hysteria2://.*insecure=0' modules/40-subscription.sh modules/85-nexus.sh modules/90-auto-update.sh; then
     echo "Hysteria2 self-signed URI still disables insecure mode." >&2
     exit 1

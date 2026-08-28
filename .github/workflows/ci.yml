@@ -63,7 +63,7 @@ jobs:
       - name: Python syntax
         run: |
           find nexus -type f -name '*.py' -print0 | xargs -0 python3 -m py_compile
-          python3 -m py_compile scripts/rebuild-bundle.py
+          python3 -m py_compile scripts/rebuild-bundle.py scripts/update-external-state.py
           python3 scripts/validate-7.1.py
 
       - name: Manifest SHA256
@@ -82,7 +82,22 @@ jobs:
           set -euo pipefail
           for test_script in tests/test-*.sh; do
             echo "Running ${test_script}"
-            bash "$test_script"
+            case "${test_script##*/}" in
+              test-backup-archive.sh|\
+              test-cloudflared-supply-chain.sh|\
+              test-health-transaction-lock.sh|\
+              test-nexus-sync.sh|\
+              test-restore-watchdog.sh|\
+              test-update-external-state.sh|\
+              test-update-external-transaction.sh|\
+              test-update-lock-security.sh|\
+              test-update-rollback-quarantine.sh)
+                sudo -E bash "$test_script"
+                ;;
+              *)
+                bash "$test_script"
+                ;;
+            esac
           done
 
   os-matrix:
