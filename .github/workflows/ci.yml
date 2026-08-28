@@ -75,7 +75,9 @@ jobs:
         run: python3 scripts/rebuild-bundle.py --check
 
       - name: Repository regression suite
-        run: bash scripts/validate.sh
+        # Restore/update regressions intentionally assert root:root ownership
+        # for locks, stages, and durable transaction markers.
+        run: sudo -E bash scripts/validate.sh
 
       - name: Standalone security, firewall and concurrency regressions
         run: |
