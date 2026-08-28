@@ -1,7 +1,18 @@
 "use strict";
 
+const LOCAL_SESSION_KEY = "rr-nexus-session";
+
+function storedSessionToken() {
+  try {
+    const token = sessionStorage.getItem(LOCAL_SESSION_KEY) || "";
+    return /^[A-Za-z0-9._-]{32,128}$/.test(token) ? token : "";
+  } catch {
+    return "";
+  }
+}
+
 const state = {
-  csrf: "", mode: "local", domain: "", port: 7900, sshHost: "服务器IP",
+  csrf: "", sessionToken: storedSessionToken(), authEpoch: 0, mode: "local", domain: "", port: 7900, sshHost: "服务器IP",
   devices: [], traffic: null, overview: null, activeView: "overview",
   filter: "all", groupFilter: "all", query: "", metricRange: "24h",
   refreshTimer: null, _prevTraffic: {}, serverPlan: null,
@@ -50,15 +61,49 @@ function errorText(code) {
     invalid_two_factor_code: "动态码无效或已过期。",
     invalid_passkey: "Passkey 验证失败。",
     passkey_unavailable: "当前访问地址不支持 Passkey，请使用 HTTPS 域名或本地 127.0.0.1。",
+    step_up_required: "此操作需要重新验证管理员身份。",
+    step_up_verification_failed: "当前密码或两步验证码不正确。",
   };
   return messages[code] || "操作未完成，请稍后重试。";
 }
 
-async function api(path, options = {}) {
+function setSessionToken(value) {
+  const token = typeof value === "string" && /^[A-Za-z0-9._-]{32,128}$/.test(value) ? value : "";
+  state.sessionToken = token;
+  try {
+    if (token) sessionStorage.setItem(LOCAL_SESSION_KEY, token);
+    else sessionStorage.removeItem(LOCAL_SESSION_KEY);
+  } catch {
+    // Private browsing/storage policy failures still work for this page load.
+  }
+}
+
+function acceptLogin(result) {
+  // Both public HTTPS and local tunnel logins return a bearer that remains
+  // confined to this origin's tab session and is never placed in a URL,
+  // cookie, or persistent storage.
+  state.authEpoch += 1;
+  setSessionToken(result?.token || "");
+}
+
+function completeSecurityChange(message) {
+  // Factor changes invalidate every server-side session, including this one.
+  // Drop the browser copy immediately and require a fresh authentication.
+  showLogin();
+  toast(`${message} 已注销全部会话，请重新登录。`);
+}
+
+async function api(path, options = {}, responseType = "json") {
+  const requestEpoch = state.authEpoch;
+  const requestToken = state.sessionToken;
   const headers = { ...(options.headers || {}) };
   if (options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   if (headers["Content-Type"] === "application/json" && typeof options.body === "object") options.body = JSON.stringify(options.body);
   if (state.csrf && !["GET", "HEAD"].includes(options.method || "GET")) headers["X-CSRF-Token"] = state.csrf;
+  const requestUrl = new URL(String(path), window.location.href);
+  if (requestToken && requestUrl.origin === window.location.origin) {
+    headers.Authorization = `Bearer ${requestToken}`;
+  }
   let response;
   try {
     response = await fetch(path, { ...options, headers, credentials: "same-origin" });
@@ -68,9 +113,15 @@ async function api(path, options = {}) {
     throw error;
   }
   const contentType = response.headers.get("content-type") || "";
-  const data = contentType.includes("application/json") ? await response.json() : null;
+  const data = contentType.includes("application/json")
+    ? await response.json()
+    : responseType === "blob" ? await response.blob() : null;
   if (!response.ok) {
-    if (response.status === 401 && path !== "/api/login") showLogin();
+    if (
+      response.status === 401
+      && requestUrl.pathname !== "/api/login"
+      && requestEpoch === state.authEpoch
+    ) showLogin();
     const error = new Error(data?.message || errorText(data?.error));
     error.code = data?.error;
     error.detail = data?.detail;
@@ -78,6 +129,98 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+async function requestStepUp(purpose, suppliedPassword = null) {
+  const password = suppliedPassword === null
+    ? prompt("请输入当前管理员密码：")
+    : suppliedPassword;
+  if (password === null) return null;
+  const security = await api("/api/security");
+  let otp = "";
+  if (security.totp_enabled) {
+    otp = prompt("请输入当前 6 位动态码：");
+    if (otp === null) return null;
+  }
+  const result = await api("/api/auth/step-up", {
+    method: "POST",
+    body: { purpose, password, otp },
+  });
+  return result.ticket;
+}
+
+const authenticatedImageLoads = new WeakMap();
+let linksDialogGeneration = 0;
+
+function releaseAuthenticatedImage(element) {
+  if (element) authenticatedImageLoads.delete(element);
+  const objectUrl = element?.dataset?.authObjectUrl;
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  if (element?.dataset) delete element.dataset.authObjectUrl;
+  element?.removeAttribute?.("src");
+}
+
+function releaseAuthenticatedImages(root = document) {
+  $$('[data-auth-src], [data-auth-object-url]', root).forEach(releaseAuthenticatedImage);
+}
+
+async function loadAuthenticatedImage(element, path, headers = {}) {
+  if (!element) return false;
+  releaseAuthenticatedImage(element);
+  const requestId = Symbol("authenticated-image");
+  const requestEpoch = state.authEpoch;
+  authenticatedImageLoads.set(element, requestId);
+  try {
+    const blob = await api(path, { headers }, "blob");
+    if (
+      authenticatedImageLoads.get(element) !== requestId
+      || state.authEpoch !== requestEpoch
+      || !element.isConnected
+    ) return false;
+    const objectUrl = URL.createObjectURL(blob);
+    element.dataset.authObjectUrl = objectUrl;
+    element.src = objectUrl;
+    return true;
+  } catch (error) {
+    if (
+      authenticatedImageLoads.get(element) !== requestId
+      || state.authEpoch !== requestEpoch
+    ) return false;
+    element.removeAttribute("src");
+    element.alt = error.message;
+    return false;
+  }
+}
+
+async function openAuthenticatedImage(path, headers = {}) {
+  const popup = window.open("about:blank", "_blank");
+  const requestEpoch = state.authEpoch;
+  if (popup) {
+    // window.open() clones same-origin sessionStorage before returning.  Erase
+    // the bearer synchronously, before yielding or navigating the QR tab.
+    try { popup.sessionStorage.removeItem(LOCAL_SESSION_KEY); } catch {}
+    popup.opener = null;
+  }
+  let objectUrl = "";
+  try {
+    const blob = await api(path, { headers }, "blob");
+    if (state.authEpoch !== requestEpoch) {
+      popup?.close();
+      return;
+    }
+    objectUrl = URL.createObjectURL(blob);
+    if (!popup) {
+      URL.revokeObjectURL(objectUrl);
+      toast("浏览器阻止了新窗口，请允许弹出窗口后重试。", true);
+      return;
+    }
+    popup.location.replace(objectUrl);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+  } catch (error) {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    popup?.close();
+    toast(error.message, true);
+  }
 }
 
 function toast(message, isError = false) {
@@ -121,7 +264,14 @@ function statusLabel(device) {
 }
 
 function showLogin() {
+  state.authEpoch += 1;
   state.csrf = "";
+  setSessionToken("");
+  $$("dialog[open]").forEach(dialog => dialog.close());
+  releaseAuthenticatedImages();
+  window.RRAdmin?.onLogout?.();
+  const totpSecret = $("#totp-secret");
+  if (totpSecret) totpSecret.textContent = "";
   clearInterval(state.refreshTimer);
   state.refreshTimer = null;
   $("#console").classList.add("hidden");
@@ -457,7 +607,7 @@ function renderCharts() {
 function configureAccessGuide() {
   let host = state.sshHost;
   if (host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
-  const command = `ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${state.port}:127.0.0.1:${state.port} root@${host}`;
+  const command = `ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${state.port}:127.0.0.1:${state.port} root@${host}`;
   $("#ssh-command").textContent = command;
   const localUrl = `http://127.0.0.1:${state.port}`;
   $("#local-panel-link").href = localUrl;
@@ -681,12 +831,16 @@ function protocolName(link) {
 }
 
 async function openLinks(device) {
+  const generation = ++linksDialogGeneration;
+  const dialog = $("#links-dialog");
   const list = $("#links-list");
+  releaseAuthenticatedImages(dialog);
   $("#links-title").textContent = `${device.name} · 连接信息`;
   list.innerHTML = '<p class="form-hint">正在生成…</p>';
-  $("#links-dialog").showModal();
+  dialog.showModal();
   try {
     const data = await api(`/api/devices/${device.id}/links`);
+    if (generation !== linksDialogGeneration || !dialog.open) return;
     const statusBar = $("#links-status");
     if (statusBar) {
       const au = data.auto_update || { enabled: false };
@@ -700,11 +854,22 @@ async function openLinks(device) {
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
     box.classList.toggle("hidden", urls.length === 0);
-    $("#subscription-urls").innerHTML = urls.map((item, idx) => `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" src="/api/devices/${encodeURIComponent(device.id)}/qr?raw=${encodeURIComponent(item.url)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-open-sub-qr="/api/devices/${encodeURIComponent(device.id)}/qr?raw=${encodeURIComponent(item.url)}">打开二维码</button></div>`).join("");
-    list.innerHTML = data.links.length ? data.links.map((link, index) => `<div class="link-row"><img src="/api/devices/${encodeURIComponent(device.id)}/qr?index=${index}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-open-qr="${index}">打开二维码</button></div></div>`).join("") : '<p class="form-hint">当前没有启用的节点协议。</p>';
+    $("#subscription-urls").innerHTML = urls.map((item, idx) => {
+      const qrPath = `/api/devices/${encodeURIComponent(device.id)}/qr?sub_index=${idx}`;
+      return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" data-auth-src="${escapeHtml(qrPath)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-open-sub-qr="${escapeHtml(qrPath)}">打开二维码</button></div>`;
+    }).join("");
+    list.innerHTML = data.links.length ? data.links.map((link, index) => {
+      const qrPath = `/api/devices/${encodeURIComponent(device.id)}/qr?index=${index}`;
+      return `<div class="link-row"><img data-auth-src="${escapeHtml(qrPath)}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-open-qr="${index}">打开二维码</button></div></div>`;
+    }).join("") : '<p class="form-hint">当前没有启用的节点协议。</p>';
+    $$('[data-auth-src]', dialog).forEach(image => loadAuthenticatedImage(image, image.dataset.authSrc));
     list.dataset.links = JSON.stringify(data.links);
     list.dataset.device = device.id;
-  } catch (error) { list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`; }
+  } catch (error) {
+    if (generation === linksDialogGeneration && dialog.open) {
+      list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    }
+  }
 }
 
 async function copyText(value) {
@@ -720,7 +885,8 @@ $("#login-form").addEventListener("submit", async event => {
   submit.disabled = true;
   $("#login-error").textContent = "";
   try {
-    await api("/api/login", { method: "POST", body: JSON.stringify({ username: values.get("username"), password: values.get("password"), otp: values.get("otp") || "" }) });
+    const login = await api("/api/login", { method: "POST", body: JSON.stringify({ username: values.get("username"), password: values.get("password"), otp: values.get("otp") || "" }) });
+    acceptLogin(login);
     const session = await api("/api/session");
     showConsole(session);
     form.reset();
@@ -752,6 +918,10 @@ $$('[data-close-rename]').forEach(button => button.addEventListener("click", () 
 $$('[data-close-reset]').forEach(button => button.addEventListener("click", () => $("#reset-dialog").close()));
 $$('[data-close-dialog]').forEach(button => button.addEventListener("click", () => $("#device-dialog").close()));
 $$('[data-close-links]').forEach(button => button.addEventListener("click", () => $("#links-dialog").close()));
+$("#links-dialog").addEventListener("close", event => {
+  linksDialogGeneration += 1;
+  releaseAuthenticatedImages(event.currentTarget);
+});
 $("#copy-ssh-command").addEventListener("click", () => copyText($("#ssh-command").textContent));
 
 $("#device-search").addEventListener("input", event => { state.query = event.target.value; renderDevices(); });
@@ -783,10 +953,10 @@ $("#links-dialog").addEventListener("click", event => {
   const rOpenSub = event.target.closest("[data-remote-open-sub-qr]");
   const links = JSON.parse($("#links-list").dataset.links || "[]");
   if (copy) copyText(links[Number(copy.dataset.copyLink)] || "");
-  if (open) window.open(`/api/devices/${encodeURIComponent($("#links-list").dataset.device)}/qr?index=${Number(open.dataset.openQr)}`, "_blank", "noopener");
-  if (rOpen) window.open(decodeURIComponent(rOpen.dataset.remoteOpenQr), "_blank", "noopener");
+  if (open) openAuthenticatedImage(`/api/devices/${encodeURIComponent($("#links-list").dataset.device)}/qr?index=${Number(open.dataset.openQr)}`);
+  if (rOpen) openAuthenticatedImage(decodeURIComponent(rOpen.dataset.remoteOpenQr));
   if (copySub) copyText(copySub.dataset.copySubUrl || "");
-  if (rOpenSub) window.open(decodeURIComponent(rOpenSub.dataset.remoteOpenSubQr), "_blank", "noopener");
+  if (rOpenSub) openAuthenticatedImage(decodeURIComponent(rOpenSub.dataset.remoteOpenSubQr));
 });
 window.addEventListener("resize", () => requestAnimationFrame(renderCharts));
 document.addEventListener("visibilitychange", () => { if (!document.hidden && state.csrf) refreshLive(false); });
@@ -806,10 +976,15 @@ $("#password-form").addEventListener("submit", async event => {
     return;
   }
   try {
-    await api("/api/change-password", { method: "POST", body: { old_password: old_pwd, new_password: new_pwd } });
-    toast("密码已更新。");
+    const ticket = await requestStepUp("change_password", old_pwd);
+    if (!ticket) return;
+    await api("/api/change-password", {
+      method: "POST",
+      headers: { "X-Step-Up-Token": ticket },
+      body: { new_password: new_pwd },
+    });
     form.reset();
-    $("#password-dialog").close();
+    completeSecurityChange("密码已更新。");
   } catch (err) {
     $("#password-form-error").textContent = err.message;
     $("#password-form-error").classList.remove("hidden");
@@ -1375,28 +1550,37 @@ function renderRemoteDevices(devices) {
 async function rsOpenLinks(id) {
   const device = (state.remoteDevices || []).find(d => String(d.id) === String(id));
   if (!device) { toast("未找到该设备，请刷新重试", true); return; }
+  const generation = ++linksDialogGeneration;
+  const dialog = $("#links-dialog");
   const list = $("#links-list");
+  releaseAuthenticatedImages(dialog);
   $("#links-title").textContent = `${device.name} · 连接信息（远程服务器）`;
   list.innerHTML = '<p class="form-hint">正在生成…</p>';
-  $("#links-dialog").showModal();
+  dialog.showModal();
   try {
     const data = await rsRemoteApi("GET", `/api/devices/${id}/links`);
+    if (generation !== linksDialogGeneration || !dialog.open) return;
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
     box.classList.toggle("hidden", urls.length === 0);
     const qrUrlOf = (params) => `/api/remote/qr?server_id=${state.remoteActive}&device_id=${encodeURIComponent(id)}&${params}`;
-    $("#subscription-urls").innerHTML = urls.map((item) => {
-      const qrUrl = qrUrlOf(`raw=${encodeURIComponent(item.url)}`);
-      return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" src="${qrUrl}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-remote-open-sub-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div>`;
+    $("#subscription-urls").innerHTML = urls.map((item, index) => {
+      const qrUrl = qrUrlOf(`sub_index=${index}`);
+      return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" data-auth-src="${escapeHtml(qrUrl)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-remote-open-sub-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div>`;
     }).join("");
     list.innerHTML = data.links.length ? data.links.map((link, index) => {
       const qrUrl = qrUrlOf(`index=${index}`);
-      return `<div class="link-row"><img src="${qrUrl}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-remote-open-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div></div>`;
+      return `<div class="link-row"><img data-auth-src="${escapeHtml(qrUrl)}" alt="${escapeHtml(protocolName(link))} 二维码"><div class="link-content"><b>${escapeHtml(protocolName(link))}</b><code>${escapeHtml(link)}</code></div><div class="link-actions"><button data-copy-link="${index}">复制链接</button><button data-remote-open-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div></div>`;
     }).join("") : '<p class="form-hint">当前没有启用的节点协议。</p>';
+    $$('[data-auth-src]', dialog).forEach(image => loadAuthenticatedImage(image, image.dataset.authSrc));
     list.dataset.links = JSON.stringify(data.links);
     list.dataset.device = id;
     list.dataset.remote = "1";
-  } catch (error) { list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`; }
+  } catch (error) {
+    if (generation === linksDialogGeneration && dialog.open) {
+      list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
+    }
+  }
 }
 
 function rsRateOf(id, bytes, isDown) {
@@ -1459,7 +1643,13 @@ async function rsKeyIssue() {
   const name = prompt("给这把钥匙起个名字（显示在钥匙里，如：香港 HKS4）：", $("#rs-key-state-note").dataset.name || "");
   if (name === null) return;
   try {
-    const result = await api("/api/remote/issue", { method: "POST", body: { name: name || "远程服务器" } });
+    const ticket = await requestStepUp("remote_issue");
+    if (!ticket) return;
+    const result = await api("/api/remote/issue", {
+      method: "POST",
+      headers: { "X-Step-Up-Token": ticket },
+      body: { name: name || "远程服务器" },
+    });
     $("#rs-key-text").textContent = result.cred;
     $("#rs-key-box-wrap").classList.remove("hidden");
     toast("钥匙已生成，复制后粘贴到主面板即可");
@@ -1469,7 +1659,13 @@ async function rsKeyIssue() {
 async function rsKeyRevoke() {
   if (!confirm("确定吊销全部远程钥匙吗？\n所有主面板持有的旧钥匙将立即失效。")) return;
   try {
-    await api("/api/remote/revoke", { method: "POST", body: {} });
+    const ticket = await requestStepUp("remote_revoke");
+    if (!ticket) return;
+    await api("/api/remote/revoke", {
+      method: "POST",
+      headers: { "X-Step-Up-Token": ticket },
+      body: {},
+    });
     $("#rs-key-box-wrap").classList.add("hidden");
     $("#rs-key-text").textContent = "";
     toast("全部旧钥匙已吊销，可重新生成");
@@ -1521,5 +1717,5 @@ $("#rs-add-form")?.addEventListener("submit", async e => {
 /* 6.6.18 订阅地址「打开二维码」按钮（与单节点一致：新窗口大图） */
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("[data-open-sub-qr]");
-  if (btn) window.open(btn.dataset.openSubQr, "_blank", "noopener");
+  if (btn) openAuthenticatedImage(btn.dataset.openSubQr);
 });

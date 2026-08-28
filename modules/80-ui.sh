@@ -67,13 +67,17 @@ show_ports() {
         printf "  %-22s %-10s %-7s %s\n" "Anytls" "---" "TCP" "(未开启)"
     fi
 
-    # 订阅：本地端口才需要在服务器防火墙放行；公网端口可能是 NAT 映射端口。
-    printf "  %-22s %-10s %-7s iptables -I INPUT -p tcp --dport %s -j ACCEPT\n" "订阅服务(本地)" "$SUB_PORT" "TCP" "$SUB_PORT"
-    if [ "$SUB_PUBLIC_PORT_IPV4" != "$SUB_PORT" ]; then
-        printf "  %-22s %-10s %-7s %s\n" "订阅地址(IPv4)" "$SUB_PUBLIC_PORT_IPV4" "TCP" "(NAT 映射 → 本地 $SUB_PORT)"
-    fi
-    if [ "$SUB_PUBLIC_PORT_IPV6" != "$SUB_PORT" ]; then
-        printf "  %-22s %-10s %-7s %s\n" "订阅地址(IPv6)" "$SUB_PUBLIC_PORT_IPV6" "TCP" "(公网 → 本地 $SUB_PORT)"
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        # 公网 HTTPS 才需要开放本机监听；公网端口可能是 NAT 映射端口。
+        printf "  %-22s %-10s %-7s iptables -I INPUT -p tcp --dport %s -j ACCEPT\n" "订阅 HTTPS" "$SUB_PORT" "TCP" "$SUB_PORT"
+        if [ "$SUB_PUBLIC_PORT_IPV4" != "$SUB_PORT" ]; then
+            printf "  %-22s %-10s %-7s %s\n" "订阅地址(IPv4)" "$SUB_PUBLIC_PORT_IPV4" "TCP" "(NAT 映射 → 本地 $SUB_PORT)"
+        fi
+        if [ "$SUB_PUBLIC_PORT_IPV6" != "$SUB_PORT" ]; then
+            printf "  %-22s %-10s %-7s %s\n" "订阅地址(IPv6)" "$SUB_PUBLIC_PORT_IPV6" "TCP" "(公网 → 本地 $SUB_PORT)"
+        fi
+    else
+        printf "  %-22s %-10s %-7s %s\n" "订阅服务" "$SUB_PORT" "TCP" "(仅 127.0.0.1，不开放防火墙)"
     fi
 
     echo -e "${CYAN}══════════════════════════════════════════════════════════════════${RESET}"
@@ -162,6 +166,13 @@ show_info() {
 
     echo ""
     echo -e "${CYAN}--- 订阅地址（按客户端选择对应地址） ---${RESET}"
+    if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        echo -e "${YELLOW}[本地安全模式] 以下 127.0.0.1 地址只能经 SSH 端口转发使用：${RESET}"
+        echo -e "${WHITE}ssh -N -L ${SUB_PORT}:127.0.0.1:${SUB_PORT} root@${ENTRY_IP_RAW}${RESET}"
+        echo -e "${YELLOW}保持隧道连接后，再在同一台电脑或手机客户端添加订阅。服务器不会公开明文订阅端口。${RESET}"
+    else
+        echo -e "${GREEN}[HTTPS] 订阅由可信域名 ${SUB_DOMAIN} 加密提供；不要忽略证书错误。${RESET}"
+    fi
     local clash_sub_url=""
     if [ "$CLASH_ENABLED" = "true" ]; then
         clash_sub_url=$(build_short_subscription_url "$SERVER_IP" "$SUB_URL_PORT" "$UUID" clash) || true

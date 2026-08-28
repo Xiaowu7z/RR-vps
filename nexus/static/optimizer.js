@@ -26,6 +26,7 @@ const OptimizerState = {
   results: [],           // 浏览器候选顺序（不等于真实代理质量排名）
   asiaResults: [],       // 亚洲入口狩猎榜结果
   egressIp: "",          // 首次 trace 检测到的出口 IP
+  egressVerified: false, // 各阶段复核是否持续确认同一出口
   egressChanged: false,  // 测速过程中出口 IP 是否变化
   vpnDetected: false,    // 是否检测到 VPN/代理特征
   networkType: "",       // WiFi / Mobile / ...
@@ -66,7 +67,7 @@ const DOWNLOAD_BYTES = 2 * 1024 * 1024;
 const STORAGE_KEY = "rr_edge_optimizer";
 const BLACKLIST_KEY = "rr_edge_optimizer_blacklist";
 const CUSTOM_DOMAINS_KEY = "rr_edge_optimizer_custom_domains";
-const HISTORY_KEY = "rr_edge_optimizer_history_v2"; // 按网络/运营商/协议隔离的历史记录
+const HISTORY_KEY = "rr_edge_optimizer_history_v3"; // 按网络/运营商/协议/用途/测速模式隔离的历史记录
 const HISTORY_N = 7;                               // 历史表现：最近 7 次滑动平均
 const HISTORY_HALFLIFE_MS = 7 * 24 * 3600 * 1000;  // 时间衰减半衰期 7 天
 const BENCHMARK_PROFILES = {
@@ -400,7 +401,7 @@ function isPrivateIp(ip) {
 /* ------------------------------------------------------------------ */
 /* 测速：单次 trace 探测                                                */
 /* ------------------------------------------------------------------ */
-async function probeTrace(domain, timeoutMs, signal) {
+async function probeTrace(domain, timeoutMs, signal, trackEgress = true) {
   const url = `https://${domain}/cdn-cgi/trace`;
   const start = performance.now();
   const ctrl = new AbortController();
@@ -411,7 +412,12 @@ async function probeTrace(domain, timeoutMs, signal) {
     else signal.addEventListener("abort", onAbort);
   }
   try {
-    const resp = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+    const resp = await fetch(url, {
+      signal: ctrl.signal,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    });
     const ttfb = performance.now() - start;
     const text = await resp.text();
     const total = performance.now() - start;
@@ -421,6 +427,8 @@ async function probeTrace(domain, timeoutMs, signal) {
       else if (line.startsWith("loc=")) loc = line.slice(4).trim().toUpperCase();
       else if (line.startsWith("ip=")) ip = line.slice(3).trim();
     }
+    // 初始基线建立后，复用每一次已有 trace 的出口字段做零额外流量校验。
+    if (trackEgress && resp.ok && ip && OptimizerState.egressIp) observeEgressIp(ip);
     return { ok: resp.ok, domain, ttfb, total, colo, loc, ip };
   } catch (e) {
     const total = performance.now() - start;
@@ -449,7 +457,13 @@ async function resolveEdgeIps(domain, protocol, signal) {
   try {
     for (const t of types) {
       const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=${t}`;
-      const resp = await fetch(url, { headers: { accept: "application/dns-json" }, cache: "no-store", signal: ctrl.signal });
+      const resp = await fetch(url, {
+        headers: { accept: "application/dns-json" },
+        cache: "no-store",
+        signal: ctrl.signal,
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+      });
       if (!resp.ok) continue;
       const data = await resp.json();
       const recs = (data.Answer || []).filter((x) => (t === "A" ? x.type === 1 : x.type === 28)).map((x) => x.data);
@@ -481,7 +495,12 @@ async function probeDownload(signal) {
     else signal.addEventListener("abort", onAbort);
   }
   try {
-    const resp = await fetch(url, { signal: ctrl.signal, cache: "no-store" });
+    const resp = await fetch(url, {
+      signal: ctrl.signal,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    });
     if (!resp.ok) return { ok: false, mbps: 0, bytes: 0 };
     const buf = await resp.arrayBuffer();
     const ms = performance.now() - start;
@@ -557,7 +576,9 @@ function historyScopeKey() {
   const network = OptimizerState.benchmarkProfile || "default";
   const operator = OptimizerState.operator || "未知";
   const protocol = OptimizerState.protocol || "dual";
-  return `${network}|${operator}|${protocol}`;
+  const use = OptimizerState.use || "proxy";
+  const mode = OptimizerState.mode || "balanced";
+  return `${network}|${operator}|${protocol}|${use}|${mode}`;
 }
 
 // 历史表现（方案B）：同一网络画像最近 7 次滑动平均 + 时间衰减；无历史 = 0.5 中性
@@ -700,7 +721,11 @@ function saveCustomDomains(list) {
 // 运营商检测：出口 IP 反查（浏览器本地发起，失败为"未知"）
 async function detectOperator() {
   try {
-    const resp = await fetch("https://ipapi.co/json/", { cache: "no-store" });
+    const resp = await fetch("https://ipapi.co/json/", {
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    });
     if (!resp.ok) return "未知";
     const data = await resp.json();
     const org = data.org || "";
@@ -709,6 +734,47 @@ async function detectOperator() {
     if (/China Unicom|中国联通|ChinaUnicom/i.test(org)) return "中国联通";
     return data.country_name || "未知";
   } catch (_e) { return "未知"; }
+}
+
+function egressIpFamily(ip) {
+  const value = String(ip || "").trim();
+  if (!value) return 0;
+  if (value.includes(":")) return 6;
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(value) ? 4 : 0;
+}
+
+// 任何一次无法确认、地址族漂移或同族地址变化，都会永久取消本轮持久化资格。
+// 地址族漂移在双栈网络中不一定代表换出口，因此不标记 changed，但仍保守地不保存。
+function observeEgressIp(ip) {
+  const baseline = OptimizerState.egressIp;
+  const observed = String(ip || "").trim();
+  if (!baseline || !observed) {
+    OptimizerState.egressVerified = false;
+    return false;
+  }
+  if (observed === baseline) return true;
+  const baselineFamily = egressIpFamily(baseline);
+  const observedFamily = egressIpFamily(observed);
+  if (baselineFamily && baselineFamily === observedFamily) {
+    OptimizerState.egressChanged = true;
+  }
+  OptimizerState.egressVerified = false;
+  return false;
+}
+
+// 用同一基准域名在阶段边界做一次轻量复核。失败不会中止展示，但禁止写历史。
+async function verifyEgressStable(signal) {
+  if (!OptimizerState.egressIp) {
+    OptimizerState.egressVerified = false;
+    return false;
+  }
+  const baselineDomain = activeBenchmarkProfile().domains[0];
+  const check = await probeTrace(baselineDomain, STAGE1_TIMEOUT_MS, signal);
+  if (!check.ok || !check.ip) {
+    OptimizerState.egressVerified = false;
+    return false;
+  }
+  return OptimizerState.egressVerified && !OptimizerState.egressChanged;
 }
 
 // 分批并发：每批 batchSize 个，批间释放资源，避免浏览器一次 1000 并发卡死
@@ -770,6 +836,8 @@ async function optimizerStart() {
   OptimizerState.asiaResults = [];
   OptimizerState.ipv4Results = [];
   OptimizerState.ipv6Results = [];
+  OptimizerState.egressIp = "";
+  OptimizerState.egressVerified = false;
   OptimizerState.egressChanged = false;
   OptimizerState.vpnDetected = false;
   OptimizerState.popCount = {};
@@ -823,8 +891,9 @@ async function optimizerStart() {
     setProgress(6, "检测网络环境…");
     const benchmarkProfile = activeBenchmarkProfile();
     const baselineDomain = benchmarkProfile.domains[0];
-    const baseline = await probeTrace(baselineDomain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
+    const baseline = await probeTrace(baselineDomain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal, false);
     OptimizerState.egressIp = baseline.ip || "";
+    OptimizerState.egressVerified = !!(baseline.ok && baseline.ip);
     OptimizerState.operator = operatorManual === "auto" ? await detectOperator() : operatorManual;
     const localIps = await detectLocalIps();
     const publicLocal = localIps.filter((ip) => !isPrivateIp(ip));
@@ -850,6 +919,7 @@ async function optimizerStart() {
       setProgress(7, `测试${benchmarkProfile.label} ${benchmarkProfile.domains.join("/")}…`);
       benchmarks = await probeBenchmark(OptimizerState.controller.signal, benchmarkProfile.domains);
     }
+    await verifyEgressStable(OptimizerState.controller.signal);
 
     // 2) Stage 1：轻量探测（batch 50/批，/cdn-cgi/trace 短超时，过滤失败）
     setProgress(8, `Stage 1 轻量探测 0/${total}…`);
@@ -868,6 +938,7 @@ async function optimizerStart() {
     });
 
     if (OptimizerState.aborted) { setProgress(100, "已停止"); toast("测速已停止。"); return; }
+    await verifyEgressStable(OptimizerState.controller.signal);
     if (!stage1.length) {
       setProgress(100, "无有效域名");
       toast("Stage 1 探测无有效域名，请检查网络后重试。", true);
@@ -896,6 +967,7 @@ async function optimizerStart() {
     });
 
     if (OptimizerState.aborted) { setProgress(100, "已停止"); toast("测速已停止。"); return; }
+    await verifyEgressStable(OptimizerState.controller.signal);
 
     // Stage 2 粗评分 → TOP FINAL_COUNT
     const stage2Scored = Object.values(perDomain)
@@ -917,9 +989,6 @@ async function optimizerStart() {
         const res = await probeTrace(m.domain, PROBE_TIMEOUT_MS, OptimizerState.controller.signal);
         m.roundsData.push(res);
         m.rounds++;
-        if (res.ok && res.ip && OptimizerState.egressIp && res.ip !== OptimizerState.egressIp) {
-          OptimizerState.egressChanged = true;
-        }
       }
       // proxy 模式：Edge 复用稳定性（连续串行 trace，不复用 roundsData，避免覆盖原 trace）
       if (mode === "proxy") {
@@ -934,15 +1003,11 @@ async function optimizerStart() {
     });
 
     if (OptimizerState.aborted) { setProgress(100, "已停止"); toast("测速已停止。"); return; }
+    await verifyEgressStable(OptimizerState.controller.signal);
 
     // 5) 最终评分 + 失败惩罚 + tiebreak 排序
     setProgress(90, "计算综合评分…");
     const results = finalists.map((m) => { m.score = computeScore(m, mode, { dl }); return m; });
-    const blist = loadBlacklist();
-    results.forEach((m) => {
-      if (m.successRate === 0 && !blist.includes(m.domain)) blist.push(m.domain);
-    });
-    saveBlacklist(blist);
     // 均衡模式按主评分；亚洲狩猎模式先按 HKG>NRT>SIN>ICN>TPE，再按主评分。
     results.sort((a, b) => compareRankedResults(a, b, huntMode));
     OptimizerState.results = results;
@@ -974,8 +1039,13 @@ async function optimizerStart() {
     renderRecommendation(results[0], dl, gateAllowed);
     renderAsiaHunt(OptimizerState.asiaResults);
     renderResults(results, dl, total, stage1.length, stage2List.length);
-    const reliable = !OptimizerState.egressChanged && (mode !== "proxy" || gateAllowed);
+    const reliable = OptimizerState.egressVerified && !OptimizerState.egressChanged && (mode !== "proxy" || gateAllowed);
     if (reliable) {
+      const blist = loadBlacklist();
+      results.forEach((m) => {
+        if (m.successRate === 0 && !blist.includes(m.domain)) blist.push(m.domain);
+      });
+      saveBlacklist(blist);
       saveLocal(results[0], dl);
       saveHistoryScores(results);
     }
@@ -983,6 +1053,8 @@ async function optimizerStart() {
 
     if (OptimizerState.egressChanged) {
       toast("⚠ 测速过程中出口 IP 发生变化（网络不稳定），结果仅供参考。", true);
+    } else if (!OptimizerState.egressVerified) {
+      toast("⚠ 无法持续确认同一出口，结果仅展示且不会写入本机历史。", true);
     }
   } catch (e) {
     if (OptimizerState.aborted || (e && e.name === "AbortError")) {

@@ -259,14 +259,9 @@ generate_node_and_sub() {
 subscription_short_token() {
     local user_id="$1"
     is_valid_uuid "$user_id" || return 1
-    python3 - "$user_id" <<'PY'
-import base64
-import hashlib
-import sys
-
-digest = hashlib.sha256(sys.argv[1].encode("ascii")).digest()[:9]
-print(base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="))
-PY
+    [ "$user_id" = "${UUID:-}" ] || return 1
+    [[ "${SUB_TOKEN:-}" =~ ^[A-Za-z0-9_-]{32}$ ]] || return 1
+    printf '%s\n' "$SUB_TOKEN"
 }
 
 create_short_subscription_alias() {
@@ -275,7 +270,7 @@ create_short_subscription_alias() {
     local target=""
     local existing_link=""
     token=$(subscription_short_token "$UUID") || return 1
-    [[ "$token" =~ ^[A-Za-z0-9_-]{12}$ ]] || return 1
+    [[ "$token" =~ ^[A-Za-z0-9_-]{32}$ ]] || return 1
     # SimpleHTTPServer serves index.html instead of exposing directory listings.
     : > "$SUB_ROOT/index.html" || return 1
     chmod 600 "$SUB_ROOT/index.html" || return 1
@@ -343,7 +338,19 @@ build_short_subscription_url() {
     is_valid_port "$public_port" || return 1
     token=$(subscription_short_token "$user_id") || return 1
     route=$(subscription_short_route "$format") || return 1
-    printf 'http://%s:%s/%s/%s' "$server_ip" "$public_port" "$route" "$token"
+    local scheme="" url_host="" url_port=""
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        is_valid_domain "${SUB_DOMAIN:-}" || return 1
+        scheme=https
+        url_host="$SUB_DOMAIN"
+        url_port="$public_port"
+    else
+        scheme=http
+        url_host=127.0.0.1
+        url_port="${SUB_PORT:-$public_port}"
+        is_valid_port "$url_port" || return 1
+    fi
+    printf '%s://%s:%s/%s/%s' "$scheme" "$url_host" "$url_port" "$route" "$token"
 }
 
 build_subscription_url() {
@@ -359,7 +366,19 @@ build_subscription_url() {
        "$server_ip$public_port$user_id" != *$'\r'* ]] || return 1
     is_valid_port "$public_port" || return 1
     is_valid_uuid "$user_id" || return 1
-    printf 'http://%s:%s/%s/%s' "$server_ip" "$public_port" "$user_id" "$file_name"
+    local scheme="" url_host="" url_port=""
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        is_valid_domain "${SUB_DOMAIN:-}" || return 1
+        scheme=https
+        url_host="$SUB_DOMAIN"
+        url_port="$public_port"
+    else
+        scheme=http
+        url_host=127.0.0.1
+        url_port="${SUB_PORT:-$public_port}"
+        is_valid_port "$url_port" || return 1
+    fi
+    printf '%s://%s:%s/%s/%s' "$scheme" "$url_host" "$url_port" "$user_id" "$file_name"
 }
 
 # ==========================================
@@ -898,9 +917,15 @@ toggle_clash_meta() {
             1)
                 if apply_config_transaction "开启 Clash Meta 订阅" "CLASH_ENABLED" "true"; then
                     select_entry_ip || { sleep 2; return; }
+                    local clash_url=""
+                    clash_url=$(build_short_subscription_url "$ENTRY_IP_RAW" "$SUB_URL_PORT" "$UUID" clash) || {
+                        echo -e "${RED}[错误] 无法生成安全订阅地址。${RESET}" >&2
+                        sleep 2
+                        return
+                    }
                     echo -e "${CYAN}==================================================${RESET}"
                     echo -e "Clash Meta 订阅地址:"
-                    echo -e "${WHITE}http://${ENTRY_IP_URI}:${SUB_URL_PORT}/${UUID}/clash_meta.yaml${RESET}"
+                    echo -e "${WHITE}${clash_url}${RESET}"
                     echo -e "${CYAN}==================================================${RESET}"
                 fi
                 sleep 3

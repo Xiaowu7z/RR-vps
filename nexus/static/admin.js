@@ -3,7 +3,10 @@
 // RR Nexus 7.1 feature module: MFA/passkeys, alert center, long-term metrics,
 // device groups/templates and single-transaction batch operations.
 (() => {
-  const adminState = { groups: [], templates: [], selected: new Set(), security: null };
+  const adminState = {
+    groups: [], templates: [], selected: new Set(), security: null,
+    totpSetupTicket: "", totpSetupGeneration: 0,
+  };
 
   const fromB64 = value => {
     const raw = atob(String(value).replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "="));
@@ -148,13 +151,38 @@
   }
 
   async function beginTotp() {
+    const generation = ++adminState.totpSetupGeneration;
+    const authEpoch = state.authEpoch;
     try {
-      const data = await api("/api/security/totp/begin", { method: "POST", body: {} });
+      const ticket = await requestStepUp("totp_begin");
+      if (!ticket || generation !== adminState.totpSetupGeneration || authEpoch !== state.authEpoch) return;
+      const data = await api("/api/security/totp/begin", {
+        method: "POST",
+        headers: { "X-Step-Up-Token": ticket },
+        body: {},
+      });
+      if (generation !== adminState.totpSetupGeneration || authEpoch !== state.authEpoch) return;
+      adminState.totpSetupTicket = data.setup_ticket || "";
       $("#totp-secret").textContent = data.secret;
-      $("#totp-qr").src = "/api/security/totp/qr?t=" + Date.now();
+      const qrLoaded = await loadAuthenticatedImage(
+        $("#totp-qr"),
+        "/api/security/totp/qr",
+        { "X-Step-Up-Token": adminState.totpSetupTicket },
+      );
+      if (!qrLoaded) {
+        if (generation === adminState.totpSetupGeneration && authEpoch === state.authEpoch) {
+          adminState.totpSetupTicket = "";
+          $("#totp-secret").textContent = "";
+          toast("二维码加载失败，请稍后重试。", true);
+        }
+        return;
+      }
+      if (generation !== adminState.totpSetupGeneration || authEpoch !== state.authEpoch) return;
       $("#totp-error").textContent = "";
       $("#totp-dialog").showModal();
-    } catch (error) { toast(error.message, true); }
+    } catch (error) {
+      if (generation === adminState.totpSetupGeneration) toast(error.message, true);
+    }
   }
 
   async function addPasskey() {
@@ -162,7 +190,13 @@
     const name = prompt("给这个 Passkey 起一个名称：", "我的设备");
     if (name === null) return;
     try {
-      const begin = await api("/api/security/passkeys/register/begin", { method: "POST", body: {} });
+      const ticket = await requestStepUp("passkey_register");
+      if (!ticket) return;
+      const begin = await api("/api/security/passkeys/register/begin", {
+        method: "POST",
+        headers: { "X-Step-Up-Token": ticket },
+        body: {},
+      });
       const options = begin.publicKey;
       options.challenge = fromB64(options.challenge);
       options.user.id = fromB64(options.user.id);
@@ -175,8 +209,7 @@
         client_data: toB64(credential.response.clientDataJSON),
         attestation: toB64(credential.response.attestationObject), transports,
       }});
-      toast("Passkey 已添加。");
-      await loadSecurity();
+      completeSecurityChange("Passkey 已添加。");
     } catch (error) { toast(error.name === "NotAllowedError" ? "已取消 Passkey 操作。" : error.message, true); }
   }
 
@@ -187,13 +220,14 @@
       const options = begin.publicKey;
       options.challenge = fromB64(options.challenge);
       const credential = await navigator.credentials.get({ publicKey: options });
-      await api("/api/passkeys/login/finish", { method: "POST", body: {
+      const login = await api("/api/passkeys/login/finish", { method: "POST", body: {
         challenge_id: begin.challenge_id, credential_id: toB64(credential.rawId),
         client_data: toB64(credential.response.clientDataJSON),
         authenticator_data: toB64(credential.response.authenticatorData),
         signature: toB64(credential.response.signature),
         user_handle: credential.response.userHandle ? toB64(credential.response.userHandle) : "",
       }});
+      acceptLogin(login);
       const session = await api("/api/session");
       showConsole(session);
       await refreshLive(false);
@@ -240,22 +274,53 @@
   $("#passkey-login").addEventListener("click", passkeyLogin);
   $("#totp-enable").addEventListener("click", beginTotp);
   $("#totp-disable").addEventListener("click", async () => {
-    const password = prompt("请输入当前管理员密码："); if (password === null) return;
-    const code = prompt("请输入当前 6 位动态码："); if (code === null) return;
-    try { await api("/api/security/totp/disable", { method: "POST", body: { password, code } }); await loadSecurity(); toast("TOTP 已关闭。"); }
+    try {
+      const ticket = await requestStepUp("totp_disable");
+      if (!ticket) return;
+      await api("/api/security/totp/disable", {
+        method: "POST", headers: { "X-Step-Up-Token": ticket }, body: {},
+      });
+      completeSecurityChange("TOTP 已关闭。");
+    }
     catch (error) { toast(error.message, true); }
   });
   $("#totp-form").addEventListener("submit", async event => {
     event.preventDefault();
-    try { await api("/api/security/totp/confirm", { method: "POST", body: { code: new FormData(event.currentTarget).get("code") } }); $("#totp-dialog").close(); await loadSecurity(); toast("TOTP 两步验证已启用。"); }
+    try {
+      await api("/api/security/totp/confirm", {
+        method: "POST",
+        headers: { "X-Step-Up-Token": adminState.totpSetupTicket },
+        body: { code: new FormData(event.currentTarget).get("code") },
+      });
+      adminState.totpSetupTicket = "";
+      completeSecurityChange("TOTP 两步验证已启用。");
+    }
     catch (error) { $("#totp-error").textContent = error.message; }
   });
-  $$('[data-close-totp]').forEach(button => button.addEventListener("click", () => $("#totp-dialog").close()));
+  $$('[data-close-totp]').forEach(button => button.addEventListener("click", () => {
+    adminState.totpSetupTicket = "";
+    $("#totp-dialog").close();
+  }));
+  function clearTotpSetupState() {
+    adminState.totpSetupGeneration += 1;
+    adminState.totpSetupTicket = "";
+    releaseAuthenticatedImage($("#totp-qr"));
+    $("#totp-qr").removeAttribute("src");
+    $("#totp-secret").textContent = "";
+  }
+  $("#totp-dialog").addEventListener("close", clearTotpSetupState);
   $("#passkey-add").addEventListener("click", addPasskey);
   $("#passkey-list").addEventListener("click", async event => {
     const button = event.target.closest("[data-delete-passkey]"); if (!button) return;
     if (!confirm("确定删除这个 Passkey？")) return;
-    try { await api(`/api/security/passkeys/${encodeURIComponent(button.dataset.deletePasskey)}`, { method: "DELETE" }); await loadSecurity(); }
+    try {
+      const ticket = await requestStepUp("passkey_delete");
+      if (!ticket) return;
+      await api(`/api/security/passkeys/${encodeURIComponent(button.dataset.deletePasskey)}`, {
+        method: "DELETE", headers: { "X-Step-Up-Token": ticket },
+      });
+      completeSecurityChange("Passkey 已删除。");
+    }
     catch (error) { toast(error.message, true); }
   });
 
@@ -321,6 +386,7 @@
 
   window.RRAdmin = {
     onConsole: () => { loadOrganization(); },
+    onLogout: clearTotpSetupState,
     loadOrganization,
     loadSecurity,
     loadMetrics,

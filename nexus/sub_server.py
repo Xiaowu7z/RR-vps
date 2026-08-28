@@ -10,6 +10,8 @@ import json
 import posixpath
 import re
 import sqlite3
+import ssl
+import sys
 import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -33,13 +35,34 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     max_active_requests = 64
     request_timeout_seconds = 15
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        ssl_context: ssl.SSLContext | None = None,
+        **kwargs: Any,
+    ) -> None:
         self._request_slots = threading.BoundedSemaphore(self.max_active_requests)
+        self._ssl_context = ssl_context
         super().__init__(*args, **kwargs)
 
     def get_request(self):  # type: ignore[no-untyped-def]
         request, address = super().get_request()
         request.settimeout(self.request_timeout_seconds)
+        if self._ssl_context is not None:
+            try:
+                # Delay the handshake until the bounded request worker runs.  A
+                # client that never sends a ClientHello therefore consumes one
+                # of the fixed request slots for at most request_timeout_seconds
+                # instead of blocking the accept loop or creating unlimited
+                # threads.
+                request = self._ssl_context.wrap_socket(
+                    request,
+                    server_side=True,
+                    do_handshake_on_connect=False,
+                )
+            except (OSError, ssl.SSLError):
+                request.close()
+                raise
         return request, address
 
     def process_request(self, request, client_address):  # type: ignore[no-untyped-def]
@@ -57,6 +80,26 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+    def handle_error(self, request, client_address):  # type: ignore[no-untyped-def]
+        # Internet scanners routinely send cleartext or abort during a TLS
+        # handshake.  Treat those as rejected clients, not application faults;
+        # otherwise ThreadingMixIn emits a full traceback for every probe and
+        # can grow the journal without bound.
+        error = sys.exc_info()[1]
+        if isinstance(error, (ssl.SSLError, ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def build_tls_context(certfile: str, keyfile: str) -> ssl.SSLContext:
+    """Build the only TLS policy accepted by the public subscription server."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_COMPRESSION
+    context.set_alpn_protocols(["http/1.1"])
+    context.load_cert_chain(certfile, keyfile)
+    return context
 
 
 def classify_personal_request(target: str) -> tuple[bool, re.Match[str] | None]:
@@ -367,7 +410,6 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
             "Access-Control-Expose-Headers": (
                 "Subscription-Userinfo, Profile-Update-Interval, Profile-Title"
             ),
-            "Cache-Control": "no-store",
         }
 
     def send_head(self):  # type: ignore[no-untyped-def]
@@ -419,6 +461,13 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
         return io.BytesIO(body)
 
     def end_headers(self) -> None:
+        # Every file served by this dedicated process is a bearer-style
+        # subscription or a related error response.  Apply the policy here so
+        # static main/recovery/UUID routes and conditional 304 responses cannot
+        # retain rotated node credentials in browsers or shared proxies.
+        self.send_header("Cache-Control", "no-store, private, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         for key, value in getattr(self, "_subscription_headers", {}).items():
             self.send_header(key, value)
         self._subscription_headers = {}
@@ -431,11 +480,22 @@ def main() -> int:
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--directory", default=".")
     parser.add_argument("--config", default="/etc/rr-nexus/nexus.json")
+    parser.add_argument("--certfile")
+    parser.add_argument("--keyfile")
     args = parser.parse_args()
+    if bool(args.certfile) != bool(args.keyfile):
+        parser.error("--certfile and --keyfile must be supplied together")
+    tls_context: ssl.SSLContext | None = None
+    if args.certfile and args.keyfile:
+        tls_context = build_tls_context(args.certfile, args.keyfile)
     handler = lambda *hargs, **kwargs: SubscriptionHandler(  # noqa: E731
         *hargs, directory=args.directory, **kwargs
     )
-    server = BoundedThreadingHTTPServer((args.bind, args.port), handler)
+    server = BoundedThreadingHTTPServer(
+        (args.bind, args.port),
+        handler,
+        ssl_context=tls_context,
+    )
     server.config_path = Path(args.config)  # type: ignore[attr-defined]
     server.serve_forever()
     return 0
