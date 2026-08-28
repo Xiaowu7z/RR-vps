@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import fcntl
 import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import re
@@ -18,25 +20,27 @@ import shutil
 import sqlite3
 import platform
 import socket
+import ssl
+import stat
 import subprocess
-import urllib.request
-import urllib.error
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
 from rr_nexus_lib.notifications import NotificationManager
+from rr_nexus_lib.http_security import UnsafeTargetError, https_post
 from rr_nexus_lib.security import (
     b64url_decode,
     b64url_encode,
@@ -66,8 +70,16 @@ except ImportError:  # pragma: no cover - installer checks and reports this
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
 CONFIG_PATH = Path(os.environ.get("RR_NEXUS_CONFIG", "/etc/rr-nexus/nexus.json"))
+UPDATE_MAINTENANCE_PATH = Path(
+    os.environ.get("RR_UPDATE_MAINTENANCE_FILE", "/run/rr-vps/update-maintenance")
+)
 MAX_BODY = 32 * 1024
 SESSION_HOURS = 12
+SESSION_COOKIE_NAME = "__Host-rr_nexus_session"
+SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{32,128}$")
+# token_urlsafe() never emits '.', so these transport markers also
+# invalidate every session created by the legacy cookie-only implementation.
+SESSION_TOKEN_PREFIX = {"local": "local.", "public": "public-bearer."}
 LOGIN_WINDOW = 30 * 60
 LOGIN_LIMIT = 5
 # 顶级防爆破：IP+账号双维、持久化、指数退避、渐进延迟
@@ -77,6 +89,10 @@ LOGIN_FAIL_DELAY = 0.35                 # 基础失败延迟（秒）
 LOGIN_FAIL_DELAY_STEP = 0.4             # 每次失败递增延迟
 LOGIN_FAIL_DELAY_MAX = 5.0              # 延迟上限
 MAX_DEVICES = 500
+# Shell-side generation is staged and normally completes well below this
+# ceiling.  Keep a bounded allowance for a fully populated low-end VPS and for
+# time spent waiting on the cross-process sync lock.
+DEVICE_SYNC_TIMEOUT_SECONDS = 300
 DEVICE_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
 DEVICE_ID_RE = re.compile(r"^dev_[a-f0-9]{12}$")
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{2,31}$")
@@ -91,21 +107,133 @@ TRAFFIC_BUCKET_SECONDS = 5 * 60
 TRAFFIC_RETENTION_SECONDS = 30 * 24 * 3600
 SYSTEM_SAMPLE_SECONDS = 60
 SYSTEM_RETENTION_SECONDS = 30 * 24 * 3600
+AUDIT_RETENTION_SECONDS = 180 * 24 * 3600
+NOTIFICATION_RETENTION_SECONDS = 90 * 24 * 3600
+MAX_AUDIT_ROWS = 100_000
+MAX_NOTIFICATION_ROWS = 20_000
 MAX_AUTO_RESET_COUNT = 120
 MAX_SERVER_TRAFFIC_GB = 1024 * 1024
 SERVER_TRAFFIC_MODES = {"both", "tx", "rx"}
 MAX_JSON_BODY_BYTES = 1024 * 1024
+MIN_ADMIN_PASSWORD_LENGTH = 12
 V2RAY_QUERY_METHOD = "/v2ray.core.app.stats.command.StatsService/QueryStats"
+
+
+def update_maintenance_active() -> bool:
+    """Fail closed while an installer transaction can still roll back.
+
+    The parent directory is created root-only by the installer.  Treat any
+    directory entry at the fixed marker path as active, including a malformed
+    entry, so corruption cannot accidentally re-open database writes.
+    """
+    try:
+        UPDATE_MAINTENANCE_PATH.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+# Argon2 is intentionally memory-hard.  One password operation below reserves
+# 64 MiB, while the HTTP server accepts up to 64 active requests; allowing all
+# of them to hash at once can therefore exhaust a small VPS.  Keep both the
+# active work set and its waiting room finite.  Overload is surfaced as a
+# generic temporary authentication failure rather than a bad password, so it
+# neither consumes brute-force attempts nor reveals whether an account exists.
+PASSWORD_HASH_MAX_CONCURRENT = 2
+PASSWORD_HASH_MAX_WAITERS = 8
+PASSWORD_HASH_WAIT_SECONDS = 5.0
+
+
+class PasswordHashBusy(RuntimeError):
+    """The bounded Argon2 worker set cannot accept more work right now."""
+
+
+class BoundedPasswordHasher:
+    """Serialize memory-hard password work behind a bounded waiting room."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = PASSWORD_HASH_MAX_CONCURRENT,
+        max_waiters: int = PASSWORD_HASH_MAX_WAITERS,
+        wait_seconds: float = PASSWORD_HASH_WAIT_SECONDS,
+        **hasher_options: Any,
+    ) -> None:
+        if max_concurrent < 1 or max_waiters < 0 or wait_seconds < 0:
+            raise ValueError("invalid password hash limiter settings")
+        self._hasher = PasswordHasher(**hasher_options)
+        self._active_slots = threading.BoundedSemaphore(max_concurrent)
+        self._queue_slots = threading.BoundedSemaphore(max_concurrent + max_waiters)
+        self._wait_seconds = wait_seconds
+
+    @contextmanager
+    def _operation(self) -> Iterator[None]:
+        if not self._queue_slots.acquire(blocking=False):
+            raise PasswordHashBusy("password hash queue is full")
+        active = False
+        try:
+            active = self._active_slots.acquire(timeout=self._wait_seconds)
+            if not active:
+                raise PasswordHashBusy("password hash workers are busy")
+            yield
+        finally:
+            if active:
+                self._active_slots.release()
+            self._queue_slots.release()
+
+    def hash(self, *args: Any, **kwargs: Any) -> str:
+        with self._operation():
+            return self._hasher.hash(*args, **kwargs)
+
+    def verify(self, *args: Any, **kwargs: Any) -> bool:
+        with self._operation():
+            return bool(self._hasher.verify(*args, **kwargs))
+
+    def check_needs_rehash(self, *args: Any, **kwargs: Any) -> bool:
+        # This only parses the encoded Argon2 parameters; it does not execute a
+        # memory-hard hash and therefore does not consume a worker slot.
+        return bool(self._hasher.check_needs_rehash(*args, **kwargs))
+
 
 # ---- 多服务器远程管理（6.6.0）----
 REMOTE_KEY_PATH = Path("/var/lib/rr-nexus/remote.key")
+REMOTE_SECURITY_LOCK_PATH = Path("/run/rr-vps/locks/nexus-security.lock")
+LETSENCRYPT_LIVE_ROOT = Path(
+    os.environ.get("RR_LE_LIVE_ROOT", "/etc/letsencrypt/live")
+)
 REMOTE_CRED_PREFIX = "rrmgr1"
 REMOTE_FAIL_WINDOW = 30 * 60          # 远程钥匙验证失败窗口（秒）
 REMOTE_FAIL_LIMIT = 10                # 同 IP 窗口内失败次数上限
-REMOTE_FAIL_DELAY = 0.5               # 验证失败基础延迟
+REMOTE_FAILURE_MAX_ROWS = 10_000      # 轮换来源也不能让持久失败表无界增长
+
+# A stolen 12-hour browser session must not be sufficient to establish new
+# administrator authentication factors or remote-management credentials.
+# Device access links remain visible to an authenticated administrator by
+# design, so session compromise is still security-significant.  Step-up
+# tickets are short-lived, bound to the exact session/action/security version,
+# and deleted atomically when the protected action starts.
+STEP_UP_TTL_SECONDS = 5 * 60
+STEP_UP_PUBLIC_PURPOSES = frozenset(
+    {
+        "change_password",
+        "totp_begin",
+        "totp_disable",
+        "passkey_register",
+        "passkey_delete",
+        "remote_issue",
+        "remote_revoke",
+    }
+)
+STEP_UP_INTERNAL_PURPOSES = frozenset({"totp_confirm"})
+STEP_UP_PURPOSES = STEP_UP_PUBLIC_PURPOSES | STEP_UP_INTERNAL_PURPOSES
 REMOTE_HTTP_TIMEOUT = 15              # 主面板调副面板超时（秒）
 REMOTE_MAX_SERVERS = 500              # 主面板可管理的服务器上限（无上限语义）
 REMOTE_CRED_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,64}$")
+
+
+class RequestBodyTooLarge(ValueError):
+    """Stop request dispatch after enforcing the endpoint body limit."""
 
 # 远程升级任务（副面板侧，6.6.3）：任务状态文件 + 异步执行升级。
 # 统一调用 rr --update-now：复用模块内 GitHub Raw/API/CDN 回退、bundle 双层校验、
@@ -163,7 +291,68 @@ def update_manifest_url() -> str:
     return f"https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/{branch}/manifest.sha256"
 
 
-def remote_key_load_or_create() -> bytes:
+@contextmanager
+def remote_security_lock() -> Iterator[None]:
+    lock_parent = REMOTE_SECURITY_LOCK_PATH.parent
+    lock_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_stat = lock_parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_gid != 0
+        or Path(os.path.realpath(lock_parent)) != lock_parent
+    ):
+        raise RuntimeError("unsafe remote security lock directory")
+    lock_parent.chmod(0o700)
+    if stat.S_IMODE(lock_parent.lstat().st_mode) != 0o700:
+        raise RuntimeError("remote security lock directory permissions are unsafe")
+    try:
+        path_stat = REMOTE_SECURITY_LOCK_PATH.lstat()
+    except FileNotFoundError:
+        path_stat = None
+    if path_stat is not None and (
+        not stat.S_ISREG(path_stat.st_mode)
+        or path_stat.st_uid != 0
+        or path_stat.st_gid != 0
+        or path_stat.st_nlink != 1
+    ):
+        raise RuntimeError("unsafe remote security lock file")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not cloexec:
+        raise RuntimeError("secure remote security lock flags unavailable")
+    descriptor = os.open(
+        REMOTE_SECURITY_LOCK_PATH,
+        os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | nofollow | cloexec,
+        0o600,
+    )
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        current_path_stat = REMOTE_SECURITY_LOCK_PATH.lstat()
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or descriptor_stat.st_uid != 0
+            or descriptor_stat.st_gid != 0
+            or descriptor_stat.st_nlink != 1
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            != (current_path_stat.st_dev, current_path_stat.st_ino)
+        ):
+            raise RuntimeError("remote security lock changed while opening")
+        os.fchmod(descriptor, 0o600)
+        lock_file = os.fdopen(descriptor, "a+b")
+        descriptor = -1
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    with lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _remote_key_load_or_create_unlocked() -> bytes:
     """副面板签发密钥：256 位随机，仅本机可读（600）。轮换即吊销全部旧钥匙。"""
     REMOTE_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -173,10 +362,24 @@ def remote_key_load_or_create() -> bytes:
     except FileNotFoundError:
         pass
     key = secrets.token_bytes(32)
-    fd = os.open(REMOTE_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(key)
+    temporary = REMOTE_KEY_PATH.with_name(
+        f".remote.key.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    )
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, REMOTE_KEY_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
     return key
+
+
+def remote_key_load_or_create() -> bytes:
+    with remote_security_lock():
+        return _remote_key_load_or_create_unlocked()
 
 
 def remote_cert_check(cfg: "NexusConfig") -> tuple[bool, str]:
@@ -186,9 +389,72 @@ def remote_cert_check(cfg: "NexusConfig") -> tuple[bool, str]:
     domain = (cfg.domain or "").strip()
     if not domain or domain == "ip" or re.fullmatch(r"[0-9.]+|[\da-fA-F:]+", domain):
         return False, "面板域名无效，需要公网证书域名"
-    cert = Path("/etc/letsencrypt/live/{}/fullchain.pem".format(domain))
-    if not cert.exists():
-        return False, "未检测到 Let's Encrypt 证书（{}）".format(cert)
+    cert = LETSENCRYPT_LIVE_ROOT / domain / "fullchain.pem"
+    private_key = cert.with_name("privkey.pem")
+    if not cert.is_file() or not private_key.is_file():
+        return False, "未检测到完整的 Let's Encrypt 证书与私钥（{}）".format(cert.parent)
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(cert))
+        identities = {
+            value.lower()
+            for kind, value in decoded.get("subjectAltName", ())
+            if kind == "DNS"
+        }
+        if domain.lower() not in identities:
+            return False, "证书 SAN 与面板域名不一致"
+        check_time = subprocess.run(
+            ["openssl", "x509", "-in", str(cert), "-noout", "-checkend", "604800"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        cert_public = subprocess.run(
+            ["openssl", "x509", "-in", str(cert), "-pubkey", "-noout"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        key_public = subprocess.run(
+            ["openssl", "pkey", "-in", str(private_key), "-pubout"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        ca_bundle = Path(
+            os.environ.get("RR_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+        )
+        trust = subprocess.run(
+            [
+                "openssl",
+                "verify",
+                "-purpose",
+                "sslserver",
+                "-CAfile",
+                str(ca_bundle),
+                "-untrusted",
+                str(cert),
+                str(cert),
+            ],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False, "无法验证面板 TLS 证书"
+    if check_time.returncode != 0:
+        return False, "面板证书已过期或将在 7 天内过期"
+    if (
+        cert_public.returncode != 0
+        or key_public.returncode != 0
+        or not cert_public.stdout
+        or not hmac.compare_digest(
+            hashlib.sha256(cert_public.stdout).digest(),
+            hashlib.sha256(key_public.stdout).digest(),
+        )
+    ):
+        return False, "面板证书与私钥不匹配"
+    if trust.returncode != 0:
+        return False, "面板证书链不受系统 CA 信任"
     return True, ""
 
 
@@ -221,8 +487,12 @@ def remote_cred_issue(name: str, cfg: "NexusConfig") -> tuple[str | None, str]:
 
 def remote_cred_parse(cred: str) -> dict | None:
     """只解析 payload（供主面板读地址/端口），不验证签名。"""
+    if not isinstance(cred, str) or len(cred) > 4096:
+        return None
     parts = cred.split(".")
     if len(parts) != 3 or parts[0] != REMOTE_CRED_PREFIX:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,4000}", parts[1]):
         return None
     try:
         padded = parts[1] + "=" * (-len(parts[1]) % 4)
@@ -230,8 +500,29 @@ def remote_cred_parse(cred: str) -> dict | None:
         payload = json.loads(raw)
     except Exception:
         return None
-    if not isinstance(payload, dict) or not payload.get("a") or not payload.get("p") or not payload.get("t"):
+    if not isinstance(payload, dict):
         return None
+    addr = payload.get("a")
+    token = payload.get("t")
+    try:
+        port_text = str(payload.get("p", ""))
+        if len(port_text) > 5 or not port_text.isdigit():
+            return None
+        port = int(port_text)
+    except (TypeError, ValueError):
+        return None
+    if (
+        payload.get("v") != 1
+        or not isinstance(addr, str)
+        or not 1 <= len(addr) <= 253
+        or any(ord(char) < 33 or ord(char) == 127 for char in addr)
+        or any(char in addr for char in "/@?#[]:")
+        or not 1 <= port <= 65535
+        or not isinstance(token, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", token)
+    ):
+        return None
+    payload["p"] = port
     return payload
 
 
@@ -242,10 +533,17 @@ def remote_cred_verify(cred: str) -> dict | None:
     parts = cred.split(".")
     if len(parts) != 3 or parts[0] != REMOTE_CRED_PREFIX:
         return None
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]{1,4000}", parts[1])
+        or not re.fullmatch(r"[A-Za-z0-9_-]{43}", parts[2])
+    ):
+        return None
     try:
         padded = parts[2] + "=" * (-len(parts[2]) % 4)
         given = base64.urlsafe_b64decode(padded)
     except Exception:
+        return None
+    if len(given) != hashlib.sha256().digest_size:
         return None
     key = remote_key_load_or_create()
     expect = hmac.new(key, (parts[0] + "." + parts[1]).encode("ascii"), hashlib.sha256).digest()
@@ -265,6 +563,22 @@ def utc_now() -> str:
 
 def epoch_now() -> int:
     return int(time.time())
+
+
+def bounded_remote_number(value: Any, maximum: float, *, integer: bool = False) -> int | float:
+    """Parse an untrusted remote metric without expensive huge-number conversion."""
+    if isinstance(value, bool):
+        number = float(int(value))
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and len(value) <= 32 and re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value):
+        number = float(value)
+    else:
+        return 0
+    if not math.isfinite(number):
+        return 0
+    number = max(0.0, min(float(maximum), number))
+    return int(number) if integer else number
 
 
 def parse_date(value: str) -> date | None:
@@ -638,6 +952,8 @@ class NexusConfig:
     traffic_mode: str = "both"
     public_port: int = 7900
     sub_port: int = 0
+    subscription_access_mode: str = "local"
+    subscription_domain: str = ""
 
     @classmethod
     def load(cls) -> "NexusConfig":
@@ -655,6 +971,8 @@ class NexusConfig:
         stats_port = int(raw.get("stats_port", 39091))
         ssh_host = str(raw.get("ssh_host", "服务器IP")).strip()
         sub_port = int(raw.get("sub_port", 0))
+        subscription_access_mode = str(raw.get("subscription_access_mode", "local"))
+        subscription_domain = str(raw.get("subscription_domain", "")).strip()
         traffic_mode = str(raw.get("traffic_mode", "both") or "both")
         if (
             mode not in {"local", "public"}
@@ -668,6 +986,23 @@ class NexusConfig:
             or len(ssh_host) > 255
             or any(ord(char) < 33 or ord(char) == 127 for char in ssh_host)
             or traffic_mode not in {"both", "upload"}
+            or subscription_access_mode not in {"local", "https"}
+            or (
+                subscription_access_mode == "https"
+                and not _is_dns_name(subscription_domain)
+            )
+            or (
+                subscription_access_mode == "local"
+                and bool(subscription_domain)
+            )
+            or (
+                CONFIG_PATH == Path("/etc/rr-nexus/nexus.json")
+                and (
+                    database != Path("/var/lib/rr-nexus/nexus.db")
+                    or subscription_root != Path("/var/lib/rr-nexus/subscriptions")
+                    or published_subscription_root != Path("/tmp/sub_server/nexus")
+                )
+            )
         ):
             raise ValueError("invalid RR Nexus config")
         return cls(
@@ -684,6 +1019,8 @@ class NexusConfig:
             traffic_mode=traffic_mode,
             public_port=public_port,
             sub_port=sub_port,
+            subscription_access_mode=subscription_access_mode,
+            subscription_domain=subscription_domain,
         )
 
     @property
@@ -698,9 +1035,12 @@ class StoreCorruptionError(RuntimeError):
 class Store:
     def __init__(self, path: Path):
         self.path = path
+        self._history_cleanup_lock = threading.Lock()
+        self._last_history_cleanup = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.verify_integrity()
         self.initialize()
+        self.prune_history(force=True)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -759,6 +1099,7 @@ class Store:
                     totp_secret TEXT NOT NULL DEFAULT '',
                     totp_pending_secret TEXT NOT NULL DEFAULT '',
                     totp_enabled INTEGER NOT NULL DEFAULT 0,
+                    security_version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -772,6 +1113,16 @@ class Store:
                     admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
                     csrf_token TEXT NOT NULL,
                     remote_ip TEXT NOT NULL,
+                    security_version INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS step_up_tokens (
+                    token_hash TEXT PRIMARY KEY,
+                    session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+                    admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+                    purpose TEXT NOT NULL,
+                    security_version INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL
                 );
@@ -857,6 +1208,7 @@ class Store:
                     failed_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_remote_failures_ip ON remote_failures(remote_ip, failed_at);
+                CREATE INDEX IF NOT EXISTS idx_remote_failures_time ON remote_failures(failed_at, id);
                 CREATE TABLE IF NOT EXISTS remote_servers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -908,6 +1260,7 @@ class Store:
                     challenge TEXT NOT NULL,
                     ceremony TEXT NOT NULL,
                     admin_id INTEGER REFERENCES admins(id) ON DELETE CASCADE,
+                    session_hash TEXT REFERENCES sessions(token_hash) ON DELETE CASCADE,
                     remote_ip TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL
@@ -917,6 +1270,8 @@ class Store:
                     applied_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
+                CREATE INDEX IF NOT EXISTS step_up_expiry_idx ON step_up_tokens(expires_at);
+                CREATE INDEX IF NOT EXISTS step_up_session_idx ON step_up_tokens(session_hash,purpose);
                 CREATE INDEX IF NOT EXISTS audit_created_idx ON audit_log(created_at);
                 CREATE INDEX IF NOT EXISTS system_samples_bucket_idx ON system_samples(bucket);
                 CREATE INDEX IF NOT EXISTS notification_log_created_idx ON notification_log(created_at);
@@ -954,6 +1309,49 @@ class Store:
                 db.execute("ALTER TABLE admins ADD COLUMN totp_pending_secret TEXT NOT NULL DEFAULT ''")
             if "totp_enabled" not in admin_columns:
                 db.execute("ALTER TABLE admins ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
+            if "security_version" not in admin_columns:
+                db.execute(
+                    "ALTER TABLE admins ADD COLUMN security_version INTEGER NOT NULL DEFAULT 0"
+                )
+            session_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "security_version" not in session_columns:
+                db.execute(
+                    "ALTER TABLE sessions ADD COLUMN security_version "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                # Legacy rows were not bound to the authentication state at
+                # issuance time.  Backfilling the current value could bless a
+                # session created by the exact login/factor-change race this
+                # column closes, so require a fresh login after migration.
+                db.execute("DELETE FROM sessions")
+            step_up_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(step_up_tokens)").fetchall()
+            }
+            if "security_version" not in step_up_columns:
+                db.execute(
+                    "ALTER TABLE step_up_tokens ADD COLUMN security_version "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+                # A pre-upgrade ticket was not bound to an authentication
+                # state and must not survive the schema migration.
+                db.execute("DELETE FROM step_up_tokens")
+            challenge_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(webauthn_challenges)").fetchall()
+            }
+            if "session_hash" not in challenge_columns:
+                db.execute(
+                    "ALTER TABLE webauthn_challenges ADD COLUMN session_hash TEXT "
+                    "REFERENCES sessions(token_hash) ON DELETE CASCADE"
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS webauthn_challenge_session_idx "
+                "ON webauthn_challenges(session_hash,ceremony,expires_at)"
+            )
             columns = {
                 row["name"] for row in db.execute("PRAGMA table_info(devices)").fetchall()
             }
@@ -1004,6 +1402,60 @@ class Store:
                 "INSERT INTO audit_log(created_at,actor,action,target,remote_ip,detail) VALUES(?,?,?,?,?,?)",
                 (utc_now(), actor[:64], action[:64], target[:128], remote_ip[:64], detail[:512]),
             )
+        self.prune_history()
+
+    def prune_history(self, *, force: bool = False) -> None:
+        """Hourly retention and hard row caps for long-running installations."""
+        now = epoch_now()
+        if not force and now - self._last_history_cleanup < 3600:
+            return
+        if not self._history_cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            if not force and now - self._last_history_cleanup < 3600:
+                return
+            audit_cutoff = datetime.fromtimestamp(
+                now - AUDIT_RETENTION_SECONDS, timezone.utc
+            ).replace(microsecond=0).isoformat()
+            notification_cutoff = datetime.fromtimestamp(
+                now - NOTIFICATION_RETENTION_SECONDS, timezone.utc
+            ).replace(microsecond=0).isoformat()
+            with self.connect() as db:
+                db.execute("DELETE FROM audit_log WHERE created_at<?", (audit_cutoff,))
+                db.execute(
+                    "DELETE FROM audit_log WHERE id NOT IN "
+                    "(SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)",
+                    (MAX_AUDIT_ROWS,),
+                )
+                db.execute(
+                    "DELETE FROM notification_log WHERE created_at<?",
+                    (notification_cutoff,),
+                )
+                db.execute(
+                    "DELETE FROM notification_log WHERE id NOT IN "
+                    "(SELECT id FROM notification_log ORDER BY id DESC LIMIT ?)",
+                    (MAX_NOTIFICATION_ROWS,),
+                )
+                db.execute(
+                    "DELETE FROM notification_dedup WHERE sent_at<?",
+                    (now - NOTIFICATION_RETENTION_SECONDS,),
+                )
+                db.execute("DELETE FROM sessions WHERE expires_at<=?", (now,))
+                db.execute("DELETE FROM step_up_tokens WHERE expires_at<=?", (now,))
+                db.execute("DELETE FROM webauthn_challenges WHERE expires_at<=?", (now,))
+                db.execute(
+                    "DELETE FROM remote_failures WHERE failed_at<?",
+                    (now - REMOTE_FAIL_WINDOW,),
+                )
+                db.execute(
+                    "DELETE FROM remote_failures WHERE id NOT IN "
+                    "(SELECT id FROM remote_failures "
+                    "ORDER BY failed_at DESC,id DESC LIMIT ?)",
+                    (REMOTE_FAILURE_MAX_ROWS,),
+                )
+            self._last_history_cleanup = now
+        finally:
+            self._history_cleanup_lock.release()
 
 
 def network_interfaces() -> list[str]:
@@ -1144,6 +1596,8 @@ class TrafficCollector:
 
     def collect_server_traffic(self) -> None:
         """Persist real host-interface RX/TX deltas for carrier-package monitoring."""
+        if update_maintenance_active():
+            return
         try:
             with self.state.store.connect() as db:
                 policy = db.execute(
@@ -1227,6 +1681,12 @@ class TrafficCollector:
             )
 
     def collect_once(self, trigger_sync: bool = False) -> tuple[bool, str]:
+        # The candidate service is deliberately started for its local/public
+        # health gates before the installer commits.  Do not let its collector
+        # create post-snapshot writes that a subsequent rollback would erase.
+        if update_maintenance_active():
+            self.set_status(False, "update_maintenance")
+            return True, "update_maintenance"
         if not self.collect_lock.acquire(blocking=False):
             return True, "collector_busy"
         quota_crossed: list[str] = []
@@ -1415,7 +1875,11 @@ class NexusState:
     def __init__(self, config: NexusConfig):
         self.config = config
         self.store = Store(config.database)
-        self.password_hasher = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+        self.password_hasher = BoundedPasswordHasher(
+            time_cost=3,
+            memory_cost=65536,
+            parallelism=2,
+        )
         # Keep unknown-user and wrong-password paths at comparable Argon2 cost
         # so login timing does not reveal whether an administrator name exists.
         self.dummy_password_hash = self.password_hasher.hash(secrets.token_urlsafe(32))
@@ -1434,6 +1898,8 @@ class NexusState:
         self._last_alert_check = 0
 
     def check_alerts_async(self) -> None:
+        if update_maintenance_active():
+            return
         now = epoch_now()
         if now - self._last_alert_check < 60 or not self._alert_lock.acquire(blocking=False):
             return
@@ -1448,6 +1914,8 @@ class NexusState:
         threading.Thread(target=run, name="rr-nexus-alerts", daemon=True).start()
 
     def evaluate_alerts(self) -> None:
+        if update_maintenance_active():
+            return
         cfg = self.notifications.settings(masked=False)
         if not cfg.get("enabled"):
             return
@@ -1627,12 +2095,21 @@ class NexusState:
         with self.store.connect() as db:
             admin = db.execute("SELECT * FROM admins WHERE username = ?", (username,)).fetchone()
             if admin:
+                password_hash = str(admin["password_hash"])
+                security_version = int(admin["security_version"])
                 try:
-                    if self.password_hasher.verify(admin["password_hash"], password):
-                        if self.password_hasher.check_needs_rehash(admin["password_hash"]):
+                    if self.password_hasher.verify(password_hash, password):
+                        if self.password_hasher.check_needs_rehash(password_hash):
                             db.execute(
-                                "UPDATE admins SET password_hash=?, updated_at=? WHERE id=?",
-                                (self.password_hasher.hash(password), utc_now(), admin["id"]),
+                                "UPDATE admins SET password_hash=?,updated_at=? "
+                                "WHERE id=? AND password_hash=? AND security_version=?",
+                                (
+                                    self.password_hasher.hash(password),
+                                    utc_now(),
+                                    admin["id"],
+                                    password_hash,
+                                    security_version,
+                                ),
                             )
                         return admin, "password"
                 except (VerifyMismatchError, InvalidHash):
@@ -1640,8 +2117,16 @@ class NexusState:
 
                 recovery_hash = sha256_text(password.strip().upper())
                 recovery = db.execute(
-                    "UPDATE recovery_codes SET used_at=? WHERE code_hash=? AND admin_id=? AND used_at IS NULL",
-                    (utc_now(), recovery_hash, admin["id"]),
+                    "UPDATE recovery_codes SET used_at=? WHERE code_hash=? "
+                    "AND admin_id=? AND used_at IS NULL AND EXISTS("
+                    "SELECT 1 FROM admins WHERE id=? AND security_version=?)",
+                    (
+                        utc_now(),
+                        recovery_hash,
+                        admin["id"],
+                        admin["id"],
+                        security_version,
+                    ),
                 )
                 if recovery.rowcount == 1:
                     return admin, "recovery"
@@ -1656,8 +2141,16 @@ class NexusState:
         return self.authenticate_with_method(username, password)[0]
 
     def create_webauthn_challenge(
-        self, ceremony: str, remote_ip: str, admin_id: int | None = None
+        self,
+        ceremony: str,
+        remote_ip: str,
+        admin_id: int | None = None,
+        session_hash: str | None = None,
     ) -> tuple[str, str]:
+        if ceremony not in {"login", "register"}:
+            raise ValueError("invalid passkey ceremony")
+        if ceremony == "register" and (admin_id is None or not session_hash):
+            raise ValueError("register challenge requires a session")
         challenge_id = secrets.token_urlsafe(24)
         challenge = b64url_encode(secrets.token_bytes(32))
         now = epoch_now()
@@ -1673,38 +2166,88 @@ class NexusState:
                 if int(recent) >= 20:
                     raise ValueError("passkey_challenge_rate_limited")
             db.execute(
-                "INSERT INTO webauthn_challenges(id,challenge,ceremony,admin_id,remote_ip,created_at,expires_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (challenge_id, challenge, ceremony, admin_id, remote_ip, now, now + 300),
+                "INSERT INTO webauthn_challenges("
+                "id,challenge,ceremony,admin_id,session_hash,remote_ip,created_at,expires_at"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    challenge_id,
+                    challenge,
+                    ceremony,
+                    admin_id,
+                    session_hash,
+                    remote_ip,
+                    now,
+                    now + 300,
+                ),
             )
         return challenge_id, challenge
 
     def consume_webauthn_challenge(
-        self, challenge_id: str, ceremony: str, remote_ip: str
+        self,
+        challenge_id: str,
+        ceremony: str,
+        remote_ip: str,
+        session_hash: str | None = None,
     ) -> sqlite3.Row | None:
+        if ceremony == "register" and not session_hash:
+            return None
         now = epoch_now()
         with self.store.connect() as db:
             # Serialize SELECT+DELETE so one WebAuthn ceremony cannot be
             # consumed twice by concurrent requests.
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT * FROM webauthn_challenges WHERE id=? AND ceremony=? AND remote_ip=? AND expires_at>?",
-                (challenge_id, ceremony, remote_ip, now),
-            ).fetchone()
+            if session_hash is None:
+                row = db.execute(
+                    "SELECT * FROM webauthn_challenges WHERE id=? AND ceremony=? "
+                    "AND remote_ip=? AND session_hash IS NULL AND expires_at>?",
+                    (challenge_id, ceremony, remote_ip, now),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT * FROM webauthn_challenges WHERE id=? AND ceremony=? "
+                    "AND remote_ip=? AND session_hash=? AND expires_at>?",
+                    (challenge_id, ceremony, remote_ip, session_hash, now),
+                ).fetchone()
             if row:
                 db.execute("DELETE FROM webauthn_challenges WHERE id=?", (challenge_id,))
         return row
 
-    def create_session(self, admin_id: int, remote_ip: str) -> tuple[str, str]:
-        token = secrets.token_urlsafe(36)
+    def create_session(
+        self,
+        admin_id: int,
+        remote_ip: str,
+        expected_security_version: int,
+    ) -> tuple[str, str] | None:
+        # Transport-specific prefixes make every pre-migration cookie token
+        # unusable as a new local bearer and prevent a token surviving a mode
+        # switch from crossing the cookie/bearer trust boundary.
+        token = SESSION_TOKEN_PREFIX[self.config.mode] + secrets.token_urlsafe(36)
         csrf = secrets.token_urlsafe(24)
         now = epoch_now()
         with self.store.connect() as db:
+            # Serialize with every factor mutation.  If the mutation commits
+            # first the version predicate rejects this stale authentication;
+            # if this insert commits first the mutation deletes the new row.
+            db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
-            db.execute(
-                "INSERT INTO sessions(token_hash,admin_id,csrf_token,remote_ip,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                (sha256_text(token), admin_id, csrf, remote_ip, now, now + SESSION_HOURS * 3600),
+            cursor = db.execute(
+                "INSERT INTO sessions("
+                "token_hash,admin_id,csrf_token,remote_ip,security_version,"
+                "created_at,expires_at) "
+                "SELECT ?,id,?,?,security_version,?,? FROM admins "
+                "WHERE id=? AND security_version=?",
+                (
+                    sha256_text(token),
+                    csrf,
+                    remote_ip,
+                    now,
+                    now + SESSION_HOURS * 3600,
+                    admin_id,
+                    int(expected_security_version),
+                ),
             )
+            if cursor.rowcount != 1:
+                return None
         return token, csrf
 
     def session(self, token: str) -> sqlite3.Row | None:
@@ -1713,12 +2256,133 @@ class NexusState:
         now = epoch_now()
         with self.store.connect() as db:
             row = db.execute(
-                "SELECT sessions.*,admins.username FROM sessions JOIN admins ON admins.id=sessions.admin_id WHERE token_hash=? AND expires_at>?",
+                "SELECT sessions.token_hash,sessions.admin_id,"
+                "sessions.csrf_token,sessions.remote_ip,"
+                "sessions.security_version AS session_security_version,"
+                "sessions.created_at,sessions.expires_at,admins.username,"
+                "admins.security_version AS admin_security_version "
+                "FROM sessions JOIN admins ON admins.id=sessions.admin_id "
+                "WHERE token_hash=? AND expires_at>? "
+                "AND sessions.security_version=admins.security_version",
                 (sha256_text(token), now),
             ).fetchone()
         return row
 
+    def issue_step_up_ticket(
+        self,
+        session_hash: str,
+        admin_id: int,
+        purpose: str,
+        now: int | None = None,
+        expected_security_version: int | None = None,
+    ) -> str:
+        """Issue one action-scoped ticket bound to the current login session."""
+        if purpose not in STEP_UP_PURPOSES:
+            raise ValueError("invalid step-up purpose")
+        issued_at = epoch_now() if now is None else int(now)
+        token = secrets.token_urlsafe(32)
+        token_hash = sha256_text(token)
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM step_up_tokens WHERE expires_at<=?", (issued_at,))
+            session = db.execute(
+                "SELECT sessions.expires_at,"
+                "sessions.security_version AS session_security_version,"
+                "admins.security_version AS admin_security_version "
+                "FROM sessions JOIN admins ON admins.id=sessions.admin_id "
+                "WHERE sessions.token_hash=? AND sessions.admin_id=? "
+                "AND sessions.expires_at>? "
+                "AND sessions.security_version=admins.security_version",
+                (session_hash, admin_id, issued_at),
+            ).fetchone()
+            if not session:
+                raise ValueError("invalid session")
+            security_version = int(session["session_security_version"])
+            if (
+                expected_security_version is not None
+                and security_version != int(expected_security_version)
+            ):
+                raise ValueError("security state changed")
+            # Rotating a same-purpose ticket keeps the table bounded and makes
+            # a second verification supersede an earlier, possibly exposed,
+            # ticket for that action.
+            db.execute(
+                "DELETE FROM step_up_tokens "
+                "WHERE session_hash=? AND admin_id=? AND purpose=?",
+                (session_hash, admin_id, purpose),
+            )
+            db.execute(
+                "INSERT INTO step_up_tokens("
+                "token_hash,session_hash,admin_id,purpose,security_version,"
+                "created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    token_hash,
+                    session_hash,
+                    admin_id,
+                    purpose,
+                    security_version,
+                    issued_at,
+                    min(issued_at + STEP_UP_TTL_SECONDS, int(session["expires_at"])),
+                ),
+            )
+        return token
+
+    def step_up_ticket_valid(
+        self,
+        token: str,
+        session_hash: str,
+        admin_id: int,
+        purpose: str,
+        now: int | None = None,
+    ) -> bool:
+        if not token or purpose not in STEP_UP_PURPOSES:
+            return False
+        checked_at = epoch_now() if now is None else int(now)
+        with self.store.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM step_up_tokens JOIN admins "
+                "ON admins.id=step_up_tokens.admin_id "
+                "WHERE step_up_tokens.token_hash=? AND session_hash=? "
+                "AND step_up_tokens.admin_id=? AND purpose=? AND expires_at>? "
+                "AND step_up_tokens.security_version=admins.security_version",
+                (sha256_text(token), session_hash, admin_id, purpose, checked_at),
+            ).fetchone()
+        return row is not None
+
+    def consume_step_up_ticket(
+        self,
+        token: str,
+        session_hash: str,
+        admin_id: int,
+        purpose: str,
+        now: int | None = None,
+    ) -> bool:
+        """Atomically consume a ticket; concurrent replay can win only once."""
+        if not token or purpose not in STEP_UP_PURPOSES:
+            return False
+        consumed_at = epoch_now() if now is None else int(now)
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM step_up_tokens WHERE expires_at<=?", (consumed_at,))
+            cursor = db.execute(
+                "DELETE FROM step_up_tokens WHERE token_hash=? AND session_hash=? "
+                "AND admin_id=? AND purpose=? AND expires_at>? "
+                "AND security_version=(SELECT security_version FROM admins "
+                "WHERE admins.id=step_up_tokens.admin_id)",
+                (sha256_text(token), session_hash, admin_id, purpose, consumed_at),
+            )
+        return cursor.rowcount == 1
+
+    def revoke_step_up_tickets(self, admin_id: int) -> None:
+        with self.store.connect() as db:
+            db.execute("DELETE FROM step_up_tokens WHERE admin_id=?", (admin_id,))
+
     def sync_devices(self) -> tuple[bool, str]:
+        # Also covers a deferred worker that was queued just before the
+        # maintenance marker appeared.  The old service is stopped before the
+        # snapshot, while the candidate service remains read-only until commit.
+        if update_maintenance_active():
+            return False, "update_maintenance"
         # P2 O(n) 合并窗口：已有同步在执行时，本次请求只标记 pending 秒回，
         # 由正在执行的同步完成后 drain（再跑一轮兜住期间的所有变更）。
         with self._sync_state_lock:
@@ -1729,17 +2393,20 @@ class NexusState:
         try:
             while True:
                 ok, detail = self._do_sync_once()
-                if not ok:
-                    return False, detail
                 with self._sync_state_lock:
-                    if not self._sync_pending:
-                        break
-                    self._sync_pending = False
-        finally:
+                    if self._sync_pending:
+                        self._sync_pending = False
+                        continue
+                    # Checking pending and handing inflight back must be one
+                    # atomic transition.  Previously a caller could set
+                    # pending after the check but before finally cleared
+                    # inflight, leaving an acknowledged update with no drainer.
+                    self._sync_inflight = False
+                    return ok, detail
+        except BaseException:
             with self._sync_state_lock:
                 self._sync_inflight = False
-
-        return True, ""
+            raise
 
     def _do_sync_once(self) -> tuple[bool, str]:
         with self.sync_lock:
@@ -1748,7 +2415,7 @@ class NexusState:
                     ["/usr/local/bin/rr", "--sync-devices"],
                     text=True,
                     capture_output=True,
-                    timeout=60,
+                    timeout=DEVICE_SYNC_TIMEOUT_SECONDS,
                     check=False,
                     env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
                 )
@@ -2099,6 +2766,68 @@ SERVER_STATS = ServerStatsSampler()
 STATE: NexusState
 
 
+def remote_failure_state(remote_ip: str, now: int | None = None) -> tuple[bool, int]:
+    """Read the persistent lock state without reserving another failure."""
+    checked_at = epoch_now() if now is None else int(now)
+    cutoff = checked_at - REMOTE_FAIL_WINDOW
+    with STATE.store.connect() as db:
+        row = db.execute(
+            "SELECT COUNT(*),MIN(failed_at) FROM remote_failures "
+            "WHERE remote_ip=? AND failed_at>?",
+            (remote_ip[:64], cutoff),
+        ).fetchone()
+    count = int(row[0] if row else 0)
+    oldest = int(row[1] or checked_at) if row else checked_at
+    if count >= REMOTE_FAIL_LIMIT:
+        return True, max(1, min(REMOTE_FAIL_WINDOW, oldest + REMOTE_FAIL_WINDOW - checked_at))
+    return False, 0
+
+
+def reserve_remote_failure(remote_ip: str, now: int | None = None) -> tuple[bool, int]:
+    """Atomically reserve one failed-auth slot and keep the journal bounded.
+
+    The boolean is true when this failure acquired one of the per-IP slots.
+    Once the threshold is full, contenders do not insert and receive the
+    remaining lock time instead.  BEGIN IMMEDIATE makes count+insert one
+    decision across all request threads and service processes.
+    """
+    failed_at = epoch_now() if now is None else int(now)
+    cutoff = failed_at - REMOTE_FAIL_WINDOW
+    address = remote_ip[:64]
+    with STATE.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM remote_failures WHERE failed_at<=?", (cutoff,))
+        row = db.execute(
+            "SELECT COUNT(*),MIN(failed_at) FROM remote_failures WHERE remote_ip=?",
+            (address,),
+        ).fetchone()
+        count = int(row[0] if row else 0)
+        oldest = int(row[1] or failed_at) if row else failed_at
+        if count >= REMOTE_FAIL_LIMIT:
+            retry_after = max(
+                1,
+                min(REMOTE_FAIL_WINDOW, oldest + REMOTE_FAIL_WINDOW - failed_at),
+            )
+            return False, retry_after
+        db.execute(
+            "INSERT INTO remote_failures(remote_ip,failed_at) VALUES(?,?)",
+            (address, failed_at),
+        )
+        # An attacker can rotate IP addresses (especially IPv6).  Retention by
+        # time alone is therefore insufficient; enforce a hard global row cap
+        # in the same write transaction.
+        total = int(db.execute("SELECT COUNT(*) FROM remote_failures").fetchone()[0])
+        excess = total - REMOTE_FAILURE_MAX_ROWS
+        if excess > 0:
+            db.execute(
+                "DELETE FROM remote_failures WHERE id IN "
+                "(SELECT id FROM remote_failures "
+                "ORDER BY failed_at,id LIMIT ?)",
+                (excess,),
+            )
+    return True, 0
+
+
 def _is_ip_address(value: str) -> bool:
     try:
         ipaddress.ip_address((value or "").strip().strip("[]"))
@@ -2107,10 +2836,53 @@ def _is_ip_address(value: str) -> bool:
         return False
 
 
+def _is_dns_name(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
+            (value or "").strip(),
+        )
+    )
+
+
 def _url_host(value: str) -> str:
     """Return an RFC 3986 host, adding brackets around an IPv6 literal."""
     host = (value or "").strip().strip("[]")
     return "[{}]".format(host) if ":" in host else host
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with finite concurrency and slow-client deadlines."""
+
+    daemon_threads = True
+    request_queue_size = 64
+    max_active_requests = 64
+    request_timeout_seconds = 15
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._request_slots = threading.BoundedSemaphore(self.max_active_requests)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):  # type: ignore[no-untyped-def]
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout_seconds)
+        return request, address
+
+    def process_request(self, request, client_address):  # type: ignore[no-untyped-def]
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):  # type: ignore[no-untyped-def]
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2118,14 +2890,31 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+        # BaseHTTPRequestHandler 默认记录完整 request line；公开订阅路径含长期
+        # token，写进 journal 即构成凭据泄漏。只记录错误状态与来源，不记录 URL。
+        try:
+            status = int(args[1]) if len(args) >= 2 else 0
+        except (TypeError, ValueError):
+            status = 0
+        if status >= 400:
+            sys.stderr.write(
+                "{} {} HTTP {}\n".format(
+                    self.log_date_time_string(), self.client_address[0], status
+                )
+            )
 
     @property
     def remote_ip(self) -> str:
         if STATE.config.mode == "public" and self.client_address[0] in {"127.0.0.1", "::1"}:
-            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
-            if forwarded and len(forwarded) <= 64:
-                return forwarded
+            forwarded = self.headers.get("X-Forwarded-For", "").strip()
+            # Nginx is configured to replace, not append, this header.  Reject
+            # lists and malformed values so an Internet client cannot choose
+            # the rate-limit/audit identity by supplying its own XFF value.
+            if forwarded and "," not in forwarded and len(forwarded) <= 64:
+                try:
+                    return str(ipaddress.ip_address(forwarded))
+                except ValueError:
+                    pass
         return self.client_address[0]
 
     def security_headers(self, content_type: str) -> None:
@@ -2136,7 +2925,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self' https:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         self.send_header("Cache-Control", "no-store")
         if STATE.config.mode == "public":
@@ -2145,11 +2934,16 @@ class Handler(BaseHTTPRequestHandler):
     def read_json_body(self) -> dict:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
-            if content_length < 0 or content_length > MAX_JSON_BODY_BYTES:
+            if content_length > MAX_JSON_BODY_BYTES:
+                raise RequestBodyTooLarge(MAX_JSON_BODY_BYTES)
+            if content_length <= 0:
                 return {}
-            raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except RequestBodyTooLarge:
+            raise
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError):
             return {}
 
     def _run_rr_json(self, argv: list[str]) -> dict:
@@ -2212,32 +3006,47 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            length = 0
-        if length <= 0 or length > MAX_BODY:
-            try:
-                raw = self.rfile.read(MAX_BODY)
-                if not raw: return None
-                payload = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError, OSError):
-                return None
-            return payload if isinstance(payload, dict) else None
+            return None
+        if length > MAX_BODY:
+            raise RequestBodyTooLarge(MAX_BODY)
+        if length <= 0:
+            return None
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
 
-    def cookie_token(self) -> str:
-        cookie = SimpleCookie()
-        try:
-            cookie.load(self.headers.get("Cookie", ""))
-        except Exception:
+    def bearer_token(self) -> str:
+        authorization = self.headers.get("Authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer":
             return ""
-        morsel = cookie.get("rr_nexus_session")
-        return morsel.value if morsel else ""
+        token = token.strip()
+        return token if SESSION_TOKEN_RE.fullmatch(token) else ""
+
+    def session_token(self) -> str:
+        # Cookies have no port boundary.  Use an origin-explicit bearer in both
+        # modes so a sibling service on the same host cannot receive or replay
+        # the panel session.  The public-bearer prefix also invalidates every
+        # public session issued by the former cookie transport.
+        token = self.bearer_token()
+        prefix = SESSION_TOKEN_PREFIX[STATE.config.mode]
+        return token if token.startswith(prefix) else ""
+
+    @staticmethod
+    def legacy_session_cookie_headers() -> dict[str, str] | None:
+        if STATE.config.mode != "public":
+            return None
+        return {
+            "Set-Cookie": (
+                f"{SESSION_COOKIE_NAME}=; Path=/; Secure; HttpOnly; "
+                "SameSite=Strict; Max-Age=0"
+            )
+        }
 
     def current_session(self) -> sqlite3.Row | None:
-        return STATE.session(self.cookie_token())
+        return STATE.session(self.session_token())
 
     def require_session(self, csrf: bool = False) -> sqlite3.Row | None:
         remote = getattr(self, "_remote_session", None)
@@ -2255,10 +3064,129 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return session
 
+    def require_step_up(
+        self,
+        session: sqlite3.Row | dict,
+        purpose: str,
+        *,
+        consume: bool = True,
+    ) -> bool:
+        """Require a session-bound, action-scoped step-up ticket."""
+        if isinstance(session, dict) and session.get("remote"):
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": "step_up_required"})
+            return False
+        token = self.headers.get("X-Step-Up-Token", "").strip()
+        if len(token) > 256:
+            token = ""
+        session_hash = str(session["token_hash"])
+        admin_id = int(session["admin_id"])
+        valid = (
+            STATE.consume_step_up_ticket(token, session_hash, admin_id, purpose)
+            if consume
+            else STATE.step_up_ticket_valid(token, session_hash, admin_id, purpose)
+        )
+        if not valid:
+            self.send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "step_up_required",
+                    "message": "此操作需要重新验证当前密码与两步验证。",
+                },
+            )
+            return False
+        return True
+
+    def handle_step_up(self, session: sqlite3.Row) -> None:
+        payload = self.read_json() or {}
+        purpose = str(payload.get("purpose", ""))
+        password = str(payload.get("password", ""))[:512]
+        otp = str(payload.get("otp", ""))[:16]
+        if purpose not in STEP_UP_PUBLIC_PURPOSES:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_step_up_purpose"})
+            return
+        locked, retry_after = STATE.client_is_locked(self.remote_ip, session["username"])
+        if locked:
+            self.send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "too_many_attempts", "retry_after": retry_after},
+                {"Retry-After": str(retry_after)},
+            )
+            return
+        with STATE.store.connect() as db:
+            admin = db.execute(
+                "SELECT password_hash,totp_secret,totp_enabled,security_version "
+                "FROM admins WHERE id=?",
+                (session["admin_id"],),
+            ).fetchone()
+        expected_security_version = int(session["session_security_version"])
+        if not admin or int(admin["security_version"]) != expected_security_version:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+            return
+        password_ok = False
+        if admin and password:
+            try:
+                password_ok = STATE.password_hasher.verify(admin["password_hash"], password)
+            except (VerifyMismatchError, InvalidHash):
+                password_ok = False
+        totp_ok = bool(
+            admin
+            and (
+                not bool(admin["totp_enabled"])
+                or (otp and verify_totp(str(admin["totp_secret"]), otp))
+            )
+        )
+        if not password_ok or not totp_ok:
+            STATE.record_login_failure(self.remote_ip, session["username"])
+            STATE.store.audit(
+                session["username"],
+                "step_up_failed",
+                purpose,
+                self.remote_ip,
+            )
+            self.send_json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "step_up_verification_failed",
+                    "message": "当前密码或两步验证码不正确。",
+                },
+            )
+            return
+        STATE.clear_login_failures(self.remote_ip, session["username"])
+        try:
+            ticket = STATE.issue_step_up_ticket(
+                str(session["token_hash"]),
+                int(session["admin_id"]),
+                purpose,
+                expected_security_version=expected_security_version,
+            )
+        except ValueError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+            return
+        STATE.store.audit(
+            session["username"], "step_up_verified", purpose, self.remote_ip
+        )
+        self.send_json(
+            HTTPStatus.OK,
+            {"ok": True, "ticket": ticket, "expires_in": STEP_UP_TTL_SECONDS},
+        )
+
     def parse_path(self) -> tuple[str, list[str], dict[str, list[str]]]:
         parsed = urllib.parse.urlsplit(self.path)
         segments = [urllib.parse.unquote(value) for value in parsed.path.split("/") if value]
         return parsed.path, segments, urllib.parse.parse_qs(parsed.query)
+
+    def reject_api_during_update(self, path: str) -> bool:
+        if not path.startswith("/api/") or not update_maintenance_active():
+            return False
+        self.send_json(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {
+                "error": "update_maintenance",
+                "message": "RR-vps 正在执行受保护更新，请稍后重试。",
+            },
+            {"Retry-After": "2"},
+        )
+        return True
 
     def do_GET(self) -> None:  # noqa: N802
         path, segments, query = self.parse_path()
@@ -2278,12 +3206,22 @@ class Handler(BaseHTTPRequestHandler):
                 {"ok": healthy, "service": "rr-nexus"},
             )
             return
+        if self.reject_api_during_update(path):
+            return
         if path == "/api/session":
             session = self.current_session()
             if not session:
-                self.send_json(HTTPStatus.OK, {"authenticated": False, "mode": STATE.config.mode})
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"authenticated": False, "mode": STATE.config.mode},
+                    self.legacy_session_cookie_headers(),
+                )
             else:
-                self.send_json(HTTPStatus.OK, {"authenticated": True, "username": session["username"], "csrf": session["csrf_token"], "mode": STATE.config.mode, "domain": STATE.config.domain, "port": STATE.config.port, "ssh_host": STATE.config.ssh_host})
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"authenticated": True, "username": session["username"], "csrf": session["csrf_token"], "mode": STATE.config.mode, "domain": STATE.config.domain, "port": STATE.config.port, "ssh_host": STATE.config.ssh_host},
+                    self.legacy_session_cookie_headers(),
+                )
             return
         if path == "/api/security":
             session = self.require_session()
@@ -2292,7 +3230,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/security/totp/qr":
             session = self.require_session()
-            if session:
+            if session and self.require_step_up(
+                session, "totp_confirm", consume=False
+            ):
                 self.handle_totp_qr(session)
             return
         if path == "/api/notifications":
@@ -2400,9 +3340,34 @@ class Handler(BaseHTTPRequestHandler):
         self.serve_static(path)
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._dispatch_post()
+        except RequestBodyTooLarge as exc:
+            self.send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "request_body_too_large", "limit": int(exc.args[0])},
+            )
+        except PasswordHashBusy:
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "authentication_temporarily_unavailable",
+                    "message": "身份验证暂时繁忙，请稍后重试。",
+                },
+                {"Retry-After": "1"},
+            )
+
+    def _dispatch_post(self) -> None:
         path, segments, _ = self.parse_path()
+        if self.reject_api_during_update(path):
+            return
         if path == "/api/login":
             self.handle_login()
+            return
+        if path == "/api/auth/step-up":
+            session = self.require_session(csrf=True)
+            if session:
+                self.handle_step_up(session)
             return
         if path == "/api/passkeys/login/begin":
             self.handle_passkey_login_begin()
@@ -2414,12 +3379,13 @@ class Handler(BaseHTTPRequestHandler):
             session = self.require_session(csrf=True)
             if session:
                 with STATE.store.connect() as db:
-                    db.execute("DELETE FROM sessions WHERE token_hash=?", (sha256_text(self.cookie_token()),))
+                    db.execute("DELETE FROM sessions WHERE token_hash=?", (sha256_text(self.session_token()),))
                 STATE.store.audit(session["username"], "logout", "session", self.remote_ip)
-                cookie = "rr_nexus_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
-                if STATE.config.secure_cookie:
-                    cookie += "; Secure"
-                self.send_json(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": cookie})
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True},
+                    self.legacy_session_cookie_headers(),
+                )
             return
         if path == "/api/devices":
             session = self.require_session(csrf=True)
@@ -2453,27 +3419,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/change-password":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "change_password"):
                 self.handle_change_password(session)
             return
         if path == "/api/security/totp/begin":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "totp_begin"):
                 self.handle_totp_begin(session)
             return
         if path == "/api/security/totp/confirm":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(
+                session, "totp_confirm", consume=False
+            ):
                 self.handle_totp_confirm(session)
             return
         if path == "/api/security/totp/disable":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "totp_disable"):
                 self.handle_totp_disable(session)
             return
         if path == "/api/security/passkeys/register/begin":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "passkey_register"):
                 self.handle_passkey_register_begin(session)
             return
         if path == "/api/security/passkeys/register/finish":
@@ -2526,12 +3494,12 @@ class Handler(BaseHTTPRequestHandler):
         # ---- 多服务器远程管理（6.6.0）----
         if path == "/api/remote/issue":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "remote_issue"):
                 self.handle_remote_issue(session)
             return
         if path == "/api/remote/revoke":
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "remote_revoke"):
                 self.handle_remote_revoke(session)
             return
         if path == "/api/remote/status":
@@ -2577,7 +3545,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_PATCH(self) -> None:  # noqa: N802
+        try:
+            self._dispatch_patch()
+        except RequestBodyTooLarge as exc:
+            self.send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "request_body_too_large", "limit": int(exc.args[0])},
+            )
+
+    def _dispatch_patch(self) -> None:
         path, segments, _ = self.parse_path()
+        if self.reject_api_during_update(path):
+            return
         if path == "/api/server/traffic-policy":
             session = self.require_session(csrf=True)
             if session:
@@ -2606,10 +3585,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_DELETE(self) -> None:  # noqa: N802
-        _, segments, _ = self.parse_path()
+        path, segments, _ = self.parse_path()
+        if self.reject_api_during_update(path):
+            return
         if len(segments) == 4 and segments[:3] == ["api", "security", "passkeys"]:
             session = self.require_session(csrf=True)
-            if session:
+            if session and self.require_step_up(session, "passkey_delete"):
                 self.handle_passkey_delete(session, segments[3])
             return
         if len(segments) == 3 and segments[:2] == ["api", "device-groups"] and segments[2].isdigit():
@@ -2637,30 +3618,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 多服务器远程管理（6.6.0）----------
 
     def remote_failure_state(self) -> tuple[bool, int]:
-        cutoff = epoch_now() - REMOTE_FAIL_WINDOW
-        with STATE.store.connect() as db:
-            db.execute("DELETE FROM remote_failures WHERE failed_at<?", (cutoff,))
-            row = db.execute(
-                "SELECT COUNT(*) FROM remote_failures WHERE remote_ip=?", (self.remote_ip,)
-            ).fetchone()
-        count = int(row[0])
-        if count >= REMOTE_FAIL_LIMIT:
-            latest = cutoff
-            with STATE.store.connect() as db:
-                recent = db.execute(
-                    "SELECT MAX(failed_at) FROM remote_failures WHERE remote_ip=?", (self.remote_ip,)
-                ).fetchone()
-            if recent and recent[0]:
-                latest = int(recent[0])
-            return True, max(1, latest + REMOTE_FAIL_WINDOW - epoch_now())
-        return False, 0
+        return remote_failure_state(self.remote_ip)
 
-    def record_remote_failure(self) -> None:
-        with STATE.store.connect() as db:
-            db.execute(
-                "INSERT INTO remote_failures(remote_ip,failed_at) VALUES(?,?)",
-                (self.remote_ip, epoch_now()),
-            )
+    def record_remote_failure(self) -> tuple[bool, int]:
+        return reserve_remote_failure(self.remote_ip)
 
     def handle_remote_issue(self, session: sqlite3.Row | dict) -> None:
         body = self.read_json_body()
@@ -2683,12 +3644,13 @@ class Handler(BaseHTTPRequestHandler):
             STATE.store.audit(session["username"], "remote_revoke_denied", "remote-key", self.remote_ip, cert_reason[:240])
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "remote_unavailable", "message": cert_reason})
             return
-        try:
-            REMOTE_KEY_PATH.unlink()
-        except FileNotFoundError:
-            pass
-        remote_key_load_or_create()
-        STATE.store.audit(session["username"], "remote_revoke", "remote-key", self.remote_ip, "全部旧钥匙已吊销")
+        with remote_security_lock():
+            try:
+                REMOTE_KEY_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            _remote_key_load_or_create_unlocked()
+            STATE.store.audit(session["username"], "remote_revoke", "remote-key", self.remote_ip, "全部旧钥匙已吊销")
         self.send_json(HTTPStatus.OK, {"ok": True})
 
     def handle_remote_status(self, session: sqlite3.Row | dict) -> None:
@@ -2702,14 +3664,32 @@ class Handler(BaseHTTPRequestHandler):
         self._remote_body = None
         locked, retry_after = self.remote_failure_state()
         if locked:
-            self.send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "too_many_attempts", "retry_after": retry_after, "message": "远程钥匙验证失败次数过多，已临时锁定"})
+            self.send_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"error": "too_many_attempts", "retry_after": retry_after, "message": "远程钥匙验证失败次数过多，已临时锁定"},
+                {"Retry-After": str(retry_after)},
+            )
             return
         body = self.read_json_body()
         cred = str((body or {}).get("cred", "") or "")
         payload = remote_cred_verify(cred)
         if payload is None:
-            self.record_remote_failure()
-            time.sleep(min(REMOTE_FAIL_DELAY + REMOTE_FAIL_DELAY * 0.5, 2.0))
+            accepted, retry_after = self.record_remote_failure()
+            if not accepted:
+                self.send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {
+                        "error": "too_many_attempts",
+                        "retry_after": retry_after,
+                        "message": "远程钥匙验证失败次数过多，已临时锁定",
+                    },
+                    {"Retry-After": str(retry_after)},
+                )
+                return
+            # HMAC verification is cheap and the persistent reservation above
+            # is bounded.  Do not sleep in the generic HTTP worker: excess
+            # contenders now receive an immediate 429 instead of occupying all
+            # 64 server workers.
             self.send_json(HTTPStatus.FORBIDDEN, {"error": "invalid_remote_cred", "message": "接入钥匙无效（伪造、篡改或已被吊销）"})
             return
         method = str((body or {}).get("method", "") or "GET").upper()
@@ -3114,26 +4094,24 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def remote_http_call(addr: str, port: int, cred: str, method: str, path: str, body: dict | None, timeout: int = REMOTE_HTTP_TIMEOUT) -> tuple[int, dict]:
-        url = "https://{}:{}/api/remote/call".format(addr, int(port))
+        url = "https://{}:{}/api/remote/call".format(_url_host(addr), int(port))
         data = json_compact({"cred": cred, "method": method, "path": path, "body": body or {}})
-        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "rr-nexus-remote/6.6"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
-                raw = resp.read() or b"{}"
-                try:
-                    payload = json.loads(raw)
-                except Exception:
-                    payload = {"_raw": raw[:200].decode("utf-8", "replace")}
-                return resp.status, payload
-        except urllib.error.HTTPError as exc:
-            raw = exc.read() or b"{}"
+            status, raw = https_post(
+                url,
+                data,
+                {"Content-Type": "application/json", "User-Agent": "rr-nexus-remote/7.1"},
+                timeout=timeout,
+            )
             try:
                 payload = json.loads(raw)
             except Exception:
-                payload = {}
-            return exc.code, payload
+                payload = {"_raw": raw[:200].decode("utf-8", "replace")}
+            return status, payload
+        except UnsafeTargetError:
+            return 0, {"error": "unsafe_remote_target", "message": "远程地址必须解析到公开网络"}
         except Exception as exc:
-            return 0, {"error": "unreachable", "message": str(exc)[:200]}
+            return 0, {"error": "unreachable", "message": type(exc).__name__}
 
     def handle_remote_servers_list(self, session: sqlite3.Row | dict) -> None:
         with STATE.store.connect() as db:
@@ -3150,6 +4128,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not name:
             name = str(payload.get("n", "") or "远程服务器")
+        if not REMOTE_CRED_NAME_RE.fullmatch(name):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_name", "message": "备注名需为 1-64 个可显示字符"})
+            return
         addr = str(payload.get("a", "") or "")
         port = int(payload.get("p", 0) or 0)
         with STATE.store.connect() as db:
@@ -3204,6 +4185,9 @@ class Handler(BaseHTTPRequestHandler):
         servers = [dict(r) for r in rows]
 
         def probe_one(server: dict) -> dict:
+            def count_value(value: Any) -> int:
+                return int(bounded_remote_number(value, MAX_DEVICES, integer=True))
+
             result = {"id": server["id"], "name": server["name"], "addr": server["addr"], "online": False}
             started = time.monotonic()
             status, body = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/overview", None)
@@ -3211,22 +4195,41 @@ class Handler(BaseHTTPRequestHandler):
             result["ping"] = ping_ms
             if status == 200 and isinstance(body, dict) and not body.get("error"):
                 result["online"] = True
-                result["devices"] = (body.get("devices") or {}).get("total", 0)
-                result["enabled"] = (body.get("devices") or {}).get("enabled", 0)
-                result["active_devices"] = (body.get("devices") or {}).get("active", 0)
-                used = int((body.get("devices") or {}).get("used", 0) or 0)
+                device_summary = body.get("devices")
+                if not isinstance(device_summary, dict):
+                    device_summary = {}
+                result["devices"] = count_value(device_summary.get("total", 0))
+                result["enabled"] = count_value(device_summary.get("enabled", 0))
+                result["active_devices"] = count_value(device_summary.get("active", 0))
+                used = int(bounded_remote_number(
+                    device_summary.get("used", 0),
+                    MAX_SERVER_TRAFFIC_GB * 1024**3,
+                    integer=True,
+                ))
                 result["used_gb"] = round(used / 1024 ** 3, 2)
-                result["services"] = body.get("services") or {}
+                services = body.get("services")
+                result["services"] = {
+                    "sing-box": "active"
+                    if isinstance(services, dict) and services.get("sing-box") == "active"
+                    else "inactive"
+                }
                 # 服务器实时指标（字段适配：cpu 是 dict{percent,...}，memory 是 dict{percent,...}）
                 s2, b2 = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/server/stats", None)
                 if s2 == 200 and isinstance(b2, dict):
                     cpu_val = b2.get("cpu")
                     mem_val = b2.get("memory")
-                    result["cpu"] = cpu_val.get("percent", 0) if isinstance(cpu_val, dict) else (cpu_val or 0)
-                    result["mem"] = mem_val.get("percent", 0) if isinstance(mem_val, dict) else (mem_val or 0)
+                    result["cpu"] = bounded_remote_number(
+                        cpu_val.get("percent", 0) if isinstance(cpu_val, dict) else cpu_val,
+                        100,
+                    )
+                    result["mem"] = bounded_remote_number(
+                        mem_val.get("percent", 0) if isinstance(mem_val, dict) else mem_val,
+                        100,
+                    )
                 s3, b3 = self.remote_http_call(server["addr"], server["port"], server["cred"], "GET", "/api/server/info", None)
                 if s3 == 200 and isinstance(b3, dict):
-                    result["ver"] = b3.get("script_version") or ""
+                    version = str(b3.get("script_version") or "")
+                    result["ver"] = version if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) else ""
                 result["state"] = "online"
             else:
                 err_code = (body or {}).get("error") if isinstance(body, dict) else ""
@@ -3281,10 +4284,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         qr_query = {}
-        if query.get("sub", [""])[0]:
+        if query.get("sub_index", [""])[0]:
+            qr_query["sub_index"] = query["sub_index"][0]
+            # Old secondary panels do not understand sub_index, but do
+            # understand sub=1.  Sending both lets a new peer render the exact
+            # format while an old peer safely falls back to the generic
+            # subscription QR instead of silently returning node index 0.
+            qr_query["sub"] = "1"
+        elif query.get("sub", [""])[0]:
             qr_query["sub"] = query["sub"][0]
-        if query.get("raw", [""])[0]:
-            qr_query["raw"] = query["raw"][0]
         if query.get("index", [""])[0]:
             qr_query["index"] = query["index"][0]
         status, result = self.remote_http_call(
@@ -3357,13 +4365,34 @@ class Handler(BaseHTTPRequestHandler):
         STATE.clear_login_failures(self.remote_ip, admin["username"])
         self.finish_login(admin, "recovery" if method == "recovery" else "password_totp" if admin["totp_enabled"] else "password")
 
-    def finish_login(self, admin: sqlite3.Row, method: str) -> None:
-        token, csrf = STATE.create_session(admin["id"], self.remote_ip)
+    def finish_login(self, admin: sqlite3.Row | dict, method: str) -> None:
+        created = STATE.create_session(
+            int(admin["id"]),
+            self.remote_ip,
+            int(admin["security_version"]),
+        )
+        if created is None:
+            self.send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "security_state_changed"},
+                self.legacy_session_cookie_headers(),
+            )
+            return
+        token, csrf = created
         STATE.store.audit(admin["username"], "login", "session", self.remote_ip, method)
-        cookie = f"rr_nexus_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_HOURS * 3600}"
-        if STATE.config.secure_cookie:
-            cookie += "; Secure"
-        self.send_json(HTTPStatus.OK, {"ok": True, "username": admin["username"], "csrf": csrf}, {"Set-Cookie": cookie})
+        # Both local and public panels keep the bearer in this tab's
+        # sessionStorage and attach it only to same-origin API requests.
+        payload = {
+            "ok": True,
+            "username": admin["username"],
+            "csrf": csrf,
+            "token": token,
+        }
+        self.send_json(
+            HTTPStatus.OK,
+            payload,
+            self.legacy_session_cookie_headers(),
+        )
 
     @staticmethod
     def webauthn_context() -> tuple[str, str] | None:
@@ -3407,14 +4436,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_totp_begin(self, session: sqlite3.Row) -> None:
         secret = generate_totp_secret()
-        with STATE.store.connect() as db:
-            db.execute(
-                "UPDATE admins SET totp_pending_secret=?,updated_at=? WHERE id=?",
-                (secret, utc_now(), session["admin_id"]),
+        expected_security_version = int(session["session_security_version"])
+        try:
+            setup_ticket = STATE.issue_step_up_ticket(
+                str(session["token_hash"]),
+                int(session["admin_id"]),
+                "totp_confirm",
+                expected_security_version=expected_security_version,
             )
+        except ValueError:
+            self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+            return
+        with STATE.store.connect() as db:
+            cursor = db.execute(
+                "UPDATE admins SET totp_pending_secret=?,updated_at=? "
+                "WHERE id=? AND security_version=?",
+                (
+                    secret,
+                    utc_now(),
+                    session["admin_id"],
+                    expected_security_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                return
         uri = totp_uri(secret, session["username"])
         STATE.store.audit(session["username"], "totp_begin", "security", self.remote_ip)
-        self.send_json(HTTPStatus.OK, {"secret": secret, "uri": uri})
+        self.send_json(
+            HTTPStatus.OK,
+            {"secret": secret, "uri": uri, "setup_ticket": setup_ticket},
+        )
 
     def handle_totp_qr(self, session: sqlite3.Row) -> None:
         with STATE.store.connect() as db:
@@ -3445,35 +4497,83 @@ class Handler(BaseHTTPRequestHandler):
             admin = db.execute(
                 "SELECT totp_pending_secret FROM admins WHERE id=?", (session["admin_id"],)
             ).fetchone()
-            secret = str(admin["totp_pending_secret"] if admin else "")
-            if not secret or not verify_totp(secret, code):
-                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_two_factor_code"})
-                return
-            db.execute(
-                "UPDATE admins SET totp_secret=?,totp_pending_secret='',totp_enabled=1,updated_at=? WHERE id=?",
-                (secret, utc_now(), session["admin_id"]),
-            )
-            db.execute("DELETE FROM sessions WHERE admin_id=? AND token_hash<>?", (
-                session["admin_id"], sha256_text(self.cookie_token()),
-            ))
-        STATE.store.audit(session["username"], "totp_enabled", "security", self.remote_ip)
-        self.send_json(HTTPStatus.OK, {"ok": True})
-
-    def handle_totp_disable(self, session: sqlite3.Row) -> None:
-        payload = self.read_json() or {}
-        password = str(payload.get("password", ""))[:512]
-        code = str(payload.get("code", ""))[:16]
-        admin, method = STATE.authenticate_with_method(session["username"], password)
-        if not admin or method != "password" or not verify_totp(str(admin["totp_secret"]), code):
-            self.send_json(HTTPStatus.FORBIDDEN, {"error": "security_verification_failed"})
+        secret = str(admin["totp_pending_secret"] if admin else "")
+        if not secret or not verify_totp(secret, code):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_two_factor_code"})
+            return
+        # The preflight validity check prevents unauthenticated code probing;
+        # the atomic consume here ensures concurrent confirmation can commit
+        # the credential change only once.
+        if not self.require_step_up(session, "totp_confirm"):
             return
         with STATE.store.connect() as db:
+            cursor = db.execute(
+                "UPDATE admins SET totp_secret=?,totp_pending_secret='',totp_enabled=1,"
+                "security_version=security_version+1,updated_at=? "
+                "WHERE id=? AND totp_pending_secret=? AND security_version=?",
+                (
+                    secret,
+                    utc_now(),
+                    session["admin_id"],
+                    secret,
+                    int(session["session_security_version"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                return
             db.execute(
-                "UPDATE admins SET totp_secret='',totp_pending_secret='',totp_enabled=0,updated_at=? WHERE id=?",
-                (utc_now(), session["admin_id"]),
+                "DELETE FROM sessions WHERE admin_id=?",
+                (session["admin_id"],),
+            )
+            db.execute(
+                "DELETE FROM step_up_tokens WHERE admin_id=?", (session["admin_id"],)
+            )
+            db.execute(
+                "DELETE FROM webauthn_challenges "
+                "WHERE admin_id=? AND ceremony='register'",
+                (session["admin_id"],),
+            )
+        STATE.store.audit(session["username"], "totp_enabled", "security", self.remote_ip)
+        self.send_json(
+            HTTPStatus.OK,
+            {"ok": True, "reauth_required": True},
+            self.legacy_session_cookie_headers(),
+        )
+
+    def handle_totp_disable(self, session: sqlite3.Row) -> None:
+        with STATE.store.connect() as db:
+            cursor = db.execute(
+                "UPDATE admins SET totp_secret='',totp_pending_secret='',totp_enabled=0,"
+                "security_version=security_version+1,updated_at=? "
+                "WHERE id=? AND security_version=?",
+                (
+                    utc_now(),
+                    session["admin_id"],
+                    int(session["session_security_version"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                return
+            db.execute(
+                "DELETE FROM sessions WHERE admin_id=?",
+                (session["admin_id"],),
+            )
+            db.execute(
+                "DELETE FROM step_up_tokens WHERE admin_id=?", (session["admin_id"],)
+            )
+            db.execute(
+                "DELETE FROM webauthn_challenges "
+                "WHERE admin_id=? AND ceremony='register'",
+                (session["admin_id"],),
             )
         STATE.store.audit(session["username"], "totp_disabled", "security", self.remote_ip)
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        self.send_json(
+            HTTPStatus.OK,
+            {"ok": True, "reauth_required": True},
+            self.legacy_session_cookie_headers(),
+        )
 
     def handle_passkey_register_begin(self, session: sqlite3.Row) -> None:
         context = self.webauthn_context()
@@ -3482,7 +4582,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         origin, rp_id = context
         challenge_id, challenge = STATE.create_webauthn_challenge(
-            "register", self.remote_ip, int(session["admin_id"])
+            "register",
+            self.remote_ip,
+            int(session["admin_id"]),
+            str(session["token_hash"]),
         )
         with STATE.store.connect() as db:
             existing = [
@@ -3525,7 +4628,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json() or {}
         context = self.webauthn_context()
         challenge_row = STATE.consume_webauthn_challenge(
-            str(payload.get("challenge_id", "")), "register", self.remote_ip
+            str(payload.get("challenge_id", "")),
+            "register",
+            self.remote_ip,
+            str(session["token_hash"]),
         )
         if context is None or not challenge_row or int(challenge_row["admin_id"] or 0) != int(session["admin_id"]):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_passkey_challenge"})
@@ -3545,17 +4651,47 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("credential id mismatch")
             name = str(payload.get("name", "通行密钥")).strip()[:64] or "通行密钥"
             with STATE.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                cursor = db.execute(
+                    "UPDATE admins SET security_version=security_version+1,updated_at=? "
+                    "WHERE id=? AND security_version=?",
+                    (
+                        utc_now(),
+                        session["admin_id"],
+                        int(session["session_security_version"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                    return
                 db.execute(
                     "INSERT INTO webauthn_credentials(credential_id,admin_id,name,public_key_pem,"
                     "algorithm,sign_count,transports,created_at) VALUES(?,?,?,?,?,?,?,?)",
                     (credential_id, session["admin_id"], name, credential.public_key_pem,
                      credential.algorithm, credential.sign_count, credential.transports, utc_now()),
                 )
+                db.execute(
+                    "DELETE FROM sessions WHERE admin_id=?",
+                    (session["admin_id"],),
+                )
+                db.execute("DELETE FROM step_up_tokens WHERE admin_id=?", (session["admin_id"],))
+                db.execute(
+                    "DELETE FROM webauthn_challenges WHERE admin_id=? AND ceremony='register'",
+                    (session["admin_id"],),
+                )
         except (ValueError, RuntimeError, sqlite3.IntegrityError) as exc:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "passkey_registration_failed", "message": str(exc)[:160]})
             return
         STATE.store.audit(session["username"], "passkey_added", credential_id, self.remote_ip, name)
-        self.send_json(HTTPStatus.CREATED, {"ok": True, "credential_id": credential_id})
+        self.send_json(
+            HTTPStatus.CREATED,
+            {
+                "ok": True,
+                "credential_id": credential_id,
+                "reauth_required": True,
+            },
+            self.legacy_session_cookie_headers(),
+        )
 
     def handle_passkey_login_begin(self) -> None:
         context = self.webauthn_context()
@@ -3597,8 +4733,12 @@ class Handler(BaseHTTPRequestHandler):
         credential_id = str(payload.get("credential_id", ""))[:2048]
         with STATE.store.connect() as db:
             row = db.execute(
-                "SELECT c.*,a.username FROM webauthn_credentials c JOIN admins a ON a.id=c.admin_id "
-                "WHERE c.credential_id=?", (credential_id,),
+                "SELECT c.credential_id,c.admin_id,c.public_key_pem,c.algorithm,"
+                "c.sign_count,a.username,"
+                "a.security_version AS admin_security_version "
+                "FROM webauthn_credentials c JOIN admins a ON a.id=c.admin_id "
+                "WHERE c.credential_id=?",
+                (credential_id,),
             ).fetchone()
         if not row:
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_passkey"})
@@ -3615,26 +4755,86 @@ class Handler(BaseHTTPRequestHandler):
             STATE.store.audit(str(row["username"]), "passkey_failed", credential_id, self.remote_ip, str(exc)[:160])
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "invalid_passkey"})
             return
+        expected_security_version = int(row["admin_security_version"])
         with STATE.store.connect() as db:
-            db.execute(
-                "UPDATE webauthn_credentials SET sign_count=?,last_used_at=? WHERE credential_id=?",
-                (sign_count, utc_now(), credential_id),
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                "UPDATE webauthn_credentials SET sign_count=?,last_used_at=? "
+                "WHERE credential_id=? AND admin_id=? AND sign_count=? "
+                "AND EXISTS(SELECT 1 FROM admins WHERE id=? "
+                "AND security_version=?)",
+                (
+                    sign_count,
+                    utc_now(),
+                    credential_id,
+                    row["admin_id"],
+                    row["sign_count"],
+                    row["admin_id"],
+                    expected_security_version,
+                ),
             )
-            admin = db.execute("SELECT * FROM admins WHERE id=?", (row["admin_id"],)).fetchone()
+            credential_updated = cursor.rowcount == 1
+        if not credential_updated:
+            self.send_json(
+                HTTPStatus.CONFLICT,
+                {"error": "security_state_changed"},
+                self.legacy_session_cookie_headers(),
+            )
+            return
         STATE.clear_login_failures(self.remote_ip, str(row["username"]))
-        self.finish_login(admin, "passkey")
+        self.finish_login(
+            {
+                "id": int(row["admin_id"]),
+                "username": str(row["username"]),
+                "security_version": expected_security_version,
+            },
+            "passkey",
+        )
 
     def handle_passkey_delete(self, session: sqlite3.Row, credential_id: str) -> None:
         with STATE.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute(
+                "SELECT 1 FROM webauthn_credentials WHERE credential_id=? AND admin_id=?",
+                (credential_id, session["admin_id"]),
+            ).fetchone()
+            if not exists:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "passkey_not_found"})
+                return
+            version_cursor = db.execute(
+                "UPDATE admins SET security_version=security_version+1,updated_at=? "
+                "WHERE id=? AND security_version=?",
+                (
+                    utc_now(),
+                    session["admin_id"],
+                    int(session["session_security_version"]),
+                ),
+            )
+            if version_cursor.rowcount != 1:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                return
             cursor = db.execute(
                 "DELETE FROM webauthn_credentials WHERE credential_id=? AND admin_id=?",
                 (credential_id, session["admin_id"]),
             )
-        if cursor.rowcount == 0:
-            self.send_json(HTTPStatus.NOT_FOUND, {"error": "passkey_not_found"})
-            return
+            if cursor.rowcount != 1:
+                self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                return
+            db.execute(
+                "DELETE FROM sessions WHERE admin_id=?",
+                (session["admin_id"],),
+            )
+            db.execute("DELETE FROM step_up_tokens WHERE admin_id=?", (session["admin_id"],))
+            db.execute(
+                "DELETE FROM webauthn_challenges WHERE admin_id=? AND ceremony='register'",
+                (session["admin_id"],),
+            )
         STATE.store.audit(session["username"], "passkey_deleted", credential_id, self.remote_ip)
-        self.send_json(HTTPStatus.OK, {"ok": True})
+        self.send_json(
+            HTTPStatus.OK,
+            {"ok": True, "reauth_required": True},
+            self.legacy_session_cookie_headers(),
+        )
 
     def handle_notifications_update(self, session: sqlite3.Row) -> None:
         try:
@@ -4243,50 +5443,61 @@ class Handler(BaseHTTPRequestHandler):
         return values, ""
 
     
-    def handle_change_password(self, session: dict[str, str]) -> None:
+    def handle_change_password(self, session: sqlite3.Row | dict) -> None:
         try:
-            cl = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(cl) if cl > 0 else b"{}"
-            body = json.loads(raw.decode("utf-8"))
-            op = str(body.get("old_password", ""))
+            body = self.read_json()
+            if body is None:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request"})
+                return
             np = str(body.get("new_password", ""))
-            if not op or not np:
-                return self.send_json(HTTPStatus.BAD_REQUEST, {"error": "密码不能为空"})
+            if not MIN_ADMIN_PASSWORD_LENGTH <= len(np) <= 512:
+                return self.send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": "invalid_new_password", "message": "新密码需为 12–512 个字符"},
+                )
             un = session["username"]
-            for attempt in range(3):
-                try:
-                    outcome = None
-                    with STATE.store.connect() as db:
-                        row = db.execute("SELECT password_hash FROM admins WHERE username=?", (un,)).fetchone()
-                        if not row:
-                            outcome = "not_found"
-                            break
-                        try:
-                            password_ok = STATE.password_hasher.verify(row["password_hash"], op)
-                        except (VerifyMismatchError, InvalidHash):
-                            password_ok = False
-                        if not password_ok:
-                            outcome = "bad_password"
-                            break
-                        db.execute("UPDATE admins SET password_hash=? WHERE username=?", (STATE.password_hasher.hash(np), un))
-                        outcome = "ok"
-                    # 事务已提交，审计用独立连接（避免事务内嵌套连接死锁）
-                    if outcome == "ok":
-                        STATE.store.audit(un, "change_password", "security", self.remote_ip)
-                        self.send_json(HTTPStatus.OK, {"ok": True})
-                    elif outcome == "bad_password":
-                        STATE.store.audit(un, "change_password_failed", "security", self.remote_ip)
-                        self.send_json(HTTPStatus.FORBIDDEN, {"error": "旧密码不正确"})
-                    else:
-                        self.send_json(HTTPStatus.NOT_FOUND, {"error": "用户不存在"})
-                    break
-                except sqlite3.OperationalError as e:
-                    if "locked" in str(e).lower() and attempt < 2:
-                        time.sleep(0.6)
-                        continue
-                    raise
+            # Step-up already verified the current password (and TOTP when
+            # enabled).  Hash before opening the write transaction so Argon2
+            # never holds the SQLite writer lock.
+            password_hash = STATE.password_hasher.hash(np)
+            with STATE.store.connect() as db:
+                cursor = db.execute(
+                    "UPDATE admins SET password_hash=?,security_version=security_version+1,"
+                    "updated_at=? WHERE id=? AND security_version=?",
+                    (
+                        password_hash,
+                        utc_now(),
+                        session["admin_id"],
+                        int(session["session_security_version"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    self.send_json(HTTPStatus.CONFLICT, {"error": "security_state_changed"})
+                    return
+                db.execute(
+                    "DELETE FROM sessions WHERE admin_id=?",
+                    (session["admin_id"],),
+                )
+                db.execute(
+                    "DELETE FROM step_up_tokens WHERE admin_id=?",
+                    (session["admin_id"],),
+                )
+                db.execute(
+                    "DELETE FROM webauthn_challenges "
+                    "WHERE admin_id=? AND ceremony='register'",
+                    (session["admin_id"],),
+                )
+            STATE.store.audit(un, "change_password", "security", self.remote_ip)
+            self.send_json(
+                HTTPStatus.OK,
+                {"ok": True, "reauth_required": True},
+                self.legacy_session_cookie_headers(),
+            )
+        except PasswordHashBusy:
+            raise
         except Exception as e:
             self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)[:100]})
+
     def _deferred_sync(self, actor: str, action: str, device_id: str, note: str) -> None:
         """后台线程执行节点同步：HTTP 响应先返回，sing-box 重启引起的瞬时断连
         （管理员若经本节点代理上网会被掐断）不再让前端误判为失败。
@@ -4515,10 +5726,10 @@ class Handler(BaseHTTPRequestHandler):
     def _device_subscription_urls(self, device: dict) -> tuple[str, list[dict[str, str]]]:
         """Build every subscription URL shown or encoded by the panel.
 
-        A real certificate domain can serve subscriptions through the panel's HTTPS
-        routes.  Local mode and public IP mode use RR's plain HTTP subscription
-        service instead: the latter panel is HTTPS-only with a self-signed
-        certificate, which subscription clients cannot reliably trust.
+        A real certificate panel domain serves subscriptions through the panel's
+        HTTPS routes.  Otherwise RR only returns either the independently verified
+        subscription HTTPS endpoint or a loopback URL intended for an SSH tunnel.
+        It never emits a public cleartext subscription URL.
         """
         device_id = str(device["id"])
         token = str(device["subscription_token"])
@@ -4565,14 +5776,24 @@ class Handler(BaseHTTPRequestHandler):
             ]
             return subscription_url, urls
 
-        # 本地模式与公网 IP 直连模式均从主订阅服务取文件。sub_port 保存
-        # 当前入口族对应的公网端口（普通 VPS 与本地监听端口相同；NAT/LXD
-        # 则是服务商映射后的公网端口）。
+        # 公网 IP 自签面板不能为订阅客户端提供可验证身份；只有独立的可信
+        # 订阅域名才能公开这些文件。本地面板则返回 127.0.0.1 地址，要求用户
+        # 同时建立订阅端口的 SSH 转发。
         sub_port = getattr(config, "sub_port", 0)
-        host = config.ssh_host or config.domain
-        if not sub_port or not host:
+        if not sub_port:
             return "", []
-        base = "http://{}:{}/nexus/{}".format(_url_host(host), sub_port, token)
+        if config.subscription_access_mode == "https":
+            if not _is_dns_name(config.subscription_domain):
+                return "", []
+            base = "https://{}:{}/nexus/{}".format(
+                config.subscription_domain,
+                sub_port,
+                token,
+            )
+        elif config.mode == "local" and config.subscription_access_mode == "local":
+            base = "http://127.0.0.1:{}/nexus/{}".format(sub_port, token)
+        else:
+            return "", []
         subscription_url = f"{base}.txt" if artifact_exists(".txt", published=True) else ""
         urls = [
             {"format": fmt, "name": name, "url": f"{base}{suffix}"}
@@ -4623,12 +5844,28 @@ class Handler(BaseHTTPRequestHandler):
         path = self.subscription_file(device_id)
         if not device or not path.is_file():
             return HTTPStatus.NOT_FOUND, {"error": "links_not_found"}
-        if query.get("sub", ["0"])[0] == "1":
+        if query.get("sub_index", [""])[0]:
+            # 浏览器只传短索引；含长期订阅 token 的 URL 由服务端重建，
+            # 避免它出现在 Nginx/浏览器/中间代理的请求查询串日志里。
+            subscription_urls = self._device_subscription_urls(device)[1]
+            try:
+                sub_index = int(query["sub_index"][0])
+                if sub_index < 0:
+                    raise IndexError
+                link = subscription_urls[sub_index]["url"]
+            except (ValueError, IndexError, KeyError, TypeError):
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid_subscription_url"}
+        elif query.get("sub", ["0"])[0] == "1":
             link = self._subscription_txt_url(device)
             if not link:
                 return HTTPStatus.BAD_REQUEST, {"error": "no_subscription_url"}
         elif query.get("raw", [""])[0]:
-            # 只接受本设备实际展示的订阅 URL，防止二维码与面板文案/文件路由漂移。
+            # A rolling-upgrade old primary forwards raw inside the authenticated
+            # remote/call JSON body.  Keep that direction compatible, but never
+            # accept raw from a browser request where it would expose the
+            # subscription token in the URL and access logs.
+            if getattr(self, "_remote_session", None) is None:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid_subscription_url"}
             link = query["raw"][0]
             valid_urls = {item["url"] for item in self._device_subscription_urls(device)[1]}
             if link not in valid_urls:
@@ -4736,29 +5973,43 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def initialize_admin(config: NexusConfig, username: str) -> int:
-    if not username or not username.strip():
-        print("管理员账号不能为空。", file=sys.stderr)
-        return 2
     username = username.strip()
-    if len(username) > 64:
-        print("管理员账号不能超过 64 个字符。", file=sys.stderr)
+    if not USERNAME_RE.fullmatch(username):
+        print("管理员账号需以字母开头，仅含字母、数字、点、下划线或连字符（3–32 位）。", file=sys.stderr)
         return 2
     password = sys.stdin.readline().rstrip("\n")
-    if not password:
-        print("管理员密码不能为空。", file=sys.stderr)
+    if not MIN_ADMIN_PASSWORD_LENGTH <= len(password) <= 512:
+        print("管理员密码需为 12–512 个字符。", file=sys.stderr)
         return 2
     state = NexusState(config)
     password_hash = state.password_hasher.hash(password)
     now = utc_now()
-    recovery_codes = [secrets.token_hex(5).upper() for _ in range(8)]
+    # 128 bits per one-time code.  Earlier 40-bit values were short enough to
+    # brute-force offline after a database leak even though only hashes are
+    # stored; 32 hexadecimal characters remain easy to copy from the console.
+    recovery_codes = [secrets.token_hex(16).upper() for _ in range(8)]
     with state.store.connect() as db:
+        # Keep the administrator identity generation monotonic even though
+        # SQLite may reuse id=1 after DELETE.  The write lock serializes
+        # concurrent resets; an in-flight authentication snapshot from before
+        # this transaction can therefore never match the replacement row's
+        # (id, security_version) pair.
+        db.execute("BEGIN IMMEDIATE")
+        previous_generation = db.execute(
+            "SELECT MAX(security_version) FROM admins"
+        ).fetchone()[0]
+        next_security_version = (
+            0 if previous_generation is None else int(previous_generation) + 1
+        )
         db.execute("DELETE FROM sessions")
         db.execute("DELETE FROM recovery_codes")
         db.execute("DELETE FROM admins")
         db.execute("DELETE FROM login_failures")
         cursor = db.execute(
-            "INSERT INTO admins(username,password_hash,created_at,updated_at) VALUES(?,?,?,?)",
-            (username, password_hash, now, now),
+            "INSERT INTO admins("
+            "username,password_hash,security_version,created_at,updated_at"
+            ") VALUES(?,?,?,?,?)",
+            (username, password_hash, next_security_version, now, now),
         )
         admin_id = cursor.lastrowid
         db.executemany(
@@ -4804,9 +6055,7 @@ def main() -> int:
             print(detail, file=sys.stderr)
             return 1
         return 0
-    server = ThreadingHTTPServer((config.listen, config.port), Handler)
-    server.daemon_threads = True
-    server.request_queue_size = 64
+    server = BoundedThreadingHTTPServer((config.listen, config.port), Handler)
     STATE.traffic.start()
     try:
         server.serve_forever(poll_interval=0.5)

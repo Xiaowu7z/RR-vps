@@ -68,6 +68,10 @@ case "${1:-}" in
                 ;;
             --rollback)
                 [ -x /usr/local/sbin/rr-update-recover ] || { echo "当前没有可用的更新回滚器。" >&2; exit 1; }
+                if ! rr_manual_update_rollback_is_safe; then
+                    echo "事务证据不安全，或本次 active-UFW 回滚窗口已被明确终止；拒绝执行无法证明可精确恢复的手动回滚。" >&2
+                    exit 1
+                fi
                 /usr/local/sbin/rr-update-recover rollback
                 exit $?
                 ;;
@@ -94,12 +98,46 @@ case "${1:-}" in
         /usr/local/sbin/rr-update-recover recover
         exit $?
         ;;
+    --recover-restore)
+        rr_restore_recover_active
+        exit $?
+        ;;
+    --watch-restore)
+        rr_restore_watch_active
+        exit $?
+        ;;
+    --restore-service-gate)
+        rr_restore_service_gate
+        exit $?
+        ;;
     --post-update)
         post_update_migrate
         exit $?
         ;;
+    --post-update-finalize)
+        case "${2:-}" in
+            "") rr_run_post_update_finalize normal ;;
+            --retire-rollback) rr_run_post_update_finalize retire-rollback ;;
+            *) echo "用法：rr --post-update-finalize [--retire-rollback]" >&2; exit 2 ;;
+        esac
+        exit $?
+        ;;
     --sync-subscriptions)
         migrate_config_schema && generate_node_and_sub
+        exit $?
+        ;;
+    --refresh-subscription)
+        # Certbot deploy hook entry point.  It only restarts the managed file
+        # server after the new certificate has passed the same strict checks as
+        # a normal install/update; it never regenerates node credentials.
+        migrate_config_schema || exit 1
+        load_config_with_defaults || exit 1
+        if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+            SUB_BIND_ADDRESS=127.0.0.1
+        else
+            select_entry_ip || exit 1
+        fi
+        start_subscription_server
         exit $?
         ;;
     --sync-devices)
@@ -114,7 +152,7 @@ case "${1:-}" in
         exit $?
         ;;
     --health-check)
-        ensure_runtime_health
+        rr_run_health_check
         exit $?
         ;;
     --version|-v)

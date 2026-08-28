@@ -44,14 +44,35 @@ check_supported_os() {
     echo -e "${GREEN}[系统] ${os_name:-$os_id $os_version} 已通过兼容性检查。${RESET}"
 }
 
+rr_ufw_installed() {
+    command -v ufw >/dev/null 2>&1 || \
+        dpkg-query -W -f='${db:Status-Status}\n' ufw 2>/dev/null | grep -qx installed
+}
+
 install_deps() {
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        printf '%s\n' '[安全拒绝] 热更新候选迁移不得运行 apt；缺少依赖时将由事务回滚。' >&2
+        return 1
+    fi
     echo -e "\n${YELLOW}正在更新系统源并安装必要组件 ...${RESET}"
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y \
         ca-certificates curl wget jq python3 python3-cryptography sqlite3 openssl iproute2 qrencode dnsutils cron \
-        iptables iptables-persistent procps tar gzip coreutils util-linux || return 1
+        iptables procps tar gzip coreutils util-linux || return 1
+
+    # Debian/Ubuntu 上 iptables-persistent 可能与已有 UFW 互斥并触发 apt
+    # 卸载 UFW。保留用户选择的防火墙及其既有规则；UFW 自身负责规则持久化。
+    # 只有系统没有 UFW 时才安装 netfilter-persistent 后端。
+    if rr_ufw_installed; then
+        echo -e "${GREEN}[防火墙] 检测到 UFW，已保留现有 UFW 配置。${RESET}"
+    else
+        debconf-set-selections 2>/dev/null <<< \
+            'iptables-persistent iptables-persistent/autosave_v4 boolean true'
+        debconf-set-selections 2>/dev/null <<< \
+            'iptables-persistent iptables-persistent/autosave_v6 boolean true'
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y \
+            iptables-persistent || return 1
+    fi
 
     if ! command -v vnstat &> /dev/null; then
         DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y vnstat || return 1
@@ -82,16 +103,120 @@ install_deps() {
     fi
 }
 
+cloudflared_token_file_supported() {
+    local version=""
+    command -v cloudflared >/dev/null 2>&1 || return 1
+    version=$(cloudflared --version 2>/dev/null | grep -Eo '[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,3}' | head -1) || return 1
+    python3 - "$version" <<'PY'
+import sys
+
+parts = tuple(int(item) for item in sys.argv[1].split("."))
+raise SystemExit(0 if parts >= (2025, 4, 0) else 1)
+PY
+}
+
 install_cloudflared() {
-    command -v cloudflared >/dev/null 2>&1 && return 0
+    cloudflared_token_file_supported && return 0
+
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        printf '%s\n' '[安全拒绝] 热更新候选缺少受支持的 Cloudflared；未下载或安装软件包。' >&2
+        return 1
+    fi
 
     echo -e "${YELLOW}仅因已选择 Argo，正在下载并安装 Cloudflared ($SYS_ARCH)...${RESET}"
     local cf_tmp_dir=""
+    local release_metadata=""
+    local release_selection=""
+    local release_tag=""
+    local asset_url=""
+    local expected_sha256=""
+    local expected_size=""
+    local asset_name="cloudflared-linux-${SYS_ARCH}.deb"
+    local release_api="${RR_CLOUDFLARED_RELEASE_API:-https://api.github.com/repos/cloudflare/cloudflared/releases/latest}"
+    local -a cf_release_values=()
     cf_tmp_dir=$(mktemp -d /tmp/rr-cloudflared.XXXXXX) || return 1
-    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 120 --output "$cf_tmp_dir/cloudflared.deb" \
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${SYS_ARCH}.deb"; then
+    release_metadata="$cf_tmp_dir/release.json"
+    release_selection="$cf_tmp_dir/selection"
+    if ! curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-all-errors \
+        --connect-timeout 10 --max-time 60 --max-filesize 5242880 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        --output "$release_metadata" "$release_api"; then
+        rm -rf "$cf_tmp_dir"
+        echo -e "${RED}[失败] 无法读取 Cloudflared 官方发布元数据。${RESET}"
+        return 1
+    fi
+    if ! python3 - "$release_metadata" "$asset_name" > "$release_selection" <<'PY'
+import json
+import re
+import sys
+import urllib.parse
+
+metadata_path, expected_name = sys.argv[1:]
+with open(metadata_path, "r", encoding="utf-8") as release_file:
+    release = json.load(release_file)
+tag = str(release.get("tag_name", ""))
+if release.get("draft") or release.get("prerelease"):
+    raise SystemExit("latest cloudflared release is not stable")
+if not re.fullmatch(r"20[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,3}", tag):
+    raise SystemExit("invalid cloudflared release tag")
+if tuple(int(item) for item in tag.split(".")) < (2025, 4, 0):
+    raise SystemExit("cloudflared release lacks token-file support")
+assets = [item for item in release.get("assets", []) if item.get("name") == expected_name]
+if len(assets) != 1:
+    raise SystemExit("cloudflared release asset is missing or duplicated")
+asset = assets[0]
+url = str(asset.get("browser_download_url", ""))
+parsed = urllib.parse.urlsplit(url)
+expected_path = f"/cloudflare/cloudflared/releases/download/{tag}/{expected_name}"
+if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.path != expected_path:
+    raise SystemExit("cloudflared asset URL is not bound to the selected tag")
+body = str(release.get("body", ""))
+matches = re.findall(
+    rf"(?mi)^\s*{re.escape(expected_name)}:\s*([0-9a-f]{{64}})\s*$",
+    body,
+)
+if len(set(matches)) != 1:
+    raise SystemExit("cloudflared release checksum is missing or ambiguous")
+checksum = matches[0]
+api_digest = str(asset.get("digest") or "")
+if api_digest and api_digest != f"sha256:{checksum}":
+    raise SystemExit("cloudflared API digest disagrees with release checksum")
+size = asset.get("size")
+if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= 128 * 1024 * 1024:
+    raise SystemExit("cloudflared asset size is invalid")
+print(tag)
+print(url)
+print(checksum)
+print(size)
+PY
+    then
+        rm -rf "$cf_tmp_dir"
+        echo -e "${RED}[安全拒绝] Cloudflared 发布版本、资产或官方 SHA256 元数据无效。${RESET}"
+        return 1
+    fi
+    mapfile -t cf_release_values < "$release_selection"
+    if [ "${#cf_release_values[@]}" -ne 4 ]; then
+        rm -rf "$cf_tmp_dir"
+        return 1
+    fi
+    release_tag="${cf_release_values[0]}"
+    asset_url="${cf_release_values[1]}"
+    expected_sha256="${cf_release_values[2]}"
+    expected_size="${cf_release_values[3]}"
+    if ! curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-all-errors \
+        --connect-timeout 10 --max-time 120 --max-filesize "$expected_size" \
+        --output "$cf_tmp_dir/cloudflared.deb" \
+        "$asset_url"; then
         rm -rf "$cf_tmp_dir"
         echo -e "${RED}[失败] Cloudflared 下载失败。${RESET}"
+        return 1
+    fi
+    if [ "$(stat -c '%s' "$cf_tmp_dir/cloudflared.deb" 2>/dev/null || printf 0)" != "$expected_size" ] || \
+       ! printf '%s  %s\n' "$expected_sha256" "$cf_tmp_dir/cloudflared.deb" | sha256sum -c - >/dev/null 2>&1 || \
+       ! dpkg-deb --info "$cf_tmp_dir/cloudflared.deb" >/dev/null 2>&1; then
+        rm -rf "$cf_tmp_dir"
+        echo -e "${RED}[安全拒绝] Cloudflared ${release_tag} 资产摘要或 DEB 结构校验失败。${RESET}"
         return 1
     fi
     if ! dpkg -i "$cf_tmp_dir/cloudflared.deb" >/dev/null 2>&1; then
@@ -99,15 +224,427 @@ install_cloudflared() {
         echo -e "${RED}[失败] Cloudflared 安装失败。${RESET}"
         return 1
     fi
+    if ! cloudflared --version 2>/dev/null | grep -Fq "$release_tag" || \
+       ! cloudflared_token_file_supported; then
+        rm -rf "$cf_tmp_dir"
+        echo -e "${RED}[安全拒绝] Cloudflared 安装后的版本与发布元数据不一致。${RESET}"
+        return 1
+    fi
     rm -rf "$cf_tmp_dir"
+}
+
+rr_ufw_backend_state() {
+    local status=""
+    command -v ufw >/dev/null 2>&1 || return 1
+    if status=$(LC_ALL=C ufw status 2>/dev/null); then
+        [[ "$status" =~ ^Status:[[:space:]]+active([[:space:]]|$) ]] && return 0
+        return 1
+    fi
+    return 2
+}
+
+rr_netfilter_backend_state() {
+    local backend="$1"
+    command -v "$backend" >/dev/null 2>&1 || return 1
+    "$backend" -w 5 -t filter -S INPUT >/dev/null 2>&1 && return 0
+    return 2
+}
+
+rr_ufw_rule_state() {
+    local proto_port="$1" proto_type="$2" action="$3" comment="$4" status=""
+    if ! status=$(LC_ALL=C ufw status 2>/dev/null); then
+        return 2
+    fi
+    if printf '%s\n' "$status" | awk -v rule="${proto_port}/${proto_type}" \
+        -v action="$action" -v comment="$comment" '
+            $1 == rule && toupper($2) == action {
+                marker=$0
+                if (sub(/^.*#[[:space:]]*/, "", marker) && marker == comment) found=1
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+        return 0
+    fi
+    return 1
+}
+
+rr_netfilter_rule_state() {
+    local backend="$1" proto_port="$2" proto_type="$3" comment="$4" target="$5" result=0
+    if "$backend" -w 5 -t filter -C INPUT -p "$proto_type" --dport "$proto_port" \
+        -m comment --comment "$comment" -j "$target" >/dev/null 2>&1; then
+        return 0
+    else
+        result=$?
+    fi
+    [ "$result" -eq 1 ] && return 1
+    return 2
+}
+
+rr_reconcile_ufw_protocol_rule() {
+    local proto_port="$1" proto_type="$2" desired="$3"
+    local desired_action="" desired_status="" desired_comment=""
+    local opposite_action="" opposite_status="" opposite_comment="" state=0 attempts=0
+    case "$desired" in
+        open)
+            desired_action=allow
+            desired_status=ALLOW
+            desired_comment="$FIREWALL_COMMENT"
+            opposite_action=deny
+            opposite_status=DENY
+            opposite_comment="$FIREWALL_BLOCK_COMMENT"
+            ;;
+        closed)
+            desired_action=deny
+            desired_status=DENY
+            desired_comment="$FIREWALL_BLOCK_COMMENT"
+            opposite_action=allow
+            opposite_status=ALLOW
+            opposite_comment="$FIREWALL_COMMENT"
+            ;;
+        *) return 1 ;;
+    esac
+
+    while [ "$attempts" -lt 100 ]; do
+        if rr_ufw_rule_state "$proto_port" "$proto_type" "$opposite_status" "$opposite_comment"; then
+            state=0
+        else
+            state=$?
+        fi
+        case "$state" in
+            0)
+                ufw --force delete "$opposite_action" "$proto_port/$proto_type" \
+                    comment "$opposite_comment" >/dev/null 2>&1 || return 1
+                attempts=$((attempts + 1))
+                ;;
+            1) break ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$attempts" -lt 100 ] || return 1
+
+    if rr_ufw_rule_state "$proto_port" "$proto_type" "$desired_status" "$desired_comment"; then
+        state=0
+    else
+        state=$?
+    fi
+    case "$state" in
+        0) ;;
+        1)
+            ufw --force "$desired_action" "$proto_port/$proto_type" \
+                comment "$desired_comment" >/dev/null 2>&1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    rr_ufw_rule_state "$proto_port" "$proto_type" "$desired_status" "$desired_comment" || return 1
+    if rr_ufw_rule_state "$proto_port" "$proto_type" "$opposite_status" "$opposite_comment"; then
+        return 1
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ]
+}
+
+rr_reconcile_netfilter_protocol_rule() {
+    local backend="$1" proto_port="$2" proto_type="$3" desired="$4"
+    local desired_comment="" desired_target="" desired_action=""
+    local opposite_comment="" opposite_target="" state=0 attempts=0
+    case "$desired" in
+        open)
+            desired_comment="$FIREWALL_COMMENT"
+            desired_target=ACCEPT
+            desired_action=-I
+            opposite_comment="$FIREWALL_BLOCK_COMMENT"
+            opposite_target=DROP
+            ;;
+        closed)
+            desired_comment="$FIREWALL_BLOCK_COMMENT"
+            desired_target=DROP
+            desired_action=-A
+            opposite_comment="$FIREWALL_COMMENT"
+            opposite_target=ACCEPT
+            ;;
+        *) return 1 ;;
+    esac
+
+    while [ "$attempts" -lt 100 ]; do
+        if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+            "$opposite_comment" "$opposite_target"; then
+            state=0
+        else
+            state=$?
+        fi
+        case "$state" in
+            0)
+                "$backend" -w 5 -t filter -D INPUT -p "$proto_type" --dport "$proto_port" \
+                    -m comment --comment "$opposite_comment" -j "$opposite_target" \
+                    >/dev/null 2>&1 || return 1
+                attempts=$((attempts + 1))
+                ;;
+            1) break ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$attempts" -lt 100 ] || return 1
+
+    if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+        "$desired_comment" "$desired_target"; then
+        state=0
+    else
+        state=$?
+    fi
+    case "$state" in
+        0) ;;
+        1)
+            "$backend" -w 5 -t filter "$desired_action" INPUT -p "$proto_type" \
+                --dport "$proto_port" -m comment --comment "$desired_comment" \
+                -j "$desired_target" >/dev/null 2>&1 || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+        "$desired_comment" "$desired_target" || return 1
+    if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+        "$opposite_comment" "$opposite_target"; then
+        return 1
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ]
+}
+
+rr_reconcile_protocol_firewall() {
+    local proto_port="$1" proto_type="$2" desired="$3"
+    local backend="" state=0 failed=false persist_netfilter=false
+
+    # A release candidate must not insert/reorder INPUT rules or persist a
+    # changed ruleset before it commits.  Transaction mode is a strict
+    # read-only gate; fresh installs and interactive changes still reconcile.
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        rr_validate_protocol_firewall "$proto_port" "$proto_type" "$desired"
+        return $?
+    fi
+
+    if rr_ufw_backend_state; then
+        state=0
+    else
+        state=$?
+    fi
+    case "$state" in
+        0)
+            if ! rr_reconcile_ufw_protocol_rule "$proto_port" "$proto_type" "$desired"; then
+                printf 'UFW 未能写入或验证 RR %s/%s 规则。\n' "$proto_type" "$proto_port" >&2
+                failed=true
+            fi
+            ;;
+        1) ;;
+        *)
+            printf '无法确认 UFW 是否已启用，拒绝静默跳过防火墙变更。\n' >&2
+            failed=true
+            ;;
+    esac
+
+    for backend in iptables ip6tables; do
+        if rr_netfilter_backend_state "$backend"; then
+            state=0
+        else
+            state=$?
+        fi
+        case "$state" in
+            0)
+                persist_netfilter=true
+                if ! rr_reconcile_netfilter_protocol_rule "$backend" "$proto_port" \
+                    "$proto_type" "$desired"; then
+                    printf '%s 未能写入或验证 RR %s/%s 规则。\n' \
+                        "$backend" "$proto_type" "$proto_port" >&2
+                    failed=true
+                fi
+                ;;
+            1) ;;
+            *)
+                printf '%s 已安装但无法读取活动 filter 后端。\n' "$backend" >&2
+                failed=true
+                ;;
+        esac
+    done
+
+    if [ "$persist_netfilter" = true ] && ! save_firewall; then
+        failed=true
+    fi
+    [ "$failed" = false ]
+}
+
+rr_validate_protocol_firewall() {
+    local proto_port="$1" proto_type="$2" desired="$3"
+    local backend="" state=0 failed=false
+    local desired_comment="" desired_target="" desired_status=""
+    local opposite_comment="" opposite_target="" opposite_status=""
+    is_valid_port "$proto_port" || return 1
+    case "$proto_type" in tcp|udp) ;; *) return 1 ;; esac
+    case "$desired" in
+        open)
+            desired_comment="$FIREWALL_COMMENT"; desired_target=ACCEPT; desired_status=ALLOW
+            opposite_comment="$FIREWALL_BLOCK_COMMENT"; opposite_target=DROP; opposite_status=DENY
+            ;;
+        closed)
+            desired_comment="$FIREWALL_BLOCK_COMMENT"; desired_target=DROP; desired_status=DENY
+            opposite_comment="$FIREWALL_COMMENT"; opposite_target=ACCEPT; opposite_status=ALLOW
+            ;;
+        *) return 1 ;;
+    esac
+
+    if rr_ufw_backend_state; then
+        rr_ufw_rule_state "$proto_port" "$proto_type" "$desired_status" \
+            "$desired_comment" || failed=true
+        if rr_ufw_rule_state "$proto_port" "$proto_type" "$opposite_status" \
+            "$opposite_comment"; then
+            failed=true
+        else
+            state=$?
+            [ "$state" -eq 1 ] || failed=true
+        fi
+    else
+        state=$?
+        [ "$state" -eq 1 ] || failed=true
+    fi
+
+    for backend in iptables ip6tables; do
+        if rr_netfilter_backend_state "$backend"; then
+            rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+                "$desired_comment" "$desired_target" || failed=true
+            if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+                "$opposite_comment" "$opposite_target"; then
+                failed=true
+            else
+                state=$?
+                [ "$state" -eq 1 ] || failed=true
+            fi
+        else
+            state=$?
+            [ "$state" -eq 1 ] || failed=true
+        fi
+    done
+
+    if [ "$failed" = true ]; then
+        printf '热更新只读检查发现 RR 防火墙 %s/%s 规则缺失、冲突或不可读；未修改规则。\n' \
+            "$proto_type" "$proto_port" >&2
+        return 1
+    fi
+    return 0
+}
+
+rr_local_subscription_loopback_ready() {
+    local pid="" state="" argument="" expect_bind=false
+    local app_seen=false port_seen=false bind_seen=false
+    local proc_root="${RR_PROC_ROOT:-/proc}" cmdline_file=""
+
+    [ "${SUB_ACCESS_MODE:-local}" = local ] || return 1
+    is_valid_port "${SUB_PORT:-}" || return 1
+    [ -f "${SUB_BIND_STATE_FILE:-}" ] && [ ! -L "${SUB_BIND_STATE_FILE:-}" ] || return 1
+    state=$(cat -- "$SUB_BIND_STATE_FILE" 2>/dev/null) || return 1
+    case "$state" in
+        "${SUB_PORT}|127.0.0.1|local|"*) ;;
+        *) return 1 ;;
+    esac
+
+    [ -f "${SUB_PID_FILE:-}" ] && [ ! -L "${SUB_PID_FILE:-}" ] || return 1
+    pid=$(cat -- "$SUB_PID_FILE" 2>/dev/null) || return 1
+    is_subscription_pid "$pid" || return 1
+    cmdline_file="${proc_root}/${pid}/cmdline"
+    [ -r "$cmdline_file" ] || return 1
+    while IFS= read -r -d '' argument; do
+        if [ "$expect_bind" = true ]; then
+            [ "$argument" = 127.0.0.1 ] && bind_seen=true
+            expect_bind=false
+            continue
+        fi
+        case "$argument" in
+            */nexus/sub_server.py) app_seen=true ;;
+            --bind) expect_bind=true ;;
+        esac
+        [ "$argument" = "$SUB_PORT" ] && port_seen=true
+    done < "$cmdline_file"
+    [ "$expect_bind" = false ] && [ "$app_seen" = true ] && \
+        [ "$port_seen" = true ] && [ "$bind_seen" = true ]
+}
+
+rr_validate_local_subscription_firewall_transition() {
+    local proto_port="$1" proto_type="tcp" backend="" state=0
+    local closed_state=0 legacy_state=0 failed=false legacy_seen=false
+
+    is_valid_port "$proto_port" || return 1
+
+    # The compatibility exception is deliberately narrower than the generic
+    # firewall validator.  Each readable backend must contain either the new
+    # exact RR DROP rule or the exact v7.1.0 RR ACCEPT rule -- never an
+    # untagged/wrong-port/wrong-protocol allow rule and never both states.
+    if rr_ufw_backend_state; then
+        if rr_ufw_rule_state "$proto_port" "$proto_type" DENY \
+            "$FIREWALL_BLOCK_COMMENT"; then closed_state=0; else closed_state=$?; fi
+        if rr_ufw_rule_state "$proto_port" "$proto_type" ALLOW \
+            "$FIREWALL_COMMENT"; then legacy_state=0; else legacy_state=$?; fi
+        case "${closed_state}:${legacy_state}" in
+            0:1) ;;
+            1:0) legacy_seen=true ;;
+            *) failed=true ;;
+        esac
+    else
+        state=$?
+        [ "$state" -eq 1 ] || failed=true
+    fi
+
+    for backend in iptables ip6tables; do
+        if rr_netfilter_backend_state "$backend"; then
+            if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+                "$FIREWALL_BLOCK_COMMENT" DROP; then closed_state=0; else closed_state=$?; fi
+            if rr_netfilter_rule_state "$backend" "$proto_port" "$proto_type" \
+                "$FIREWALL_COMMENT" ACCEPT; then legacy_state=0; else legacy_state=$?; fi
+            case "${closed_state}:${legacy_state}" in
+                0:1) ;;
+                1:0) legacy_seen=true ;;
+                *) failed=true ;;
+            esac
+        else
+            state=$?
+            [ "$state" -eq 1 ] || failed=true
+        fi
+    done
+
+    if [ "$failed" = true ]; then
+        printf '热更新只读检查拒绝无法精确归属的订阅防火墙规则（tcp/%s）；未修改规则。\n' \
+            "$proto_port" >&2
+        return 1
+    fi
+    if [ "$legacy_seen" = true ]; then
+        if ! rr_local_subscription_loopback_ready; then
+            printf '热更新发现旧版订阅放行规则，但无法证明新订阅服务仅监听 127.0.0.1；拒绝继续。\n' >&2
+            return 1
+        fi
+        RR_FIREWALL_FINALIZE_REQUIRED=true
+    fi
+    return 0
 }
 
 open_firewall() {
     # Argo 模式只监听 127.0.0.1，不占用公网防火墙端口；TLS 直连时才放行。
     if [ "${VM_TLS_ENABLED:-false}" = "true" ]; then
-        open_protocol_firewall "$PORT" "tcp"
+        open_protocol_firewall "$PORT" "tcp" || return 1
     fi
-    open_protocol_firewall "$SUB_PORT" "tcp"
+    # Public subscription exposure is decided by its access mode.  Local/SSH
+    # mode must never retain an inbound allow rule left by an older release.
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        open_protocol_firewall "$SUB_PORT" "tcp" || return 1
+    elif [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        # v7.1.0 always left a precisely tagged public ACCEPT for SUB_PORT.
+        # The candidate cannot mutate external firewall state before commit,
+        # so accept that one legacy state only while the replacement server is
+        # demonstrably loopback-only.  A durable post-commit finalizer removes
+        # it; every other closed-port caller remains strict.
+        rr_validate_local_subscription_firewall_transition "$SUB_PORT" || return 1
+    else
+        close_protocol_firewall "$SUB_PORT" "tcp" || return 1
+    fi
 }
 
 open_protocol_firewall() {
@@ -115,36 +652,7 @@ open_protocol_firewall() {
     local proto_type="$2"
     is_valid_port "$proto_port" || return 1
     case "$proto_type" in tcp|udp) ;; *) return 1 ;; esac
-    if command -v ufw &> /dev/null; then
-        ufw --force delete deny "$proto_port/$proto_type" comment "$FIREWALL_BLOCK_COMMENT" >/dev/null 2>&1 || true
-        ufw allow "$proto_port/$proto_type" comment "$FIREWALL_COMMENT" >/dev/null 2>&1 || true
-    fi
-    if command -v iptables &> /dev/null; then
-        # 先移除 close 时插入的拒绝基线，再放行（幂等）
-        while iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1; do
-            iptables -D INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || break
-        done
-        iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
-            iptables -I INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT 2>/dev/null || true
-    fi
-    if command -v ip6tables &> /dev/null; then
-        while ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1; do
-            ip6tables -D INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || break
-        done
-        ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || \
-            ip6tables -I INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT 2>/dev/null || true
-    fi
-    if command -v iptables >/dev/null 2>&1 || command -v ip6tables >/dev/null 2>&1; then
-        save_firewall
-    fi
+    rr_reconcile_protocol_firewall "$proto_port" "$proto_type" open
 }
 
 close_protocol_firewall() {
@@ -152,46 +660,65 @@ close_protocol_firewall() {
     local proto_type="$2"
     is_valid_port "$proto_port" || return 0
     case "$proto_type" in tcp|udp) ;; *) return 1 ;; esac
+    rr_reconcile_protocol_firewall "$proto_port" "$proto_type" closed
+}
 
-    if command -v ufw >/dev/null 2>&1; then
-        ufw --force delete allow "$proto_port/$proto_type" comment "$FIREWALL_COMMENT" >/dev/null 2>&1 || true
-        ufw --force deny "$proto_port/$proto_type" comment "$FIREWALL_BLOCK_COMMENT" >/dev/null 2>&1 || true
+open_configured_firewall() {
+    load_config_with_defaults || return 1
+    open_firewall || return 1
+    if [ "${VL_ENABLED:-false}" = true ]; then open_protocol_firewall "$VL_PORT" tcp || return 1; fi
+    if [ "${HY2_ENABLED:-false}" = true ]; then open_protocol_firewall "$HY2_PORT" udp || return 1; fi
+    if [ "${TU5_ENABLED:-false}" = true ]; then open_protocol_firewall "$TU5_PORT" udp || return 1; fi
+    if [ "${AN_ENABLED:-false}" = true ]; then open_protocol_firewall "$AN_PORT" tcp || return 1; fi
+    if [ "${NAIVE_ENABLED:-false}" = true ]; then
+        case "${NAIVE_MODE:-h2}" in
+            h2) open_protocol_firewall "$NAIVE_PORT" tcp || return 1 ;;
+            h3) open_protocol_firewall "$NAIVE_PORT" udp || return 1 ;;
+            both)
+                open_protocol_firewall "$NAIVE_PORT" tcp || return 1
+                open_protocol_firewall "$NAIVE_PORT" udp || return 1
+                ;;
+            *) return 1 ;;
+        esac
     fi
-    while command -v iptables >/dev/null 2>&1 && \
-          iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || break
-    done
-    while command -v ip6tables >/dev/null 2>&1 && \
-          ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1; do
-        ip6tables -D INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1 || break
-    done
-    # P2 修复：关闭 = 显式拒绝基线。INPUT 默认策略是 ACCEPT，只删放行规则
-    # 端口依然可达（无拒绝基线）；在链尾补一条 DROP，关闭后连接被明确拒绝。
-    # open 时会先删掉这条 DROP 再放行，语义闭环且不影响其他服务。
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || \
-            iptables -A INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP 2>/dev/null || true
+    if [ -n "${HY2_HOP_PORTS:-}" ] && declare -F install_hop_rules >/dev/null 2>&1; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            declare -F rr_validate_hop_rules >/dev/null 2>&1 || return 1
+            rr_validate_hop_rules HY2 "$HY2_PORT" "$HY2_HOP_PORTS" || return 1
+        else
+            install_hop_rules HY2 "$HY2_PORT" "$HY2_HOP_PORTS" || return 1
+        fi
     fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -C INPUT -p "$proto_type" --dport "$proto_port" \
-            -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP >/dev/null 2>&1 || \
-            ip6tables -A INPUT -p "$proto_type" --dport "$proto_port" \
-                -m comment --comment "$FIREWALL_BLOCK_COMMENT" -j DROP 2>/dev/null || true
+    if [ -n "${TU5_HOP_PORTS:-}" ] && declare -F install_hop_rules >/dev/null 2>&1; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            declare -F rr_validate_hop_rules >/dev/null 2>&1 || return 1
+            rr_validate_hop_rules TU5 "$TU5_PORT" "$TU5_HOP_PORTS" || return 1
+        else
+            install_hop_rules TU5 "$TU5_PORT" "$TU5_HOP_PORTS" || return 1
+        fi
     fi
-    save_firewall
+    if [ -r "${NEXUS_CONFIG_FILE:-/etc/rr-nexus/nexus.json}" ] && \
+       [ "$(jq -r '.mode // empty' "${NEXUS_CONFIG_FILE:-/etc/rr-nexus/nexus.json}" 2>/dev/null)" = public ]; then
+        local panel_port=""
+        panel_port=$(jq -r '.public_port // empty' "${NEXUS_CONFIG_FILE:-/etc/rr-nexus/nexus.json}" 2>/dev/null) || return 1
+        open_protocol_firewall "$panel_port" tcp || return 1
+    fi
+    [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] || save_firewall
 }
 
 save_firewall() {
-    command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
-    if command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
-        service iptables save >/dev/null 2>&1 || true
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        if ! netfilter-persistent save >/dev/null 2>&1; then
+            printf 'netfilter-persistent 无法持久化 RR 防火墙规则。\n' >&2
+            return 1
+        fi
+    elif command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
+        if ! service iptables save >/dev/null 2>&1; then
+            printf 'iptables 服务无法持久化 RR 防火墙规则。\n' >&2
+            return 1
+        fi
     fi
+    return 0
 }
 
 # ==========================================
@@ -360,6 +887,33 @@ duration_to_seconds() {
     esac
 }
 
+ensure_subscription_root() {
+    local root_uid=""
+    # /tmp 使用 sticky bit 只能保护已经由 root 创建的目录；首次创建前仍可能被
+    # 普通用户抢占为目录或符号链接。绝不跟随或接管这类对象，也不自动删除，
+    # 以免把攻击者选择的目标变成 root 的递归删除对象。
+    if [ -L "$SUB_ROOT" ] || { [ -e "$SUB_ROOT" ] && [ ! -d "$SUB_ROOT" ]; }; then
+        echo -e "${RED}[安全拒绝] 订阅目录不是普通目录：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    if [ ! -d "$SUB_ROOT" ]; then
+        mkdir -m 700 -- "$SUB_ROOT" 2>/dev/null || true
+    fi
+    if [ -L "$SUB_ROOT" ] || [ ! -d "$SUB_ROOT" ]; then
+        echo -e "${RED}[安全拒绝] 无法安全创建订阅目录：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    root_uid=$(stat -c '%u' -- "$SUB_ROOT" 2>/dev/null) || return 1
+    if [ "$root_uid" != 0 ]; then
+        echo -e "${RED}[安全拒绝] 订阅目录不属于 root：${SUB_ROOT}${RESET}" >&2
+        return 1
+    fi
+    chmod 700 -- "$SUB_ROOT" || return 1
+    # chmod 后再次检查，防止检查与使用之间对象发生变化。
+    [ ! -L "$SUB_ROOT" ] && [ -d "$SUB_ROOT" ] && \
+        [ "$(stat -c '%u' -- "$SUB_ROOT" 2>/dev/null)" = 0 ]
+}
+
 is_subscription_pid() {
     local pid="${1:-}"
     local cmdline=""
@@ -374,6 +928,57 @@ is_subscription_pid() {
     process_cwd=$(readlink -f "/proc/${pid}/cwd" 2>/dev/null) || return 1
     expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 1
     [ "$process_cwd" = "$expected_cwd" ]
+}
+
+managed_subscription_pids() {
+    # 状态文件可能因跨版本更新/回滚位于 /run 或旧版 /tmp，甚至已经丢失。
+    # 按“受支持命令行 + RR 订阅根 cwd”双重条件扫描 /proc，避免仅凭名称
+    # pkill 误伤用户进程，也确保无 PID 文件的 RR 孤儿 worker 仍可回收。
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local expected_cwd=""
+    local process_dir=""
+    local pid=""
+    local cmdline=""
+    local process_cwd=""
+    expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 0
+    for process_dir in "$proc_root"/[0-9]*; do
+        [ -r "$process_dir/cmdline" ] || continue
+        pid="${process_dir##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
+        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
+        [ "$process_cwd" = "$expected_cwd" ] || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+subscription_server_running() {
+    local pid=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && return 0
+    done < <(managed_subscription_pids)
+    return 1
+}
+
+stop_subscription_servers() {
+    local pid=""
+    local stopped=true
+    local attempt=0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        # 进程可能在扫描和 kill 之间自行退出；最终是否仍存在才决定失败。
+        kill "$pid" 2>/dev/null || true
+    done < <(managed_subscription_pids)
+    while [ "$attempt" -lt 20 ] && subscription_server_running; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    subscription_server_running && stopped=false
+    rm -f "$SUB_PID_FILE" "$SUB_BIND_STATE_FILE" \
+        /run/rr-vps-subscription.pid /run/rr-vps-subscription.bind \
+        /tmp/sub_server.pid /tmp/sub_server.bind
+    [ "$stopped" = true ]
 }
 
 # ==========================================

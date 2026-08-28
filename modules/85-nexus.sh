@@ -8,7 +8,11 @@ NEXUS_SUB_ROOT="${NEXUS_DATA_DIR}/subscriptions"
 NEXUS_SERVICE_FILE="/etc/systemd/system/rr-nexus.service"
 NEXUS_NGINX_SITE="/etc/nginx/sites-available/rr-nexus.conf"
 NEXUS_APP="${RR_LIB_DIR}/nexus/rr_nexus.py"
-NEXUS_CORE_RELEASE_API="https://api.github.com/repos/${RR_REPOSITORY}/releases/tags/rr-nexus-core"
+NEXUS_CORE_UPSTREAM_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+NEXUS_CORE_RELEASE_API="https://api.github.com/repos/${RR_REPOSITORY}/releases/tags"
+NEXUS_CORE_RELEASE_REVISION=1
+NEXUS_SYNC_LOCK_FILE="${RR_NEXUS_SYNC_LOCK_FILE:-/run/rr-vps/locks/nexus-sync.lock}"
+NEXUS_SYNC_LOCK_WAIT_SECONDS="${RR_NEXUS_SYNC_LOCK_WAIT_SECONDS:-300}"
 
 nexus_is_installed() {
     [ -f "$NEXUS_CONFIG_FILE" ] && [ -f "$NEXUS_SERVICE_FILE" ] && [ -f "$NEXUS_APP" ]
@@ -26,6 +30,7 @@ nexus_panel_url() {
     local domain=""
     local public_port=""
     local ssh_host=""
+    local domain_is_ip=false
     mode=$(jq -r '.mode // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     domain=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     public_port=$(jq -r '.public_port // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
@@ -35,8 +40,10 @@ nexus_panel_url() {
         return 0
     fi
     [ "$mode" = "public" ] || return 1
+    is_ip_version "$domain" 4 && domain_is_ip=true
+    is_ip_version "$domain" 6 && domain_is_ip=true
     # 域名模式（真证书）；IP 直连（自签证书）
-    if [ -n "$domain" ] && [ "$domain" != "ip" ] && ! printf '%s' "$domain" | grep -qE '^[0-9.]+$'; then
+    if [ -n "$domain" ] && [ "$domain" != "ip" ] && [ "$domain_is_ip" = false ]; then
         if [ "${public_port:-443}" = "443" ]; then
             printf 'https://%s' "$domain"
         else
@@ -46,6 +53,9 @@ nexus_panel_url() {
         local host=""
         host="${ssh_host:-$domain}"
         [ -n "$host" ] || return 1
+        host="${host#[}"
+        host="${host%]}"
+        is_ip_version "$host" 6 && host="[$host]"
         printf 'https://%s:%s' "$host" "${public_port:-7900}"
     fi
 }
@@ -65,16 +75,66 @@ nexus_show_local_tutorial() {
     [[ "$ssh_host" == *:* ]] && ssh_host="[$ssh_host]"
     echo -e "${CYAN}============ 本地模式连接教程（每次打开面板前执行） ============${RESET}"
     echo -e "${YELLOW}1. 在你自己的电脑终端（不是当前 VPS SSH 窗口）执行：${RESET}"
-    echo -e "${GREEN}ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${tunnel_port}:127.0.0.1:7900 root@${ssh_host}${RESET}"
-    echo -e "${YELLOW}2. 输入服务器 root 密码（屏幕不显示字符是正常的安全行为）。${RESET}"
-    echo -e "${YELLOW}3. 保持该终端窗口打开，再用浏览器访问：${RESET}${CYAN}http://127.0.0.1:${tunnel_port}${RESET}"
-    echo -e "${YELLOW}4. 用完按 Ctrl+C 关闭隧道；终端一关，面板本地访问也会断开。${RESET}"
+    echo -e "${GREEN}ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${tunnel_port}:127.0.0.1:7900 root@${ssh_host}${RESET}"
+    echo -e "${YELLOW}2. 首次连接先核对 SSH 主机指纹，再确认写入 known_hosts；不要关闭主机密钥校验。${RESET}"
+    echo -e "${YELLOW}3. 输入服务器 root 密码（屏幕不显示字符是正常的安全行为）。${RESET}"
+    echo -e "${YELLOW}4. 保持该终端窗口打开，再用浏览器访问：${RESET}${CYAN}http://127.0.0.1:${tunnel_port}${RESET}"
+    echo -e "${YELLOW}5. 用完按 Ctrl+C 关闭隧道；终端一关，面板本地访问也会断开。${RESET}"
     echo -e "${CYAN}=================================================================================${RESET}"
 }
 
 nexus_core_supports_traffic() {
     [ -x "$SINGBOX_BIN" ] || return 1
     "$SINGBOX_BIN" version 2>/dev/null | grep -qw 'with_v2ray_api'
+}
+
+nexus_validate_traffic_core_release() {
+    local release_file="$1"
+    local upstream_tag="$2"
+    local version=""
+    local release_tag=""
+    local builder_commit=""
+    local expected_assets=""
+    local asset_base=""
+    [ -f "$release_file" ] && [ ! -L "$release_file" ] || return 1
+    [[ "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    version="${upstream_tag#v}"
+    release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"
+    builder_commit=$(jq -r '.target_commitish // empty' "$release_file" 2>/dev/null) || return 1
+    [[ "$builder_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    expected_assets=$(jq -cn --arg version "$version" '[
+        "BUILD_INFO", "SHA256SUMS",
+        "rr-sing-box-\($version)-linux-amd64.tar.gz",
+        "rr-sing-box-\($version)-linux-arm64.tar.gz"
+    ] | sort') || return 1
+    asset_base="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/"
+    jq -e --arg tag "$release_tag" --arg target "$builder_commit" \
+        --arg base "$asset_base" --argjson assets "$expected_assets" '
+        .tag_name == $tag and .target_commitish == $target and
+        .draft == false and .prerelease == false and .immutable == true and
+        (.assets | type) == "array" and
+        ([.assets[].name] | sort) == $assets and
+        all(.assets[];
+            (.name | type) == "string" and
+            .browser_download_url == ($base + .name))
+    ' "$release_file" >/dev/null || return 1
+}
+
+nexus_fetch_traffic_core_release() {
+    local target_file="$1"
+    local upstream_file="${target_file}.upstream"
+    local upstream_tag=""
+    local release_tag=""
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
+        -o "$upstream_file" "$NEXUS_CORE_UPSTREAM_API" || return 1
+    upstream_tag=$(jq -r '.tag_name // empty' "$upstream_file")
+    [[ "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
+        -o "$target_file" "${NEXUS_CORE_RELEASE_API}/${release_tag}" || return 1
+    nexus_validate_traffic_core_release "$target_file" "$upstream_tag"
 }
 
 nexus_stats_port() {
@@ -108,6 +168,113 @@ nexus_atomic_copy() {
     mv -f "$target_tmp" "$target_path"
 }
 
+nexus_prepare_sync_lock() {
+    local lock_file="$1" lock_dir="" canonical=""
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    if [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
+        [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+        [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    else
+        mkdir -p -- "$lock_dir" || return 1
+    fi
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    chmod 0700 -- "$lock_dir" || return 1
+    [ "$(stat -c %a -- "$lock_dir" 2>/dev/null)" = 700 ] || return 1
+    if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    [ "$(stat -c %u:%h -- "$lock_file" 2>/dev/null)" = "0:1" ] || return 1
+    chown 0:0 -- "$lock_file" || return 1
+    chmod 0600 -- "$lock_file" || return 1
+    [ "$(stat -c %u:%g:%a:%h -- "$lock_file" 2>/dev/null)" = "0:0:600:1" ]
+}
+
+nexus_sync_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" fd_identity=""
+    local shell_pid="${BASHPID:-$$}"
+    local fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
+}
+
+nexus_with_sync_lock() {
+    # The panel, cron worker and health timer are separate processes.  A
+    # thread-only lock in rr_nexus.py cannot serialize their config rebuilds.
+    local callback="${1:-}"
+    shift || true
+    declare -F "$callback" >/dev/null 2>&1 || return 2
+    if [ "${RR_NEXUS_SYNC_LOCK_HELD:-false}" = true ]; then
+        "$callback" "$@"
+        return $?
+    fi
+
+    local wait_seconds="${NEXUS_SYNC_LOCK_WAIT_SECONDS:-300}"
+    local lock_fd=""
+    local status=0
+    [[ "$wait_seconds" =~ ^[1-9][0-9]{0,3}$ ]] || wait_seconds=300
+    nexus_prepare_sync_lock "$NEXUS_SYNC_LOCK_FILE" || return 1
+    exec {lock_fd}>>"$NEXUS_SYNC_LOCK_FILE" || return 1
+    if ! nexus_sync_lock_fd_is_safe "$NEXUS_SYNC_LOCK_FILE" "$lock_fd"; then
+        exec {lock_fd}>&-
+        return 1
+    fi
+    if ! flock -w "$wait_seconds" "$lock_fd"; then
+        echo "RR Nexus device sync lock timed out after ${wait_seconds}s" >&2
+        exec {lock_fd}>&-
+        return 75
+    fi
+
+    # Bash locals are dynamically scoped, so nested generation called by the
+    # locked sync transaction reuses this lock instead of deadlocking itself.
+    local RR_NEXUS_SYNC_LOCK_HELD=true
+    "$callback" "$@" || status=$?
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&-
+    return "$status"
+}
+
+nexus_atomic_exchange_tree() {
+    # Both paths are sibling directories created by this sync.  renameat2's
+    # RENAME_EXCHANGE makes the complete generation visible in one operation;
+    # the source path then contains the previous generation for rollback.
+    local source_dir="$1"
+    local target_dir="$2"
+    [[ "$source_dir" = "${target_dir}.stage."* ]] || return 1
+    [ -d "$source_dir" ] && [ ! -L "$source_dir" ] || return 1
+    [ -d "$target_dir" ] && [ ! -L "$target_dir" ] || return 1
+    python3 - "$source_dir" "$target_dir" <<'PY'
+import ctypes
+import errno
+import os
+import sys
+
+source, target = map(os.path.abspath, sys.argv[1:])
+if os.path.dirname(source) != os.path.dirname(target):
+    raise SystemExit(2)
+libc = ctypes.CDLL(None, use_errno=True)
+renameat2 = getattr(libc, "renameat2", None)
+if renameat2 is None:
+    raise SystemExit(3)
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+if renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 2) != 0:
+    error = ctypes.get_errno()
+    if error in (errno.ENOSYS, errno.EINVAL, errno.EXDEV):
+        raise SystemExit(3)
+    raise OSError(error, os.strerror(error), target)
+directory_fd = os.open(os.path.dirname(target), os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}
+
 nexus_traffic_user_names() {
     if [ ! -f "$NEXUS_DB_FILE" ]; then
         printf '%s\n' '[]'
@@ -139,33 +306,107 @@ nexus_collect_traffic_once() {
     RR_NEXUS_CONFIG="$NEXUS_CONFIG_FILE" python3 "$NEXUS_APP" --collect-traffic
 }
 
+nexus_validate_core_build_info() {
+    local build_info="$1"
+    local expected_version="$2"
+    local expected_release="$3"
+    local expected_builder_commit="$4"
+    local line=""
+    local key=""
+    local value=""
+    local source_commit=""
+    local -A fields=()
+    [ -f "$build_info" ] && [ ! -L "$build_info" ] || return 1
+    [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    [ "$expected_release" = \
+        "rr-nexus-core-v${expected_version}-r${NEXUS_CORE_RELEASE_REVISION}" ] || return 1
+    [[ "$expected_builder_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] && [[ "$line" != *$'\r'* ]] && [[ "$line" != *$'\t'* ]] || return 1
+        key="${line%%=*}"
+        value="${line#*=}"
+        [ "$key" != "$line" ] && [ -n "$value" ] || return 1
+        case "$key" in
+            SING_BOX_VERSION|SING_BOX_TAG|SOURCE_COMMIT|RR_BUILDER_COMMIT|RR_CORE_RELEASE|BUILD_TAG|SOURCE) ;;
+            *) return 1 ;;
+        esac
+        [ -z "${fields[$key]+present}" ] || return 1
+        fields["$key"]="$value"
+    done < "$build_info"
+
+    [ "${#fields[@]}" -eq 7 ] || return 1
+    [ "${fields[SING_BOX_VERSION]:-}" = "$expected_version" ] || return 1
+    [ "${fields[SING_BOX_TAG]:-}" = "v${expected_version}" ] || return 1
+    source_commit="${fields[SOURCE_COMMIT]:-}"
+    [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [ "${fields[RR_BUILDER_COMMIT]:-}" = "$expected_builder_commit" ] || return 1
+    [ "${fields[RR_CORE_RELEASE]:-}" = "$expected_release" ] || return 1
+    [ "${fields[BUILD_TAG]:-}" = with_v2ray_api ] || return 1
+    [ "${fields[SOURCE]:-}" = \
+        "https://github.com/SagerNet/sing-box/tree/v${expected_version}" ] || return 1
+}
+
 nexus_traffic_core_version() {
     local work_dir=""
     local release_json=""
     local build_info=""
     local info_url=""
     local version=""
+    local source_tag=""
+    local release_tag=""
+    local builder_commit=""
     work_dir=$(mktemp -d /tmp/rr-nexus-version.XXXXXX) || return 1
     release_json="$work_dir/release.json"
     build_info="$work_dir/BUILD_INFO"
-    if ! curl -fsSL --retry 2 --connect-timeout 8 --max-time 30 \
-        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
-        -o "$release_json" "$NEXUS_CORE_RELEASE_API"; then
+    if ! nexus_fetch_traffic_core_release "$release_json"; then
         rm -rf "$work_dir"
         return 1
     fi
+    release_tag=$(jq -r '.tag_name // empty' "$release_json")
+    builder_commit=$(jq -r '.target_commitish // empty' "$release_json")
+    source_tag=$(jq -r '.tag_name // empty' "${release_json}.upstream")
+    version="${source_tag#v}"
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
-    if [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
+    if [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ] || \
        ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
            -o "$build_info" "$info_url"; then
         rm -rf "$work_dir"
         return 1
     fi
-    version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
+    if ! nexus_validate_core_build_info \
+        "$build_info" "$version" "$release_tag" "$builder_commit"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
     rm -rf "$work_dir"
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
     printf '%s\n' "$version"
+}
+
+nexus_validate_core_checksums() {
+    local checksums="$1"
+    local expected_version="$2"
+    local awk_bin="${RR_AWK_BIN:-awk}"
+    [ -f "$checksums" ] || return 1
+    [[ "$expected_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    command -v "$awk_bin" >/dev/null 2>&1 || return 1
+    # Debian 12 and Ubuntu 22.04 use mawk versions where interval expressions
+    # such as {64} are not portable.  Check length separately so a valid
+    # digest is accepted by the same default awk users actually run.
+    "$awk_bin" -v expected="$expected_version" '
+        BEGIN {
+            amd64 = "rr-sing-box-" expected "-linux-amd64.tar.gz"
+            arm64 = "rr-sing-box-" expected "-linux-arm64.tar.gz"
+        }
+        /[\r\t]/ || NF != 2 || $0 != ($1 "  " $2) ||
+        length($1) != 64 || $1 !~ /^[0-9a-f]+$/ ||
+        ($2 != amd64 && $2 != arm64) { invalid = 1; exit }
+        seen[$2]++ { exit 1 }
+        END {
+            if (invalid || NR != 2 || seen[amd64] != 1 || seen[arm64] != 1) exit 1
+        }
+    ' "$checksums"
 }
 
 nexus_download_traffic_core() {
@@ -180,37 +421,50 @@ nexus_download_traffic_core() {
     local expected=""
     local actual=""
     local version=""
+    local source_tag=""
+    local builder_commit=""
     local extracted=""
+    local actual_version=""
 
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
-        -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
-        -o "$release_json" "$NEXUS_CORE_RELEASE_API" || return 1
+    nexus_fetch_traffic_core_release "$release_json" || return 1
+    local release_tag=""
+    release_tag=$(jq -r '.tag_name // empty' "$release_json")
+    builder_commit=$(jq -r '.target_commitish // empty' "$release_json")
+    source_tag=$(jq -r '.tag_name // empty' "${release_json}.upstream")
+    version="${source_tag#v}"
     checksum_url=$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url' \
         "$release_json" | head -n 1)
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
-    if [[ ! "$checksum_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || \
-       [[ ! "$info_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]]; then
+    if [ "$checksum_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/SHA256SUMS" ] || \
+       [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ]; then
         return 1
     fi
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$checksums" "$checksum_url" || return 1
     curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$build_info" "$info_url" || return 1
-    version=$(awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' "$build_info")
-    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
+    nexus_validate_core_build_info \
+        "$build_info" "$version" "$release_tag" "$builder_commit" || return 1
+    nexus_validate_core_checksums "$checksums" "$version" || return 1
     archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
     archive_url=$(jq -r --arg name "$archive_name" \
         '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
-    [[ "$archive_url" =~ ^https://github\.com/${RR_REPOSITORY}/releases/download/rr-nexus-core/ ]] || return 1
-    curl -fL --retry 3 --connect-timeout 10 --max-time 240 -o "$work_dir/$archive_name" "$archive_url" || return 1
+    [ "$archive_url" = "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}" ] || return 1
+    curl -fL --retry 3 --connect-timeout 10 --max-time 240 --max-filesize 104857600 \
+        -o "$work_dir/$archive_name" "$archive_url" || return 1
+    [ "$(stat -c %s "$work_dir/$archive_name" 2>/dev/null || echo 0)" -le 104857600 ] || return 1
     expected=$(awk -v name="$archive_name" '$2 == name {print $1; exit}' "$checksums")
     actual=$(sha256sum "$work_dir/$archive_name" | awk '{print $1}')
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] || return 1
     extracted="sing-box-${version}-linux-${SYS_ARCH}/sing-box"
     tar -tzf "$work_dir/$archive_name" "$extracted" >/dev/null 2>&1 || return 1
     tar --no-same-owner -xzf "$work_dir/$archive_name" -C "$work_dir" "$extracted" 2>/dev/null || return 1
+    [ -f "$work_dir/$extracted" ] && [ ! -L "$work_dir/$extracted" ] && \
+        [ "$(stat -c %h "$work_dir/$extracted" 2>/dev/null || echo 0)" -eq 1 ] || return 1
     install -m 755 "$work_dir/$extracted" "$work_dir/sing-box" || return 1
     "$work_dir/sing-box" version 2>/dev/null | grep -qw 'with_v2ray_api' || return 1
-    version_ge "$(get_singbox_version "$work_dir/sing-box")" "$MIN_SINGBOX_VERSION" || return 1
+    actual_version=$(get_singbox_version "$work_dir/sing-box") || return 1
+    [ "$actual_version" = "$version" ] || return 1
+    version_ge "$actual_version" "$MIN_SINGBOX_VERSION" || return 1
 }
 
 nexus_enable_traffic_engine() {
@@ -223,6 +477,11 @@ nexus_enable_traffic_engine() {
     managed_singbox_running && was_running=true
 
     if ! nexus_core_supports_traffic; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            rm -rf "$tx_dir"
+            echo -e "${RED}[失败] 热更新候选缺少既有流量统计内核；未下载或替换 Sing-box。${RESET}" >&2
+            return 1
+        fi
         echo -e "${YELLOW}正在安装 RR Nexus 实时流量统计内核（官方 Sing-box 源码构建）……${RESET}"
         if ! nexus_download_traffic_core "$tx_dir"; then
             rm -rf "$tx_dir"
@@ -324,247 +583,287 @@ PY
 
 generate_nexus_device_subscriptions() {
     [ -f "$NEXUS_DB_FILE" ] || return 0
+    nexus_with_sync_lock _generate_nexus_device_subscriptions_staged
+}
+
+_generate_nexus_device_subscriptions_staged() {
+    local private_target="$NEXUS_SUB_ROOT"
+    local published_target="${SUB_ROOT}/nexus"
+    local private_stage=""
+    local published_stage=""
+    [ ! -L "$private_target" ] && [ ! -L "$published_target" ] || return 1
+    ensure_subscription_root || return 1
+    install -d -m 700 "$NEXUS_DATA_DIR" "$private_target" "$published_target" || return 1
+    private_stage=$(mktemp -d "${private_target}.stage.XXXXXX") || return 1
+    published_stage=$(mktemp -d "${published_target}.stage.XXXXXX") || {
+        rm -rf -- "$private_stage"
+        return 1
+    }
+
+    if ! NEXUS_SUB_ROOT="$private_stage" RR_NEXUS_PUBLISH_ROOT="$published_stage" \
+        _generate_nexus_device_subscriptions_into_stage; then
+        rm -rf -- "$private_stage" "$published_stage"
+        return 1
+    fi
+    if ! nexus_atomic_exchange_tree "$private_stage" "$private_target"; then
+        rm -rf -- "$private_stage" "$published_stage"
+        return 1
+    fi
+    if ! nexus_atomic_exchange_tree "$published_stage" "$published_target"; then
+        # The public tree was not exposed.  Put the private tree back too so a
+        # failed two-target publication never reports success with split state.
+        nexus_atomic_exchange_tree "$private_stage" "$private_target" >/dev/null 2>&1 || true
+        rm -rf -- "$private_stage" "$published_stage"
+        return 1
+    fi
+    # After RENAME_EXCHANGE these paths contain the complete previous trees.
+    rm -rf -- "$private_stage" "$published_stage"
+    return 0
+}
+
+_generate_nexus_device_subscriptions_into_stage() {
     load_config_with_defaults || return 1
+    ensure_subscription_root || return 1
     validate_subscription_crypto_material || return 1
     select_entry_ip || return 1
     # 面板进程会在每次打开「链接与二维码」时重读这两个值。这样入口 IP、
     # IPv4/IPv6 或 NAT 公网订阅端口变化后，无需重启面板也不会生成旧二维码。
     nexus_sync_subscription_endpoint || return 1
-    install -d -m 700 "$NEXUS_DATA_DIR" "$NEXUS_SUB_ROOT" || return 1
+    install -d -m 700 "$NEXUS_SUB_ROOT" "$RR_NEXUS_PUBLISH_ROOT" || return 1
 
-    local rows_file=""
-    rows_file=$(mktemp /tmp/rr-nexus-devices.XXXXXX) || return 1
-    if ! python3 - "$NEXUS_DB_FILE" > "$rows_file" <<'PY'; then
+    local work_dir="$NEXUS_SUB_ROOT/.work"
+    local rows_file="$work_dir/devices.tsv"
+    local active_file="$work_dir/active.tsv"
+    local template_dir="$work_dir/templates"
+    local template_uuid="00000000-0000-4000-8000-000000000001"
+    local template_alias="RR-NEXUS-TEMPLATE-ALIAS-A1B2C3D4"
+    local template_user="rr_nexus_template_user_a1b2c3d4"
+    local template_password="rr_nexus_template_password_a1b2c3d4"
+    [ "$template_uuid" != "$UUID" ] || template_uuid="00000000-0000-4000-8000-000000000002"
+    install -d -m 700 "$work_dir" "$template_dir" || return 1
+    : > "$active_file"
+
+    if ! python3 - "$NEXUS_DB_FILE" "${NAIVE_PASS:-}" > "$rows_file" <<'PY'; then
 import datetime
+import hashlib
 import sqlite3
 import sys
 
-# 不用 mode=ro：SQLite 只读连接在 -shm 缺失时读不到 WAL 里的新提交，导致刚创建的设备"消失"
-connection = sqlite3.connect(sys.argv[1], timeout=5)
-# B2/E15：与面板 /sub 路由、sing-box 用户生成（nexus_protocol_users）语义对齐——
-# 停用/已到期/额度用尽的设备不再生成订阅文件，双路由（面板 /sub 与 sub_server /nexus）一致拒绝。
+database, naive_password = sys.argv[1:]
+# A writable connection sees committed WAL rows even when a read-only URI is
+# opened before SQLite has created the shared-memory sidecar.
+connection = sqlite3.connect(database, timeout=5)
 today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-for row in connection.execute(
-    "SELECT id,credential,name,subscription_token FROM devices "
+for device_id, credential, token in connection.execute(
+    "SELECT id,credential,subscription_token FROM devices "
     "WHERE enabled=1 "
     "AND (expires_at IS NULL OR expires_at='' OR expires_at>=?) "
     "AND (quota_bytes=0 OR used_bytes<quota_bytes) "
     "ORDER BY created_at",
     (today,),
 ):
-    print("\t".join(str(value) for value in row))
+    naive = hashlib.sha256(f"{naive_password}:{device_id}".encode()).hexdigest()[:24]
+    print(device_id, credential, token, naive, sep="\t")
+connection.close()
 PY
-        rm -f "$rows_file"
         return 1
     fi
 
-    local device_id=""
-    local credential=""
-    local device_name=""
-    local sub_token=""
-    local display_name=""
-    local node_alias=""
-    local all_links=""
-    local link=""
-    local active_ids="|"
-    local active_tokens="|"
-    local server_uri="$ENTRY_IP_URI"
-    local server_raw="$ENTRY_IP_RAW"
-    local output_tmp=""
-    while IFS=$'\t' read -r device_id credential device_name sub_token; do
-        [[ "$device_id" =~ ^dev_[a-f0-9]{12}$ ]] || continue
-        is_valid_uuid "$credential" || continue
-        # 设备备注只供管理员在面板辨认，绝不进入客户端订阅。设备 ID 本身由
-        # 12 位随机十六进制生成，取前 8 位作为稳定且不可读出备注的节点别名。
-        node_alias="RR-${device_id#dev_}"
-        node_alias="${node_alias:0:11}"
-        node_alias=$(printf '%s' "$node_alias" | tr '[:lower:]' '[:upper:]')
-        display_name=$(jq -nr --arg value "$node_alias" '$value|@uri')
-        all_links=""
+    # Full Sing-box and Clash output depends on node settings, but device
+    # differences are four scalar values.  Build each format once and perform
+    # byte-safe substitutions in one Python pass instead of spawning jq and
+    # file utilities thousands of times for 500 devices.
+    if declare -F generate_client_json >/dev/null 2>&1 && \
+       declare -F generate_clash_yaml >/dev/null 2>&1; then
+        RR_CLIENT_UUID_OVERRIDE="$template_uuid" RR_CLIENT_NAME_OVERRIDE="$template_alias" \
+            RR_NAIVE_USER_OVERRIDE="$template_user" RR_NAIVE_PASS_OVERRIDE="$template_password" \
+            RR_SUB_OUTPUT_DIR="$template_dir" generate_client_json "$ENTRY_IP_RAW" 2>/dev/null || true
+        RR_CLIENT_UUID_OVERRIDE="$template_uuid" RR_CLIENT_NAME_OVERRIDE="$template_alias" \
+            RR_NAIVE_USER_OVERRIDE="$template_user" RR_NAIVE_PASS_OVERRIDE="$template_password" \
+            RR_SUB_OUTPUT_DIR="$template_dir" generate_client_json "$ENTRY_IP_RAW" vless 2>/dev/null || true
+        RR_CLIENT_UUID_OVERRIDE="$template_uuid" RR_CLIENT_NAME_OVERRIDE="$template_alias" \
+            RR_SUB_OUTPUT_DIR="$template_dir" generate_clash_yaml "$ENTRY_IP_RAW" 2>/dev/null || true
+    fi
 
-        if [ "$VM_ENABLED" != "false" ]; then
-            local vm_json=""
-            if [ "$VM_TLS_ENABLED" = "true" ]; then
-                vm_json=$(jq -nc --arg name "VMess · $node_alias" --arg add "$server_raw" \
-                    --arg port "$PORT" --arg id "$credential" --arg path "/${UUID}-vm" \
-                    '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:"www.bing.com",path:$path,tls:"tls",sni:"www.bing.com",fp:"chrome",allowInsecure:"1",insecure:"1"}')
-            else
-                vm_json=$(jq -nc --arg name "VMess Argo · $node_alias" --arg add "$CDN_IP" \
-                    --arg port "$ARGO_EDGE_PORT" --arg id "$credential" --arg host "$ARGO_DOMAIN" \
-                    --arg path "/${UUID}-vm" \
-                    '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}')
-            fi
-            link="vmess://$(printf '%s' "$vm_json" | base64 -w 0)"
-            all_links="$link"
-            # Argo 优选副节点（自动优选 worker 解析的 CNAME，仅 Argo 模式）
-            if [ "$VM_TLS_ENABLED" != "true" ] && [ -s /tmp/sub_server/preferred_cnames.txt ]; then
-                local pref_add="" pref_index=1
+    local vm_templates="$work_dir/vmess-json.tsv"
+    : > "$vm_templates"
+    if [ "$VM_ENABLED" != false ]; then
+        local vm_json=""
+        if [ "$VM_TLS_ENABLED" = true ]; then
+            vm_json=$(jq -nc --arg name "VMess · $template_alias" --arg add "$ENTRY_IP_RAW" \
+                --arg port "$PORT" --arg id "$template_uuid" --arg path "/${UUID}-vm" \
+                '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:"www.bing.com",path:$path,tls:"tls",sni:"www.bing.com",fp:"chrome",allowInsecure:"1",insecure:"1"}') || return 1
+            printf '%s\n' "$vm_json" >> "$vm_templates"
+        else
+            vm_json=$(jq -nc --arg name "VMess Argo · $template_alias" --arg add "$CDN_IP" \
+                --arg port "$ARGO_EDGE_PORT" --arg id "$template_uuid" --arg host "$ARGO_DOMAIN" \
+                --arg path "/${UUID}-vm" \
+                '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}') || return 1
+            printf '%s\n' "$vm_json" >> "$vm_templates"
+            if [ -s /tmp/sub_server/preferred_cnames.txt ]; then
+                local pref_add=""
+                local pref_index=1
                 while IFS= read -r pref_add; do
                     [ -n "$pref_add" ] || continue
-                    vm_json=$(jq -nc --arg name "VMess Argo优选${pref_index} · $node_alias" --arg add "$pref_add" \
-                        --arg port "$ARGO_EDGE_PORT" --arg id "$credential" --arg host "$ARGO_DOMAIN" \
+                    vm_json=$(jq -nc --arg name "VMess Argo优选${pref_index} · $template_alias" --arg add "$pref_add" \
+                        --arg port "$ARGO_EDGE_PORT" --arg id "$template_uuid" --arg host "$ARGO_DOMAIN" \
                         --arg path "/${UUID}-vm" \
-                        '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}')
-                    link="vmess://$(printf '%s' "$vm_json" | base64 -w 0)"
-                    all_links="${all_links}
-$link"
+                        '{v:"2",ps:$name,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"",host:$host,path:$path,tls:"tls",sni:$host,fp:"chrome"}') || return 1
+                    printf '%s\n' "$vm_json" >> "$vm_templates"
                     pref_index=$((pref_index + 1))
                 done < /tmp/sub_server/preferred_cnames.txt
             fi
         fi
-        if [ "$VL_ENABLED" = "true" ] && [ "$VL_PORT" != "0" ]; then
-            link="vless://${credential}@${server_uri}:${VL_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#VLESS-${display_name}"
+    fi
+
+    local hy2_extra=""
+    local hy2_hop=""
+    if [ "$HY2_ENABLED" = true ] && [ "$HY2_PORT" != 0 ]; then
+        hy2_hop=$(get_hop_ports "$HY2_PORT")
+        [ -n "$hy2_hop" ] && hy2_extra="&mport=${hy2_hop//:/-}"
+    fi
+    local device_id=""
+    local credential=""
+    local sub_token=""
+    local ndev_pw=""
+    local node_alias=""
+    local all_links=""
+    local link=""
+    while IFS=$'\t' read -r device_id credential sub_token ndev_pw; do
+        [[ "$device_id" =~ ^dev_[a-f0-9]{12}$ ]] || continue
+        is_valid_uuid "$credential" || continue
+        [[ "$sub_token" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || sub_token=""
+        [[ "$ndev_pw" =~ ^[a-f0-9]{24}$ ]] || return 1
+        node_alias="RR-${device_id#dev_}"
+        node_alias="${node_alias:0:11}"
+        node_alias="${node_alias^^}"
+        all_links=""
+
+        while IFS= read -r vm_json; do
+            [ -n "$vm_json" ] || continue
+            vm_json="${vm_json//$template_uuid/$credential}"
+            vm_json="${vm_json//$template_alias/$node_alias}"
+            link="RR_NEXUS_VMESS_JSON:${vm_json}"
+            all_links="${all_links:+$all_links$'\n'}$link"
+        done < "$vm_templates"
+        if [ "$VL_ENABLED" = true ] && [ "$VL_PORT" != 0 ]; then
+            link="vless://${credential}@${ENTRY_IP_URI}:${VL_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=apple.com&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#VLESS-${node_alias}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
-        if [ "$HY2_ENABLED" = "true" ] && [ "$HY2_PORT" != "0" ]; then
-            local hy2_hop=""
-            local hy2_extra=""
-            hy2_hop=$(get_hop_ports "$HY2_PORT")
-            [ -n "$hy2_hop" ] && hy2_extra="&mport=$(printf '%s' "$hy2_hop" | tr ':' '-')"
-            # 服务端启用了 Salamander 混淆；个人 URI 必须携带同一混淆密码，
-            # 否则 NekoBox 等客户端虽能导入，却无法建立连接。
-            link="hysteria2://${credential}@${server_uri}:${HY2_PORT}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256=${CERT_SHA256}&obfs=salamander&obfs-password=${UUID}${hy2_extra}#HY2-${display_name}"
+        if [ "$HY2_ENABLED" = true ] && [ "$HY2_PORT" != 0 ]; then
+            link="hysteria2://${credential}@${ENTRY_IP_URI}:${HY2_PORT}?security=tls&alpn=h3&insecure=1&sni=www.bing.com&pinSHA256=${CERT_SHA256}&obfs=salamander&obfs-password=${UUID}${hy2_extra}#HY2-${node_alias}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
-        if [ "$TU5_ENABLED" = "true" ] && [ "$TU5_PORT" != "0" ]; then
-            link="tuic://${credential}:${credential}@${server_uri}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&allow_insecure=1#TUIC-${display_name}"
+        if [ "$TU5_ENABLED" = true ] && [ "$TU5_PORT" != 0 ]; then
+            link="tuic://${credential}:${credential}@${ENTRY_IP_URI}:${TU5_PORT}?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=www.bing.com&insecure=1&allow_insecure=1#TUIC-${node_alias}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
-        if [ "$AN_ENABLED" = "true" ] && [ "$AN_PORT" != "0" ]; then
-            link="anytls://${credential}@${server_uri}:${AN_PORT}?sni=www.bing.com&insecure=1#AnyTLS-${display_name}"
+        if [ "$AN_ENABLED" = true ] && [ "$AN_PORT" != 0 ]; then
+            link="anytls://${credential}@${ENTRY_IP_URI}:${AN_PORT}?sni=www.bing.com&insecure=1#AnyTLS-${node_alias}"
             all_links="${all_links:+$all_links$'\n'}$link"
         fi
-        # NAIVE-SUPPORT: NaiveProxy URI（每设备独立凭据：username=设备ID，密码=无状态复算，流量可精确归属）
-        if [ "$NAIVE_ENABLED" = "true" ] && [ "$NAIVE_PORT" != "0" ]; then
-            local ndev_pw=""
-            ndev_pw=$(nexus_device_naive_password "$device_id") || ndev_pw="$NAIVE_PASS"
+        if [ "$NAIVE_ENABLED" = true ] && [ "$NAIVE_PORT" != 0 ]; then
             if [ "${NAIVE_MODE:-h2}" != h3 ]; then
-                link="naive+https://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive-H2·${display_name}"
+                link="naive+https://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}#RR-Naive-H2·${node_alias}"
                 all_links="${all_links:+$all_links$'\n'}$link"
             fi
             if [ "${NAIVE_MODE:-h2}" != h2 ]; then
-                link="naive+quic://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}?congestion_control=${NAIVE_QUIC_CC:-bbr}#RR-Naive-H3·${display_name}"
+                link="naive+quic://${device_id}:${ndev_pw}@${NAIVE_DOMAIN}:${NAIVE_PORT}?congestion_control=${NAIVE_QUIC_CC:-bbr}#RR-Naive-H3·${node_alias}"
                 all_links="${all_links:+$all_links$'\n'}$link"
             fi
         fi
-
-        output_tmp=$(mktemp "$NEXUS_SUB_ROOT/.${device_id}.XXXXXX") || { rm -f "$rows_file"; return 1; }
-        printf '%s\n' "$all_links" > "$output_tmp"
-        chmod 600 "$output_tmp"
-        mv -f "$output_tmp" "$NEXUS_SUB_ROOT/${device_id}.txt"
-        # 多格式订阅：Sing-box 完整配置 + Clash Meta YAML（复用主订阅生成器，凭据与输出目录覆盖）
-        # NAIVE-SUPPORT: json/yaml 里的 naive 由 generate_client_json/generate_clash_yaml 内部处理（主线 40-subscription.sh 已支持），此处无需额外逻辑
-        if declare -F generate_client_json >/dev/null 2>&1 && declare -F generate_clash_yaml >/dev/null 2>&1; then
-            local device_sub_dir="${NEXUS_SUB_ROOT}/.fmt-${device_id}"
-            install -d -m 700 "$device_sub_dir"
-            local ndev_ou="$device_id"
-            local ndev_op=""
-            ndev_op=$(nexus_device_naive_password "$device_id") || ndev_op="$NAIVE_PASS"
-            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
-                generate_client_json "$server_raw" 2>/dev/null; then
-                nexus_atomic_copy "$device_sub_dir/client.json" "$NEXUS_SUB_ROOT/${device_id}.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                # 旧版 Reality 单节点地址继续生成，仅用于已有订阅平滑热更。
-                if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_NAIVE_USER_OVERRIDE="$ndev_ou" RR_NAIVE_PASS_OVERRIDE="$ndev_op" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
-                    generate_client_json "$server_raw" vless 2>/dev/null; then
-                    nexus_atomic_copy "$device_sub_dir/client-vl.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                else
-                    rm -f "$NEXUS_SUB_ROOT/${device_id}-vl.json"
-                fi
-            else
-                rm -f "$NEXUS_SUB_ROOT/${device_id}.json" "$NEXUS_SUB_ROOT/${device_id}-vl.json"
-            fi
-            # URI/Base64 订阅只依赖上面已经生成的原始链接，不能被 Sing-box
-            # JSON 的生成结果连带跳过；这保证 NekoBox 等地址始终同步刷新。
-            local _dev_txt="$NEXUS_SUB_ROOT/${device_id}.txt"
-            if [ -s "$_dev_txt" ]; then
-                local _encoded_tmp=""
-                _encoded_tmp=$(mktemp "$NEXUS_SUB_ROOT/.${device_id}-encoded.XXXXXX") || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                if ! base64 -w0 < "$_dev_txt" > "$_encoded_tmp" || ! chmod 600 "$_encoded_tmp"; then
-                    rm -f "$_encoded_tmp"
-                    rm -rf "$device_sub_dir"
-                    rm -f "$rows_file"
-                    return 1
-                fi
-                mv -f "$_encoded_tmp" "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt"
-                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-sr.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-            fi
-            if RR_CLIENT_UUID_OVERRIDE="$credential" RR_CLIENT_NAME_OVERRIDE="$node_alias" RR_SUB_OUTPUT_DIR="$device_sub_dir" \
-                generate_clash_yaml "$server_raw" 2>/dev/null && \
-                RR_CLIENT_UUID_OVERRIDE="$credential" RR_SUB_OUTPUT_DIR="$device_sub_dir" generate_clash_client_copies 2>/dev/null; then
-                nexus_atomic_copy "$device_sub_dir/clash_meta.yaml" "$NEXUS_SUB_ROOT/${device_id}.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                nexus_atomic_copy "$device_sub_dir/client-mihomo.yaml" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                nexus_atomic_copy "$device_sub_dir/client-clash-verge.yaml" "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-                nexus_atomic_copy "$device_sub_dir/client-flclash.yaml" "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml" || { rm -rf "$device_sub_dir"; rm -f "$rows_file"; return 1; }
-            else
-                rm -f "$NEXUS_SUB_ROOT/${device_id}.yaml" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" \
-                    "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml"
-            fi
-            rm -rf "$device_sub_dir"
-        fi
-        # 同步一份到主订阅服务器目录（本地模式用户通过主订阅地址获取个人订阅）
-        if [ -n "$sub_token" ] && [ -d "$SUB_ROOT" ]; then
-            local nexus_pub_dir="${SUB_ROOT}/nexus"
-            install -d -m 700 "$nexus_pub_dir"
-            nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}.txt" "$nexus_pub_dir/${sub_token}.txt" || { rm -f "$rows_file"; return 1; }
-            # 逐格式同步；新一轮未生成的格式必须同时删除旧发布副本，避免
-            # 个人地址/二维码继续返回上一次配置的陈旧内容。
-            local _split_sfx=""
-            for _split_sfx in ".json" ".yaml" "-vl.json" "-mihomo.yaml" "-clash-verge.yaml" "-flclash.yaml" "-v2rayn.txt" "-v2rayng.txt" "-sr.txt" "-nekobox.txt"; do
-                if [ -f "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" ]; then
-                    nexus_atomic_copy "$NEXUS_SUB_ROOT/${device_id}${_split_sfx}" "$nexus_pub_dir/${sub_token}${_split_sfx}" || { rm -f "$rows_file"; return 1; }
-                else
-                    rm -f "$nexus_pub_dir/${sub_token}${_split_sfx}"
-                fi
-            done
-            active_tokens="${active_tokens}${sub_token}|"
-        fi
-        active_ids="${active_ids}${device_id}|"
+        printf '%s\n' "$all_links" > "$NEXUS_SUB_ROOT/${device_id}.txt" || return 1
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$device_id" "$credential" "$sub_token" "$node_alias" "$ndev_pw" >> "$active_file"
     done < "$rows_file"
-    rm -f "$rows_file"
 
-    local existing_file=""
-    for existing_file in "$NEXUS_SUB_ROOT"/dev_*.txt; do
-        [ -f "$existing_file" ] || continue
-        device_id=$(basename "$existing_file" .txt)
-        # 跳过按客户端拆分的订阅文件。
-        case "$device_id" in
-            *-v2rayn|*-v2rayng|*-sr|*-nekobox) continue ;;
-        esac
-        if [[ "$active_ids" != *"|${device_id}|"* ]]; then
-            # 同步删除按客户端拆分的订阅文件（-vl/-v2rayn/-v2rayng/-sr/-nekobox），
-            # 旧实现只删 .txt/.json/.yaml，已删设备的拆分文件残留（D10）
-            rm -f "$existing_file" "$NEXUS_SUB_ROOT/${device_id}.json" "$NEXUS_SUB_ROOT/${device_id}.yaml" \
-                "$NEXUS_SUB_ROOT/${device_id}-vl.json" "$NEXUS_SUB_ROOT/${device_id}-mihomo.yaml" "$NEXUS_SUB_ROOT/${device_id}-clash-verge.yaml" \
-                "$NEXUS_SUB_ROOT/${device_id}-flclash.yaml" "$NEXUS_SUB_ROOT/${device_id}-v2rayn.txt" "$NEXUS_SUB_ROOT/${device_id}-v2rayng.txt" \
-                "$NEXUS_SUB_ROOT/${device_id}-sr.txt" "$NEXUS_SUB_ROOT/${device_id}-nekobox.txt"
-        fi
-    done
-    # 清理主订阅目录中已删除设备的订阅副本
-    if [ -d "${SUB_ROOT}/nexus" ]; then
-        # 目录枚举防护（D4）：与根目录/短路由目录一致放置空白 index.html（0600），
-        # SimpleHTTPServer 存在 index.html 时不输出目录清单
-        : > "${SUB_ROOT}/nexus/index.html" 2>/dev/null || true
-        chmod 600 "${SUB_ROOT}/nexus/index.html" 2>/dev/null || true
-        for pub_file in "${SUB_ROOT}"/nexus/*.txt; do
-            [ -f "$pub_file" ] || continue
-            pub_token=$(basename "$pub_file" .txt)
-            case "$pub_token" in
-                *-v2rayn|*-v2rayng|*-sr|*-nekobox) continue ;;
-            esac
-            if [[ "$active_tokens" != *"|${pub_token}|"* ]]; then
-                rm -f "$pub_file" "${SUB_ROOT}/nexus/${pub_token}.json" "${SUB_ROOT}/nexus/${pub_token}.yaml" \
-                    "${SUB_ROOT}/nexus/${pub_token}-vl.json" "${SUB_ROOT}/nexus/${pub_token}-mihomo.yaml" "${SUB_ROOT}/nexus/${pub_token}-clash-verge.yaml" \
-                    "${SUB_ROOT}/nexus/${pub_token}-flclash.yaml" "${SUB_ROOT}/nexus/${pub_token}-v2rayn.txt" "${SUB_ROOT}/nexus/${pub_token}-v2rayng.txt" \
-                    "${SUB_ROOT}/nexus/${pub_token}-sr.txt" "${SUB_ROOT}/nexus/${pub_token}-nekobox.txt"
-            fi
-        done
+    if ! python3 - "$active_file" "$NEXUS_SUB_ROOT" "$RR_NEXUS_PUBLISH_ROOT" \
+        "$template_dir" "$template_uuid" "$template_alias" "$template_user" "$template_password" <<'PY'; then
+import base64
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+active_path, private_raw, public_raw, template_raw, *placeholder_raw = sys.argv[1:]
+private_root = Path(private_raw)
+public_root = Path(public_raw)
+template_root = Path(template_raw)
+placeholders = [value.encode() for value in placeholder_raw]
+device_re = re.compile(r"dev_[a-f0-9]{12}\Z")
+token_re = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+
+def write(path: Path, content: bytes) -> None:
+    with path.open("wb") as output:
+        output.write(content)
+    path.chmod(0o600)
+
+templates = {}
+for source_name, suffix in (
+    ("client.json", ".json"),
+    ("client-vl.json", "-vl.json"),
+    ("clash_meta.yaml", ".yaml"),
+):
+    source = template_root / source_name
+    if source.is_file():
+        templates[suffix] = source.read_bytes()
+
+suffixes = (
+    ".txt", ".json", ".yaml", "-vl.json", "-mihomo.yaml",
+    "-clash-verge.yaml", "-flclash.yaml", "-v2rayn.txt",
+    "-v2rayng.txt", "-sr.txt", "-nekobox.txt",
+)
+with open(active_path, encoding="utf-8") as active:
+    for line in active:
+        device_id, credential, token, alias, naive_password = line.rstrip("\n").split("\t")
+        if not device_re.fullmatch(device_id):
+            raise ValueError("invalid device id in staged sync")
+        raw_path = private_root / f"{device_id}.txt"
+        converted = []
+        for raw_line in raw_path.read_bytes().splitlines():
+            marker = b"RR_NEXUS_VMESS_JSON:"
+            if raw_line.startswith(marker):
+                raw_line = b"vmess://" + base64.b64encode(raw_line[len(marker):])
+            converted.append(raw_line)
+        raw = b"\n".join(converted) + b"\n"
+        write(raw_path, raw)
+
+        replacements = [credential.encode(), alias.encode(), device_id.encode(), naive_password.encode()]
+        for suffix, template in templates.items():
+            rendered = template
+            for old, new in zip(placeholders, replacements):
+                rendered = rendered.replace(old, new)
+            write(private_root / f"{device_id}{suffix}", rendered)
+
+        encoded = base64.b64encode(raw)
+        for suffix in ("-v2rayn.txt", "-v2rayng.txt", "-sr.txt", "-nekobox.txt"):
+            write(private_root / f"{device_id}{suffix}", encoded)
+        yaml_path = private_root / f"{device_id}.yaml"
+        if yaml_path.is_file():
+            yaml = yaml_path.read_bytes()
+            for suffix in ("-mihomo.yaml", "-clash-verge.yaml", "-flclash.yaml"):
+                write(private_root / f"{device_id}{suffix}", yaml)
+
+        if token and token_re.fullmatch(token):
+            for suffix in suffixes:
+                source = private_root / f"{device_id}{suffix}"
+                if source.is_file():
+                    write(public_root / f"{token}{suffix}", source.read_bytes())
+
+write(public_root / "index.html", b"")
+PY
+        return 1
     fi
+    rm -rf -- "$work_dir"
     return 0
 }
 
 sync_nexus_devices() {
+    nexus_with_sync_lock _sync_nexus_devices_locked
+}
+
+_sync_nexus_devices_locked() {
     [ -f "$CONFIG_FILE" ] || return 1
     load_config_with_defaults || return 1
     # QueryStats(reset=true) flushes the current per-user delta before a
@@ -572,6 +871,7 @@ sync_nexus_devices() {
     nexus_collect_traffic_once >/dev/null 2>&1 || true
     local snapshot=""
     local was_running=false
+    local config_changed=false
     snapshot=$(mktemp /tmp/rr-nexus-singbox.XXXXXX) || return 1
     if [ -f /etc/sing-box/config.json ]; then
         cp -p /etc/sing-box/config.json "$snapshot" || { rm -f "$snapshot"; return 1; }
@@ -584,6 +884,7 @@ sync_nexus_devices() {
         rm -f "$snapshot"
         return 1
     fi
+    [ "$SINGBOX_CONFIG_CHANGED" = true ] && config_changed=true
     if [ "$SINGBOX_CONFIG_CHANGED" = true ] && [ "$was_running" = true ] && any_node_protocol_enabled; then
         if ! restart_singbox; then
             [ -s "$snapshot" ] && cp -p "$snapshot" /etc/sing-box/config.json
@@ -593,7 +894,10 @@ sync_nexus_devices() {
         fi
     fi
     if ! generate_nexus_device_subscriptions; then
-        if [ -s "$snapshot" ]; then
+        # A subscription-only failure must not bounce an unchanged node.  Only
+        # roll back/restart when this transaction actually installed a new
+        # Sing-box config (normally because the effective user list changed).
+        if [ "$config_changed" = true ] && [ -s "$snapshot" ]; then
             cp -p "$snapshot" /etc/sing-box/config.json
             [ "$was_running" = true ] && restart_singbox >/dev/null 2>&1 || true
         fi
@@ -604,48 +908,425 @@ sync_nexus_devices() {
     return 0
 }
 
+NEXUS_GRPCIO_MIN_VERSION="1.43.0"
+NEXUS_GRPCIO_PIP_VERSION="1.83.0"
+NEXUS_TYPING_EXTENSIONS_PIP_VERSION="4.12.2"
+NEXUS_PYPI_API_ROOT="https://pypi.org/pypi"
+NEXUS_PYPI_FILES_HOST="files.pythonhosted.org"
+NEXUS_PYPI_METADATA_MAX_BYTES=5242880
+NEXUS_PYPI_WHEEL_MAX_BYTES=134217728
+
+nexus_system_python() {
+    env -u PYTHONHOME -u PYTHONPATH python3 -I "$@"
+}
+
+nexus_python_pip() {
+    nexus_system_python -m pip "$@"
+}
+
+nexus_version_is_numeric() {
+    nexus_system_python - "$1" <<'PY'
+import re
+import sys
+
+raise SystemExit(0 if re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", sys.argv[1]) else 1)
+PY
+}
+
+nexus_version_at_least() {
+    nexus_system_python - "$1" "$2" <<'PY'
+import re
+import sys
+
+values = sys.argv[1:]
+if not all(re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value) for value in values):
+    raise SystemExit(2)
+parts = [[int(part) for part in value.split(".")] for value in values]
+width = max(map(len, parts))
+parts = [part + [0] * (width - len(part)) for part in parts]
+raise SystemExit(0 if parts[0] >= parts[1] else 1)
+PY
+}
+
+nexus_grpc_installed_version() {
+    nexus_system_python - <<'PY'
+import re
+
+try:
+    import grpc
+except Exception:
+    raise SystemExit(1)
+value = getattr(grpc, "__version__", "")
+if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+nexus_typing_extensions_installed_version() {
+    nexus_system_python - <<'PY'
+import re
+from importlib import metadata
+
+try:
+    import typing_extensions
+    value = metadata.version("typing_extensions")
+except Exception:
+    raise SystemExit(1)
+if not hasattr(typing_extensions, "Self") or not hasattr(typing_extensions, "override"):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+nexus_current_python_abi() {
+    nexus_system_python - <<'PY'
+import sys
+
+if sys.implementation.name != "cpython":
+    raise SystemExit(1)
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+PY
+}
+
+nexus_current_wheel_arch() {
+    local machine=""
+    machine=$(uname -m) || return 1
+    case "$machine" in
+        x86_64|amd64) printf '%s\n' x86_64 ;;
+        aarch64|arm64) printf '%s\n' aarch64 ;;
+        *)
+            echo "Unsupported grpcio wheel architecture: $machine" >&2
+            return 1
+            ;;
+    esac
+}
+
+nexus_pypi_fetch() {
+    local url="$1"
+    local output_file="$2"
+    local max_bytes="$3"
+    [[ "$max_bytes" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    curl --fail --silent --show-error \
+        --proto '=https' --tlsv1.2 \
+        --retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 300 \
+        --connect-timeout 10 --max-time 180 --max-filesize "$max_bytes" \
+        -H 'User-Agent: RR-vps Nexus dependency installer' \
+        --output "$output_file" "$url"
+}
+
+nexus_resolve_pypi_wheel() {
+    local metadata_file="$1"
+    local package="$2"
+    local expected_version="$3"
+    local python_abi="$4"
+    local wheel_arch="$5"
+    nexus_system_python - "$metadata_file" "$package" "$expected_version" \
+        "$python_abi" "$wheel_arch" "$NEXUS_PYPI_FILES_HOST" <<'PY'
+import json
+import re
+import sys
+from urllib.parse import urlsplit
+
+metadata_path, package, expected_version, python_abi, wheel_arch, files_host = sys.argv[1:]
+
+
+def reject(message):
+    print(f"Invalid PyPI metadata: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            reject(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+if package not in {"grpcio", "typing_extensions"}:
+    reject("unexpected package")
+if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", expected_version):
+    reject("unexpected version")
+if package == "grpcio":
+    if not re.fullmatch(r"cp[0-9]+", python_abi):
+        reject("unexpected Python ABI")
+    if wheel_arch not in {"x86_64", "aarch64"}:
+        reject("unsupported architecture")
+
+try:
+    with open(metadata_path, "r", encoding="utf-8") as metadata_stream:
+        metadata = json.load(metadata_stream, object_pairs_hook=unique_object)
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    reject(str(error))
+
+if not isinstance(metadata, dict):
+    reject("root is not an object")
+info = metadata.get("info")
+members = metadata.get("urls")
+metadata_name = info.get("name") if isinstance(info, dict) else None
+canonical_name = lambda value: re.sub(r"[-_.]+", "-", value).lower()
+if (
+    not isinstance(metadata_name, str)
+    or canonical_name(metadata_name) != canonical_name(package)
+):
+    reject("package name mismatch")
+if info.get("version") != expected_version:
+    reject("release version mismatch")
+if not isinstance(members, list) or not members or len(members) > 512:
+    reject("invalid release member list")
+
+seen_filenames = set()
+seen_urls = set()
+candidates = []
+for member in members:
+    if not isinstance(member, dict):
+        reject("release member is not an object")
+    filename = member.get("filename")
+    url = member.get("url")
+    if not isinstance(filename, str) or not re.fullmatch(r"[A-Za-z0-9._+-]+", filename):
+        reject("invalid member filename")
+    if not isinstance(url, str):
+        reject("invalid member URL")
+    if filename in seen_filenames or url in seen_urls:
+        reject("duplicate release member")
+    seen_filenames.add(filename)
+    seen_urls.add(url)
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        reject("malformed member URL")
+    expected_path = rf"/packages/[0-9a-f]{{2}}/[0-9a-f]{{2}}/[0-9a-f]{{60}}/{re.escape(filename)}"
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != files_host
+        or parsed.netloc != files_host
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not re.fullmatch(expected_path, parsed.path)
+    ):
+        reject("member URL is outside the trusted PyPI file host")
+
+    matches = False
+    if package == "typing_extensions":
+        matches = (
+            filename == f"typing_extensions-{expected_version}-py3-none-any.whl"
+            and member.get("python_version") == "py3"
+        )
+    else:
+        prefix = f"grpcio-{expected_version}-{python_abi}-{python_abi}-"
+        if filename.startswith(prefix) and filename.endswith(".whl"):
+            platform = filename[len(prefix):-4]
+            allowed_tags = {
+                f"manylinux_2_17_{wheel_arch}",
+                f"manylinux2014_{wheel_arch}",
+            }
+            platform_tags = platform.split(".")
+            matches = (
+                len(platform_tags) == len(set(platform_tags))
+                and f"manylinux_2_17_{wheel_arch}" in platform_tags
+                and set(platform_tags) <= allowed_tags
+                and member.get("python_version") == python_abi
+            )
+    if not matches:
+        continue
+    if member.get("packagetype") != "bdist_wheel" or member.get("yanked") is not False:
+        reject("matching file is not an active binary wheel")
+    digests = member.get("digests")
+    digest = digests.get("sha256") if isinstance(digests, dict) else None
+    size = member.get("size")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        reject("invalid wheel SHA256")
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= 134217728:
+        reject("invalid wheel size")
+    candidates.append((filename, url, digest, size))
+
+if len(candidates) != 1:
+    reject(f"expected exactly one compatible wheel, found {len(candidates)}")
+print(*candidates[0], sep="\n")
+PY
+}
+
+nexus_pip_install_local_wheel() {
+    local wheel_file="$1"
+    local pip_help=""
+    local -a pip_args=(
+        --isolated install --disable-pip-version-check --no-input
+        --no-index --no-deps --no-cache-dir --only-binary=:all:
+    )
+    pip_help=$(PIP_CONFIG_FILE=/dev/null nexus_python_pip --isolated install --help 2>&1) || true
+    if [[ "$pip_help" == *"--break-system-packages"* ]]; then
+        pip_args+=(--break-system-packages)
+    fi
+    (
+        unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_TARGET PIP_PREFIX
+        unset PIP_REQUIRE_VIRTUALENV PIP_CONSTRAINT PIP_BUILD_CONSTRAINT PIP_CACHE_DIR
+        export PIP_CONFIG_FILE=/dev/null
+        nexus_python_pip "${pip_args[@]}" "$wheel_file"
+    )
+}
+
+nexus_install_verified_pypi_wheel() (
+    local package="$1"
+    local expected_version="$2"
+    local python_abi="py3"
+    local wheel_arch="any"
+    local metadata_url=""
+    local work_dir=""
+    local metadata_file=""
+    local resolved=""
+    local wheel_name=""
+    local wheel_url=""
+    local expected_digest=""
+    local expected_size=""
+    local wheel_file=""
+    local actual_digest=""
+    local actual_size=""
+    local -a wheel_fields=()
+
+    case "$package" in
+        grpcio)
+            python_abi=$(nexus_current_python_abi) || return 1
+            wheel_arch=$(nexus_current_wheel_arch) || return 1
+            ;;
+        typing_extensions) ;;
+        *) return 1 ;;
+    esac
+    umask 077
+    work_dir=$(mktemp -d /tmp/rr-nexus-pypi.XXXXXX) || return 1
+    trap 'rm -rf -- "$work_dir"' EXIT
+    metadata_file="$work_dir/release.json"
+    metadata_url="${NEXUS_PYPI_API_ROOT}/${package}/${expected_version}/json"
+    nexus_pypi_fetch "$metadata_url" "$metadata_file" \
+        "$NEXUS_PYPI_METADATA_MAX_BYTES" || return 1
+    [ -f "$metadata_file" ] && [ ! -L "$metadata_file" ] || return 1
+    actual_size=$(stat -c '%s' "$metadata_file") || return 1
+    [ "$actual_size" -gt 0 ] && [ "$actual_size" -le "$NEXUS_PYPI_METADATA_MAX_BYTES" ] || return 1
+    resolved=$(nexus_resolve_pypi_wheel \
+        "$metadata_file" "$package" "$expected_version" "$python_abi" "$wheel_arch") || return 1
+    mapfile -t wheel_fields <<< "$resolved"
+    [ "${#wheel_fields[@]}" -eq 4 ] || return 1
+    wheel_name="${wheel_fields[0]}"
+    wheel_url="${wheel_fields[1]}"
+    expected_digest="${wheel_fields[2]}"
+    expected_size="${wheel_fields[3]}"
+    case "$wheel_url" in
+        "https://${NEXUS_PYPI_FILES_HOST}/packages/"*) ;;
+        *) return 1 ;;
+    esac
+
+    wheel_file="$work_dir/$wheel_name"
+    nexus_pypi_fetch "$wheel_url" "$wheel_file" \
+        "$NEXUS_PYPI_WHEEL_MAX_BYTES" || return 1
+    [ -f "$wheel_file" ] && [ ! -L "$wheel_file" ] || return 1
+    actual_size=$(stat -c '%s' "$wheel_file") || return 1
+    [ "$actual_size" = "$expected_size" ] && \
+        [ "$actual_size" -le "$NEXUS_PYPI_WHEEL_MAX_BYTES" ] || return 1
+    actual_digest=$(sha256sum "$wheel_file") || return 1
+    actual_digest="${actual_digest%% *}"
+    if [ "$actual_digest" != "$expected_digest" ]; then
+        echo "PyPI wheel SHA256 mismatch for $wheel_name" >&2
+        return 1
+    fi
+    nexus_pip_install_local_wheel "$wheel_file"
+)
+
+nexus_ensure_typing_extensions() {
+    local installed_version=""
+    installed_version=$(nexus_typing_extensions_installed_version 2>/dev/null) || true
+    if [ -n "$installed_version" ]; then
+        nexus_version_is_numeric "$installed_version" || return 1
+        if nexus_version_at_least "$installed_version" 4.12.0 && \
+            ! nexus_version_at_least "$installed_version" 5.0.0; then
+            return 0
+        fi
+        if nexus_version_at_least "$installed_version" 5.0.0; then
+            echo "Refusing to downgrade typing_extensions $installed_version" >&2
+            return 1
+        fi
+    fi
+    nexus_install_verified_pypi_wheel \
+        typing_extensions "$NEXUS_TYPING_EXTENSIONS_PIP_VERSION" || return 1
+    installed_version=$(nexus_typing_extensions_installed_version 2>/dev/null) || return 1
+    [ "$installed_version" = "$NEXUS_TYPING_EXTENSIONS_PIP_VERSION" ]
+}
+
+nexus_install_grpcio_pip_fallback() {
+    local installed_version=""
+    installed_version=$(nexus_grpc_installed_version 2>/dev/null) || true
+    if [ -n "$installed_version" ]; then
+        nexus_version_is_numeric "$installed_version" || return 1
+        if nexus_version_at_least "$installed_version" "$NEXUS_GRPCIO_PIP_VERSION" && \
+            [ "$installed_version" != "$NEXUS_GRPCIO_PIP_VERSION" ]; then
+            echo "Keeping newer grpcio $installed_version; refusing to downgrade it." >&2
+            return 0
+        fi
+        [ "$installed_version" = "$NEXUS_GRPCIO_PIP_VERSION" ] && return 0
+    fi
+    nexus_ensure_typing_extensions || return 1
+    nexus_install_verified_pypi_wheel grpcio "$NEXUS_GRPCIO_PIP_VERSION" || return 1
+    installed_version=$(nexus_grpc_installed_version 2>/dev/null) || return 1
+    if [ "$installed_version" != "$NEXUS_GRPCIO_PIP_VERSION" ]; then
+        echo "grpcio post-install version mismatch: expected $NEXUS_GRPCIO_PIP_VERSION, got ${installed_version:-missing}" >&2
+        return 1
+    fi
+}
+
 nexus_install_dependencies() {
+    local grpcio_version=""
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        nexus_dependencies_available || {
+            echo -e "${RED}错误：热更新候选缺少 Nexus 依赖；未运行 apt/pip，事务将回滚。${RESET}" >&2
+            return 1
+        }
+        return 0
+    fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o DPkg::Lock::Timeout=120 update -y || return 1
     apt-get -o DPkg::Lock::Timeout=120 install -y \
-        python3 python3-pip python3-argon2 python3-cryptography qrencode sqlite3 jq || return 1
+        python3 python3-pip python3-argon2 python3-cryptography \
+        python3-typing-extensions qrencode sqlite3 jq || return 1
 
-    # P1 修复：grpcio < 1.43 在 Ubuntu 22.04 上会导致面板 CPU 死循环。
-    # 优先级：已装新版跳过 → apt 源版（Debian12=1.51 / Ubuntu24=1.60 直接满足，
-    # 且不引入 pip 依赖冲突）→ 最后才 pip 兜底（仅 Ubuntu22 需要，源版 1.41）。
-    grpcio_version_ok() {
-        python3 -c 'import grpc; v = grpc.__version__.split("."); raise SystemExit(0 if int(v[0]) > 1 or (int(v[0]) == 1 and int(v[1]) >= 43) else 1)' 2>/dev/null
-    }
-    if grpcio_version_ok; then
-        return 0
-    fi
-    if apt-get -o DPkg::Lock::Timeout=120 install -y python3-grpcio >/dev/null 2>&1 && grpcio_version_ok; then
-        return 0
+    # Debian 12 and Ubuntu 24.04 ship a safe grpcio and remain apt-only.  The
+    # Ubuntu 22.04 package is 1.41, so it falls through to the verified wheel.
+    apt-get -o DPkg::Lock::Timeout=120 install -y python3-grpcio >/dev/null 2>&1 || true
+    grpcio_version=$(nexus_grpc_installed_version 2>/dev/null) || true
+    if [ -n "$grpcio_version" ]; then
+        nexus_version_is_numeric "$grpcio_version" || return 1
+        if nexus_version_at_least "$grpcio_version" "$NEXUS_GRPCIO_MIN_VERSION"; then
+            return 0
+        fi
     fi
 
-    # pip 兜底：卸载 apt 旧版（Ubuntu22 的 1.41），改从 PyPI 装 >=1.43。
-    # 坑：apt 装的 typing_extensions 无 pip RECORD 文件，pip 升级它时报
-    # "Cannot uninstall typing_extensions" 导致整个安装失败——
-    # 先 --ignore-installed 装 pip 版 shadow 掉 debian 版（/usr/local/lib 优先）。
-    if dpkg -l python3-grpcio >/dev/null 2>&1; then
-        apt-get -o DPkg::Lock::Timeout=120 remove -y python3-grpcio >/dev/null 2>&1 || true
-    fi
-    local pip_extra=""
-    if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
-        pip_extra="--break-system-packages"
-    fi
-    python3 -m pip install $pip_extra -q --ignore-installed typing_extensions 2>/dev/null || true
-    python3 -m pip install $pip_extra -q "grpcio>=1.43" || {
-        echo -e "${RED}错误：pip 安装 grpcio 失败（网络或依赖冲突），面板安装中止。${RESET}" >&2
-        return 1
-    }
-
-    # 验证安装结果：版本必须 >= 1.43
-    if ! grpcio_version_ok; then
-        echo -e "${RED}错误：grpcio 版本低于 1.43（存在 CPU 死循环缺陷），安装失败${RESET}" >&2
+    if ! nexus_install_grpcio_pip_fallback; then
+        echo -e "${RED}错误：无法安全安装固定版本 grpcio ${NEXUS_GRPCIO_PIP_VERSION}，面板安装中止。${RESET}" >&2
         return 1
     fi
     return 0
+}
+
+nexus_dependencies_available() {
+    local grpcio_version=""
+    local command_name=""
+    local PYTHONDONTWRITEBYTECODE=1
+    export PYTHONDONTWRITEBYTECODE
+    for command_name in python3 qrencode sqlite3 jq; do
+        command -v "$command_name" >/dev/null 2>&1 || return 1
+    done
+    python3 - <<'PY' >/dev/null 2>&1 || return 1
+import argon2
+import cryptography
+import grpc
+PY
+    grpcio_version=$(nexus_grpc_installed_version 2>/dev/null) || return 1
+    nexus_version_is_numeric "$grpcio_version" && \
+        nexus_version_at_least "$grpcio_version" "$NEXUS_GRPCIO_MIN_VERSION"
 }
 
 nexus_write_config() {
@@ -656,6 +1337,7 @@ nexus_write_config() {
     local backend_port=7900  # backend ALWAYS binds to 7900
     local stats_port="$4"
     local ssh_host="$5"
+    local acme_email="${7:-}"
 
     mkdir -p /etc/rr-nexus /var/lib/rr-nexus/subscriptions
     local cfg='{
@@ -670,6 +1352,8 @@ nexus_write_config() {
   "ssh_host": "__SSH_HOST__",
   "public_port": __USER_PORT__,
   "sub_port": __SUB_PORT__,
+  "subscription_access_mode": "__SUB_ACCESS_MODE__",
+  "subscription_domain": "__SUB_DOMAIN__",
   "traffic_mode": "__TRAFFIC_MODE__"
 }'
     cfg="${cfg//__MODE__/$mode}"
@@ -682,7 +1366,12 @@ nexus_write_config() {
     # sub_port 在 Nexus 配置里表示二维码/订阅地址应使用的公网端口。
     # 普通 VPS 与 SUB_PORT 相同；NAT/LXD 必须使用当前入口族的映射端口。
     cfg="${cfg//__SUB_PORT__/${SUB_URL_PORT:-${SUB_PORT:-0}}}"
+    cfg="${cfg//__SUB_ACCESS_MODE__/${SUB_ACCESS_MODE:-local}}"
+    cfg="${cfg//__SUB_DOMAIN__/${SUB_DOMAIN:-}}"
     cfg="${cfg//__TRAFFIC_MODE__/$traffic_mode_val}"
+    if [ -n "$acme_email" ]; then
+        cfg=$(jq --arg acme_email "$acme_email" '.acme_email=$acme_email' <<<"$cfg") || return 1
+    fi
     echo "$cfg" > "$NEXUS_CONFIG_FILE"
     chmod 600 "$NEXUS_CONFIG_FILE"
 }
@@ -694,16 +1383,26 @@ nexus_sync_subscription_endpoint() {
 
     local current_host=""
     local current_port=""
+    local current_access_mode=""
+    local current_sub_domain=""
     local tmp=""
     current_host=$(jq -r '.ssh_host // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     current_port=$(jq -r '.sub_port // 0' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
-    if [ "$current_host" = "$ENTRY_IP_RAW" ] && [ "$current_port" = "$SUB_URL_PORT" ]; then
+    current_access_mode=$(jq -r '.subscription_access_mode // "local"' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
+    current_sub_domain=$(jq -r '.subscription_domain // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
+    if [ "$current_host" = "$ENTRY_IP_RAW" ] && [ "$current_port" = "$SUB_URL_PORT" ] && \
+       [ "$current_access_mode" = "${SUB_ACCESS_MODE:-local}" ] && \
+       [ "$current_sub_domain" = "${SUB_DOMAIN:-}" ]; then
         return 0
     fi
 
     tmp=$(mktemp /tmp/rr-nexus-endpoint.XXXXXX) || return 1
     if ! jq --arg ssh_host "$ENTRY_IP_RAW" --argjson sub_port "$SUB_URL_PORT" \
-        '.ssh_host=$ssh_host | .sub_port=$sub_port' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+        --arg subscription_access_mode "${SUB_ACCESS_MODE:-local}" \
+        --arg subscription_domain "${SUB_DOMAIN:-}" \
+        '.ssh_host=$ssh_host | .sub_port=$sub_port |
+         .subscription_access_mode=$subscription_access_mode |
+         .subscription_domain=$subscription_domain' "$NEXUS_CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -717,6 +1416,9 @@ nexus_migrate_runtime_config() {
     local stats_port=""
     local ssh_host=""
     local sub_url_port=""
+    local mode=""
+    local domain=""
+    local domain_is_ip=false
     local tmp=""
     panel_port=$(jq -r '.port // 7900' "$NEXUS_CONFIG_FILE" 2>/dev/null) || return 1
     is_valid_port "$panel_port" || return 1
@@ -726,6 +1428,10 @@ nexus_migrate_runtime_config() {
     fi
     ssh_host=$(jq -r '.ssh_host // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null)
     sub_url_port=$(jq -r '.sub_port // 0' "$NEXUS_CONFIG_FILE" 2>/dev/null)
+    mode=$(jq -r '.mode // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null)
+    domain=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null)
+    is_ip_version "$domain" 4 && domain_is_ip=true
+    is_ip_version "$domain" 6 && domain_is_ip=true
     if select_entry_ip >/dev/null 2>&1; then
         ssh_host="$ENTRY_IP_RAW"
         if is_valid_port "${SUB_URL_PORT:-}"; then
@@ -743,9 +1449,20 @@ nexus_migrate_runtime_config() {
         is_valid_port "$sub_url_port" || sub_url_port=0
     fi
     tmp=$(mktemp /tmp/rr-nexus-migrate.XXXXXX) || return 1
-    if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" --argjson sub_port "$sub_url_port" \
+    if [ "$mode" = public ] && { [ "$domain" = ip ] || [ "$domain_is_ip" = true ]; }; then
+        domain="$ssh_host"
+    fi
+    if ! jq --argjson stats_port "$stats_port" --arg ssh_host "$ssh_host" --arg domain "$domain" --argjson sub_port "$sub_url_port" \
+        --arg subscription_access_mode "${SUB_ACCESS_MODE:-local}" \
+        --arg subscription_domain "${SUB_DOMAIN:-}" \
         --arg published_subscription_root "${SUB_ROOT}/nexus" \
-        '.stats_port=$stats_port | .ssh_host=$ssh_host | .sub_port=$sub_port | .published_subscription_root=$published_subscription_root' "$NEXUS_CONFIG_FILE" > "$tmp"; then
+        '.listen="127.0.0.1" | .port=7900 | .database="/var/lib/rr-nexus/nexus.db" |
+         .subscription_root="/var/lib/rr-nexus/subscriptions" |
+         .stats_port=$stats_port | .ssh_host=$ssh_host | .domain=$domain | .sub_port=$sub_port |
+         .subscription_access_mode=$subscription_access_mode |
+         .subscription_domain=$subscription_domain |
+         .published_subscription_root=$published_subscription_root' \
+        "$NEXUS_CONFIG_FILE" > "$tmp"; then
         rm -f "$tmp"
         return 1
     fi
@@ -823,12 +1540,15 @@ nexus_prompt_admin() {
     local init_output=""
     while true; do
         read -rp "管理员账号: " username
-        [ -n "$username" ] && break
-        echo -e "${RED}账号不能为空。${RESET}"
+        [[ "$username" =~ ^[A-Za-z][A-Za-z0-9_.-]{2,31}$ ]] && break
+        echo -e "${RED}账号需以字母开头，仅含字母、数字、点、下划线或连字符（3–32 位）。${RESET}"
     done
     while true; do
         read -rsp "管理员密码: " password; echo
-        [ -n "$password" ] || { echo -e "${RED}密码不能为空。${RESET}"; continue; }
+        [ "${#password}" -ge 12 ] && [ "${#password}" -le 512 ] || {
+            echo -e "${RED}密码需为 12–512 个字符。${RESET}"
+            continue
+        }
         read -rsp "再次输入密码: " password_again; echo
         [ "$password" = "$password_again" ] && break
         echo -e "${RED}两次密码不一致。${RESET}"
@@ -902,14 +1622,93 @@ nexus_choose_stats_port() {
     printf '%s\n' "$candidate"
 }
 
+nexus_commit_nginx_candidate() {
+    local candidate="$1"
+    local target="$2"
+    local enabled_link="$3"
+    local obsolete_link="${4:-}"
+    local transaction_dir=""
+    local path=""
+    local index=0
+    local nginx_was_active=false
+    local transaction_ok=true
+    local restore_ok=true
+    local -a managed_paths=("$target" "$enabled_link")
+    local -a managed_present=()
+    [ -n "$obsolete_link" ] && managed_paths+=("$obsolete_link")
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+
+    systemctl is-active --quiet nginx >/dev/null 2>&1 && nginx_was_active=true
+    transaction_dir=$(mktemp -d "${TMPDIR:-/tmp}/rr-nexus-nginx-site.XXXXXX") || return 1
+    mkdir -p "$transaction_dir/items" || {
+        rm -rf "$transaction_dir"
+        return 1
+    }
+    for index in "${!managed_paths[@]}"; do
+        path="${managed_paths[$index]}"
+        managed_present[$index]=false
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            cp -a -- "$path" "$transaction_dir/items/$index" || {
+                rm -rf "$transaction_dir"
+                return 1
+            }
+            managed_present[$index]=true
+        fi
+    done
+
+    mv -f -- "$candidate" "$target" || transaction_ok=false
+    if [ "$transaction_ok" = true ]; then
+        rm -f -- "$enabled_link" || transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ] && [ -n "$obsolete_link" ]; then
+        rm -f -- "$obsolete_link" || transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ]; then
+        ln -sfnT "$target" "$enabled_link" || transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ] && ! nginx -t >/dev/null 2>&1; then
+        transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ] && [ "$nginx_was_active" = true ] && \
+       ! systemctl reload nginx >/dev/null 2>&1; then
+        transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ]; then
+        rm -rf "$transaction_dir"
+        return 0
+    fi
+
+    # Validation/reload failure must restore the exact former RR-owned files.
+    # This keeps a bad candidate from poisoning the next boot or unrelated
+    # Nginx maintenance, while leaving every user-owned site untouched.
+    rm -f -- "$candidate"
+    for path in "${managed_paths[@]}"; do
+        rm -f -- "$path" || restore_ok=false
+    done
+    for index in "${!managed_paths[@]}"; do
+        if [ "${managed_present[$index]}" = true ] && \
+           ! cp -a -- "$transaction_dir/items/$index" "${managed_paths[$index]}"; then
+            restore_ok=false
+        fi
+    done
+    if [ "$nginx_was_active" = true ]; then
+        nginx -t >/dev/null 2>&1 || restore_ok=false
+        systemctl reload nginx >/dev/null 2>&1 || restore_ok=false
+    fi
+    rm -rf "$transaction_dir"
+    [ "$restore_ok" = true ] || \
+        printf '%s\n' '[错误] Nexus Nginx 站点写入失败，且原配置未能完整恢复。' >&2
+    return 1
+}
+
 nexus_write_nginx_site() {
     local domain="$1"
     local port="$2"
     local tmp=""
-    tmp=$(mktemp /etc/nginx/sites-available/.rr-nexus.XXXXXX) || return 1
+    local nginx_available_dir="${NEXUS_NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+    local nginx_enabled_dir="${NEXUS_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+    tmp=$(mktemp "$nginx_available_dir/.rr-nexus.XXXXXX") || return 1
     if ! cat > "$tmp" <<EOF
-limit_req_zone \$binary_remote_addr zone=rr_nexus_login:10m rate=10r/m;
-
 server {
     listen 80;
     listen [::]:80;
@@ -920,24 +1719,8 @@ server {
         root /var/www/rr-nexus-certbot;
     }
 
-    location = /api/login {
-        limit_req zone=rr_nexus_login burst=5 nodelay;
-        proxy_pass http://127.0.0.1:7900;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
     location / {
-        proxy_pass http://127.0.0.1:7900;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 65s;
+        return 444;
     }
 }
 EOF
@@ -946,21 +1729,20 @@ EOF
         return 1
     fi
     chmod 644 "$tmp"
-    mv -f "$tmp" "$NEXUS_NGINX_SITE"
-    ln -sfn "$NEXUS_NGINX_SITE" /etc/nginx/sites-enabled/rr-nexus.conf
-    # 语法通过后必须 reload，否则新写的 server 块不生效（仍走 default 站
-    # 导致 LE acme-challenge 404，证书签发失败——6.6.14 修复）
-    if nginx -t 2>/dev/null; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-    fi
+    nexus_commit_nginx_candidate "$tmp" "$NEXUS_NGINX_SITE" \
+        "$nginx_enabled_dir/rr-nexus.conf"
 }
 
 nexus_write_nginx_custom_port() {
     local domain="$1"
     local port="$2"
     local tmp=""
-    tmp=$(mktemp /etc/nginx/sites-available/.rr-nexus-port.XXXXXX) || return 1
+    local nginx_available_dir="${NEXUS_NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+    local nginx_enabled_dir="${NEXUS_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+    tmp=$(mktemp "$nginx_available_dir/.rr-nexus-port.XXXXXX") || return 1
     if ! cat > "$tmp" <<EOF
+limit_req_zone \$binary_remote_addr zone=rr_nexus_login:10m rate=10r/m;
+
 server {
     listen ${port} ssl;
     listen [::]:${port} ssl;
@@ -970,6 +1752,34 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
 
+    location ^~ /sub/ {
+        access_log off;
+        error_log /dev/null crit;
+        proxy_pass http://127.0.0.1:7900;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 65s;
+    }
+
+    # 热更新时，已打开但未刷新的旧页面可能仍把订阅 token 放在
+    # ?raw= 查询串。后端会拒绝它，但 Nginx 必须在转发前就停止记录。
+    location ~ ^/api/(devices/[^/]+/qr|remote/qr)/?$ {
+        access_log off;
+        error_log /dev/null crit;
+        proxy_pass http://127.0.0.1:7900;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 65s;
+    }
+
     location = /api/login {
         limit_req zone=rr_nexus_login burst=5 nodelay;
         proxy_pass http://127.0.0.1:7900;
@@ -997,6 +1807,22 @@ server {
     server_name ${domain};
     location /.well-known/acme-challenge/ {
         root /var/www/rr-nexus-certbot;
+    }
+    location = /sub {
+        access_log off;
+        error_log /dev/null crit;
+        return 404;
+    }
+    location ^~ /sub/ {
+        access_log off;
+        error_log /dev/null crit;
+        return 404;
+    }
+
+    location ~ ^/api/(devices/[^/]+/qr|remote/qr)/?$ {
+        access_log off;
+        error_log /dev/null crit;
+        return 404;
     }
     location / {
         return 301 https://\$host:${port}\$request_uri;
@@ -1008,17 +1834,19 @@ EOF
         return 1
     fi
     chmod 644 "$tmp"
-    mv -f "$tmp" "${NEXUS_NGINX_SITE}.port"
-    ln -sfn "${NEXUS_NGINX_SITE}.port" /etc/nginx/sites-enabled/rr-nexus-port.conf
-    if nginx -t 2>/dev/null; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-    fi
+    nexus_commit_nginx_candidate "$tmp" "${NEXUS_NGINX_SITE}.port" \
+        "$nginx_enabled_dir/rr-nexus-port.conf" \
+        "$nginx_enabled_dir/rr-nexus.conf"
 }
 
 nexus_enable_public_https() {
     local domain="$1"
     local email="$2"
     local port="$3"
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        echo -e "${RED}[失败] 热更新事务不新签发面板证书；请先修复既有 HTTPS 状态。${RESET}" >&2
+        return 1
+    fi
     export DEBIAN_FRONTEND=noninteractive
     apt-get install -y nginx certbot python3-certbot-nginx || return 1
     if { tcp_port_in_use 80 || tcp_port_in_use 443; } && \
@@ -1028,36 +1856,26 @@ nexus_enable_public_https() {
     fi
     nexus_write_nginx_site "$domain" "$port" || return 1
     systemctl enable --now nginx >/dev/null 2>&1 || return 1
-    open_protocol_firewall 80 tcp
+    open_protocol_firewall 80 tcp || return 1
 
-    if [ "$port" = "443" ]; then
-        # 标准流程：certbot 自动配置 443 SSL 并重定向 HTTP
-        open_protocol_firewall 443 tcp
-        if ! certbot --nginx -d "$domain" -m "$email" --agree-tos --non-interactive --redirect; then
-            echo -e "${RED}[失败] Let's Encrypt 证书签发失败。请检查域名解析和 80/443 入站后重试。${RESET}"
-            nexus_remove_public_proxy
-            return 1
-        fi
-    else
-        # 自定义端口：webroot 验证签证书（不碰 443），再手写独立端口 HTTPS server
-        local webroot="/var/www/rr-nexus-certbot"
-        # 6.6.15：机器 root umask 077（如 DMIT 模板）时 mkdir/certbot 生成的
-        # 目录为 700、挑战文件为 600，nginx(www-data) 读取报 Permission denied
-        # 导致 LE 验证 403。显式 chmod 目录链 + umask 022 子壳跑 certbot。
-        mkdir -p "$webroot/.well-known/acme-challenge"
-        chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge"
-        if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$domain" -m "$email" --agree-tos --non-interactive); then
-            echo -e "${RED}[失败] Let's Encrypt 证书签发失败。请检查域名解析和 80 端口入站后重试。${RESET}"
-            nexus_remove_public_proxy
-            return 1
-        fi
-        if ! nexus_write_nginx_custom_port "$domain" "$port"; then
-            echo -e "${RED}[失败] 独立端口 HTTPS 配置写入失败。${RESET}"
-            nexus_remove_public_proxy
-            return 1
-        fi
-        open_protocol_firewall "$port" tcp
+    # 始终使用可审计的 webroot 签发，再由 RR 写入完整 TLS/HTTP 分离配置。
+    # 不能使用 certbot --redirect：它生成的 server 级跳转可能把首次出现的
+    # /sub/<token> 明文请求重定向并写日志，token 在跳转前就已经泄露。
+    local webroot="/var/www/rr-nexus-certbot"
+    mkdir -p "$webroot/.well-known/acme-challenge"
+    chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge"
+    if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$domain" -m "$email" --agree-tos --non-interactive); then
+        echo -e "${RED}[失败] Let's Encrypt 证书签发失败。请检查域名解析和 80 端口入站后重试。${RESET}"
+        nexus_remove_public_proxy
+        return 1
     fi
+    rm -f /etc/nginx/sites-enabled/rr-nexus.conf
+    if ! nexus_write_nginx_custom_port "$domain" "$port"; then
+        echo -e "${RED}[失败] HTTPS 配置写入失败。${RESET}"
+        nexus_remove_public_proxy
+        return 1
+    fi
+    open_protocol_firewall "$port" tcp || return 1
 
     if [ ! -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ]; then
         nexus_remove_public_proxy
@@ -1078,6 +1896,374 @@ nexus_remove_public_proxy() {
     rm -f /etc/nginx/sites-enabled/rr-nexus-port.conf "${NEXUS_NGINX_SITE}.port"
     if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
         systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+}
+
+nexus_enable_public_ip_https() {
+    local address="$1"
+    local port="$2"
+    local nginx_available_dir="${NEXUS_NGINX_AVAILABLE_DIR:-/etc/nginx/sites-available}"
+    local nginx_enabled_dir="${NEXUS_NGINX_ENABLED_DIR:-/etc/nginx/sites-enabled}"
+    local cert_dir="${NEXUS_CERT_DIR:-/etc/rr-nexus/certs}"
+    local cert_file="$cert_dir/ip.crt"
+    local key_file="$cert_dir/ip.key"
+    local site="$nginx_available_dir/rr-nexus-ip.conf"
+    local site_tmp=""
+    local cert_tmp=""
+    local key_tmp=""
+    local transaction_dir=""
+    local transaction_ok=true
+    local restore_ok=true
+    local replace_cert=false
+    local candidate_reload_attempted=false
+    local nginx_was_active=false
+    local nginx_was_enabled=false
+    local path=""
+    local index=0
+    local -a managed_paths=()
+    local -a managed_present=()
+    is_ip_version "$address" 4 || is_ip_version "$address" 6 || return 1
+    is_valid_port "$port" || return 1
+    [ "$port" != 7900 ] || return 1
+
+    systemctl is-active --quiet nginx >/dev/null 2>&1 && nginx_was_active=true
+    systemctl is-enabled --quiet nginx >/dev/null 2>&1 && nginx_was_enabled=true
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] && [ "$nginx_was_active" != true ]; then
+        echo -e "${RED}[失败] 热更新候选不会启动原本停止的 Nginx。${RESET}" >&2
+        return 1
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v nginx >/dev/null 2>&1; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            echo -e "${RED}[失败] 热更新候选缺少 Nginx；未运行 apt 安装。${RESET}" >&2
+            return 1
+        fi
+        apt-get install -y nginx >/dev/null 2>&1 || return 1
+    elif [ "${RR_UPDATE_TRANSACTION:-0}" != 1 ]; then
+        # Keep the existing interactive repair behavior outside an update.
+        apt-get install -y nginx >/dev/null 2>&1 || return 1
+    fi
+    if [ "${RR_UPDATE_TRANSACTION:-0}" != 1 ]; then
+        install -d -m 700 "$cert_dir" || return 1
+    fi
+    if [ ! -s "$cert_file" ] || [ ! -s "$key_file" ] || \
+       ! certificate_identity_matches "$cert_file" "$address" || \
+       ! certificate_private_key_matches "$cert_file" "$key_file"; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            echo -e "${RED}[失败] 热更新候选不会生成新的公网 IP 面板证书。${RESET}" >&2
+            return 1
+        fi
+        replace_cert=true
+        cert_tmp=$(mktemp "$cert_dir/.ip.crt.XXXXXX") || return 1
+        key_tmp=$(mktemp "$cert_dir/.ip.key.XXXXXX") || { rm -f "$cert_tmp"; return 1; }
+        if ! (umask 077; openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "$key_tmp" -out "$cert_tmp" -subj "/CN=${address}" \
+            -addext "subjectAltName=IP:${address}" >/dev/null 2>&1); then
+            rm -f "$cert_tmp" "$key_tmp"
+            return 1
+        fi
+        chmod 600 "$key_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+        chmod 644 "$cert_tmp" || { rm -f "$cert_tmp" "$key_tmp"; return 1; }
+    fi
+
+    install -d -m 755 "$nginx_available_dir" "$nginx_enabled_dir" || {
+        rm -f "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    site_tmp=$(mktemp "$nginx_available_dir/.rr-nexus-ip.XXXXXX") || {
+        rm -f "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    if ! cat > "$site_tmp" <<NGXEOF
+limit_req_zone \$binary_remote_addr zone=rr_nexus_ip_login:10m rate=10r/m;
+
+server {
+    listen ${port} ssl;
+    listen [::]:${port} ssl;
+    server_name _;
+    client_max_body_size 32k;
+    ssl_certificate ${cert_file};
+    ssl_certificate_key ${key_file};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # IP 模式使用自签证书，不能作为订阅客户端的可信入口。即使调用方
+    # 知道设备 token，也必须在代理层拒绝，且不能把 token 写入日志。
+    location = /sub {
+        access_log off;
+        error_log /dev/null crit;
+        return 404;
+    }
+
+    location ^~ /sub/ {
+        access_log off;
+        error_log /dev/null crit;
+        return 404;
+    }
+
+    location ~ ^/api/(devices/[^/]+/qr|remote/qr)/?$ {
+        access_log off;
+        error_log /dev/null crit;
+        proxy_pass http://127.0.0.1:7900;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 65s;
+    }
+
+    location = /api/login {
+        limit_req zone=rr_nexus_ip_login burst=5 nodelay;
+        proxy_pass http://127.0.0.1:7900;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 65s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:7900;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 65s;
+    }
+}
+NGXEOF
+    then
+        rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+        return 1
+    fi
+    chmod 644 "$site_tmp" || {
+        rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+        return 1
+    }
+
+    # Only RR-owned files take part in this transaction.  In particular, the
+    # distro default site and user-created Nginx sites must never be removed or
+    # rewritten while Nexus changes access mode.
+    managed_paths=(
+        "$site"
+        "$nginx_enabled_dir/rr-nexus.conf"
+        "$nginx_enabled_dir/rr-nexus-port.conf"
+        "$nginx_enabled_dir/rr-nexus-ip.conf"
+        "$cert_file"
+        "$key_file"
+    )
+    transaction_dir=$(mktemp -d "${TMPDIR:-/tmp}/rr-nexus-nginx.XXXXXX") || {
+        rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    mkdir -p "$transaction_dir/items" || {
+        rm -rf "$transaction_dir"
+        rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    for index in "${!managed_paths[@]}"; do
+        path="${managed_paths[$index]}"
+        managed_present[$index]=false
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            if ! cp -a -- "$path" "$transaction_dir/items/$index"; then
+                rm -rf "$transaction_dir"
+                rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+                return 1
+            fi
+            managed_present[$index]=true
+        fi
+    done
+
+    # Stage every file and link change before asking Nginx to load it.  Any
+    # failed validation/service operation below restores this exact snapshot.
+    if [ "$replace_cert" = true ]; then
+        if mv -f "$key_tmp" "$key_file" && mv -f "$cert_tmp" "$cert_file"; then
+            key_tmp=""
+            cert_tmp=""
+        else
+            transaction_ok=false
+        fi
+    fi
+    if [ "$transaction_ok" = true ]; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            [ "$(stat -c %a "$key_file" 2>/dev/null)" = 600 ] && \
+                [ "$(stat -c %a "$cert_file" 2>/dev/null)" = 644 ] || transaction_ok=false
+        elif ! chmod 600 "$key_file" || ! chmod 644 "$cert_file"; then
+            transaction_ok=false
+        fi
+    fi
+    if [ "$transaction_ok" = true ]; then
+        if mv -f "$site_tmp" "$site"; then
+            site_tmp=""
+        else
+            transaction_ok=false
+        fi
+    fi
+    if [ "$transaction_ok" = true ] && \
+       ! rm -f "$nginx_enabled_dir/rr-nexus.conf" \
+           "$nginx_enabled_dir/rr-nexus-port.conf" \
+           "$nginx_enabled_dir/rr-nexus-ip.conf"; then
+        transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ] && \
+       ! ln -sfnT "$site" "$nginx_enabled_dir/rr-nexus-ip.conf"; then
+        transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ] && ! nginx -t >/dev/null 2>&1; then
+        transaction_ok=false
+    fi
+    if [ "$transaction_ok" = true ]; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            systemctl is-active --quiet nginx >/dev/null 2>&1 || transaction_ok=false
+        elif ! systemctl enable --now nginx >/dev/null 2>&1; then
+            transaction_ok=false
+        fi
+    fi
+    if [ "$transaction_ok" = true ]; then
+        candidate_reload_attempted=true
+        if systemctl reload nginx >/dev/null 2>&1; then
+            :
+        else
+            transaction_ok=false
+        fi
+    fi
+    if [ "$transaction_ok" = true ] && ! open_protocol_firewall "$port" tcp; then
+        transaction_ok=false
+    fi
+
+    if [ "$transaction_ok" != true ]; then
+        rm -f "$site_tmp" "$cert_tmp" "$key_tmp"
+        for path in "${managed_paths[@]}"; do
+            if ! rm -f -- "$path"; then
+                restore_ok=false
+            fi
+        done
+        for index in "${!managed_paths[@]}"; do
+            if [ "${managed_present[$index]}" = true ] && \
+               ! cp -a -- "$transaction_dir/items/$index" "${managed_paths[$index]}"; then
+                restore_ok=false
+            fi
+        done
+
+        # Restore both dimensions of the original unit state.  Once a reload
+        # was attempted its outcome can be ambiguous, so reload the restored
+        # site (or restart as a last resort) before reporting the failure.
+        if [ "$nginx_was_active" = true ]; then
+            if ! systemctl is-active --quiet nginx >/dev/null 2>&1; then
+                systemctl start nginx >/dev/null 2>&1 || restore_ok=false
+            elif [ "$candidate_reload_attempted" = true ]; then
+                systemctl reload nginx >/dev/null 2>&1 || \
+                    systemctl restart nginx >/dev/null 2>&1 || restore_ok=false
+            fi
+        else
+            systemctl stop nginx >/dev/null 2>&1 || restore_ok=false
+        fi
+        if [ "$nginx_was_enabled" = true ]; then
+            systemctl enable nginx >/dev/null 2>&1 || restore_ok=false
+        else
+            systemctl disable nginx >/dev/null 2>&1 || restore_ok=false
+        fi
+        rm -rf "$transaction_dir"
+        [ "$restore_ok" = true ] || \
+            printf '%s\n' '[错误] Nexus Nginx 配置切换失败，且自动回滚未完整完成。' >&2
+        return 1
+    fi
+
+    rm -rf "$transaction_dir"
+    return 0
+}
+
+nexus_reconcile_public_proxy() {
+    [ -r "$NEXUS_CONFIG_FILE" ] || return 0
+    local mode="" domain="" port="" acme_email="" domain_is_ip=false
+    mode=$(jq -r '.mode // empty' "$NEXUS_CONFIG_FILE") || return 1
+    domain=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE") || return 1
+    port=$(jq -r '.public_port // empty' "$NEXUS_CONFIG_FILE") || return 1
+    is_valid_port "$port" || return 1
+    if [ "$mode" = local ]; then
+        nexus_remove_public_proxy
+        return 0
+    fi
+    [ "$mode" = public ] || return 1
+    is_ip_version "$domain" 4 && domain_is_ip=true
+    is_ip_version "$domain" 6 && domain_is_ip=true
+    if [ "$domain_is_ip" = true ]; then
+        nexus_enable_public_ip_https "$domain" "$port"
+        return $?
+    fi
+    [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] || return 1
+    if [ -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ] && \
+       { [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] || [ -s "$NEXUS_NGINX_SITE" ] || \
+         [ -s "${NEXUS_NGINX_SITE}.port" ]; }; then
+        # 旧版本的自定义端口站点可能缺少登录限流共享区或订阅日志保护。
+        # 每次更新都从当前可信配置重建，不能只因为旧文件能通过 nginx -t
+        # 就继续沿用。
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            command -v nginx >/dev/null 2>&1 && \
+                systemctl is-active --quiet nginx >/dev/null 2>&1 || {
+                printf '%s\n' '热更新候选不会安装或启动原本不可用的 Nginx。' >&2
+                return 1
+            }
+        fi
+        nexus_write_nginx_custom_port "$domain" "$port" || return 1
+        if [ "${RR_UPDATE_TRANSACTION:-0}" != 1 ]; then
+            systemctl enable --now nginx >/dev/null 2>&1 || return 1
+        fi
+        open_protocol_firewall 80 tcp || return 1
+        open_protocol_firewall "$port" tcp || return 1
+        return 0
+    fi
+    acme_email=$(jq -r '.acme_email // empty' "$NEXUS_CONFIG_FILE") || return 1
+    [[ "$acme_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || {
+        printf '公网域名备份缺少 ACME 邮箱，无法在目标机安全重建证书。\n' >&2
+        return 1
+    }
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        printf '%s\n' '热更新候选不会删除代理站点或新签发面板证书。' >&2
+        return 1
+    fi
+    nexus_remove_public_proxy
+    nexus_enable_public_https "$domain" "$acme_email" "$port"
+}
+
+nexus_public_proxy_health_check() {
+    [ -r "$NEXUS_CONFIG_FILE" ] || return 0
+    local mode="" domain="" port="" health_host="" domain_is_ip=false
+    mode=$(jq -r '.mode // empty' "$NEXUS_CONFIG_FILE") || return 1
+    [ "$mode" = public ] || return 0
+    domain=$(jq -r '.domain // empty' "$NEXUS_CONFIG_FILE") || return 1
+    port=$(jq -r '.public_port // empty' "$NEXUS_CONFIG_FILE") || return 1
+    is_valid_port "$port" || return 1
+    is_ip_version "$domain" 4 && domain_is_ip=true
+    is_ip_version "$domain" 6 && domain_is_ip=true
+    if [ "$domain_is_ip" = true ]; then
+        certificate_identity_matches /etc/rr-nexus/certs/ip.crt "$domain" || return 1
+        openssl x509 -in /etc/rr-nexus/certs/ip.crt -noout -checkend 604800 >/dev/null 2>&1 || return 1
+    else
+        certificate_identity_matches "/etc/letsencrypt/live/${domain}/fullchain.pem" "$domain" || return 1
+        openssl x509 -in "/etc/letsencrypt/live/${domain}/fullchain.pem" \
+            -noout -checkend 604800 >/dev/null 2>&1 || return 1
+    fi
+    # Exercise the real TLS/Nginx proxy locally.  The external VPS job checks
+    # the public route and firewall separately so NAT hairpin support is not a
+    # prerequisite for a safe local rollback decision.
+    if [ "$domain_is_ip" = true ]; then
+        health_host="$domain"
+        is_ip_version "$domain" 6 && health_host="[${domain}]"
+        # IP mode intentionally uses a self-signed certificate.  Identity is
+        # pinned immediately above against the certificate IP SAN; -k is never used for
+        # a trusted domain certificate.
+        curl -fkSs --connect-timeout 3 --max-time 8 \
+            -H "Host: ${health_host}" "https://127.0.0.1:${port}/healthz" >/dev/null
+    else
+        curl -fSs --connect-timeout 3 --max-time 8 \
+            --resolve "${domain}:${port}:127.0.0.1" \
+            "https://${domain}:${port}/healthz" >/dev/null
     fi
 }
 
@@ -1208,154 +2394,14 @@ nexus_install() {
                 [[ "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] && break
                 echo -e "${RED}邮箱格式无效。${RESET}"
             done
-            nexus_write_config public "${domain,,}" "$port" "$stats_port" "$ENTRY_IP_RAW" "$traffic_mode_val" || return 1
+            nexus_write_config public "${domain,,}" "$port" "$stats_port" "$ENTRY_IP_RAW" "$traffic_mode_val" "$email" || return 1
             nexus_enable_public_https "${domain,,}" "$email" "$port" || return 1
             ;;
                 3)
             nexus_remove_public_proxy
             nexus_write_config public "$ENTRY_IP_RAW" "$port" "$stats_port" "$ENTRY_IP_RAW" "$traffic_mode_val" || return 1
-            # B4/E12：直连模式面板端口防火墙放行（与订阅端口放行同模式）。
-            # 默认 DROP 策略的机器上不加此规则面板公网不可达。
-            open_protocol_firewall "$port" "tcp"
-            local ngx_port=""
-            ngx_port=$(jq -r ".public_port // 7900" "$NEXUS_CONFIG_FILE" 2>/dev/null || echo "$port")
-            
             echo -e "${YELLOW}正在配置 IP 直连 HTTPS（自签证书）……${RESET}"
-            local cert_dir="/etc/rr-nexus/certs"
-            mkdir -p "$cert_dir"
-            openssl req -x509 -nodes -days 3650 -newkey rsa:2048                 -keyout "$cert_dir/ip.key" -out "$cert_dir/ip.crt"                 -subj "/CN=${ENTRY_IP_RAW}" -addext "subjectAltName=IP:${ENTRY_IP_RAW}" 2>/dev/null || {
-                echo -e "${RED}[失败] 自签证书生成失败。${RESET}"
-                return 1
-            }
-            chmod 600 "$cert_dir/ip.key" "$cert_dir/ip.crt"
-            apt-get install -y nginx libnginx-mod-stream >/dev/null 2>&1 || true
-
-            # 生成 HTTP 反代配置
-            cat > /etc/nginx/sites-available/rr-nexus-ip.conf <<NGXEOF
-server {
-    listen 80;
-    listen PORT_PLACEHOLDER ssl;
-    ssl_certificate ${cert_dir}/ip.crt;
-    ssl_certificate_key ${cert_dir}/ip.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    location / {
-        proxy_pass http://127.0.0.1:7900;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-    }
-}
-NGXEOF
-            sed -i "s/PORT_PLACEHOLDER/${ngx_port}/g" /etc/nginx/sites-available/rr-nexus-ip.conf
-
-            # 443 被占用时走独立端口，不搞 SNI 分流
-            local need_sni=false
-            if ss -tlnp 2>/dev/null | grep -q ":443 "; then
-                echo -e "${YELLOW}[提示] 443 被占用，面板将使用独立端口 ${ngx_port}。${RESET}"
-                need_sni=false
-            fi
-
-            if [ "$need_sni" = true ]; then
-                # === SNI 分流模式 ===
-                # 1. 修改 sing-box 监听从 *:443 到 127.0.0.1:8443
-                local sb_config="/etc/sing-box/config.json"
-                local sb_backup="/etc/sing-box/config.json.bak.nx.$(date +%s)"
-                if [ -f "$sb_config" ]; then
-                    cp "$sb_config" "$sb_backup" || return 1
-                    # 替换 VLESS Reality listen
-                    local tmp_sb=""
-                    tmp_sb=$(mktemp /tmp/sb-config-nx.XXXXXX) || return 1
-                    jq '
-                        .inbounds |= map(
-                            if (.listen == "::" or .listen == "" or .listen == "0.0.0.0") and (.listen_port == 443) then
-                                .listen = "127.0.0.1" | .listen_port = 8443
-                            else . end
-                        )
-                    ' "$sb_config" > "$tmp_sb" 2>/dev/null || {
-                        cp "$sb_backup" "$sb_config" 2>/dev/null
-                        rm -f "$tmp_sb" "$sb_backup"
-                        echo -e "${RED}[失败] sing-box 配置修改失败，原配置已恢复。${RESET}"
-                        return 1
-                    }
-                    mv "$tmp_sb" "$sb_config" || return 1
-                    chmod 600 "$sb_config"
-                fi
-
-                # 2. Nginx stream SNI 分流接管 443
-                [ -z "$(nginx -V 2>&1 | grep stream_module)" ] && apt-get install -y libnginx-mod-stream >/dev/null 2>&1 || true
-                sed -i '/^stream {/,/^}/d' /etc/nginx/nginx.conf 2>/dev/null || true
-                sed -i '/^load_module.*stream/d' /etc/nginx/nginx.conf 2>/dev/null || true
-                cat > /tmp/rr-nexus-stream.conf <<NGXEOF
-stream {
-    map \$ssl_preread_server_name \$backend {
-        ${ENTRY_IP_RAW}  nexus_panel;
-        # B5/E14：其余 SNI 走节点上游（修正前 default 也指向 nexus_panel，
-        # singbox_node 上游从未被引用——若该分支被启用会将 443 节点流量全导面板）
-        default          singbox_node;
-    }
-    upstream nexus_panel {
-        server 127.0.0.1:${ngx_port};
-    }
-    upstream singbox_node {
-        server 127.0.0.1:8443;
-    }
-    server {
-        listen 443;
-        listen [::]:443;
-        ssl_preread on;
-        proxy_pass \$backend;
-    }
-}
-NGXEOF
-                python3 -c "
-lines=open('/etc/nginx/nginx.conf').readlines()
-# Prepend load_module if not present
-if not any('load_module' in l and 'stream' in l for l in lines):
-    lines.insert(0,'load_module modules/ngx_stream_module.so;\n')
-# Insert stream after last }
-for i in range(len(lines)-1,-1,-1):
-    if '}' in lines[i] and not lines[i].strip().startswith('#'):
-        lines.insert(i+1,'\n')
-        lines.insert(i+1,open('/tmp/rr-nexus-stream.conf').read())
-        break
-open('/etc/nginx/nginx.conf','w').write(''.join(lines))
-"
-                rm -f /tmp/rr-nexus-stream.conf
-
-                echo -e "${CYAN}SNI 分流：面板 IP → Nexus，其他域名 → sing-box${RESET}"
-            else
-                # === 直连模式（端口不冲突） ===
-                sed -i '/^stream {/,/^}/d' /etc/nginx/nginx.conf 2>/dev/null || true
-            fi
-
-            rm -f /etc/nginx/sites-enabled/rr-nexus-ip.conf
-            ln -sf /etc/nginx/sites-available/rr-nexus-ip.conf /etc/nginx/sites-enabled/rr-nexus-ip.conf
-            rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-
-            # 启动 Nginx
-            if ! nginx -t; then
-                echo -e "${RED}[失败] Nginx 配置错误。${RESET}"
-                [ "$need_sni" = true ] && [ -f "$sb_backup" ] && cp "$sb_backup" "$sb_config" 2>/dev/null
-                return 1
-            fi
-            systemctl stop nginx 2>/dev/null || true
-            sleep 1
-            systemctl start nginx || { echo -e "${RED}[失败] Nginx 启动失败。${RESET}"; [ "$need_sni" = true ] && [ -f "$sb_backup" ] && cp "$sb_backup" "$sb_config" 2>/dev/null; return 1; }
-            sleep 1
-
-            # 重启 sing-box（如果改了配置）
-            if [ "$need_sni" = true ] && systemctl is-active --quiet sing-box 2>/dev/null; then
-                systemctl restart sing-box 2>/dev/null || true
-                sleep 1
-                if ! systemctl is-active --quiet sing-box; then
-                    echo -e "${RED}[警告] sing-box 重启失败，正在回滚配置……${RESET}"
-                    [ -f "$sb_backup" ] && cp "$sb_backup" "$sb_config" 2>/dev/null
-                    systemctl restart sing-box 2>/dev/null || true
-                fi
-            fi
-            rm -f "$sb_backup" 2>/dev/null || true
-            systemctl enable --now nginx 2>/dev/null || true
+            nexus_enable_public_ip_https "$ENTRY_IP_RAW" "$port" || return 1
             ;;
         *) echo -e "${RED}输入无效，未安装。${RESET}"; return 1 ;;
     esac
@@ -1414,7 +2460,7 @@ open('/etc/nginx/nginx.conf','w').write(''.join(lines))
             ;;
         3)
             echo -e "${CYAN}正在检测公网 IP 入口……${RESET}"
-            test_url=$(nexus_access_url)
+            test_url=$(nexus_panel_url)
             # 仅自签 IP 模式允许跳过 CA 校验；域名模式必须通过完整 TLS 校验。
             curl --fail --silent --show-error --insecure --connect-timeout 5 --max-time 10 \
                 "${test_url%/}/healthz" >/dev/null 2>&1 && reachability_ok=true
@@ -1488,7 +2534,7 @@ nexus_menu() {
         if nexus_is_installed && [ "$mode" = "local" ]; then
             nexus_show_local_tutorial 2>/dev/null || true
         fi
-        echo -e " 安全：Argon2id 密码、登录限流、CSRF、HttpOnly 会话、恢复码、审计日志"
+        echo -e " 安全：Argon2id 密码、登录限流、CSRF、同源标签页 Bearer 会话、恢复码、审计日志"
         echo -e " 设备：独立凭据、独立协议链接、二维码、启停、到期与实时上下行流量"
         echo -e "${CYAN}=================================================================================${RESET}"
         echo -e "  ${PURPLE}1.${RESET} 安装 / 重新配置访问模式"

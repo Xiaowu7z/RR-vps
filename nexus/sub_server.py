@@ -7,8 +7,12 @@ import argparse
 import base64
 import io
 import json
+import posixpath
 import re
 import sqlite3
+import ssl
+import sys
+import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -21,6 +25,111 @@ TOKEN_FILE_RE = re.compile(
     r"^([A-Za-z0-9_-]{20,64}?)(?:-clash-verge\.yaml|-mihomo\.yaml|-flclash\.yaml|"
     r"-v2rayng\.txt|-v2rayn\.txt|-nekobox\.txt|-vl\.json|-sr\.txt|\.json|\.yaml|\.txt)$"
 )
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Bound public subscription workers and evict stalled clients."""
+
+    daemon_threads = True
+    request_queue_size = 64
+    max_active_requests = 64
+    request_timeout_seconds = 15
+
+    def __init__(
+        self,
+        *args: Any,
+        ssl_context: ssl.SSLContext | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._request_slots = threading.BoundedSemaphore(self.max_active_requests)
+        self._ssl_context = ssl_context
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):  # type: ignore[no-untyped-def]
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout_seconds)
+        if self._ssl_context is not None:
+            try:
+                # Delay the handshake until the bounded request worker runs.  A
+                # client that never sends a ClientHello therefore consumes one
+                # of the fixed request slots for at most request_timeout_seconds
+                # instead of blocking the accept loop or creating unlimited
+                # threads.
+                request = self._ssl_context.wrap_socket(
+                    request,
+                    server_side=True,
+                    do_handshake_on_connect=False,
+                )
+            except (OSError, ssl.SSLError):
+                request.close()
+                raise
+        return request, address
+
+    def process_request(self, request, client_address):  # type: ignore[no-untyped-def]
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):  # type: ignore[no-untyped-def]
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def handle_error(self, request, client_address):  # type: ignore[no-untyped-def]
+        # Internet scanners routinely send cleartext or abort during a TLS
+        # handshake.  Treat those as rejected clients, not application faults;
+        # otherwise ThreadingMixIn emits a full traceback for every probe and
+        # can grow the journal without bound.
+        error = sys.exc_info()[1]
+        if isinstance(error, (ssl.SSLError, ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def build_tls_context(certfile: str, keyfile: str) -> ssl.SSLContext:
+    """Build the only TLS policy accepted by the public subscription server."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.options |= ssl.OP_NO_COMPRESSION
+    context.set_alpn_protocols(["http/1.1"])
+    context.load_cert_chain(certfile, keyfile)
+    return context
+
+
+def classify_personal_request(target: str) -> tuple[bool, re.Match[str] | None]:
+    """Return whether *target* reaches the protected ``/nexus`` namespace.
+
+    ``SimpleHTTPRequestHandler`` normalizes dot segments before opening a file.
+    Authorization must therefore classify the normalized path as well as the
+    path received on the wire.  Ambiguous spellings are deliberately rejected
+    instead of being normalized into an authorized subscription request.
+    """
+    parsed = urllib.parse.urlsplit(target)
+    try:
+        decoded = urllib.parse.unquote(parsed.path, errors="strict")
+    except UnicodeDecodeError:
+        return parsed.path.startswith("/nexus"), None
+    normalized = "/" + posixpath.normpath(decoded).lstrip("/")
+    protected = (
+        decoded == "/nexus"
+        or decoded.startswith("/nexus/")
+        or normalized == "/nexus"
+        or normalized.startswith("/nexus/")
+    )
+    if not protected:
+        return False, None
+    if decoded != normalized:
+        return True, None
+    filename = normalized.removeprefix("/nexus/")
+    if not filename or "/" in filename:
+        return True, None
+    return True, TOKEN_FILE_RE.fullmatch(filename)
 
 
 def expiry_epoch(value: str | None) -> int:
@@ -271,19 +380,11 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, _format: str, *_args: object) -> None:
+        # 订阅 URL 包含 UUID/个人 token，完全禁用默认 request-line 日志。
         return
 
-    def device_for_request(self) -> sqlite3.Row | None:
-        parsed = urllib.parse.urlsplit(self.path)
-        path = urllib.parse.unquote(parsed.path)
-        if not path.startswith("/nexus/") or "/" in path.removeprefix("/nexus/"):
-            return None
-        matched = TOKEN_FILE_RE.fullmatch(Path(path).name)
-        if not matched:
-            return None
-        database = load_database_path(self.server.config_path)  # type: ignore[attr-defined]
-        if database is None:
-            return None
+    @staticmethod
+    def device_for_token(database: Path, token: str) -> sqlite3.Row | None:
         try:
             connection = sqlite3.connect(database, timeout=5)
             connection.row_factory = sqlite3.Row
@@ -292,7 +393,7 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
                     "SELECT id,subscription_token,enabled,quota_bytes,used_bytes,"
                     "uploaded_bytes,downloaded_bytes,expires_at FROM devices "
                     "WHERE subscription_token=?",
-                    (matched.group(1),),
+                    (token,),
                 ).fetchone()
             finally:
                 connection.close()
@@ -309,20 +410,23 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
             "Access-Control-Expose-Headers": (
                 "Subscription-Userinfo, Profile-Update-Interval, Profile-Title"
             ),
-            "Cache-Control": "no-store",
         }
 
     def send_head(self):  # type: ignore[no-untyped-def]
-        parsed = urllib.parse.urlsplit(self.path)
-        candidate = urllib.parse.unquote(parsed.path)
-        is_personal = candidate.startswith("/nexus/") and TOKEN_FILE_RE.fullmatch(Path(candidate).name)
-        database = load_database_path(self.server.config_path)  # type: ignore[attr-defined]
-        device = self.device_for_request() if is_personal and database is not None else None
-        if is_personal and database is not None and device is None:
+        is_personal, matched = classify_personal_request(self.path)
+        if not is_personal:
+            return super().send_head()
+        if matched is None:
             self.send_error(HTTPStatus.NOT_FOUND, "subscription not found")
             return None
+        database = load_database_path(self.server.config_path)  # type: ignore[attr-defined]
+        if database is None:
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "subscription database unavailable")
+            return None
+        device = self.device_for_token(database, matched.group(1))
         if device is None:
-            return super().send_head()
+            self.send_error(HTTPStatus.NOT_FOUND, "subscription not found")
+            return None
 
         headers = self.subscription_headers(device)
         today = datetime.now(timezone.utc).date().isoformat()
@@ -357,6 +461,13 @@ class SubscriptionHandler(SimpleHTTPRequestHandler):
         return io.BytesIO(body)
 
     def end_headers(self) -> None:
+        # Every file served by this dedicated process is a bearer-style
+        # subscription or a related error response.  Apply the policy here so
+        # static main/recovery/UUID routes and conditional 304 responses cannot
+        # retain rotated node credentials in browsers or shared proxies.
+        self.send_header("Cache-Control", "no-store, private, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         for key, value in getattr(self, "_subscription_headers", {}).items():
             self.send_header(key, value)
         self._subscription_headers = {}
@@ -369,11 +480,22 @@ def main() -> int:
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--directory", default=".")
     parser.add_argument("--config", default="/etc/rr-nexus/nexus.json")
+    parser.add_argument("--certfile")
+    parser.add_argument("--keyfile")
     args = parser.parse_args()
+    if bool(args.certfile) != bool(args.keyfile):
+        parser.error("--certfile and --keyfile must be supplied together")
+    tls_context: ssl.SSLContext | None = None
+    if args.certfile and args.keyfile:
+        tls_context = build_tls_context(args.certfile, args.keyfile)
     handler = lambda *hargs, **kwargs: SubscriptionHandler(  # noqa: E731
         *hargs, directory=args.directory, **kwargs
     )
-    server = ThreadingHTTPServer((args.bind, args.port), handler)
+    server = BoundedThreadingHTTPServer(
+        (args.bind, args.port),
+        handler,
+        ssl_context=tls_context,
+    )
     server.config_path = Path(args.config)  # type: ignore[attr-defined]
     server.serve_forever()
     return 0

@@ -11,22 +11,127 @@ write_auto_update_worker() {
 # RR_AUTO_UPDATE_VERSION=8
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import ipaddress
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import uuid as uuidlib
 
 CONFIG_FILE = "/etc/argo_vmess.conf"
 LOG_FILE = "/var/log/auto_update_sub.log"
+SUB_ROOT = "/tmp/sub_server"
+MAX_LOG_BYTES = 1024 * 1024
+UPDATE_LOCK_PATH = "/run/rr-vps/locks/update.lock"
+
+# Do not race update/restore snapshots.  The verified update installer already
+# owns this lock and explicitly delegates it through RR_WORKER_LOCK_HELD; cron
+# and manual standalone runs acquire their own non-blocking lock instead.
+WORKER_LOCK = None
+if os.environ.get("RR_WORKER_LOCK_HELD") != "1":
+    try:
+        lock_parent = os.path.dirname(UPDATE_LOCK_PATH)
+        os.makedirs(lock_parent, mode=0o700, exist_ok=True)
+        parent_stat = os.lstat(lock_parent)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != 0
+            or parent_stat.st_gid != 0
+            or os.path.realpath(lock_parent) != lock_parent
+        ):
+            raise RuntimeError("unsafe update lock directory")
+        os.chmod(lock_parent, 0o700)
+        if stat.S_IMODE(os.lstat(lock_parent).st_mode) != 0o700:
+            raise RuntimeError("update lock directory permissions are unsafe")
+        try:
+            path_stat = os.lstat(UPDATE_LOCK_PATH)
+        except FileNotFoundError:
+            path_stat = None
+        if path_stat is not None and (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_uid != 0
+            or path_stat.st_gid != 0
+            or path_stat.st_nlink != 1
+        ):
+            raise RuntimeError("unsafe update lock file")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if not nofollow or not cloexec:
+            raise RuntimeError("secure update lock flags unavailable")
+        descriptor = os.open(
+            UPDATE_LOCK_PATH,
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | nofollow | cloexec,
+            0o600,
+        )
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            current_path_stat = os.lstat(UPDATE_LOCK_PATH)
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or descriptor_stat.st_uid != 0
+                or descriptor_stat.st_gid != 0
+                or descriptor_stat.st_nlink != 1
+                or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                != (current_path_stat.st_dev, current_path_stat.st_ino)
+            ):
+                raise RuntimeError("update lock changed while opening")
+            os.fchmod(descriptor, 0o600)
+            WORKER_LOCK = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        fcntl.flock(WORKER_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if WORKER_LOCK is not None:
+            WORKER_LOCK.close()
+        sys.exit(0)
+    except (OSError, RuntimeError):
+        if WORKER_LOCK is not None:
+            WORKER_LOCK.close()
+        sys.exit(1)
 
 
 def log(msg):
+    try:
+        if os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+            temporary = f"{LOG_FILE}.{os.getpid()}.tmp"
+            with open(LOG_FILE, "rb") as current:
+                current.seek(-MAX_LOG_BYTES // 2, os.SEEK_END)
+                tail = current.read()
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as trimmed:
+                trimmed.write(tail)
+                trimmed.flush()
+                os.fsync(trimmed.fileno())
+            os.replace(temporary, LOG_FILE)
+    except (FileNotFoundError, OSError):
+        try:
+            os.unlink(temporary)
+        except (NameError, FileNotFoundError, OSError):
+            pass
     with open(LOG_FILE, "a", encoding="utf-8") as log_file:
         log_file.write(msg + "\n")
+    os.chmod(LOG_FILE, 0o600)
+
+
+def ensure_subscription_root():
+    """Atomically create or verify the root-owned, non-symlink publish root."""
+    try:
+        os.mkdir(SUB_ROOT, mode=0o700)
+    except FileExistsError:
+        pass
+    root_stat = os.lstat(SUB_ROOT)
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != 0:
+        raise RuntimeError("unsafe subscription root")
+    os.chmod(SUB_ROOT, 0o700)
+    root_stat = os.lstat(SUB_ROOT)
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != 0:
+        raise RuntimeError("subscription root changed during validation")
 
 
 try:
@@ -44,6 +149,12 @@ try:
                 env[key] = parsed[0] if parsed else ""
 except Exception as exc:
     log(f"Config read error: {exc}")
+    sys.exit(1)
+
+try:
+    ensure_subscription_root()
+except Exception as exc:
+    log(f"Subscription root error: {exc}")
     sys.exit(1)
 
 
@@ -136,7 +247,7 @@ else:
 if not server_ip_raw:
     log(
         f"No inbound address available for ENTRY_IP_MODE={entry_mode}; "
-        f"ipv6_source={ipv6_source}, ipv6_egress={ipv6_egress}, local_ula={local_ipv6_ula}"
+        f"ipv6_source={ipv6_source}"
     )
     sys.exit(1)
 
@@ -244,7 +355,7 @@ if vm_enabled:
                 preferred_addrs.append(cname)
 
     # 优选结果落盘，供面板设备订阅生成 Argo 优选副节点（设备凭据版）
-    preferred_file = "/tmp/sub_server/preferred_cnames.txt"
+    preferred_file = os.path.join(SUB_ROOT, "preferred_cnames.txt")
     try:
         if preferred_addrs:
             with open(preferred_file, "w", encoding="utf-8") as preferred_handle:
@@ -316,7 +427,7 @@ if naive_enabled and naive_port != "0" and naive_user and naive_pass and naive_d
 sub_content = "\n".join(all_links)
 final_b64 = base64.b64encode(sub_content.encode("utf-8")).decode("utf-8")
 
-target_dir = f"/tmp/sub_server/{uuid}"
+target_dir = os.path.join(SUB_ROOT, uuid)
 os.makedirs(target_dir, mode=0o700, exist_ok=True)
 for filename, content in (("jhsub.txt", sub_content), ("jhsub_encoded.txt", final_b64)):
     temp_path = os.path.join(target_dir, f".{filename}.{os.getpid()}.tmp")
@@ -338,7 +449,7 @@ for filename in ("client-v2rayn.txt", "client-v2rayng.txt", "client-sr.txt", "cl
 
 log(
     f"Updated subscription with {len(all_links)} nodes; "
-    f"entry={entry_mode}:{server_ip_raw}; ipv6_source={ipv6_source}"
+    f"entry_mode={entry_mode}; ipv6_source={ipv6_source}"
 )
 
 # 主订阅更新后同步面板设备订阅（含 Argo 优选副节点与最新 Argo 域名）

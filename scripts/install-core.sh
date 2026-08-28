@@ -3,11 +3,16 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
+RR_RELEASE_TAG="v7.1.1"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
-RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/heads/${RR_BRANCH}"
+RR_SOURCE_REF="$RR_RELEASE_TAG"
+[ "$RR_BRANCH" = beta ] && RR_SOURCE_REF=beta
+RR_REF_KIND=tags
+[ "$RR_BRANCH" = beta ] && RR_REF_KIND=heads
+RR_RAW_BASE="https://raw.githubusercontent.com/${RR_REPOSITORY}/refs/${RR_REF_KIND}/${RR_SOURCE_REF}"
 RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
-RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_BRANCH}"
+RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LAUNCHER="/usr/local/bin/rr"
@@ -26,12 +31,441 @@ TRANSACTION_ACTIVE=false
 ROLLBACK_FAILED=false
 RR_TX_ROOT="/var/lib/rr-update"
 RR_ACTIVE_TX="${RR_TX_ROOT}/active"
+RR_SUBSCRIPTION_SAFE_VERSION="7.1.1"
+RR_RECOVERY_HELPER="${RR_RECOVERY_HELPER:-/usr/local/sbin/rr-update-recover}"
+RR_UPDATE_EXTERNAL_HELPER="${RR_UPDATE_EXTERNAL_HELPER:-/usr/local/sbin/rr-update-external-state}"
 TX_DIR=""
 KEEP_TRANSACTION=false
 UPDATE_LOCK_FD=""
+RR_HEALTH_MONITOR_FROZEN=false
+RR_HEALTH_TIMER_WAS_ENABLED=false
+RR_HEALTH_TIMER_WAS_ACTIVE=false
+RR_HEALTH_SERVICE_WAS_ACTIVE=false
+RR_HEALTH_STATE_CAPTURED=false
+RR_UPDATE_WRITERS_FROZEN=false
+RR_UPDATE_MAINTENANCE_ACTIVE=false
+RR_SINGBOX_WAS_ACTIVE=false
+RR_SINGBOX_WAS_ENABLED=false
+RR_NEXUS_WAS_ACTIVE=false
+RR_NEXUS_WAS_ENABLED=false
+RR_SUBSCRIPTION_WAS_ACTIVE=false
+RR_HEALTH_TIMER_FILE="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
 
 rr_error() {
     echo "[RR-vps] $*" >&2
+}
+
+rr_prepare_update_lock_file() {
+    local lock_file="${1:-$RR_UPDATE_LOCK_FILE}"
+    local lock_dir="" canonical=""
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    if [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
+        [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+        [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    else
+        mkdir -p -- "$lock_dir" || return 1
+    fi
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    chmod 0700 -- "$lock_dir" || return 1
+    [ "$(stat -c %a -- "$lock_dir" 2>/dev/null)" = 700 ] || return 1
+    if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    [ "$(stat -c %u:%h -- "$lock_file" 2>/dev/null)" = "0:1" ] || return 1
+    chown 0:0 -- "$lock_file" || return 1
+    chmod 0600 -- "$lock_file" || return 1
+    [ "$(stat -c %u:%g:%a:%h -- "$lock_file" 2>/dev/null)" = "0:0:600:1" ]
+}
+
+rr_update_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" fd_identity=""
+    local shell_pid="${BASHPID:-$$}"
+    local fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
+}
+
+rr_freeze_health_monitor() {
+    local attempt=0
+    if [ "${RR_HEALTH_STATE_CAPTURED:-false}" != true ]; then
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        RR_HEALTH_TIMER_WAS_ACTIVE=false
+        RR_HEALTH_SERVICE_WAS_ACTIVE=false
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
+            RR_HEALTH_TIMER_WAS_ENABLED=true
+        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
+            RR_HEALTH_TIMER_WAS_ACTIVE=true
+        systemctl is-active --quiet argo-rr-health.service 2>/dev/null && \
+            RR_HEALTH_SERVICE_WAS_ACTIVE=true
+        RR_HEALTH_STATE_CAPTURED=true
+    fi
+    RR_HEALTH_MONITOR_FROZEN=true
+
+    # A legacy runtime does not know about the shared transaction lock.  Stop
+    # both the scheduler and an already-running oneshot before any installer
+    # recovery or snapshot work, and wait until systemd confirms both exited.
+    systemctl stop argo-rr-health.timer argo-rr-health.service >/dev/null 2>&1 || true
+    while [ "$attempt" -lt 30 ]; do
+        if ! systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
+           ! systemctl is-active --quiet argo-rr-health.service 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if systemctl is-active --quiet argo-rr-health.timer 2>/dev/null || \
+       systemctl is-active --quiet argo-rr-health.service 2>/dev/null; then
+        rr_error "无法冻结健康检查服务，已拒绝创建并发更新快照。"
+        return 1
+    fi
+}
+
+rr_resume_health_monitor_after_abort() {
+    [ "$RR_HEALTH_MONITOR_FROZEN" = true ] || return 0
+    if [ "$RR_HEALTH_TIMER_WAS_ENABLED" = true ] && \
+       [ -f "$RR_HEALTH_TIMER_FILE" ]; then
+        systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || return 1
+    else
+        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
+    fi
+    RR_HEALTH_MONITOR_FROZEN=false
+}
+
+rr_wait_unit_state() {
+    local unit="$1" wanted="$2" attempt=0
+    while [ "$attempt" -lt 50 ]; do
+        if [ "$wanted" = active ]; then
+            systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+        else
+            systemctl is-active --quiet "$unit" 2>/dev/null || return 0
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+rr_set_private_marker() {
+    local target="$1" parent=""
+    parent=$(dirname -- "$target") || return 1
+    (umask 077; : > "$target") && chmod 600 "$target" && \
+        sync -f "$target" && sync -f "$parent"
+}
+
+rr_write_transaction_format() {
+    local target="$TX_DIR/transaction-format" temporary=""
+    temporary="$TX_DIR/.transaction-format.$$"
+    (umask 077; printf '2\n' > "$temporary") && chmod 600 "$temporary" && \
+        sync -f "$temporary" && mv -f "$temporary" "$target" && \
+        sync -f "$TX_DIR" && \
+        [ "$(stat -c '%u:%g:%a:%h' "$target" 2>/dev/null)" = 0:0:600:1 ] && \
+        [ "$(cat "$target" 2>/dev/null)" = 2 ]
+}
+
+rr_transaction_format_state() {
+    local tx="" marker=""
+    tx="${1:-$TX_DIR}"
+    marker="$tx/transaction-format"
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    [ -f "$marker" ] && [ ! -L "$marker" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$marker" 2>/dev/null)" = 0:0:600:1 ] && \
+        [ "$(cat "$marker" 2>/dev/null)" = 2 ] || return 2
+    return 0
+}
+
+rr_external_state_marker_is_safe() {
+    local backup="" marker=""
+    backup="${1:-$BACKUP_DIR}"
+    marker="$backup/external_state_required"
+    [ -f "$marker" ] && [ ! -L "$marker" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$marker" 2>/dev/null)" = 0:0:600:1 ]
+}
+
+rr_snapshot_external_state() {
+    [ -x "$RR_UPDATE_EXTERNAL_HELPER" ] && [ -f "$RR_UPDATE_EXTERNAL_HELPER" ] && \
+        [ ! -L "$RR_UPDATE_EXTERNAL_HELPER" ] || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" snapshot "$BACKUP_DIR" --tx-root "$RR_TX_ROOT" || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT" || return 1
+    rr_set_private_marker "$BACKUP_DIR/external_state_required" || return 1
+    rr_external_state_marker_is_safe "$BACKUP_DIR"
+}
+
+rr_install_restore_external_state_if_required() {
+    local state=0
+    if rr_transaction_format_state "$TX_DIR"; then
+        state=0
+    else
+        state=$?
+    fi
+    case "$state" in
+        0) ;;
+        1)
+            rr_error "兼容恢复旧事务：该事务没有外部状态快照。"
+            return 0
+            ;;
+        *)
+            rr_error "事务格式标记损坏，拒绝跳过外部状态恢复。"
+            return 1
+            ;;
+    esac
+    rr_external_state_marker_is_safe "$BACKUP_DIR" || {
+        rr_error "外部状态快照必需标记缺失或不安全。"
+        return 1
+    }
+    [ -x "$RR_UPDATE_EXTERNAL_HELPER" ] && [ -f "$RR_UPDATE_EXTERNAL_HELPER" ] && \
+        [ ! -L "$RR_UPDATE_EXTERNAL_HELPER" ] || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_ROOT" || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"
+}
+
+rr_capture_update_writer_state() {
+    if [ "${RR_HEALTH_STATE_CAPTURED:-false}" != true ]; then
+        RR_HEALTH_TIMER_WAS_ENABLED=false
+        RR_HEALTH_TIMER_WAS_ACTIVE=false
+        RR_HEALTH_SERVICE_WAS_ACTIVE=false
+        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
+            RR_HEALTH_TIMER_WAS_ENABLED=true
+        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
+            RR_HEALTH_TIMER_WAS_ACTIVE=true
+        systemctl is-active --quiet argo-rr-health.service 2>/dev/null && \
+            RR_HEALTH_SERVICE_WAS_ACTIVE=true
+        RR_HEALTH_STATE_CAPTURED=true
+    fi
+    RR_SINGBOX_WAS_ACTIVE=false
+    RR_SINGBOX_WAS_ENABLED=false
+    RR_NEXUS_WAS_ACTIVE=false
+    RR_NEXUS_WAS_ENABLED=false
+    RR_SUBSCRIPTION_WAS_ACTIVE=false
+    systemctl is-active --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ACTIVE=true
+    systemctl is-enabled --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ENABLED=true
+    systemctl is-active --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ACTIVE=true
+    systemctl is-enabled --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ENABLED=true
+    rr_subscription_running && RR_SUBSCRIPTION_WAS_ACTIVE=true
+    return 0
+}
+
+rr_persist_update_writer_state() {
+    local marker=""
+    for marker in \
+        "singbox_was_running:$RR_SINGBOX_WAS_ACTIVE" \
+        "singbox_was_enabled:$RR_SINGBOX_WAS_ENABLED" \
+        "nexus_was_running:$RR_NEXUS_WAS_ACTIVE" \
+        "nexus_was_enabled:$RR_NEXUS_WAS_ENABLED" \
+        "subscription_was_running:$RR_SUBSCRIPTION_WAS_ACTIVE" \
+        "health_timer_was_enabled:$RR_HEALTH_TIMER_WAS_ENABLED" \
+        "health_timer_was_running:$RR_HEALTH_TIMER_WAS_ACTIVE" \
+        "health_service_was_running:$RR_HEALTH_SERVICE_WAS_ACTIVE"; do
+        [ "${marker#*:}" = true ] || continue
+        rr_set_private_marker "$BACKUP_DIR/${marker%%:*}" || return 1
+    done
+    rr_set_private_marker "$BACKUP_DIR/writer_state_complete"
+}
+
+rr_create_update_maintenance_marker() {
+    local marker_tx="${1:-$TX_DIR}" marker_dir="" temporary="" owner=""
+    [ -n "$marker_tx" ] || return 1
+    marker_dir=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+    [ -d "$marker_dir" ] && [ ! -L "$marker_dir" ] || return 1
+    [ "$(stat -c '%u:%g' "$marker_dir" 2>/dev/null)" = 0:0 ] || return 1
+    chmod 0700 "$marker_dir" || return 1
+    if [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || [ -L "$RR_UPDATE_MAINTENANCE_FILE" ]; then
+        [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] && \
+            [ "$(stat -c '%u:%g:%a:%h' "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null)" = 0:0:600:1 ] || return 1
+        owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
+        [ "$owner" = "$marker_tx" ] || return 1
+        RR_UPDATE_MAINTENANCE_ACTIVE=true
+        return 0
+    fi
+    temporary=$(mktemp "$marker_dir/.update-maintenance.XXXXXX") || return 1
+    if ! chmod 600 "$temporary" || ! printf '%s\n' "$marker_tx" > "$temporary" || \
+       ! sync -f "$temporary" || \
+       ! mv -f "$temporary" "$RR_UPDATE_MAINTENANCE_FILE"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null)" = 0:0:600:1 ] && \
+        sync -f "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$marker_dir" && \
+        RR_UPDATE_MAINTENANCE_ACTIVE=true
+}
+
+rr_clear_update_maintenance_marker() {
+    local owner="" parent=""
+    [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || return 0
+    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] || return 1
+    owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
+    [ "$owner" = "$TX_DIR" ] || return 1
+    parent=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+    rm -f -- "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$parent" && \
+        RR_UPDATE_MAINTENANCE_ACTIVE=false
+}
+
+rr_freeze_update_writers() {
+    RR_UPDATE_WRITERS_FROZEN=true
+    systemctl stop rr-nexus sing-box >/dev/null 2>&1 || true
+    rr_wait_unit_state rr-nexus inactive || return 1
+    rr_wait_unit_state sing-box inactive || return 1
+    rr_stop_subscription_servers || return 1
+    rr_freeze_health_monitor || return 1
+}
+
+rr_restore_unit_state() {
+    local unit="$1" active_marker="$2" enabled_marker="$3"
+    if [ -f "$enabled_marker" ]; then
+        systemctl enable "$unit" >/dev/null 2>&1 || return 1
+        systemctl is-enabled --quiet "$unit" 2>/dev/null || return 1
+    else
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        systemctl is-enabled --quiet "$unit" 2>/dev/null && return 1
+    fi
+    if [ -f "$active_marker" ]; then
+        systemctl restart "$unit" >/dev/null 2>&1 || return 1
+        rr_wait_unit_state "$unit" active
+    else
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+        rr_wait_unit_state "$unit" inactive
+    fi
+}
+
+rr_run_health_check_bounded() {
+    local pid="" attempt=0 status=0
+    RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check >/dev/null 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+        return 1
+    fi
+    wait "$pid" || status=$?
+    [ "$status" -eq 0 ]
+}
+
+rr_restart_health_service_bounded() {
+    local pid="" attempt=0 status=0
+    systemctl start argo-rr-health.service >/dev/null 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+        systemctl stop argo-rr-health.service >/dev/null 2>&1 || true
+        rr_wait_unit_state argo-rr-health.service inactive || true
+        return 1
+    fi
+    wait "$pid" || status=$?
+    [ "$status" -eq 0 ]
+}
+
+rr_restore_update_writer_state() {
+    local backup="${1:-$BACKUP_DIR}" subscription_policy="${2:-normal}" failed=false
+    if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
+        [ -x "$RR_LAUNCHER" ] && rr_run_health_check_bounded || failed=true
+        rr_subscription_running || failed=true
+    else
+        rr_stop_subscription_servers || failed=true
+        rr_subscription_running && failed=true
+    fi
+    rr_restore_unit_state sing-box "$backup/singbox_was_running" \
+        "$backup/singbox_was_enabled" || failed=true
+    rr_restore_unit_state rr-nexus "$backup/nexus_was_running" \
+        "$backup/nexus_was_enabled" || failed=true
+    rr_restore_unit_state argo-rr-health.timer "$backup/health_timer_was_running" \
+        "$backup/health_timer_was_enabled" || failed=true
+    if [ -f "$backup/health_service_was_running" ]; then
+        rr_restart_health_service_bounded || failed=true
+    fi
+    [ "$failed" = false ] || return 1
+    RR_UPDATE_WRITERS_FROZEN=false
+    RR_HEALTH_MONITOR_FROZEN=false
+}
+
+rr_verify_update_writer_state() {
+    local backup="${1:-$BACKUP_DIR}" unit="" active_marker="" enabled_marker=""
+    for unit in sing-box rr-nexus argo-rr-health.timer; do
+        case "$unit" in
+            sing-box) active_marker=singbox_was_running; enabled_marker=singbox_was_enabled ;;
+            rr-nexus) active_marker=nexus_was_running; enabled_marker=nexus_was_enabled ;;
+            *) active_marker=health_timer_was_running; enabled_marker=health_timer_was_enabled ;;
+        esac
+        if [ -f "$backup/$active_marker" ]; then
+            rr_wait_unit_state "$unit" active || return 1
+        else
+            rr_wait_unit_state "$unit" inactive || return 1
+        fi
+        if [ -f "$backup/$enabled_marker" ]; then
+            systemctl is-enabled --quiet "$unit" 2>/dev/null || return 1
+        else
+            systemctl is-enabled --quiet "$unit" 2>/dev/null && return 1
+        fi
+    done
+    if [ -f "$backup/subscription_was_running" ]; then
+        rr_subscription_running || return 1
+    else
+        ! rr_subscription_running
+    fi
+}
+
+rr_managed_subscription_pids() {
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local subscription_root="${RR_SUB_ROOT:-/tmp/sub_server}"
+    local expected_cwd=""
+    local process_dir=""
+    local pid=""
+    local cmdline=""
+    local process_cwd=""
+    expected_cwd=$(readlink -f "$subscription_root" 2>/dev/null) || return 0
+    for process_dir in "$proc_root"/[0-9]*; do
+        [ -r "$process_dir/cmdline" ] || continue
+        pid="${process_dir##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
+        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
+        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
+        [ "$process_cwd" = "$expected_cwd" ] || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+rr_subscription_running() {
+    local pid=""
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && return 0
+    done < <(rr_managed_subscription_pids)
+    return 1
+}
+
+rr_stop_subscription_servers() {
+    local pid=""
+    local stopped=true
+    local attempt=0
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+    done < <(rr_managed_subscription_pids)
+    while [ "$attempt" -lt 20 ] && rr_subscription_running; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    rr_subscription_running && stopped=false
+    rm -f /run/rr-vps-subscription.pid /run/rr-vps-subscription.bind \
+        /tmp/sub_server.pid /tmp/sub_server.bind
+    [ "$stopped" = true ]
 }
 
 rr_test_fault() {
@@ -50,13 +484,14 @@ rr_download() {
     local target_file="$2"
     local cache_buster=""
     local relative_path=""
+    local official_manifest="${3:-false}"
 
     cache_buster=$(date +%s)
     case "$source_url" in
         "${RR_RAW_BASE}/"*) relative_path="${source_url#"${RR_RAW_BASE}/"}" ;;
     esac
 
-    if [ -n "$RR_GITHUB_MIRROR" ]; then
+    if [ "$official_manifest" != true ] && [ -n "$RR_GITHUB_MIRROR" ]; then
         if command -v curl >/dev/null 2>&1; then
             curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 \
                 "${RR_GITHUB_MIRROR}${source_url}" -o "$target_file" 2>/dev/null && return 0
@@ -73,7 +508,7 @@ rr_download() {
         if [ -n "$relative_path" ]; then
             curl -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
                 -H "Accept: application/vnd.github.raw+json" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" \
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" \
                 -o "$target_file" 2>/dev/null && return 0
             curl -4 -fsSL --retry 2 --connect-timeout 10 --max-time 180 \
                 "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" \
@@ -86,7 +521,7 @@ rr_download() {
             wget -q --timeout=15 --tries=2 \
                 --header="Accept: application/vnd.github.raw+json" \
                 -O "$target_file" \
-                "${RR_API_BASE}/${relative_path}?ref=${RR_BRANCH}&t=${cache_buster}" && return 0
+                "${RR_API_BASE}/${relative_path}?ref=${RR_SOURCE_REF}&t=${cache_buster}" && return 0
             wget -4 -q --timeout=15 --tries=2 \
                 -O "$target_file" "${RR_CDN_BASE}/${relative_path}?t=${cache_buster}" && return 0
         fi
@@ -108,6 +543,7 @@ rr_manifest_is_valid() {
         $2 == "rr" { launcher = 1; next }
         $2 == "scripts/naive-cert-hook.sh" { naive_hook = 1; next }
         $2 == "scripts/update-recover.sh" { recovery = 1; next }
+        $2 == "scripts/update-external-state.py" { external_state = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
         $2 == "nexus/sub_server.py" { nexus_sub = 1; next }
@@ -115,7 +551,7 @@ rr_manifest_is_valid() {
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
-            if (!launcher || !naive_hook || !recovery || modules < 2) exit 1
+            if (!launcher || !naive_hook || !recovery || !external_state || modules < 2) exit 1
             if (!nexus_app || !nexus_sub || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
@@ -125,13 +561,145 @@ rr_bundle_archive_is_safe() {
     local archive_file="$1"
     [ -s "$archive_file" ] || return 1
     # The runtime payload is normally below 1 MiB. Refuse unexpectedly large
-    # downloads and any archive member outside the exact release namespace.
+    # downloads and inspect the raw tar stream before any extraction.  The
+    # same validator is embedded in the installed runtime because this stable
+    # bootstrap must be independently safe when upgrading an old release.
     [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
-    tar -tzf "$archive_file" 2>/dev/null | awk '
-        !/^rr-bundle\/(manifest\.sha256|rr|scripts\/(naive-cert-hook|update-recover)\.sh|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/[A-Za-z0-9._-]+\.py|nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
-        seen[$0]++ { exit 1 }
-        END { if (NR < 2) exit 1 }
-    '
+    python3 - "$archive_file" <<'PYEOF'
+import gzip
+import re
+import sys
+import tarfile
+
+archive = sys.argv[1]
+max_members = 512
+max_member_size = 16 * 1024 * 1024
+max_total_size = 64 * 1024 * 1024
+max_padding = 1024 * 1024
+allowed = re.compile(
+    r"^rr-bundle/(?:manifest\.sha256|rr|"
+    r"scripts/(?:naive-cert-hook|update-recover)\.sh|"
+    r"scripts/update-external-state\.py|"
+    r"modules/[0-9][0-9A-Za-z_-]*\.sh|"
+    r"nexus/[A-Za-z0-9._-]+\.py|"
+    r"nexus/rr_nexus_lib/[A-Za-z0-9._-]+\.py|"
+    r"nexus/static/[A-Za-z0-9._-]+\.(?:html|css|js))$"
+)
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def octal(field, label):
+    if field and field[0] & 0x80:
+        fail(f"base-256 {label}")
+    value = field.strip(b" \0")
+    if not value:
+        return 0
+    if any(byte < 48 or byte > 55 for byte in value):
+        fail(f"invalid {label}")
+    return int(value, 8)
+
+
+def text_field(field, label):
+    value, separator, tail = field.partition(b"\0")
+    if separator and any(tail):
+        fail(f"ambiguous {label}")
+    try:
+        return value.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"non-ascii {label}") from exc
+
+
+names = []
+declared_total = 0
+with gzip.open(archive, "rb") as stream:
+    zero_blocks = 0
+    while True:
+        header = stream.read(512)
+        if len(header) != 512:
+            fail("truncated tar header")
+        if header == b"\0" * 512:
+            zero_blocks += 1
+            if zero_blocks == 2:
+                break
+            continue
+        if zero_blocks:
+            fail("data after a partial end marker")
+        stored_checksum = octal(header[148:156], "checksum")
+        calculated_checksum = sum(header[:148]) + (32 * 8) + sum(header[156:])
+        if stored_checksum != calculated_checksum:
+            fail("tar checksum mismatch")
+        typeflag = header[156:157]
+        if typeflag not in (b"\0", b"0"):
+            fail("non-regular member or tar extension")
+        name = text_field(header[:100], "name")
+        prefix = text_field(header[345:500], "prefix")
+        if prefix:
+            name = prefix + "/" + name
+        if not allowed.fullmatch(name):
+            fail("member outside the release allowlist")
+        if name in names:
+            fail("duplicate member")
+        size = octal(header[124:136], "size")
+        if size > max_member_size:
+            fail("member too large")
+        declared_total += size
+        if declared_total > max_total_size:
+            fail("expanded archive too large")
+        names.append(name)
+        if len(names) > max_members:
+            fail("too many members")
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                fail("truncated member")
+            remaining -= len(chunk)
+        padding = (-size) % 512
+        if padding and len(stream.read(padding)) != padding:
+            fail("truncated member padding")
+    trailing = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        trailing += len(chunk)
+        if trailing > max_padding or any(chunk):
+            fail("unexpected data after tar end marker")
+
+if len(names) < 2:
+    fail("empty bundle")
+
+actual_names = []
+actual_total = 0
+with tarfile.open(archive, mode="r:gz") as handle:
+    for member in handle:
+        if not member.isreg() or member.pax_headers:
+            fail("unsafe interpreted member")
+        if member.name not in names or member.name in actual_names:
+            fail("interpreted member mismatch")
+        if member.size < 0 or member.size > max_member_size:
+            fail("interpreted member too large")
+        source = handle.extractfile(member)
+        if source is None:
+            fail("unreadable regular member")
+        read_size = 0
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            read_size += len(chunk)
+            actual_total += len(chunk)
+            if read_size > member.size or actual_total > max_total_size:
+                fail("payload exceeds declared limits")
+        if read_size != member.size:
+            fail("truncated interpreted member")
+        actual_names.append(member.name)
+if actual_names != names:
+    fail("tar parser disagreement")
+PYEOF
 }
 
 rr_bundle_tree_is_valid() {
@@ -156,6 +724,7 @@ rr_bundle_tree_is_valid() {
     done
     bash -n "$bundle_root/scripts/naive-cert-hook.sh" || return 1
     bash -n "$bundle_root/scripts/update-recover.sh" || return 1
+    python3 -m py_compile "$bundle_root/scripts/update-external-state.py" || return 1
     local python_file=""
     while IFS= read -r python_file; do
         python3 -m py_compile "$python_file" || return 1
@@ -232,7 +801,17 @@ rr_backup_file() {
 rr_backup_dir() {
     local source_dir="$1"
     local backup_name="$2"
+    local source_uid=""
+    if [ -L "$source_dir" ]; then
+        rr_error "拒绝备份符号链接目录：${source_dir}"
+        return 1
+    fi
     if [ -d "$source_dir" ]; then
+        source_uid=$(stat -c '%u' -- "$source_dir" 2>/dev/null) || return 1
+        if [ "$source_uid" != 0 ]; then
+            rr_error "拒绝备份非 root 所有的运行目录：${source_dir}"
+            return 1
+        fi
         cp -a "$source_dir" "$BACKUP_DIR/$backup_name" || return 1
         : > "$BACKUP_DIR/had_${backup_name}"
     fi
@@ -292,6 +871,10 @@ rr_restore_dir() {
     local target_dir="$2"
     rm -rf "$target_dir" || return 1
     if [ -f "$BACKUP_DIR/had_${backup_name}" ]; then
+        if [ -L "$BACKUP_DIR/$backup_name" ] || [ ! -d "$BACKUP_DIR/$backup_name" ]; then
+            rr_error "拒绝恢复不安全的目录备份：${backup_name}"
+            return 1
+        fi
         mkdir -p "$(dirname "$target_dir")" || return 1
         cp -a "$BACKUP_DIR/$backup_name" "$target_dir" || return 1
     fi
@@ -313,18 +896,32 @@ rr_write_phase() {
     local phase="$1" temporary=""
     [ -n "$TX_DIR" ] || return 1
     temporary="$TX_DIR/.phase.$$"
-    printf '%s\n' "$phase" > "$temporary" && mv -f "$temporary" "$TX_DIR/phase"
+    (umask 077; printf '%s\n' "$phase" > "$temporary") && chmod 600 "$temporary" && \
+        sync -f "$temporary" && mv -f "$temporary" "$TX_DIR/phase" && sync -f "$TX_DIR"
 }
 
 rr_prepare_recovery_runtime() {
     local recovery_source="$PAYLOAD_DIR/scripts/update-recover.sh"
-    local recovery_target="/usr/local/sbin/rr-update-recover"
+    local recovery_target="$RR_RECOVERY_HELPER"
     local recovery_tmp=""
+    local external_source="$PAYLOAD_DIR/scripts/update-external-state.py"
+    local external_tmp=""
     [ -s "$recovery_source" ] && bash -n "$recovery_source" || return 1
+    [ -s "$external_source" ] && python3 -m py_compile "$external_source" || return 1
     mkdir -p /usr/local/sbin /etc/systemd/system "$RR_TX_ROOT/transactions" || return 1
     chmod 700 "$RR_TX_ROOT"
+    external_tmp=$(mktemp /usr/local/sbin/.rr-update-external-state.XXXXXX) || return 1
+    if ! install -m 755 "$external_source" "$external_tmp" || \
+       ! sync -f "$external_tmp" || \
+       ! mv -f "$external_tmp" "$RR_UPDATE_EXTERNAL_HELPER" || \
+       ! sync -f /usr/local/sbin; then
+        rm -f "$external_tmp"
+        return 1
+    fi
     recovery_tmp=$(mktemp /usr/local/sbin/.rr-update-recover.XXXXXX) || return 1
-    install -m 755 "$recovery_source" "$recovery_tmp" && mv -f "$recovery_tmp" "$recovery_target" || {
+    install -m 755 "$recovery_source" "$recovery_tmp" && \
+        sync -f "$recovery_tmp" && mv -f "$recovery_tmp" "$recovery_target" && \
+        sync -f /usr/local/sbin || {
         rm -f "$recovery_tmp"
         return 1
     }
@@ -348,19 +945,44 @@ EOF
 }
 
 rr_discard_previous_transaction() {
-    local previous="" phase=""
+    local previous="" phase="" format_state=0
     [ -r "$RR_ACTIVE_TX" ] || return 0
     previous=$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null)
     case "$previous" in "$RR_TX_ROOT"/transactions/*) ;; *) return 1 ;; esac
     [ -d "$previous" ] || { rm -f "$RR_ACTIVE_TX"; return 0; }
     phase=$(head -n 1 "$previous/phase" 2>/dev/null || true)
     case "$phase" in
-        committed|rolled_back|aborted)
+        committed)
+            if rr_transaction_format_state "$previous"; then
+                format_state=0
+            else
+                format_state=$?
+            fi
+            if [ "$format_state" -eq 2 ]; then
+                rr_error "旧事务格式标记损坏，拒绝清理或覆盖回滚证据。"
+                return 1
+            fi
+            if [ "$format_state" -eq 0 ]; then
+                rr_create_update_maintenance_marker "$previous" || return 1
+                RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" \
+                    --post-update-finalize --retire-rollback || return 1
+            fi
+            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
+            RR_UPDATE_MAINTENANCE_ACTIVE=false
+            rm -rf -- "$previous" || return 1
+            rm -f "$RR_ACTIVE_TX"
+            ;;
+        rolled_back|rolled_back_degraded)
+            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
+            rm -rf -- "$previous" || return 1
+            rm -f "$RR_ACTIVE_TX"
+            ;;
+        aborted)
             rm -rf -- "$previous" || return 1
             rm -f "$RR_ACTIVE_TX"
             ;;
         *)
-            /usr/local/sbin/rr-update-recover recover || return 1
+            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
             ;;
     esac
 }
@@ -372,21 +994,51 @@ rr_prune_stale_transactions() {
         [ "$transaction" = "$active" ] && continue
         case "$transaction" in "$RR_TX_ROOT"/transactions/*) ;; *) continue ;; esac
         phase=$(head -n 1 "$transaction/phase" 2>/dev/null || true)
-        case "$phase" in rolled_back|aborted) rm -rf -- "$transaction" || return 1 ;; esac
+        case "$phase" in rolled_back|rolled_back_degraded|aborted) rm -rf -- "$transaction" || return 1 ;; esac
     done < <(find "$RR_TX_ROOT/transactions" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
 }
 
 rr_snapshot_runtime() {
+    # Resolve a prior durable transaction first.  The new transaction records
+    # every writer state and publishes its active pointer before stopping even
+    # the health timer, so SIGKILL never leaves an untracked frozen writer.
     rr_prepare_recovery_runtime || return 1
     rr_discard_previous_transaction || return 1
     rr_prune_stale_transactions || return 1
+    if declare -F rr_capture_update_writer_state >/dev/null; then
+        rr_capture_update_writer_state || return 1
+    fi
     TX_DIR="$RR_TX_ROOT/transactions/$(date -u '+%Y%m%dT%H%M%SZ')-$$"
     BACKUP_DIR="$TX_DIR/backup"
     mkdir -p "$BACKUP_DIR" || return 1
     chmod 700 "$TX_DIR" "$BACKUP_DIR"
-    printf '%s\n' "$TX_DIR" > "${RR_ACTIVE_TX}.tmp.$$" || return 1
+    rr_write_transaction_format || return 1
+
+    if declare -F rr_persist_update_writer_state >/dev/null; then
+        rr_persist_update_writer_state || return 1
+        rr_write_phase state_recorded || return 1
+    else
+        rr_write_phase snapshotting || return 1
+    fi
+    (umask 077; printf '%s\n' "$TX_DIR" > "${RR_ACTIVE_TX}.tmp.$$") || return 1
+    chmod 600 "${RR_ACTIVE_TX}.tmp.$$" || return 1
+    sync -f "${RR_ACTIVE_TX}.tmp.$$" || return 1
     mv -f "${RR_ACTIVE_TX}.tmp.$$" "$RR_ACTIVE_TX" || return 1
-    rr_write_phase snapshotting || return 1
+    sync -f "$RR_ACTIVE_TX" && sync -f "$RR_TX_ROOT" || return 1
+    if declare -F rr_persist_update_writer_state >/dev/null; then
+        rr_create_update_maintenance_marker || return 1
+        rr_write_phase freezing || return 1
+        rr_freeze_update_writers || return 1
+        rr_write_phase snapshotting || return 1
+    else
+        rr_freeze_health_monitor || return 1
+    fi
+
+    # Snapshot fixed RR-owned Nginx, Cloudflared and firewall state only after
+    # every writer is frozen and before the candidate can mutate anything.
+    # The format/required markers distinguish this transaction from a legacy
+    # 7.1.0 transaction whose recovery helper knew nothing about external state.
+    rr_snapshot_external_state || return 1
 
     rr_backup_file "$RR_LAUNCHER" rr_launcher || return 1
     rr_backup_file /etc/argo_vmess.conf argo_vmess.conf || return 1
@@ -406,13 +1058,11 @@ rr_snapshot_runtime() {
     rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db || return 1
     rr_backup_dir /tmp/sub_server sub_server || return 1
 
-    systemctl is-active --quiet sing-box 2>/dev/null && : > "$BACKUP_DIR/singbox_was_running"
-    systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$BACKUP_DIR/nexus_was_running"
-    pgrep -f 'subscription_server\.py' >/dev/null 2>&1 && \
-        : > "$BACKUP_DIR/subscription_was_running"
     pgrep -f 'cloudflared.*tunnel' >/dev/null 2>&1 && : > "$BACKUP_DIR/argo_was_running"
-    systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
+    if [ "${RR_HEALTH_TIMER_WAS_ENABLED:-false}" = true ] && \
+       [ ! -f "$BACKUP_DIR/health_timer_was_enabled" ]; then
         : > "$BACKUP_DIR/health_timer_was_enabled"
+    fi
 
     # Service state probes are optional metadata. A fresh server has none of
     # these units yet, so their non-zero status must not turn a valid empty
@@ -425,24 +1075,27 @@ rr_rollback() {
     [ "$TRANSACTION_ACTIVE" = true ] || return 0
     TRANSACTION_ACTIVE=false
     local rollback_failed=false
+    local subscription_policy="normal"
     rr_error "新版本校验失败，正在恢复升级前状态……"
 
     systemctl stop sing-box rr-nexus >/dev/null 2>&1 || true
-    pkill -f 'subscription_server\.py' >/dev/null 2>&1 || true
+    rr_stop_subscription_servers || rollback_failed=true
 
-    if [ "$RUNTIME_REPLACED" = true ]; then
-        if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
-            rm -rf "$RR_LIB_DIR"
-            if mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
-                OLD_RUNTIME=""
-            else
-                rollback_failed=true
-            fi
+    # OLD_RUNTIME becomes authoritative as soon as the live directory is moved.
+    # A catchable failure can occur before RUNTIME_REPLACED flips to true (for
+    # example a failed candidate move), so keying restoration only on that flag
+    # would discard the sole old runtime during cleanup.
+    if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
+        if { [ ! -e "$RR_LIB_DIR" ] || rm -rf "$RR_LIB_DIR"; } && \
+           mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
+            OLD_RUNTIME=""
         else
-            rm -rf "$RR_LIB_DIR" || rollback_failed=true
+            rollback_failed=true
         fi
-        RUNTIME_REPLACED=false
+    elif [ "$RUNTIME_REPLACED" = true ]; then
+        rm -rf "$RR_LIB_DIR" || rollback_failed=true
     fi
+    RUNTIME_REPLACED=false
 
     rr_restore_file rr_launcher "$RR_LAUNCHER" || rollback_failed=true
     rr_restore_file argo_vmess.conf /etc/argo_vmess.conf || rollback_failed=true
@@ -462,51 +1115,143 @@ rr_rollback() {
     rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db || rollback_failed=true
     rr_restore_dir sub_server /tmp/sub_server || rollback_failed=true
 
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if [ -f "$BACKUP_DIR/health_timer_was_enabled" ] && \
-       [ -f /etc/systemd/system/argo-rr-health.timer ]; then
-        systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || true
-    else
-        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
+    rr_install_restore_external_state_if_required || rollback_failed=true
+    systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
+    if [ "$rollback_failed" = true ]; then
+        ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_write_phase recovery_failed >/dev/null 2>&1 || true
+        rr_error "严重：内部或外部状态未能完整恢复；所有写入服务保持冻结，事务证据已保留。"
+        return 1
     fi
-    if [ -f "$BACKUP_DIR/singbox_was_running" ] && \
-       [ -f /etc/systemd/system/sing-box.service ]; then
-        systemctl restart sing-box >/dev/null 2>&1 || true
-    else
-        systemctl stop sing-box >/dev/null 2>&1 || true
+
+    # A pre-7.1.1 runtime can recreate the former cleartext public subscription
+    # from its health timer (or when the user runs the old rr manually).  The
+    # candidate recovery helper lives outside the replaceable runtime and owns
+    # the quarantine.  Non-canonical TX_DIR values only occur in isolated unit
+    # scaffolding; every real installer transaction is below transactions/.
+    case "$TX_DIR" in
+        "$RR_TX_ROOT"/transactions/*)
+            if [ -x "$RR_RECOVERY_HELPER" ] &&
+               "$RR_RECOVERY_HELPER" apply-rollback-policy "$TX_DIR"; then
+                subscription_policy=$(head -n 1 "$TX_DIR/rollback-subscription-status" 2>/dev/null || printf degraded)
+            else
+                subscription_policy=degraded
+                rollback_failed=true
+            fi
+            ;;
+    esac
+    case "$subscription_policy" in normal|quarantined|degraded) ;; *) subscription_policy=degraded; rollback_failed=true ;; esac
+    if [ "$rollback_failed" = true ]; then
+        ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_write_phase recovery_failed >/dev/null 2>&1 || true
+        rr_error "严重：旧版订阅隔离策略未能完成；写入服务保持冻结，事务证据已保留。"
+        return 1
     fi
-    if [ -f "$BACKUP_DIR/nexus_was_running" ] && \
-       [ -f /etc/systemd/system/rr-nexus.service ]; then
-        systemctl restart rr-nexus >/dev/null 2>&1 || true
+    if declare -F rr_restore_update_writer_state >/dev/null; then
+        rr_restore_update_writer_state "$BACKUP_DIR" "$subscription_policy" || rollback_failed=true
     else
-        systemctl stop rr-nexus >/dev/null 2>&1 || true
-    fi
-    if [ -f "$BACKUP_DIR/subscription_was_running" ] && [ -x "$RR_LAUNCHER" ]; then
-        "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || \
-            rr_error "警告：旧版订阅服务未能自动恢复，请执行 rr 重试。"
+        if [ -f "$BACKUP_DIR/health_timer_was_enabled" ]; then
+            systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || true
+        else
+            systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
+        fi
+        if [ -f "$BACKUP_DIR/singbox_was_running" ]; then
+            systemctl restart sing-box >/dev/null 2>&1 || true
+        else
+            systemctl stop sing-box >/dev/null 2>&1 || true
+        fi
+        if [ -f "$BACKUP_DIR/nexus_was_running" ]; then
+            systemctl restart rr-nexus >/dev/null 2>&1 || true
+        else
+            systemctl stop rr-nexus >/dev/null 2>&1 || true
+        fi
+        if [ "$subscription_policy" = normal ] && \
+           [ -f "$BACKUP_DIR/subscription_was_running" ] && [ -x "$RR_LAUNCHER" ]; then
+            RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || rollback_failed=true
+        fi
     fi
     if [ "$rollback_failed" = true ]; then
         ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_write_phase recovery_failed >/dev/null 2>&1 || true
         rr_error "严重：回滚未完整完成；现场备份将保留在 ${BACKUP_DIR}，请勿删除。"
         [ -n "$OLD_RUNTIME" ] && rr_error "旧运行目录仍保留在 ${OLD_RUNTIME}。"
         return 1
     fi
-    rr_write_phase rolled_back >/dev/null 2>&1 || true
+    if [ "$subscription_policy" = normal ]; then
+        rr_write_phase rolled_back || {
+            ROLLBACK_FAILED=true
+            return 1
+        }
+    else
+        rr_write_phase rolled_back_degraded || {
+            ROLLBACK_FAILED=true
+            return 1
+        }
+        KEEP_TRANSACTION=true
+    fi
+    if declare -F rr_clear_update_maintenance_marker >/dev/null && \
+       ! rr_clear_update_maintenance_marker "$TX_DIR"; then
+        ROLLBACK_FAILED=true
+        rr_write_phase recovery_failed >/dev/null 2>&1 || true
+        rr_error "严重：维护状态标记未能安全清理；事务证据已保留。"
+        return 1
+    fi
     rm -f "$RR_ACTIVE_TX"
+    sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
     if [ -f "$BACKUP_DIR/runtime_did_not_exist" ]; then
         systemctl disable rr-update-recovery.service >/dev/null 2>&1 || true
-        rm -f -- /etc/systemd/system/rr-update-recovery.service /usr/local/sbin/rr-update-recover
+        rm -f -- /etc/systemd/system/rr-update-recovery.service \
+            "$RR_RECOVERY_HELPER" "$RR_UPDATE_EXTERNAL_HELPER"
         systemctl daemon-reload >/dev/null 2>&1 || true
         rm -rf -- "$RR_TX_ROOT"
     fi
-    rr_error "回滚完成：原 rr、配置、内核、Nexus 数据库和订阅已恢复。"
+    if [ "$subscription_policy" = normal ]; then
+        rr_error "回滚完成：原 rr、配置、内核、Nexus 数据库和订阅已恢复。"
+    else
+        rr_error "回滚完成（DEGRADED）：原数据和运行文件已恢复，但旧版公网订阅已安全隔离。"
+        rr_error "请升级到 ${RR_SUBSCRIPTION_SAFE_VERSION} 或更高版本；诊断：/usr/local/sbin/rr-update-recover status"
+    fi
     return 0
 }
 
 rr_cleanup() {
-    local result="${1:-0}"
+    local result="${1:-0}" cleanup_phase=""
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
         rr_rollback || result=1
+    fi
+    [ -n "$TX_DIR" ] && cleanup_phase=$(head -n 1 "$TX_DIR/phase" 2>/dev/null || true)
+    if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" != true ] && \
+       [ "$RR_UPDATE_WRITERS_FROZEN" = true ] && \
+       [[ "$cleanup_phase" =~ ^(freezing|snapshotting|prepared)$ ]]; then
+        if rr_restore_update_writer_state "$BACKUP_DIR" normal && \
+           rr_write_phase aborted && \
+           rr_clear_update_maintenance_marker "$TX_DIR"; then
+            rm -f -- "$RR_ACTIVE_TX"
+            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+        else
+            rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            result=1
+        fi
+    fi
+    [ -n "$TX_DIR" ] && cleanup_phase=$(head -n 1 "$TX_DIR/phase" 2>/dev/null || true)
+    if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" != true ] && \
+       [ "$RR_UPDATE_WRITERS_FROZEN" != true ] && \
+       [ "$RR_UPDATE_MAINTENANCE_ACTIVE" = true ] && \
+       [ "$ROLLBACK_FAILED" != true ] && [ "$cleanup_phase" = state_recorded ]; then
+        if rr_write_phase aborted && rr_clear_update_maintenance_marker "$TX_DIR"; then
+            rm -f -- "$RR_ACTIVE_TX"
+            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+        else
+            rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            result=1
+        fi
     fi
     [ -n "$STAGE_ROOT" ] && rm -rf "$STAGE_ROOT"
     [ -n "$NEW_RUNTIME" ] && [ -e "$NEW_RUNTIME" ] && rm -rf "$NEW_RUNTIME"
@@ -516,6 +1261,12 @@ rr_cleanup() {
         [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
         [ -n "$TX_DIR" ] && [ -d "$TX_DIR" ] && rm -rf "$TX_DIR"
         [ -n "$TX_DIR" ] && [ "$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null || true)" = "$TX_DIR" ] && rm -f "$RR_ACTIVE_TX"
+    fi
+    if [ "$RR_UPDATE_WRITERS_FROZEN" != true ] && \
+       [ "$RR_HEALTH_MONITOR_FROZEN" = true ] && \
+       ! rr_resume_health_monitor_after_abort; then
+        rr_error "健康检查定时器未能恢复；请执行 systemctl status argo-rr-health.timer。"
+        result=1
     fi
     return "$result"
 }
@@ -537,7 +1288,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "f7d7af9e368b617ed6a9ad8b982b7ee8d23564c50c261f2a285937a246f05b5d" ] && \
+        if [ "$actual" = "8a17fe67b5914cb366f73df1299eac0e2b5fce64afd9445ab67b0e5d52540836" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -552,7 +1303,9 @@ rr_fetch_release() {
     echo "[RR-vps] ⚡ 高速模式未命中，切换逐文件下载……"
     rm -rf "$PAYLOAD_DIR"
     mkdir -p "$PAYLOAD_DIR/modules"
-    rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
+    # manifest 是逐文件下载的信任锚；镜像只能搬运随后按官方哈希校验的文件，
+    # 不能提供或替换这份锚点。
+    rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true || return 1
     rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || {
         rr_error "远程发布清单格式无效。"
         return 1
@@ -574,7 +1327,7 @@ rr_fetch_release() {
         sleep 10
         rm -rf "$PAYLOAD_DIR"
         mkdir -p "$PAYLOAD_DIR"
-        rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" || return 1
+        rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true || return 1
         rr_manifest_is_valid "$STAGE_ROOT/manifest.sha256" || { rr_error "远程发布清单格式无效。"; return 1; }
         while read -r _ relative_path; do
             mkdir -p "$PAYLOAD_DIR/$(dirname "$relative_path")"
@@ -589,6 +1342,9 @@ rr_fetch_release() {
         fi
     fi
     bash -n "$PAYLOAD_DIR/rr" || return 1
+    bash -n "$PAYLOAD_DIR/scripts/naive-cert-hook.sh" || return 1
+    bash -n "$PAYLOAD_DIR/scripts/update-recover.sh" || return 1
+    python3 -m py_compile "$PAYLOAD_DIR/scripts/update-external-state.py" || return 1
     local shell_file=""
     for shell_file in "$PAYLOAD_DIR"/modules/*.sh; do
         bash -n "$shell_file" || return 1
@@ -638,6 +1394,10 @@ rr_install_release() {
         rr_error "无法完整备份当前安装，已取消更新。"
         return 1
     }
+    "$RR_RECOVERY_HELPER" snapshot-metadata "$TX_DIR" || {
+        rr_error "无法可信记录回滚目标版本与订阅端口，已在切换运行文件前取消更新。"
+        return 1
+    }
 
     NEW_RUNTIME=$(mktemp -d /usr/local/lib/.rr-install.XXXXXX) || return 1
     install -d -m 755 "$NEW_RUNTIME/modules"
@@ -657,6 +1417,8 @@ rr_install_release() {
         "$NEW_RUNTIME/scripts/naive-cert-hook.sh" || return 1
     install -m 755 "$PAYLOAD_DIR/scripts/update-recover.sh" \
         "$NEW_RUNTIME/scripts/update-recover.sh" || return 1
+    install -m 755 "$PAYLOAD_DIR/scripts/update-external-state.py" \
+        "$NEW_RUNTIME/scripts/update-external-state.py" || return 1
     if [ -f "$PAYLOAD_DIR/nexus/rr_nexus.py" ]; then
         # Nexus 后端与前端均以已校验的 manifest 为唯一来源。允许安全地
         # 拆分 Python/JS/CSS 模块，不再需要同步维护安装器文件白名单。
@@ -699,6 +1461,14 @@ rr_install_release() {
     mv "$NEW_LAUNCHER" "$RR_LAUNCHER" || return 1
     NEW_LAUNCHER=""
 
+    # A host previously rolled back to an unsafe runtime may already have the
+    # independent quarantine reserving SUB_PORT.  Suspend only its process;
+    # keep the marker/firewall until the safe candidate has fully migrated so
+    # a crash still causes boot recovery to re-apply the quarantine.
+    if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
+        "$RR_RECOVERY_HELPER" suspend-quarantine || return 1
+    fi
+
     rr_write_phase migrating || return 1
     if ! RR_UPDATE_TRANSACTION=1 \
         RR_UPDATE_SINGBOX_WAS_RUNNING="$([ -f "$BACKUP_DIR/singbox_was_running" ] && printf true || printf false)" \
@@ -706,18 +1476,38 @@ rr_install_release() {
         RR_UPDATE_SUBSCRIPTION_WAS_RUNNING="$([ -f "$BACKUP_DIR/subscription_was_running" ] && printf true || printf false)" \
         RR_UPDATE_ARGO_WAS_RUNNING="$([ -f "$BACKUP_DIR/argo_was_running" ] && printf true || printf false)" \
         RR_UPDATE_HEALTH_TIMER_WAS_ENABLED="$([ -f "$BACKUP_DIR/health_timer_was_enabled" ] && printf true || printf false)" \
-        "$RR_LAUNCHER" --post-update; then
+        RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update; then
+        rr_rollback
+        return 1
+    fi
+    if [ ! -f "$BACKUP_DIR/runtime_did_not_exist" ] && \
+       ! rr_verify_update_writer_state "$BACKUP_DIR"; then
+        rr_error "候选版本未恢复升级前的服务启用/运行状态，正在回滚。"
         rr_rollback
         return 1
     fi
     rr_test_fault migrated || return 1
+
+    if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
+        "$RR_RECOVERY_HELPER" clear-quarantine || {
+            rr_rollback
+            return 1
+        }
+    fi
 
     if ! rr_write_phase committed; then
         rr_rollback
         return 1
     fi
     TRANSACTION_ACTIVE=false
+    RR_HEALTH_MONITOR_FROZEN=false
+    RR_UPDATE_WRITERS_FROZEN=false
     KEEP_TRANSACTION=true
+    if ! RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update-finalize; then
+        rr_error "版本已提交，但订阅防火墙收尾失败；事务与维护标记已保留，绝不回滚已提交版本。"
+        return 1
+    fi
+    rr_clear_update_maintenance_marker "$TX_DIR" || return 1
     return 0
 }
 
@@ -733,8 +1523,16 @@ trap 'rr_cleanup "$?"' EXIT
 trap 'exit 130' INT TERM HUP
 
 rr_check_system || exit 1
-mkdir -p /run/lock || exit 1
-exec {UPDATE_LOCK_FD}>/run/lock/rr-update.lock || exit 1
+rr_prepare_update_lock_file "$RR_UPDATE_LOCK_FILE" || {
+    rr_error "共享更新锁文件不安全，已拒绝安装/更新。"
+    exit 1
+}
+exec {UPDATE_LOCK_FD}>>"$RR_UPDATE_LOCK_FILE" || exit 1
+rr_update_lock_fd_is_safe "$RR_UPDATE_LOCK_FILE" "$UPDATE_LOCK_FD" || {
+    exec {UPDATE_LOCK_FD}>&-
+    rr_error "共享更新锁文件在打开时发生变化，已拒绝安装/更新。"
+    exit 1
+}
 if ! flock -n "$UPDATE_LOCK_FD"; then
     rr_error "另一个安装/更新任务正在运行，本次未改动系统。"
     exit 1

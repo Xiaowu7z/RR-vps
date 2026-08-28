@@ -90,6 +90,7 @@ validate_node_port() {
 # ==========================================
 generate_node_and_sub() {
     load_config_with_defaults || return 1
+    ensure_subscription_root || return 1
     # T9：证书缺失时自动重建（保持节点可起、订阅可再生成），失败则拒绝继续。
     ensure_tls_certificates || return 1
     validate_subscription_crypto_material || return 1
@@ -102,7 +103,7 @@ generate_node_and_sub() {
     local SERVER_IP="$ENTRY_IP_URI"
     local SERVER_IP_RAW="$ENTRY_IP_RAW"
     local SUB_PATH_DIR="${SUB_ROOT}/${UUID}"
-    mkdir -p "$SUB_PATH_DIR"
+    mkdir -p -- "$SUB_PATH_DIR"
     chmod 700 "$SUB_ROOT" "$SUB_PATH_DIR" 2>/dev/null || true
 
     local all_links=""
@@ -258,14 +259,9 @@ generate_node_and_sub() {
 subscription_short_token() {
     local user_id="$1"
     is_valid_uuid "$user_id" || return 1
-    python3 - "$user_id" <<'PY'
-import base64
-import hashlib
-import sys
-
-digest = hashlib.sha256(sys.argv[1].encode("ascii")).digest()[:9]
-print(base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="))
-PY
+    [ "$user_id" = "${UUID:-}" ] || return 1
+    [[ "${SUB_TOKEN:-}" =~ ^[A-Za-z0-9_-]{32}$ ]] || return 1
+    printf '%s\n' "$SUB_TOKEN"
 }
 
 create_short_subscription_alias() {
@@ -274,7 +270,7 @@ create_short_subscription_alias() {
     local target=""
     local existing_link=""
     token=$(subscription_short_token "$UUID") || return 1
-    [[ "$token" =~ ^[A-Za-z0-9_-]{12}$ ]] || return 1
+    [[ "$token" =~ ^[A-Za-z0-9_-]{32}$ ]] || return 1
     # SimpleHTTPServer serves index.html instead of exposing directory listings.
     : > "$SUB_ROOT/index.html" || return 1
     chmod 600 "$SUB_ROOT/index.html" || return 1
@@ -342,7 +338,19 @@ build_short_subscription_url() {
     is_valid_port "$public_port" || return 1
     token=$(subscription_short_token "$user_id") || return 1
     route=$(subscription_short_route "$format") || return 1
-    printf 'http://%s:%s/%s/%s' "$server_ip" "$public_port" "$route" "$token"
+    local scheme="" url_host="" url_port=""
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        is_valid_domain "${SUB_DOMAIN:-}" || return 1
+        scheme=https
+        url_host="$SUB_DOMAIN"
+        url_port="$public_port"
+    else
+        scheme=http
+        url_host=127.0.0.1
+        url_port="${SUB_PORT:-$public_port}"
+        is_valid_port "$url_port" || return 1
+    fi
+    printf '%s://%s:%s/%s/%s' "$scheme" "$url_host" "$url_port" "$route" "$token"
 }
 
 build_subscription_url() {
@@ -358,7 +366,19 @@ build_subscription_url() {
        "$server_ip$public_port$user_id" != *$'\r'* ]] || return 1
     is_valid_port "$public_port" || return 1
     is_valid_uuid "$user_id" || return 1
-    printf 'http://%s:%s/%s/%s' "$server_ip" "$public_port" "$user_id" "$file_name"
+    local scheme="" url_host="" url_port=""
+    if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
+        is_valid_domain "${SUB_DOMAIN:-}" || return 1
+        scheme=https
+        url_host="$SUB_DOMAIN"
+        url_port="$public_port"
+    else
+        scheme=http
+        url_host=127.0.0.1
+        url_port="${SUB_PORT:-$public_port}"
+        is_valid_port "$url_port" || return 1
+    fi
+    printf '%s://%s:%s/%s/%s' "$scheme" "$url_host" "$url_port" "$user_id" "$file_name"
 }
 
 # ==========================================
@@ -529,7 +549,11 @@ generate_client_json() {
         client_final="direct"
         remote_dns_detour='"detour":"direct"'
     fi
-    local full_json='{"dns":{"servers":[{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","tls":{"enabled":true,"server_name":"cloudflare-dns.com"},'"$remote_dns_detour"'},{"type":"udp","tag":"local","server":"223.5.5.5"}],"final":"remote"},"inbounds":[{"type":"tun","tag":"tun-in","address":["172.19.0.1/30","fd00::1/126"],"auto_route":true,"strict_route":true}],'"$outbounds_json"',"route":{"rules":[{"inbound":"tun-in","action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"domain_suffix":['$RR_CN_DOMAINS'],"action":"route","outbound":"direct"},{"ip_is_private":true,"action":"route","outbound":"direct"}],"default_domain_resolver":"remote","final":"'"$client_final"'"}}'
+    # 代理服务器地址可能是域名（固定 Argo/Naive）。若这里使用经 proxy
+    # detour 的 remote DoH，会形成“先连代理才能解析代理域名”的自举闭环。
+    # 客户端普通 DNS 仍由 dns.final=remote 处理；这里只让出站服务器域名的
+    # 首次解析使用 local，符合 sing-box shared dial fields 的语义。
+    local full_json='{"dns":{"servers":[{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","tls":{"enabled":true,"server_name":"cloudflare-dns.com"},'"$remote_dns_detour"'},{"type":"udp","tag":"local","server":"223.5.5.5"}],"final":"remote"},"inbounds":[{"type":"tun","tag":"tun-in","address":["172.19.0.1/30","fd00::1/126"],"auto_route":true,"strict_route":true}],'"$outbounds_json"',"route":{"rules":[{"inbound":"tun-in","action":"sniff"},{"protocol":"dns","action":"hijack-dns"},{"domain_suffix":['$RR_CN_DOMAINS'],"action":"route","outbound":"direct"},{"ip_is_private":true,"action":"route","outbound":"direct"}],"default_domain_resolver":"local","final":"'"$client_final"'"}}'
 
     local SUB_PATH_DIR="${RR_SUB_OUTPUT_DIR:-${SUB_ROOT}/${uuid_val}}"
     mkdir -p "$SUB_PATH_DIR"
@@ -893,9 +917,15 @@ toggle_clash_meta() {
             1)
                 if apply_config_transaction "开启 Clash Meta 订阅" "CLASH_ENABLED" "true"; then
                     select_entry_ip || { sleep 2; return; }
+                    local clash_url=""
+                    clash_url=$(build_short_subscription_url "$ENTRY_IP_RAW" "$SUB_URL_PORT" "$UUID" clash) || {
+                        echo -e "${RED}[错误] 无法生成安全订阅地址。${RESET}" >&2
+                        sleep 2
+                        return
+                    }
                     echo -e "${CYAN}==================================================${RESET}"
                     echo -e "Clash Meta 订阅地址:"
-                    echo -e "${WHITE}http://${ENTRY_IP_URI}:${SUB_URL_PORT}/${UUID}/clash_meta.yaml${RESET}"
+                    echo -e "${WHITE}${clash_url}${RESET}"
                     echo -e "${CYAN}==================================================${RESET}"
                 fi
                 sleep 3

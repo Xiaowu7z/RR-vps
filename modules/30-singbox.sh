@@ -5,6 +5,10 @@
 # 3. 安装并配置 Sing-box 内核
 # ==========================================
 install_singbox() {
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        printf '%s\n' '[安全拒绝] 热更新候选迁移不得下载或替换 Sing-box 内核。' >&2
+        return 1
+    fi
     echo -e "\n${YELLOW}正在下载并部署 Sing-box 核心 ($SYS_ARCH)...${RESET}"
     local sb_tmp_dir=""
     local sb_tag=""
@@ -831,6 +835,8 @@ restore_config_transaction_snapshot() {
     local restart_required="$4"
     local restore_failed=false
 
+    ensure_subscription_root || return 1
+
     cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE" || return 1
     if [ -f "$tx_dir/had_runtime_config" ]; then
         cp -p "$tx_dir/config.json" /etc/sing-box/config.json || return 1
@@ -891,6 +897,7 @@ apply_config_transaction() {
         rm -rf "$tx_dir"
         return 1
     fi
+    ensure_subscription_root || { rm -rf "$tx_dir"; return 1; }
     old_uuid="$UUID"
     if [ -f /etc/sing-box/config.json ]; then
         cp -p /etc/sing-box/config.json "$tx_dir/config.json" || { rm -rf "$tx_dir"; return 1; }
@@ -998,66 +1005,298 @@ sync_runtime_state() {
     if [ "$SINGBOX_CONFIG_CHANGED" = true ] && [ "$was_running" = true ]; then
         restart_singbox || return 1
     fi
-    if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_HOP_PORTS" ] && \
-       ! install_hop_rules "HY2" "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1; then
-        echo -e "${RED}[错误] HY2 跳跃规则无法应用到当前入口地址族，运行状态未同步。${RESET}" >&2
-        return 1
+    if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_HOP_PORTS" ]; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            rr_validate_hop_rules "HY2" "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1 || {
+                echo -e "${RED}[错误] HY2 跳跃规则只读检查失败，热更新未修改防火墙。${RESET}" >&2
+                return 1
+            }
+        elif ! install_hop_rules "HY2" "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1; then
+            echo -e "${RED}[错误] HY2 跳跃规则无法应用到当前入口地址族，运行状态未同步。${RESET}" >&2
+            return 1
+        fi
     fi
     generate_node_and_sub || return 1
     return 0
 }
 
+# Read-side equivalent of install_hop_rules for an uncommitted release
+# candidate.  Existing tagged and legacy rules are accepted, but nothing is
+# appended, removed or persisted.
+rr_validate_hop_rules() {
+    local label="$1" main_port="$2" spec_list="$3"
+    local required_command="" spec="" found=false
+    local -a specs=()
+    [ -z "$spec_list" ] && return 0
+    is_valid_port "$main_port" && is_valid_hop_spec "$spec_list" || return 1
+    case "${ENTRY_IP_MODE:-auto}" in
+        ipv4) required_command=iptables ;;
+        ipv6) required_command=ip6tables ;;
+        *)
+            if select_entry_ip >/dev/null 2>&1 && is_ip_version "$ENTRY_IP_RAW" 6; then
+                required_command=ip6tables
+            else
+                required_command=iptables
+            fi
+            ;;
+    esac
+    command -v "$required_command" >/dev/null 2>&1 || return 1
+    IFS=',' read -r -a specs <<< "$spec_list"
+    for spec in "${specs[@]}"; do
+        found=false
+        "$required_command" -w 5 -t nat -C PREROUTING -p udp --dport "$spec" \
+            -m comment --comment "argo-rr-${label}" -j REDIRECT \
+            --to-ports "$main_port" >/dev/null 2>&1 && found=true
+        [ "$found" = true ] || \
+            "$required_command" -w 5 -t nat -C PREROUTING -p udp --dport "$spec" \
+                -j REDIRECT --to-ports "$main_port" >/dev/null 2>&1 && found=true
+        [ "$found" = true ] || \
+            "$required_command" -w 5 -t nat -C PREROUTING -p udp --dport "$spec" \
+                -m comment --comment "argo-rr-${label}" -j DNAT \
+                --to-destination ":${main_port}" >/dev/null 2>&1 && found=true
+        [ "$found" = true ] || \
+            "$required_command" -w 5 -t nat -C PREROUTING -p udp --dport "$spec" \
+                -j DNAT --to-destination ":${main_port}" >/dev/null 2>&1 && found=true
+        [ "$found" = true ] || return 1
+    done
+}
+
 # NAIVE-SUPPORT：Let’s Encrypt 真证书申请与续签（NaiveProxy 专用）
+naive_acme_port_80_is_safe() {
+    # 未占用可直接启动 Nginx；已占用时只接受确实由 Nginx 监听的情形。
+    # 不能仅用 pgrep 判断，因为 Nginx 可能只监听其他端口，而 80 实际由
+    # Apache/Caddy 等用户服务占用。
+    ! tcp_port_in_use 80 && return 0
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -ltnp 'sport = :80' 2>/dev/null | grep -q '"nginx"'
+}
+
+restore_naive_acme_nginx_state() {
+    local site="$1"
+    local enabled="$2"
+    local site_backup="$3"
+    local had_site="$4"
+    local had_enabled="$5"
+    local old_enabled_target="$6"
+    if [ "$had_site" = true ]; then
+        cp -p "$site_backup" "$site" || return 1
+    else
+        rm -f "$site"
+    fi
+    if [ "$had_enabled" = true ]; then
+        ln -sfn "$old_enabled_target" "$enabled" || return 1
+    else
+        rm -f "$enabled"
+    fi
+    if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+prepare_naive_acme_webroot() {
+    local naive_domain="$1"
+    local webroot="${RR_NAIVE_ACME_WEBROOT:-/var/www/rr-nexus-certbot}"
+    local site="${RR_NAIVE_ACME_NGINX_SITE:-/etc/nginx/sites-available/rr-naive-acme.conf}"
+    local enabled="${RR_NAIVE_ACME_NGINX_ENABLED:-/etc/nginx/sites-enabled/rr-naive-acme.conf}"
+    local site_tmp=""
+    local site_backup=""
+    local old_enabled_target=""
+    local had_site=false
+    local had_enabled=false
+
+    is_valid_domain "$naive_domain" || {
+        echo -e "${RED}[失败] NaiveProxy 域名格式无效。${RESET}" >&2
+        return 1
+    }
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v nginx >/dev/null 2>&1 || ! command -v certbot >/dev/null 2>&1; then
+        if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+            echo -e "${RED}[失败] 热更新候选缺少 Nginx/Certbot；未运行 apt 安装。${RESET}" >&2
+            return 1
+        fi
+        apt-get install -y nginx certbot >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 或 certbot 安装失败。${RESET}" >&2
+            return 1
+        }
+    fi
+    if ! naive_acme_port_80_is_safe; then
+        echo -e "${RED}[拒绝] 80 端口已被非 Nginx 程序占用；未终止该程序，也未覆盖其配置。${RESET}" >&2
+        return 1
+    fi
+
+    mkdir -p "$webroot/.well-known/acme-challenge" "$(dirname "$site")" "$(dirname "$enabled")" || return 1
+    # 某些 VPS 模板以 root umask 077 预建 /var/www（700）。即使 Webroot
+    # 本身是 755，Nginx 也无法穿过父目录并会把 try_files 的 EACCES 表现
+    # 成 404。仅增加父目录 execute 位（可穿越），不开放目录读取/列表。
+    chmod a+x "$(dirname "$webroot")" || return 1
+    chmod 755 "$webroot" "$webroot/.well-known" "$webroot/.well-known/acme-challenge" || return 1
+    [ ! -L "$site" ] || {
+        echo -e "${RED}[拒绝] NaiveProxy Nginx 站点文件是符号链接，未覆盖。${RESET}" >&2
+        return 1
+    }
+    if [ -e "$enabled" ] && [ ! -L "$enabled" ]; then
+        echo -e "${RED}[拒绝] NaiveProxy Nginx 启用项不是符号链接，未覆盖。${RESET}" >&2
+        return 1
+    fi
+    if [ -f "$site" ]; then
+        had_site=true
+        site_backup=$(mktemp /tmp/rr-naive-acme-site.XXXXXX) || return 1
+        cp -p "$site" "$site_backup" || { rm -f "$site_backup"; return 1; }
+    fi
+    if [ -L "$enabled" ]; then
+        had_enabled=true
+        old_enabled_target=$(readlink "$enabled") || { rm -f "$site_backup"; return 1; }
+    fi
+
+    site_tmp=$(mktemp "$(dirname "$site")/.rr-naive-acme.XXXXXX") || { rm -f "$site_backup"; return 1; }
+    if ! cat > "$site_tmp" <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${naive_domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${webroot};
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+    then
+        rm -f "$site_tmp" "$site_backup"
+        return 1
+    fi
+    chmod 644 "$site_tmp" || { rm -f "$site_tmp" "$site_backup"; return 1; }
+    mv -f "$site_tmp" "$site" || { rm -f "$site_tmp" "$site_backup"; return 1; }
+    if ! ln -sfn "$site" "$enabled"; then
+        restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+            "$had_site" "$had_enabled" "$old_enabled_target" || true
+        rm -f "$site_backup"
+        return 1
+    fi
+
+    if ! nginx -t >/dev/null 2>&1; then
+        restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+            "$had_site" "$had_enabled" "$old_enabled_target" || true
+        rm -f "$site_backup"
+        echo -e "${RED}[失败] Nginx 配置检查失败，NaiveProxy ACME 站点已回滚。${RESET}" >&2
+        return 1
+    fi
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 无法重新加载 NaiveProxy ACME 站点。${RESET}" >&2
+            restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+                "$had_site" "$had_enabled" "$old_enabled_target" || true
+            rm -f "$site_backup"
+            return 1
+        }
+    else
+        systemctl enable --now nginx >/dev/null 2>&1 || {
+            echo -e "${RED}[失败] Nginx 无法启动，不能进行 NaiveProxy 域名验证。${RESET}" >&2
+            restore_naive_acme_nginx_state "$site" "$enabled" "$site_backup" \
+                "$had_site" "$had_enabled" "$old_enabled_target" || true
+            rm -f "$site_backup"
+            return 1
+        }
+    fi
+    rm -f "$site_backup"
+    open_protocol_firewall 80 tcp || return 1
+    return 0
+}
+
+naive_certificate_pair_valid() {
+    local certificate="$1" private_key="$2" domain="$3"
+    [ -s "$certificate" ] && [ -s "$private_key" ] || return 1
+    certificate_identity_matches "$certificate" "$domain" || return 1
+    openssl x509 -in "$certificate" -noout -checkend 604800 >/dev/null 2>&1 || return 1
+    certificate_private_key_matches "$certificate" "$private_key"
+}
+
+sync_naive_certificate_pair() {
+    local source_dir="$1" target_dir="$2" domain="$3" cert_tmp="" key_tmp=""
+    naive_certificate_pair_valid "$source_dir/fullchain.pem" "$source_dir/privkey.pem" "$domain" || return 1
+    install -d -m 700 "$target_dir" || return 1
+    cert_tmp=$(mktemp "$target_dir/.fullchain.XXXXXX") || return 1
+    key_tmp=$(mktemp "$target_dir/.privkey.XXXXXX") || { rm -f "$cert_tmp"; return 1; }
+    install -m 600 "$source_dir/fullchain.pem" "$cert_tmp" && \
+        install -m 600 "$source_dir/privkey.pem" "$key_tmp" && \
+        mv -f "$key_tmp" "$target_dir/privkey.pem" && \
+        mv -f "$cert_tmp" "$target_dir/fullchain.pem" || {
+            rm -f "$cert_tmp" "$key_tmp"
+            return 1
+        }
+}
+
 ensure_naive_certificate() {
     # 返回 0=证书就绪；非 0=失败。真证书，不允许自签。
     local naive_domain="${1:-$NAIVE_DOMAIN}"
     local le_email="${2:-${LE_EMAIL:-}}"
-    # LE 拒绝 example.com 邮箱；未配置时从域名派生合法邮箱
-    [ -n "$le_email" ] || le_email="admin@${naive_domain}"
+    local le_live_root="${RR_LE_LIVE_ROOT:-/etc/letsencrypt/live}"
+    local naive_cert_dir="${RR_NAIVE_CERT_DIR:-/etc/rr-naive}"
+    local webroot="${RR_NAIVE_ACME_WEBROOT:-/var/www/rr-nexus-certbot}"
     [ -n "$naive_domain" ] || { echo -e "${RED}[失败] 未设置 NaiveProxy 域名。${RESET}" >&2; return 1; }
-    mkdir -p /etc/rr-naive
+    is_valid_domain "$naive_domain" || { echo -e "${RED}[失败] NaiveProxy 域名格式无效。${RESET}" >&2; return 1; }
+    # LE 拒绝 example.com 邮箱；未配置时从已校验域名派生合法邮箱。
+    [ -n "$le_email" ] || le_email="admin@${naive_domain}"
 
-    # 已存在 LE 证书则直接同步（幂等）
-    if [ -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" ]; then
-        cp -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" /etc/rr-naive/fullchain.pem || return 1
-        cp -f "/etc/letsencrypt/live/${naive_domain}/privkey.pem" /etc/rr-naive/privkey.pem || return 1
-        chmod 600 /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        if ! naive_certificate_pair_valid \
+            "${le_live_root}/${naive_domain}/fullchain.pem" \
+            "${le_live_root}/${naive_domain}/privkey.pem" "$naive_domain"; then
+            echo -e "${RED}[失败] 热更新候选不会签发或续签 NaiveProxy 证书。${RESET}" >&2
+            return 1
+        fi
+        install -d -m 700 "$naive_cert_dir" || return 1
+        sync_naive_certificate_pair "${le_live_root}/${naive_domain}" \
+            "$naive_cert_dir" "$naive_domain" || return 1
+        deploy_naive_cert_hook
+        return $?
+    fi
+    install -d -m 700 "$naive_cert_dir" || return 1
+
+    # Webroot 模式不仅需要目录，还必须在签发及续签时有真实 HTTP 服务。
+    # 首装阶段 Sing-box/Nexus 尚未启动，因此先安全配置 Nginx 并放行 80。
+    prepare_naive_acme_webroot "$naive_domain" || return 1
+
+    # 仅复用 SAN、有效期和私钥都匹配的在线 lineage。Portable restore
+    # 带来的叶子证书没有目标机续签配置，必须在这里重新建立 lineage。
+    if naive_certificate_pair_valid "${le_live_root}/${naive_domain}/fullchain.pem" \
+        "${le_live_root}/${naive_domain}/privkey.pem" "$naive_domain"; then
+        sync_naive_certificate_pair "${le_live_root}/${naive_domain}" "$naive_cert_dir" "$naive_domain" || return 1
         deploy_naive_cert_hook
         return 0
     fi
 
-    # certbot webroot 申请（域名必须已解析到本机）
-    if ! command -v certbot >/dev/null 2>&1; then
-        echo -e "${YELLOW}正在安装 certbot（Let’s Encrypt 官方客户端）……${RESET}"
-        apt-get install -y certbot >/dev/null 2>&1 || { echo -e "${RED}[失败] certbot 安装失败。${RESET}" >&2; return 1; }
-    fi
     # 6.6.15：root umask 077（DMIT 模板等）会让目录 700/文件 600，
     # nginx(www-data) 读不了挑战文件 → LE 403。显式 chmod + umask 022。
-    mkdir -p /var/www/rr-nexus-certbot/.well-known/acme-challenge
-    chmod 755 /var/www/rr-nexus-certbot /var/www/rr-nexus-certbot/.well-known /var/www/rr-nexus-certbot/.well-known/acme-challenge
     echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let’s Encrypt 真证书……${RESET}"
-    if ! (umask 022 && certbot certonly --webroot -w /var/www/rr-nexus-certbot -d "$naive_domain" \
-        -m "$le_email" --agree-tos --non-interactive --quiet 2>/dev/null); then
+    if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$naive_domain" \
+        -m "$le_email" --agree-tos --non-interactive --quiet --force-renewal 2>/dev/null); then
         echo -e "${RED}[失败] 证书申请失败：请确认 ${naive_domain} 已解析到本机公网 IP、80 端口可访问；如日志提示邮箱被拒（invalid email），请在 /etc/argo_vmess.conf 添加 LE_EMAIL=你的邮箱 后重试。${RESET}" >&2
         return 1
     fi
-    cp -f "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" /etc/rr-naive/fullchain.pem || return 1
-    cp -f "/etc/letsencrypt/live/${naive_domain}/privkey.pem" /etc/rr-naive/privkey.pem || return 1
-    chmod 600 /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem
+    sync_naive_certificate_pair "${le_live_root}/${naive_domain}" "$naive_cert_dir" "$naive_domain" || return 1
     deploy_naive_cert_hook
     echo -e "${GREEN}[成功] NaiveProxy Let’s Encrypt 真证书已就绪（/etc/rr-naive/）。${RESET}"
     return 0
 }
 
 deploy_naive_cert_hook() {
-    # certbot renew 后的 deploy 钩子：同步新证书并热载 sing-box
+    # certbot renew 后的通用 deploy 钩子：同步 NaiveProxy 证书，并在
+    # 同一 lineage 也承载订阅 HTTPS 时安全刷新订阅进程。
     local naive_domain="${1:-$NAIVE_DOMAIN}"
     [ -n "$naive_domain" ] || return 0
     local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
     local hook_source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
     mkdir -p "$hook_dir"
-    local hook_file="${hook_dir}/rr-naive-cert.sh"
+    local hook_file="${hook_dir}/rr-certificates.sh"
     [ -s "$hook_source" ] && bash -n "$hook_source" || return 1
+    install -d -m 700 "$hook_dir" || return 1
     install -m 700 "$hook_source" "$hook_file" || return 1
+    rm -f "${hook_dir}/rr-naive-cert.sh"
     return 0
 }

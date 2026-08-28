@@ -4,6 +4,10 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
+expected_version=$(sed -n '1s/^RR-vps //p' version | tr -d '[:space:]')
+case "$expected_version" in
+    ''|*[!0-9A-Za-z.-]*) echo "Invalid repository version: $expected_version" >&2; exit 1 ;;
+esac
 
 python3 scripts/rebuild-bundle.py --check
 bash scripts/validate.sh
@@ -29,10 +33,12 @@ export PATH="$mock_bin:$PATH"
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 test -x /usr/local/sbin/rr-update-recover
+test -x /usr/local/sbin/rr-update-external-state
 test -s /usr/local/lib/rr/modules/61-update-guard.sh
 test -x /usr/local/lib/rr/scripts/naive-cert-hook.sh
+test -x /usr/local/lib/rr/scripts/update-external-state.py
 test -s /usr/local/lib/rr/nexus/rr_nexus_lib/security.py
 test -s /usr/local/lib/rr/nexus/static/admin.js
 
@@ -42,12 +48,27 @@ test -s /usr/local/lib/rr/nexus/static/admin.js
 test ! -e /usr/local/bin/rr
 test ! -e /usr/local/lib/rr
 test ! -e /usr/local/sbin/rr-update-recover
+test ! -e /usr/local/sbin/rr-update-external-state
 test ! -e /var/lib/rr-update
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade
 
 first_manifest=$(sha256sum /usr/local/lib/rr/manifest.sha256 | awk '{print $1}')
+# Exercise the catchable failure window after the old runtime was moved but
+# before the candidate became live.  This is distinct from SIGKILL recovery:
+# the installer's EXIT rollback itself must restore the only old copy.
+if RR_TEST_FAULTS=1 RR_TEST_FAIL_PHASE=old_runtime_moved \
+   RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
+   RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
+   bash scripts/install-core.sh --upgrade; then
+    echo "catchable old-runtime-moved fault unexpectedly succeeded" >&2
+    exit 1
+fi
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
+test "$(sha256sum /usr/local/lib/rr/manifest.sha256 | awk '{print $1}')" = "$first_manifest"
+test ! -e /var/lib/rr-update/active
+
 # Simulate an uncatchable power-loss window after the old runtime was moved.
 if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=old_runtime_moved \
    RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
@@ -57,7 +78,7 @@ if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=old_runtime_moved \
     exit 1
 fi
 /usr/local/sbin/rr-update-recover recover
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
@@ -73,7 +94,7 @@ if RR_TEST_FAULTS=1 RR_TEST_CRASH_PHASE=runtime_swapped \
     exit 1
 fi
 /usr/local/sbin/rr-update-recover recover
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
@@ -82,7 +103,7 @@ RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
 # The previous committed transaction is deliberately retained.  Prove the
 # one-command manual rollback works and leaves a loadable runtime.
 /usr/local/sbin/rr-update-recover rollback
-/usr/local/bin/rr --version | grep -F "RR-vps 7.1.0"
+/usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 
 # Exercise the user-facing complete uninstall in the disposable container.
 printf 'y\n' | bash -c '
@@ -95,5 +116,6 @@ printf 'y\n' | bash -c '
 test ! -e /usr/local/bin/rr
 test ! -e /usr/local/lib/rr
 test ! -e /usr/local/sbin/rr-update-recover
+test ! -e /usr/local/sbin/rr-update-external-state
 
 echo "OS matrix smoke passed: $(. /etc/os-release; printf '%s %s' "$ID" "$VERSION_ID")"
