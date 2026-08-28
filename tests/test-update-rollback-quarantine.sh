@@ -259,6 +259,7 @@ printf '%s\n' '[7/9] in-process installer rollback consumes the same policy befo
     rr_restore_file() { :; }
     rr_restore_dir() { :; }
     rr_restore_sqlite() { :; }
+    rr_install_restore_external_state_if_required() { :; }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }
 
     prepare_immediate() {

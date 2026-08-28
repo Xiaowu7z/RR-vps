@@ -68,6 +68,7 @@ rr_manifest_is_valid() {
         $2 == "rr" { launcher = 1; next }
         $2 == "scripts/naive-cert-hook.sh" { naive_hook = 1; next }
         $2 == "scripts/update-recover.sh" { recovery = 1; next }
+        $2 == "scripts/update-external-state.py" { external_state = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
         $2 ~ /^nexus\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
@@ -75,7 +76,7 @@ rr_manifest_is_valid() {
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
-            if (!launcher || !naive_hook || !recovery || modules < 2) exit 1
+            if (!launcher || !naive_hook || !recovery || !external_state || modules < 2) exit 1
             if (!nexus_app || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
@@ -85,11 +86,146 @@ rr_bundle_archive_is_safe() {
     local archive_file="$1"
     [ -s "$archive_file" ] || return 1
     [ "$(stat -c %s "$archive_file" 2>/dev/null || echo 0)" -le 52428800 ] || return 1
-    tar -tzf "$archive_file" 2>/dev/null | awk '
-        !/^rr-bundle\/(manifest\.sha256|rr|scripts\/(naive-cert-hook|update-recover)\.sh|modules\/[0-9][0-9A-Za-z_-]*\.sh|nexus\/[A-Za-z0-9._-]+\.py|nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py|nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js))$/ { exit 1 }
-        seen[$0]++ { exit 1 }
-        END { if (NR < 2) exit 1 }
-    '
+    # The mirror is only a transport and may be attacker-controlled.  Inspect
+    # the raw tar stream before extraction so links, PAX/GNU extensions,
+    # duplicate members and small compressed bombs cannot reach tar(1).
+    python3 - "$archive_file" <<'PYEOF'
+import gzip
+import re
+import sys
+import tarfile
+
+archive = sys.argv[1]
+max_members = 512
+max_member_size = 16 * 1024 * 1024
+max_total_size = 64 * 1024 * 1024
+max_padding = 1024 * 1024
+allowed = re.compile(
+    r"^rr-bundle/(?:manifest\.sha256|rr|"
+    r"scripts/(?:naive-cert-hook|update-recover)\.sh|"
+    r"scripts/update-external-state\.py|"
+    r"modules/[0-9][0-9A-Za-z_-]*\.sh|"
+    r"nexus/[A-Za-z0-9._-]+\.py|"
+    r"nexus/rr_nexus_lib/[A-Za-z0-9._-]+\.py|"
+    r"nexus/static/[A-Za-z0-9._-]+\.(?:html|css|js))$"
+)
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def octal(field, label):
+    if field and field[0] & 0x80:
+        fail(f"base-256 {label}")
+    value = field.strip(b" \0")
+    if not value:
+        return 0
+    if any(byte < 48 or byte > 55 for byte in value):
+        fail(f"invalid {label}")
+    return int(value, 8)
+
+
+def text_field(field, label):
+    value, separator, tail = field.partition(b"\0")
+    if separator and any(tail):
+        fail(f"ambiguous {label}")
+    try:
+        return value.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"non-ascii {label}") from exc
+
+
+names = []
+declared_total = 0
+with gzip.open(archive, "rb") as stream:
+    zero_blocks = 0
+    while True:
+        header = stream.read(512)
+        if len(header) != 512:
+            fail("truncated tar header")
+        if header == b"\0" * 512:
+            zero_blocks += 1
+            if zero_blocks == 2:
+                break
+            continue
+        if zero_blocks:
+            fail("data after a partial end marker")
+        stored_checksum = octal(header[148:156], "checksum")
+        calculated_checksum = sum(header[:148]) + (32 * 8) + sum(header[156:])
+        if stored_checksum != calculated_checksum:
+            fail("tar checksum mismatch")
+        typeflag = header[156:157]
+        if typeflag not in (b"\0", b"0"):
+            fail("non-regular member or tar extension")
+        name = text_field(header[:100], "name")
+        prefix = text_field(header[345:500], "prefix")
+        if prefix:
+            name = prefix + "/" + name
+        if not allowed.fullmatch(name):
+            fail("member outside the release allowlist")
+        if name in names:
+            fail("duplicate member")
+        size = octal(header[124:136], "size")
+        if size > max_member_size:
+            fail("member too large")
+        declared_total += size
+        if declared_total > max_total_size:
+            fail("expanded archive too large")
+        names.append(name)
+        if len(names) > max_members:
+            fail("too many members")
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                fail("truncated member")
+            remaining -= len(chunk)
+        padding = (-size) % 512
+        if padding and len(stream.read(padding)) != padding:
+            fail("truncated member padding")
+    trailing = 0
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            break
+        trailing += len(chunk)
+        if trailing > max_padding or any(chunk):
+            fail("unexpected data after tar end marker")
+
+if len(names) < 2:
+    fail("empty bundle")
+
+# A second independent parse checks that Python's tar interpretation matches
+# the raw headers and that every declared regular-file payload is readable.
+actual_names = []
+actual_total = 0
+with tarfile.open(archive, mode="r:gz") as handle:
+    for member in handle:
+        if not member.isreg() or member.pax_headers:
+            fail("unsafe interpreted member")
+        if member.name not in names or member.name in actual_names:
+            fail("interpreted member mismatch")
+        if member.size < 0 or member.size > max_member_size:
+            fail("interpreted member too large")
+        source = handle.extractfile(member)
+        if source is None:
+            fail("unreadable regular member")
+        read_size = 0
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            read_size += len(chunk)
+            actual_total += len(chunk)
+            if read_size > member.size or actual_total > max_total_size:
+                fail("payload exceeds declared limits")
+        if read_size != member.size:
+            fail("truncated interpreted member")
+        actual_names.append(member.name)
+if actual_names != names:
+    fail("tar parser disagreement")
+PYEOF
 }
 
 rr_bundle_tree_is_valid() {
@@ -117,9 +253,26 @@ rr_bundle_tree_is_valid() {
         [ -f "$shell_file" ] || return 1
         bash -n "$shell_file" || return 1
     done
+    python3 -m py_compile "$bundle_root/scripts/update-external-state.py" || return 1
     while IFS= read -r python_file; do
         python3 -m py_compile "$python_file" || return 1
     done < <(find "$bundle_root/nexus" -type f -name '*.py' -print | LC_ALL=C sort)
+}
+
+rr_bundle_manifest_matches_trusted_source() {
+    local bundle_manifest="$1"
+    local trusted_manifest=""
+    local matched=false
+
+    [ -s "$bundle_manifest" ] || return 1
+    trusted_manifest=$(mktemp /tmp/rr-bundle-manifest.XXXXXX) || return 1
+    if rr_download_file "$RR_MANIFEST_URL" "$trusted_manifest" 3 true && \
+       rr_manifest_is_valid "$trusted_manifest" && \
+       cmp -s "$bundle_manifest" "$trusted_manifest"; then
+        matched=true
+    fi
+    rm -f "$trusted_manifest"
+    [ "$matched" = true ]
 }
 
 rr_prepare_bootstrap() {
@@ -134,6 +287,14 @@ rr_prepare_bootstrap() {
 # H16/T12：健康自愈失败不得静默——写 /var/log/rr-health.log + syslog（logger）。
 # 供 ensure_runtime_health 在内核重装失败、孤立进程发现等场景记录，面板同步提示。
 RR_HEALTH_LOG="/var/log/rr-health.log"
+RR_FIREWALL_TX_ROOT="${RR_FIREWALL_TX_ROOT:-/var/lib/rr-update}"
+RR_FIREWALL_ACTIVE_TX="${RR_FIREWALL_ACTIVE_TX:-${RR_FIREWALL_TX_ROOT}/active}"
+RR_FIREWALL_FINALIZE_REQUIRED="${RR_FIREWALL_FINALIZE_REQUIRED:-false}"
+RR_FIREWALL_FINALIZE_PENDING_NAME="firewall-finalize-pending"
+RR_FIREWALL_FINALIZE_FAILED_NAME="firewall-finalize-failed"
+RR_FIREWALL_FINALIZE_DEFERRED_NAME="firewall-finalize-deferred-active-ufw"
+RR_FIREWALL_FINALIZE_COMPLETE_NAME="firewall-finalize-complete"
+RR_FIREWALL_ROLLBACK_RETIRED_NAME="firewall-rollback-retired"
 rr_health_log() {
     local message="${1:-}" log_size=0 trim_tmp=""
     [ -n "$message" ] || return 0
@@ -149,6 +310,316 @@ rr_health_log() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" >> "$RR_HEALTH_LOG" 2>/dev/null || true
     chmod 600 "$RR_HEALTH_LOG" 2>/dev/null || true
     logger -t rr-health "$message" 2>/dev/null || true
+}
+
+rr_update_dir_is_safe() {
+    local directory="$1" mode="" canonical=""
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    canonical=$(readlink -f -- "$directory" 2>/dev/null) || return 1
+    [ "$canonical" = "$directory" ] || return 1
+    [ "$(stat -c '%u:%g' -- "$directory" 2>/dev/null)" = 0:0 ] || return 1
+    mode=$(stat -c '%a' -- "$directory" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 ))
+}
+
+rr_update_private_file_is_safe() {
+    local path="$1"
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h' -- "$path" 2>/dev/null)" = 0:0:600:1 ]
+}
+
+rr_current_update_transaction() {
+    local root="$RR_FIREWALL_TX_ROOT" transactions="" tx="" name="" format_file=""
+    local -a active_lines=()
+
+    # Return 1 only for the ordinary "no retained transaction" case.  Unsafe
+    # state returns 2 so callers cannot silently treat attacker-controlled
+    # evidence as absence.
+    [ -e "$RR_FIREWALL_ACTIVE_TX" ] || [ -L "$RR_FIREWALL_ACTIVE_TX" ] || return 1
+    rr_update_dir_is_safe "$root" || return 2
+    transactions="${root}/transactions"
+    rr_update_dir_is_safe "$transactions" || return 2
+    rr_update_private_file_is_safe "$RR_FIREWALL_ACTIVE_TX" || return 2
+    mapfile -t active_lines < "$RR_FIREWALL_ACTIVE_TX" || return 2
+    [ "${#active_lines[@]}" -eq 1 ] || return 2
+    tx="${active_lines[0]}"
+    case "$tx" in
+        "$transactions"/*) name="${tx##*/}" ;;
+        *) return 2 ;;
+    esac
+    [[ "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || return 2
+    rr_update_dir_is_safe "$tx" || return 2
+    [ "$(stat -c '%a' -- "$tx" 2>/dev/null)" = 700 ] || return 2
+    format_file="$tx/transaction-format"
+    rr_update_private_file_is_safe "$format_file" || return 2
+    [ "$(cat -- "$format_file" 2>/dev/null)" = 2 ] || return 2
+    printf '%s\n' "$tx"
+}
+
+rr_update_transaction_phase() {
+    local tx="$1" phase_file=""
+    local -a phase_lines=()
+    phase_file="${tx}/phase"
+    rr_update_private_file_is_safe "$phase_file" || return 1
+    mapfile -t phase_lines < "$phase_file" || return 1
+    [ "${#phase_lines[@]}" -eq 1 ] || return 1
+    printf '%s\n' "${phase_lines[0]}"
+}
+
+rr_write_firewall_finalize_evidence() {
+    local tx="$1" name="$2" value="$3" target="" temporary=""
+    case "$name" in
+        "$RR_FIREWALL_FINALIZE_PENDING_NAME"|"$RR_FIREWALL_FINALIZE_FAILED_NAME"|\
+        "$RR_FIREWALL_FINALIZE_DEFERRED_NAME"|"$RR_FIREWALL_FINALIZE_COMPLETE_NAME"|\
+        "$RR_FIREWALL_ROLLBACK_RETIRED_NAME") ;;
+        *) return 1 ;;
+    esac
+    [[ "$value" =~ ^local-subscription-firewall-v1\ [0-9]+$ ]] || return 1
+    target="${tx}/${name}"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        rr_update_private_file_is_safe "$target" || return 1
+        [ "$(cat -- "$target" 2>/dev/null)" = "$value" ] || return 1
+        return 0
+    fi
+    temporary=$(mktemp "${tx}/.${name}.XXXXXX") || return 1
+    if ! chmod 600 -- "$temporary" || \
+       ! printf '%s\n' "$value" > "$temporary" || \
+       ! sync -f "$temporary" || ! mv -f -- "$temporary" "$target" || \
+       ! sync -f "$tx"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    rr_update_private_file_is_safe "$target" && \
+        [ "$(cat -- "$target" 2>/dev/null)" = "$value" ]
+}
+
+rr_read_firewall_finalize_evidence() {
+    local tx="$1" name="$2" target="" value="" port=""
+    local -a lines=()
+    target="${tx}/${name}"
+    rr_update_private_file_is_safe "$target" || return 1
+    mapfile -t lines < "$target" || return 1
+    [ "${#lines[@]}" -eq 1 ] || return 1
+    value="${lines[0]}"
+    [[ "$value" =~ ^local-subscription-firewall-v1\ ([0-9]+)$ ]] || return 1
+    port="${BASH_REMATCH[1]}"
+    is_valid_port "$port" || return 1
+    printf '%s\n' "$port"
+}
+
+rr_record_firewall_finalize_pending() {
+    local tx="" phase=""
+    [ "$RR_FIREWALL_FINALIZE_REQUIRED" = true ] || return 0
+    tx=$(rr_current_update_transaction) || return 1
+    phase=$(rr_update_transaction_phase "$tx") || return 1
+    [ "$phase" = migrating ] || return 1
+    is_valid_port "${SUB_PORT:-}" || return 1
+    rr_write_firewall_finalize_evidence "$tx" \
+        "$RR_FIREWALL_FINALIZE_PENDING_NAME" \
+        "local-subscription-firewall-v1 ${SUB_PORT}"
+}
+
+rr_snapshot_ufw_state() {
+    local tx="$1" state_file="" complete_file="" required_file=""
+    state_file="${tx}/backup/external-state/state.json"
+    complete_file="${tx}/backup/external-state/complete"
+    required_file="${tx}/backup/external_state_required"
+    python3 - "$state_file" "$complete_file" "$tx" "$required_file" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+
+def secure_read(path):
+    before = os.lstat(path)
+    if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+            or before.st_uid != 0 or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600):
+        raise SystemExit(1)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise SystemExit(1)
+        chunks = []
+        total = 0
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > 16 * 1024 * 1024:
+                raise SystemExit(1)
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+transaction = os.path.realpath(sys.argv[3])
+if transaction != sys.argv[3]:
+    raise SystemExit(1)
+for directory in (transaction, os.path.join(transaction, "backup"),
+                  os.path.join(transaction, "backup", "external-state")):
+    info = os.lstat(directory)
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022
+            or os.path.realpath(directory) != directory):
+        raise SystemExit(1)
+if secure_read(sys.argv[4]):
+    raise SystemExit(1)
+raw = secure_read(sys.argv[1])
+marker = secure_read(sys.argv[2]).decode("ascii").strip().split()
+if len(marker) != 2 or marker[0] != "rr-update-external-state-v2":
+    raise SystemExit(1)
+if hashlib.sha256(raw).hexdigest() != marker[1]:
+    raise SystemExit(1)
+value = json.loads(raw)
+if value.get("version") != marker[0]:
+    raise SystemExit(1)
+state = value.get("firewall", {}).get("ufw", {}).get("state")
+if state not in {"active", "inactive", "absent"}:
+    raise SystemExit(1)
+print(state)
+PY
+}
+
+rr_current_ufw_state() {
+    local state=0
+    command -v ufw >/dev/null 2>&1 || { printf '%s\n' absent; return 0; }
+    if rr_ufw_backend_state; then
+        printf '%s\n' active
+        return 0
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ] || return 1
+    printf '%s\n' inactive
+}
+
+rr_finalize_committed_firewall() {
+    local mode="${1:-normal}" tx="" phase="" port="" evidence=""
+    local snapshot_ufw="" current_ufw="" result=0
+    case "$mode" in normal|health|retire-rollback) ;; *) return 2 ;; esac
+
+    if tx=$(rr_current_update_transaction); then
+        :
+    else
+        result=$?
+        [ "$result" -eq 1 ] && [ "$mode" = health ] && return 0
+        return 1
+    fi
+    phase=$(rr_update_transaction_phase "$tx") || return 1
+    if [ "$phase" != committed ]; then
+        [ "$mode" = health ] && return 0
+        return 1
+    fi
+    if [ ! -e "$tx/$RR_FIREWALL_FINALIZE_PENDING_NAME" ] && \
+       [ ! -L "$tx/$RR_FIREWALL_FINALIZE_PENDING_NAME" ]; then
+        return 0
+    fi
+    port=$(rr_read_firewall_finalize_evidence "$tx" \
+        "$RR_FIREWALL_FINALIZE_PENDING_NAME") || return 1
+    evidence="local-subscription-firewall-v1 ${port}"
+    snapshot_ufw=$(rr_snapshot_ufw_state "$tx") || {
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_FINALIZE_FAILED_NAME" "$evidence" >/dev/null 2>&1 || true
+        return 1
+    }
+    current_ufw=$(rr_current_ufw_state) || {
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_FINALIZE_FAILED_NAME" "$evidence" >/dev/null 2>&1 || true
+        return 1
+    }
+    if [ "$snapshot_ufw" != "$current_ufw" ]; then
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_FINALIZE_FAILED_NAME" "$evidence" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Active UFW snapshots use a full read-only equality invariant.  Changing
+    # even an RR-owned rule while the committed transaction remains available
+    # for manual rollback would make that rollback fail.  Preserve the exact
+    # rules and a root-only pending/deferred marker until a future update first
+    # retires the old rollback window, or an operator explicitly chooses the
+    # retire-rollback mode.
+    if [ "$snapshot_ufw" = active ] && [ "$mode" != retire-rollback ]; then
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_FINALIZE_DEFERRED_NAME" "$evidence"
+        return $?
+    fi
+
+    if [ "$snapshot_ufw" = active ]; then
+        # This marker is the durable record that the caller explicitly retired
+        # the active-UFW rollback window.  Publish it before the first rule
+        # mutation so a crash can never leave rollback looking safe.
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_ROLLBACK_RETIRED_NAME" "$evidence" || return 1
+    fi
+
+    load_config_with_defaults || result=1
+    if [ "$result" -eq 0 ] && \
+       { [ "${SUB_ACCESS_MODE:-local}" != local ] || [ "${SUB_PORT:-}" != "$port" ]; }; then
+        result=1
+    fi
+    if [ "$result" -eq 0 ]; then
+        RR_UPDATE_TRANSACTION=0 open_configured_firewall || result=1
+    fi
+    if [ "$result" -ne 0 ]; then
+        rr_write_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_FINALIZE_FAILED_NAME" "$evidence" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    # Publish completion before removing pending/failure markers.  If the
+    # subsequent directory fsync fails, there is still durable evidence rather
+    # than a failed return with every trace erased.
+    rr_write_firewall_finalize_evidence "$tx" \
+        "$RR_FIREWALL_FINALIZE_COMPLETE_NAME" "$evidence" || return 1
+    rm -f -- "$tx/$RR_FIREWALL_FINALIZE_PENDING_NAME" \
+        "$tx/$RR_FIREWALL_FINALIZE_FAILED_NAME" \
+        "$tx/$RR_FIREWALL_FINALIZE_DEFERRED_NAME" || return 1
+    sync -f "$tx"
+}
+
+rr_manual_update_rollback_is_safe() {
+    local tx="" phase="" marker="" state=0
+    if tx=$(rr_current_update_transaction); then
+        :
+    else
+        state=$?
+        [ "$state" -eq 1 ]
+        return $?
+    fi
+    phase=$(rr_update_transaction_phase "$tx") || return 1
+    [ "$phase" = committed ] || return 0
+    marker="$tx/$RR_FIREWALL_ROLLBACK_RETIRED_NAME"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        rr_read_firewall_finalize_evidence "$tx" \
+            "$RR_FIREWALL_ROLLBACK_RETIRED_NAME" >/dev/null || return 1
+        return 1
+    fi
+    return 0
+}
+
+rr_run_post_update_finalize() {
+    local mode="${1:-normal}" finalize_lock_file="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+    local finalize_lock_fd="" result=0
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" != 1 ]; then
+        rr_secure_lock_prepare "$finalize_lock_file" || return 1
+        exec {finalize_lock_fd}>>"$finalize_lock_file" || return 1
+        if ! rr_secure_lock_fd_is_safe "$finalize_lock_file" "$finalize_lock_fd"; then
+            exec {finalize_lock_fd}>&-
+            return 1
+        fi
+        flock -n "$finalize_lock_fd" || { exec {finalize_lock_fd}>&-; return 1; }
+    fi
+    rr_finalize_committed_firewall "$mode" || result=$?
+    [ -z "$finalize_lock_fd" ] || exec {finalize_lock_fd}>&-
+    return "$result"
 }
 
     check_update() {
@@ -194,6 +665,7 @@ post_update_migrate() {
     local subscription_was_running="${RR_UPDATE_SUBSCRIPTION_WAS_RUNNING:-true}"
     local argo_was_running="${RR_UPDATE_ARGO_WAS_RUNNING:-true}"
     local health_timer_was_enabled="${RR_UPDATE_HEALTH_TIMER_WAS_ENABLED:-true}"
+    RR_FIREWALL_FINALIZE_REQUIRED=false
     check_supported_os >/dev/null 2>&1 || return 1
     # A machine without RR-vps configuration has no managed runtime to stop or
     # migrate. Returning before service operations avoids touching an unrelated
@@ -211,7 +683,11 @@ post_update_migrate() {
         # Replace the legacy inline certbot hook during hot update.  The 7.1
         # hook only accepts the configured Naive lineage and cannot copy an
         # unrelated certificate renewed in the same certbot run.
-        deploy_naive_cert_hook || return 1
+        if [ "${RR_PORTABLE_RESTORE:-0}" = 1 ]; then
+            ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || return 1
+        else
+            deploy_naive_cert_hook || return 1
+        fi
     fi
 
     # A failed first-install candidate intentionally contains empty keys and
@@ -228,13 +704,26 @@ post_update_migrate() {
     if any_node_protocol_enabled; then
         current_version=$(get_singbox_version "$SINGBOX_BIN" 2>/dev/null || true)
         if [ -z "$current_version" ]; then
+            if [ "$update_tx" = 1 ]; then
+                printf '%s\n' '[安全拒绝] 热更新候选缺少 Sing-box 内核；未下载，准备回滚。' >&2
+                return 1
+            fi
             install_singbox || return 1
         elif ! version_ge "$current_version" "$MIN_SINGBOX_VERSION"; then
+            if [ "$update_tx" = 1 ]; then
+                printf '[安全拒绝] 热更新候选所需 Sing-box 版本高于现有 %s；未升级，准备回滚。\n' \
+                    "$current_version" >&2
+                return 1
+            fi
             # 下载失败时仍保留旧核心；只要现有协议配置能通过校验，脚本更新可以继续。
             install_singbox >/dev/null 2>&1 || true
         fi
 
         if [ ! -f /etc/systemd/system/sing-box.service ]; then
+            if [ "$update_tx" = 1 ]; then
+                printf '%s\n' '[安全拒绝] 热更新候选缺少既有 Sing-box systemd 单元；未创建外部服务。' >&2
+                return 1
+            fi
             build_singbox_config || return 1
             setup_systemd || return 1
             generate_node_and_sub || return 1
@@ -249,7 +738,7 @@ post_update_migrate() {
 
     if crontab -l 2>/dev/null | grep -q 'auto_update_sub.py'; then
         write_auto_update_worker || return 1
-        python3 /usr/local/bin/auto_update_sub.py >/dev/null 2>&1 || return 1
+        RR_WORKER_LOCK_HELD=1 python3 /usr/local/bin/auto_update_sub.py >/dev/null 2>&1 || return 1
     fi
 
     load_config_with_defaults || return 1
@@ -278,6 +767,7 @@ post_update_migrate() {
     if [ -f "$NEXUS_SERVICE_FILE" ]; then
         nexus_install_dependencies || return 1
         nexus_migrate_runtime_config || return 1
+        nexus_reconcile_public_proxy || return 1
         nexus_enable_traffic_engine || return 1
         ensure_nexus_service_guards
         RR_NEXUS_CONFIG="$NEXUS_CONFIG_FILE" python3 "$NEXUS_APP" --check || return 1
@@ -287,6 +777,10 @@ post_update_migrate() {
         else
             systemctl stop rr-nexus >/dev/null 2>&1 || true
         fi
+    fi
+    open_configured_firewall || return 1
+    if [ "$update_tx" = 1 ] && [ "$RR_FIREWALL_FINALIZE_REQUIRED" = true ]; then
+        rr_record_firewall_finalize_pending || return 1
     fi
 
     # 事务健康门：任一关失败都让核心安装器自动回滚。
@@ -314,6 +808,7 @@ PY
         local nexus_health_port=""
         nexus_health_port=$(jq -r '.port // 7900' "$NEXUS_CONFIG_FILE" 2>/dev/null || printf 7900)
         curl -fsS --connect-timeout 3 --max-time 8 "http://127.0.0.1:${nexus_health_port}/healthz" >/dev/null || return 1
+        nexus_public_proxy_health_check || return 1
     fi
     if [ "$update_tx" = 1 ] && [ "$subscription_was_running" != true ]; then
         local migrated_sub_pid=""
@@ -331,6 +826,10 @@ PY
 ensure_runtime_health() {
     [ "$HEALTH_CHECK_DONE" = false ] || return 0
     HEALTH_CHECK_DONE=true
+    if ! rr_finalize_committed_firewall health; then
+        rr_health_log "已提交更新的订阅防火墙待收敛失败；保留事务证据且未回滚，请运行 rr doctor"
+        return 1
+    fi
     [ -f "$CONFIG_FILE" ] || return 0
     migrate_config_schema >/dev/null 2>&1 || return 0
     load_config_with_defaults || return 0
@@ -390,9 +889,11 @@ ensure_runtime_health() {
     # 设备到期和额度状态可能在无人操作时变化；定时同步只会在用户列表
     # 实际变化时重启 Sing-box，平时不会打断在线节点。
     if command -v timeout >/dev/null 2>&1 && \
-       declare -F sync_nexus_devices >/dev/null 2>&1 && \
+       [ -x "$RR_LAUNCHER" ] && \
        [ -f "${NEXUS_DB_FILE:-/nonexistent}" ]; then
-        timeout 15 sync_nexus_devices >/dev/null 2>&1 || true
+        # timeout can only exec a program; a non-exported Bash function exits
+        # 127 without doing any work.  Re-enter through the supported CLI.
+        timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-devices >/dev/null 2>&1 || true
     fi
 
     local sub_pid=""
@@ -402,9 +903,44 @@ ensure_runtime_health() {
        [ ! -s "${SUB_ROOT}/${UUID}/client.json" ]; then
         # 订阅自愈加超时保护：重建含公网入口探测，网络异常时不能拖垮
         # 整个健康检查链（此前实测一次网络抖动把链条卡住导致订阅迟迟未拉起）。
-        timeout 90 generate_node_and_sub >/dev/null 2>&1 || true
+        timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-subscriptions >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+rr_run_health_check() {
+    local health_lock_file="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+    local health_lock_fd=""
+    local health_result=0
+
+    # The installer/recovery path already owns the shared transaction lock and
+    # must explicitly delegate that ownership before re-entering the launcher.
+    # Normal timer/manual invocations take the same lock as update, backup and
+    # restore so they can never repair services or rewrite subscriptions while
+    # a transaction snapshot is in progress.
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" != 1 ]; then
+        rr_secure_lock_prepare "$health_lock_file" || {
+            rr_health_log "共享事务锁文件不安全，健康检查已拒绝运行"
+            return 1
+        }
+        exec {health_lock_fd}>>"$health_lock_file" || return 1
+        if ! rr_secure_lock_fd_is_safe "$health_lock_file" "$health_lock_fd"; then
+            exec {health_lock_fd}>&-
+            rr_health_log "共享事务锁在打开时发生变化，健康检查已拒绝运行"
+            return 1
+        fi
+        if ! flock -n "$health_lock_fd"; then
+            # A timer firing during an update/backup is expected.  Skipping is
+            # success so systemd does not enter a retry/failure loop; the next
+            # timer pass will perform the check after the transaction exits.
+            exec {health_lock_fd}>&-
+            return 0
+        fi
+    fi
+
+    RR_UPDATE_LOCK_HELD=1 ensure_runtime_health || health_result=$?
+    [ -z "$health_lock_fd" ] || exec {health_lock_fd}>&-
+    return "$health_result"
 }
 
 
@@ -433,7 +969,12 @@ do_update() {
        rr_bundle_archive_is_safe "$bundle_tmp" && \
        tar --no-same-owner --no-same-permissions -xzf \
            "$bundle_tmp" -C "$bundle_stage" 2>/dev/null && \
-       rr_bundle_tree_is_valid "$bundle_stage/rr-bundle"; then
+       rr_bundle_tree_is_valid "$bundle_stage/rr-bundle" && \
+       rr_bundle_manifest_matches_trusted_source \
+           "$bundle_stage/rr-bundle/manifest.sha256"; then
+        # A user mirror is only an untrusted transport.  Do not use the
+        # bundle's self-reported version or manifest for update/downgrade
+        # decisions until its complete manifest matches a trusted source.
         remote_ver=$(grep -o '^SCRIPT_VERSION="[0-9][0-9.]*"' \
             "$bundle_stage/rr-bundle/modules/00-runtime.sh" 2>/dev/null | head -1 | cut -d'"' -f2)
         if [ -s "$RR_LOCAL_MANIFEST" ] && \

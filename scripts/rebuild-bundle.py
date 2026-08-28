@@ -39,7 +39,12 @@ def release_files() -> list[str]:
     release builder again.
     """
 
-    members = ["rr", "scripts/naive-cert-hook.sh", "scripts/update-recover.sh"]
+    members = [
+        "rr",
+        "scripts/naive-cert-hook.sh",
+        "scripts/update-recover.sh",
+        "scripts/update-external-state.py",
+    ]
     members.extend(
         f"modules/{path.name}"
         for path in sorted((BASE / "modules").glob("*.sh"), key=lambda item: item.name)
@@ -63,6 +68,7 @@ EXEC_MEMBERS = {
     "rr",
     "scripts/naive-cert-hook.sh",
     "scripts/update-recover.sh",
+    "scripts/update-external-state.py",
     *[item for item in MANIFEST_FILES if item.endswith(".py")],
 }
 BUNDLE_HASH_PATTERN = re.compile(r'\[ "\$actual" = "([0-9a-f]{64})" \]')

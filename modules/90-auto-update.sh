@@ -11,6 +11,7 @@ write_auto_update_worker() {
 # RR_AUTO_UPDATE_VERSION=8
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import ipaddress
 import json
 import os
@@ -25,6 +26,74 @@ CONFIG_FILE = "/etc/argo_vmess.conf"
 LOG_FILE = "/var/log/auto_update_sub.log"
 SUB_ROOT = "/tmp/sub_server"
 MAX_LOG_BYTES = 1024 * 1024
+UPDATE_LOCK_PATH = "/run/rr-vps/locks/update.lock"
+
+# Do not race update/restore snapshots.  The verified update installer already
+# owns this lock and explicitly delegates it through RR_WORKER_LOCK_HELD; cron
+# and manual standalone runs acquire their own non-blocking lock instead.
+WORKER_LOCK = None
+if os.environ.get("RR_WORKER_LOCK_HELD") != "1":
+    try:
+        lock_parent = os.path.dirname(UPDATE_LOCK_PATH)
+        os.makedirs(lock_parent, mode=0o700, exist_ok=True)
+        parent_stat = os.lstat(lock_parent)
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != 0
+            or parent_stat.st_gid != 0
+            or os.path.realpath(lock_parent) != lock_parent
+        ):
+            raise RuntimeError("unsafe update lock directory")
+        os.chmod(lock_parent, 0o700)
+        if stat.S_IMODE(os.lstat(lock_parent).st_mode) != 0o700:
+            raise RuntimeError("update lock directory permissions are unsafe")
+        try:
+            path_stat = os.lstat(UPDATE_LOCK_PATH)
+        except FileNotFoundError:
+            path_stat = None
+        if path_stat is not None and (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_uid != 0
+            or path_stat.st_gid != 0
+            or path_stat.st_nlink != 1
+        ):
+            raise RuntimeError("unsafe update lock file")
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        if not nofollow or not cloexec:
+            raise RuntimeError("secure update lock flags unavailable")
+        descriptor = os.open(
+            UPDATE_LOCK_PATH,
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | nofollow | cloexec,
+            0o600,
+        )
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            current_path_stat = os.lstat(UPDATE_LOCK_PATH)
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or descriptor_stat.st_uid != 0
+                or descriptor_stat.st_gid != 0
+                or descriptor_stat.st_nlink != 1
+                or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                != (current_path_stat.st_dev, current_path_stat.st_ino)
+            ):
+                raise RuntimeError("update lock changed while opening")
+            os.fchmod(descriptor, 0o600)
+            WORKER_LOCK = os.fdopen(descriptor, "a+", encoding="utf-8")
+            descriptor = -1
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        fcntl.flock(WORKER_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if WORKER_LOCK is not None:
+            WORKER_LOCK.close()
+        sys.exit(0)
+    except (OSError, RuntimeError):
+        if WORKER_LOCK is not None:
+            WORKER_LOCK.close()
+        sys.exit(1)
 
 
 def log(msg):

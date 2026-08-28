@@ -14,15 +14,51 @@ RR_QUARANTINE_FILE="${RR_QUARANTINE_FILE:-${RR_TX_ROOT}/subscription-quarantine}
 RR_QUARANTINE_UNIT="${RR_QUARANTINE_UNIT:-/etc/systemd/system/rr-subscription-quarantine.service}"
 RR_QUARANTINE_READY="${RR_QUARANTINE_READY:-/run/rr-subscription-quarantine.ready}"
 RR_RECOVERY_SELF="${RR_RECOVERY_SELF:-/usr/local/sbin/rr-update-recover}"
+RR_UPDATE_EXTERNAL_HELPER="${RR_UPDATE_EXTERNAL_HELPER:-/usr/local/sbin/rr-update-external-state}"
 RR_IPV6_STATE_FILE="${RR_IPV6_STATE_FILE:-/proc/net/if_inet6}"
 RR_HEALTH_SERVICE_FILE="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
-RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
+RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
 RR_QUARANTINE_COMMENT="rr-vps unsafe rollback subscription quarantine"
 RR_UPDATE_RECOVERY_LOCK_FD=""
 
 rr_recover_log() {
     printf '[RR-vps recovery] %s\n' "$*" >&2
     logger -t rr-update-recovery "$*" 2>/dev/null || true
+}
+
+rr_prepare_update_lock_file() {
+    local lock_file="$1" lock_dir="" canonical=""
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    if [ -e "$lock_dir" ] || [ -L "$lock_dir" ]; then
+        [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+        [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    else
+        mkdir -p -- "$lock_dir" || return 1
+    fi
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    [ "$(stat -c %u:%g -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    chmod 0700 -- "$lock_dir" || return 1
+    [ "$(stat -c %a -- "$lock_dir" 2>/dev/null)" = 700 ] || return 1
+    if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    [ "$(stat -c %u:%h -- "$lock_file" 2>/dev/null)" = "0:1" ] || return 1
+    chown 0:0 -- "$lock_file" || return 1
+    chmod 0600 -- "$lock_file" || return 1
+    [ "$(stat -c %u:%g:%a:%h -- "$lock_file" 2>/dev/null)" = "0:0:600:1" ]
+}
+
+rr_update_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" fd_identity=""
+    local shell_pid="${BASHPID:-$$}"
+    local fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
 }
 
 rr_managed_subscription_pids() {
@@ -72,10 +108,179 @@ rr_stop_subscription_servers() {
     [ "$stopped" = true ]
 }
 
+rr_wait_unit_state() {
+    local unit="$1" wanted="$2" attempt=0
+    while [ "$attempt" -lt 50 ]; do
+        if [ "$wanted" = active ]; then
+            systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+        else
+            systemctl is-active --quiet "$unit" 2>/dev/null || return 0
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+rr_clear_update_maintenance_marker() {
+    local tx="$1" owner="" parent=""
+    [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || return 0
+    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h' "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null)" = 0:0:600:1 ] || return 1
+    owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
+    [ "$owner" = "$tx" ] || return 1
+    parent=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+    rm -f -- "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$parent"
+}
+
+rr_transaction_format_state() {
+    local tx="$1" marker=""
+    marker="$tx/transaction-format"
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    [ -f "$marker" ] && [ ! -L "$marker" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$marker" 2>/dev/null)" = 0:0:600:1 ] && \
+        [ "$(cat "$marker" 2>/dev/null)" = 2 ] || return 2
+    return 0
+}
+
+rr_external_state_marker_is_safe() {
+    local backup="$1" marker=""
+    marker="$backup/external_state_required"
+    [ -f "$marker" ] && [ ! -L "$marker" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$marker" 2>/dev/null)" = 0:0:600:1 ]
+}
+
+rr_restore_external_state_if_required() {
+    local tx="$1" backup="$2" state=0
+    if rr_transaction_format_state "$tx"; then
+        state=0
+    else
+        state=$?
+    fi
+    case "$state" in
+        0) ;;
+        1)
+            rr_recover_log "legacy transaction has no external-state snapshot; using the 7.1.0 recovery contract"
+            return 0
+            ;;
+        *)
+            rr_recover_log "transaction format marker is unsafe; refusing a legacy fallback"
+            return 1
+            ;;
+    esac
+    rr_external_state_marker_is_safe "$backup" || {
+        rr_recover_log "required external-state snapshot marker is missing or unsafe"
+        return 1
+    }
+    [ -x "$RR_UPDATE_EXTERNAL_HELPER" ] && [ -f "$RR_UPDATE_EXTERNAL_HELPER" ] && \
+        [ ! -L "$RR_UPDATE_EXTERNAL_HELPER" ] || {
+        rr_recover_log "external-state recovery helper is unavailable or unsafe"
+        return 1
+    }
+    "$RR_UPDATE_EXTERNAL_HELPER" restore "$backup" --tx-root "$RR_TX_ROOT" || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" verify "$backup" --tx-root "$RR_TX_ROOT"
+}
+
+rr_restore_unit_state() {
+    local unit="$1" active_marker="$2" enabled_marker="$3"
+    if [ -f "$enabled_marker" ]; then
+        systemctl enable "$unit" >/dev/null 2>&1 || return 1
+        systemctl is-enabled --quiet "$unit" 2>/dev/null || return 1
+    else
+        systemctl disable "$unit" >/dev/null 2>&1 || true
+        systemctl is-enabled --quiet "$unit" 2>/dev/null && return 1
+    fi
+    if [ -f "$active_marker" ]; then
+        systemctl restart "$unit" >/dev/null 2>&1 || return 1
+        rr_wait_unit_state "$unit" active
+    else
+        systemctl stop "$unit" >/dev/null 2>&1 || true
+        rr_wait_unit_state "$unit" inactive
+    fi
+}
+
+rr_restart_health_service_bounded() {
+    local pid="" attempt=0 status=0
+    systemctl start argo-rr-health.service >/dev/null 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" >/dev/null 2>&1 || true
+        wait "$pid" 2>/dev/null || true
+        systemctl stop argo-rr-health.service >/dev/null 2>&1 || true
+        rr_wait_unit_state argo-rr-health.service inactive || true
+        return 1
+    fi
+    wait "$pid" || status=$?
+    [ "$status" -eq 0 ]
+}
+
+rr_restore_recorded_writer_state() {
+    local backup="$1" subscription_policy="${2:-normal}" failed=false
+    if [ ! -f "$backup/writer_state_complete" ]; then
+        if [ -f "$backup/health_timer_was_enabled" ]; then
+            systemctl enable argo-rr-health.timer >/dev/null 2>&1 || failed=true
+            systemctl start --no-block argo-rr-health.timer >/dev/null 2>&1 || failed=true
+        else
+            systemctl disable argo-rr-health.timer >/dev/null 2>&1 || true
+            systemctl stop --no-block argo-rr-health.timer >/dev/null 2>&1 || true
+        fi
+        if [ -f "$backup/singbox_was_running" ]; then
+            systemctl restart --no-block sing-box >/dev/null 2>&1 || failed=true
+        else
+            systemctl stop --no-block sing-box >/dev/null 2>&1 || true
+        fi
+        if [ -f "$backup/nexus_was_running" ]; then
+            systemctl restart --no-block rr-nexus >/dev/null 2>&1 || failed=true
+        else
+            systemctl stop --no-block rr-nexus >/dev/null 2>&1 || true
+        fi
+        if [ "$subscription_policy" = normal ] && \
+           { [ -f "$backup/subscription_was_running" ] || [ -f "$backup/argo_was_running" ]; } && \
+           [ -f "$RR_HEALTH_SERVICE_FILE" ]; then
+            systemctl start --no-block argo-rr-health.service >/dev/null 2>&1 || failed=true
+        fi
+        [ "$failed" = false ]
+        return
+    fi
+    if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
+        [ -x "$RR_LAUNCHER" ] && timeout 30 env RR_UPDATE_LOCK_HELD=1 \
+            "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || failed=true
+        rr_subscription_running || failed=true
+    else
+        rr_stop_subscription_servers || failed=true
+        rr_subscription_running && failed=true
+    fi
+    rr_restore_unit_state sing-box "$backup/singbox_was_running" \
+        "$backup/singbox_was_enabled" || failed=true
+    rr_restore_unit_state rr-nexus "$backup/nexus_was_running" \
+        "$backup/nexus_was_enabled" || failed=true
+    rr_restore_unit_state argo-rr-health.timer "$backup/health_timer_was_running" \
+        "$backup/health_timer_was_enabled" || failed=true
+    if [ -f "$backup/health_service_was_running" ]; then
+        rr_restart_health_service_bounded || failed=true
+    fi
+    [ "$failed" = false ]
+}
+
 rr_acquire_update_lock() {
     [ "${RR_UPDATE_LOCK_HELD:-0}" != 1 ] || return 0
-    mkdir -p "$(dirname "$RR_UPDATE_LOCK_FILE")" || return 1
-    exec {RR_UPDATE_RECOVERY_LOCK_FD}>"$RR_UPDATE_LOCK_FILE" || return 1
+    rr_prepare_update_lock_file "$RR_UPDATE_LOCK_FILE" || {
+        rr_recover_log "unsafe shared update lock file"
+        return 1
+    }
+    exec {RR_UPDATE_RECOVERY_LOCK_FD}>>"$RR_UPDATE_LOCK_FILE" || return 1
+    if ! rr_update_lock_fd_is_safe "$RR_UPDATE_LOCK_FILE" "$RR_UPDATE_RECOVERY_LOCK_FD"; then
+        exec {RR_UPDATE_RECOVERY_LOCK_FD}>&-
+        RR_UPDATE_RECOVERY_LOCK_FD=""
+        rr_recover_log "shared update lock changed while opening"
+        return 1
+    fi
     if ! flock -n "$RR_UPDATE_RECOVERY_LOCK_FD"; then
         rr_recover_log "another install, update, backup, or restore transaction holds the shared lock"
         exec {RR_UPDATE_RECOVERY_LOCK_FD}>&-
@@ -133,6 +338,13 @@ rr_write_private_value() {
     temporary="$(dirname "$target")/.${target##*/}.$$"
     (umask 077; printf '%s\n' "$value" > "$temporary") &&
         chmod 600 "$temporary" && mv -f "$temporary" "$target"
+}
+
+rr_recovery_write_phase() {
+    local tx="$1" phase="$2" temporary=""
+    temporary="$tx/.phase.$$"
+    (umask 077; printf '%s\n' "$phase" > "$temporary") && chmod 600 "$temporary" && \
+        sync -f "$temporary" && mv -f "$temporary" "$tx/phase" && sync -f "$tx"
 }
 
 rr_snapshot_rollback_metadata() {
@@ -609,64 +821,64 @@ rr_restore_transaction() {
     rr_restore_dir sub_server /tmp/sub_server || failed=true
     rr_restore_database || failed=true
 
+    rr_restore_external_state_if_required "$tx" "$RR_BACKUP" || failed=true
+    rr_verify_restored_state || failed=true
+    systemctl daemon-reload >/dev/null 2>&1 || failed=true
+    if [ "$failed" = true ]; then
+        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recover_log "internal or external rollback failed; writers remain frozen and evidence is retained at $tx"
+        return 1
+    fi
+
     if ! rr_apply_rollback_subscription_policy "$tx"; then
         failed=true
     fi
     subscription_policy=$(head -n 1 "$tx/rollback-subscription-status" 2>/dev/null || printf degraded)
     case "$subscription_policy" in normal|quarantined|degraded) ;; *) subscription_policy=degraded; failed=true ;; esac
-
-    rr_verify_restored_state || failed=true
-    systemctl daemon-reload >/dev/null 2>&1 || failed=true
-    if [ -f "$RR_BACKUP/health_timer_was_enabled" ]; then
-        systemctl enable argo-rr-health.timer >/dev/null 2>&1 || failed=true
-        systemctl start --no-block argo-rr-health.timer >/dev/null 2>&1 || true
-    else
-        systemctl disable argo-rr-health.timer >/dev/null 2>&1 || true
-        systemctl stop --no-block argo-rr-health.timer >/dev/null 2>&1 || true
+    if [ "$failed" = true ]; then
+        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recover_log "rollback subscription policy failed; writers remain frozen and evidence is retained at $tx"
+        return 1
     fi
-    if [ -f "$RR_BACKUP/singbox_was_running" ]; then
-        systemctl restart --no-block sing-box >/dev/null 2>&1 || failed=true
-    else
-        systemctl stop --no-block sing-box >/dev/null 2>&1 || true
-    fi
-    if [ -f "$RR_BACKUP/nexus_was_running" ]; then
-        systemctl restart --no-block rr-nexus >/dev/null 2>&1 || failed=true
-    else
-        systemctl stop --no-block rr-nexus >/dev/null 2>&1 || true
-    fi
-    if [ "$subscription_policy" = normal ] && \
-       { [ -f "$RR_BACKUP/subscription_was_running" ] || [ -f "$RR_BACKUP/argo_was_running" ]; } && \
-       [ -f "$RR_HEALTH_SERVICE_FILE" ]; then
-        # Recovery runs before network.target. Queue the network-dependent
-        # health pass instead of synchronously waiting and creating an ordering
-        # cycle during boot.
-        systemctl start --no-block argo-rr-health.service >/dev/null 2>&1 || true
-    fi
+    rr_restore_recorded_writer_state "$RR_BACKUP" "$subscription_policy" || failed=true
 
     if [ "$failed" = true ]; then
-        printf 'recovery_failed\n' > "$tx/phase"
+        rr_recovery_write_phase "$tx" recovery_failed || true
         rr_recover_log "recovery was incomplete; evidence retained at $tx"
         return 1
     fi
     if [ "$subscription_policy" != normal ]; then
-        printf 'rolled_back_degraded\n' > "$tx/phase"
+        rr_recovery_write_phase "$tx" rolled_back_degraded || return 1
+        if ! rr_clear_update_maintenance_marker "$tx"; then
+            rr_recovery_write_phase "$tx" recovery_failed || true
+            rr_recover_log "maintenance marker cleanup failed; evidence retained at $tx"
+            return 1
+        fi
         rm -f -- "$RR_ACTIVE_TX"
+        sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
         rr_recover_log "rollback completed in DEGRADED mode: legacy public subscription is quarantined; upgrade to ${RR_SUBSCRIPTION_SAFE_VERSION}+ before re-enabling it"
         return 3
     fi
-    printf 'rolled_back\n' > "$tx/phase"
+    rr_recovery_write_phase "$tx" rolled_back || return 1
+    if ! rr_clear_update_maintenance_marker "$tx"; then
+        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recover_log "maintenance marker cleanup failed; evidence retained at $tx"
+        return 1
+    fi
     rm -f -- "$RR_ACTIVE_TX"
+    sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
     rr_recover_log "rollback completed"
     if [ -f "$RR_BACKUP/runtime_did_not_exist" ]; then
         systemctl disable rr-update-recovery.service >/dev/null 2>&1 || true
-        rm -f -- /etc/systemd/system/rr-update-recovery.service /usr/local/sbin/rr-update-recover
+        rm -f -- /etc/systemd/system/rr-update-recovery.service \
+            /usr/local/sbin/rr-update-recover "$RR_UPDATE_EXTERNAL_HELPER"
         systemctl daemon-reload >/dev/null 2>&1 || true
         rm -rf -- "$RR_TX_ROOT"
     fi
 }
 
 main() {
-    local mode="${1:-recover}" argument="${2:-}" tx="" phase="" quarantine_json='{"active":false}'
+    local mode="${1:-recover}" argument="${2:-}" tx="" phase="" format_state=0 quarantine_json='{"active":false}'
     case "$mode" in
         recover|rollback|status|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine|quarantine-guard) ;;
         *) echo "usage: rr-update-recover [recover|rollback|status|snapshot-metadata TX|apply-rollback-policy TX|suspend-quarantine|clear-quarantine|quarantine-guard]" >&2; return 2 ;;
@@ -699,14 +911,50 @@ main() {
             "$tx" "$phase" "$quarantine_json"
         return 0
     fi
-    if [ "$mode" = recover ] && { [ "$phase" = snapshotting ] || [ "$phase" = prepared ]; }; then
-        printf 'aborted\n' > "$tx/phase"
-        rm -f -- "$RR_ACTIVE_TX"
-        rr_recover_log "stale pre-mutation transaction discarded; runtime was never switched"
-        return 0
+    if rr_transaction_format_state "$tx"; then
+        format_state=0
+    else
+        format_state=$?
     fi
-    if [ "$mode" = recover ] && { [ "$phase" = committed ] || [ "$phase" = rolled_back ]; }; then
-        return 0
+    if [ "$format_state" -eq 2 ]; then
+        case "$phase" in committed|rolled_back|rolled_back_degraded) ;; *) rr_recovery_write_phase "$tx" recovery_failed || true ;; esac
+        rr_recover_log "transaction format marker is unsafe; active transaction and evidence retained at $tx"
+        return 1
+    fi
+    if [ "$mode" = recover ] && [ "$phase" = state_recorded ]; then
+        if rr_recovery_write_phase "$tx" aborted && \
+           rr_clear_update_maintenance_marker "$tx"; then
+            rm -f -- "$RR_ACTIVE_TX"
+            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+            rr_recover_log "stale state-record transaction discarded; no service had been stopped"
+            return 0
+        fi
+        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recover_log "state-record recovery failed; active transaction and evidence retained at $tx"
+        return 1
+    fi
+    if [ "$mode" = recover ] && \
+       { [ "$phase" = freezing ] || [ "$phase" = snapshotting ] || [ "$phase" = prepared ]; }; then
+        RR_BACKUP="$tx/backup"
+        if rr_restore_recorded_writer_state "$RR_BACKUP" normal && \
+           rr_recovery_write_phase "$tx" aborted && \
+           rr_clear_update_maintenance_marker "$tx"; then
+            rm -f -- "$RR_ACTIVE_TX"
+            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+            rr_recover_log "stale pre-mutation transaction discarded; original service state restored"
+            return 0
+        fi
+        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recover_log "pre-mutation service recovery failed; active transaction and evidence retained at $tx"
+        return 1
+    fi
+    if [ "$mode" = recover ] && \
+       { [ "$phase" = committed ] || [ "$phase" = rolled_back ] || [ "$phase" = rolled_back_degraded ]; }; then
+        if rr_clear_update_maintenance_marker "$tx"; then
+            return 0
+        fi
+        rr_recover_log "terminal transaction marker cleanup failed; terminal phase and evidence retained at $tx"
+        return 1
     fi
     rr_restore_transaction "$tx" "$([ "$mode" = rollback ] && printf 'manual rollback requested' || printf 'interrupted update detected')"
 }
