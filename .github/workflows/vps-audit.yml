@@ -117,7 +117,8 @@ jobs:
             | sha256sum -c - >/root/rr-audit-transfer-sha.log 2>&1
           cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
           chmod 700 "$cleanup_runtime"
-          tar -xzf "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime"
+          tar --no-same-owner --no-same-permissions -xzf \
+            "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime" --strip-components=1
           for module_file in "$cleanup_runtime"/modules/*.sh; do
             # shellcheck disable=SC1090
             source "$module_file"
@@ -428,7 +429,8 @@ jobs:
           # host, then exercise a completely new 7.1.0 -> 7.1.1 cycle below.
           cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
           chmod 700 "$cleanup_runtime"
-          tar -xzf "$candidate/rr-bundle.tar.gz" -C "$cleanup_runtime"
+          tar --no-same-owner --no-same-permissions -xzf \
+            "$candidate/rr-bundle.tar.gz" -C "$cleanup_runtime" --strip-components=1
           for module_file in "$cleanup_runtime"/modules/*.sh; do
             # shellcheck disable=SC1090
             source "$module_file"
@@ -838,7 +840,8 @@ jobs:
 
           cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
           chmod 700 "$cleanup_runtime"
-          tar -xzf "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime"
+          tar --no-same-owner --no-same-permissions -xzf \
+            "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime" --strip-components=1
           for module_file in "$cleanup_runtime"/modules/*.sh; do
             # shellcheck disable=SC1090
             source "$module_file"
