@@ -7,6 +7,7 @@ rr_download_file() {
     local timeout_seconds="${3:-10}"
     local cache_buster=""
     local relative_path=""
+    local official_only="${4:-false}"
 
     cache_buster=$(date +%s)
     case "$source_url" in
@@ -15,7 +16,7 @@ rr_download_file() {
 
     # 用户显式配置的 GitHub 代理优先；兼容 https://ghproxy/... 这类
     # “代理前缀 + 原始 URL”形式。失败后继续走官方源和内置回退。
-    if [ -n "${RR_GITHUB_MIRROR:-}" ]; then
+    if [ "$official_only" != true ] && [ -n "${RR_GITHUB_MIRROR:-}" ]; then
         if command -v curl >/dev/null 2>&1; then
             curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
                 "${RR_GITHUB_MIRROR}${source_url}" -o "$target_file" 2>/dev/null && return 0
@@ -29,7 +30,7 @@ rr_download_file() {
         curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
             -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
             "${source_url}?t=${cache_buster}" -o "$target_file" 2>/dev/null && return 0
-        if [ -n "$relative_path" ]; then
+        if [ "${RR_UPDATE_CHANNEL:-stable}" = beta ] && [ -n "$relative_path" ]; then
             # GitHub 官方 Contents API 可绕过 raw.githubusercontent.com 的
             # DNS/路由故障；raw media type 让响应直接成为文件内容。
             curl -fsSL --retry 2 --connect-timeout "$timeout_seconds" --max-time 120 \
@@ -43,7 +44,7 @@ rr_download_file() {
     elif command -v wget >/dev/null 2>&1; then
         wget -q --timeout="$timeout_seconds" --tries=3 \
             -O "$target_file" "${source_url}?t=${cache_buster}" && return 0
-        if [ -n "$relative_path" ]; then
+        if [ "${RR_UPDATE_CHANNEL:-stable}" = beta ] && [ -n "$relative_path" ]; then
             wget -q --timeout="$timeout_seconds" --tries=2 \
                 --header="Accept: application/vnd.github.raw+json" \
                 -O "$target_file" \
@@ -123,7 +124,7 @@ rr_bundle_tree_is_valid() {
 
 rr_prepare_bootstrap() {
     local target_file="$1"
-    rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 && \
+    rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true && \
         [ -s "$target_file" ] && \
         bash -n "$target_file" 2>/dev/null && \
         grep -q '^RR_BOOTSTRAP_VERSION=' "$target_file" && \
@@ -134,9 +135,19 @@ rr_prepare_bootstrap() {
 # 供 ensure_runtime_health 在内核重装失败、孤立进程发现等场景记录，面板同步提示。
 RR_HEALTH_LOG="/var/log/rr-health.log"
 rr_health_log() {
-    local message="${1:-}"
+    local message="${1:-}" log_size=0 trim_tmp=""
     [ -n "$message" ] || return 0
+    log_size=$(stat -c '%s' "$RR_HEALTH_LOG" 2>/dev/null || echo 0)
+    if [[ "$log_size" =~ ^[0-9]+$ ]] && [ "$log_size" -gt 1048576 ]; then
+        trim_tmp=$(mktemp /var/log/.rr-health.XXXXXX) || trim_tmp=""
+        if [ -n "$trim_tmp" ]; then
+            tail -c 524288 "$RR_HEALTH_LOG" > "$trim_tmp" 2>/dev/null && \
+                chmod 600 "$trim_tmp" && mv -f "$trim_tmp" "$RR_HEALTH_LOG"
+            rm -f "$trim_tmp"
+        fi
+    fi
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$message" >> "$RR_HEALTH_LOG" 2>/dev/null || true
+    chmod 600 "$RR_HEALTH_LOG" 2>/dev/null || true
     logger -t rr-health "$message" 2>/dev/null || true
 }
 
@@ -149,7 +160,7 @@ rr_health_log() {
     UPDATE_CHECK_ERROR=""
     SCRIPT_VER_STATUS="${YELLOW}检查失败（网络不可用）${RESET}"
     remote_manifest=$(mktemp /tmp/rr-manifest-check.XXXXXX) || return 0
-    if ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3; then
+    if ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3 true; then
         UPDATE_CHECK_ERROR="GitHub Raw、API 与 CDN 均不可达"
         SCRIPT_VER_STATUS="${YELLOW}检查失败（下载链路不可用）${RESET}"
         rm -f "$remote_manifest"
@@ -192,7 +203,7 @@ post_update_migrate() {
     systemctl stop sing-box 2>/dev/null || true
     systemctl stop rr-subscription 2>/dev/null || true
     systemctl stop rr-nexus 2>/dev/null || true
-    pkill -f "subscription_server.py" 2>/dev/null || true
+    stop_subscription_servers || return 1
     sleep 1
     migrate_config_schema || return 1
     load_config_with_defaults || return 1

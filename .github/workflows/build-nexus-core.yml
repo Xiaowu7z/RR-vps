@@ -2,66 +2,314 @@ name: Build RR Nexus traffic core
 
 on:
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Full main commit SHA that already passed CI
+        required: true
+        type: string
   schedule:
     - cron: "17 3 * * *"
-  push:
-    paths:
-      - ".github/workflows/build-nexus-core.yml"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: rr-nexus-core
+  group: rr-nexus-core-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  version:
+  verify-ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      builder_sha: ${{ steps.gate.outputs.builder_sha }}
+    steps:
+      - name: Require the current main tip and its latest successful CI push
+        id: gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || {
+            echo "Core builds must run from the main workflow ref." >&2
+            exit 1
+          }
+
+          builder_sha=$GITHUB_SHA
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "sha must be a full lowercase commit SHA." >&2
+              exit 1
+            }
+            [ "$REQUESTED_SHA" = "$builder_sha" ] || {
+              echo "The dispatched workflow revision is not the requested commit." >&2
+              exit 1
+            }
+          elif [ "$GITHUB_EVENT_NAME" != schedule ]; then
+            echo "Unexpected core build event: $GITHUB_EVENT_NAME" >&2
+            exit 1
+          fi
+
+          main_sha=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$builder_sha" ] || {
+            echo "Core build SHA is not the current remote main tip." >&2
+            exit 1
+          }
+
+          ci_runs=$(gh api --paginate --slurp \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+          jq -e --arg sha "$builder_sha" '
+            (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+            $run != null and $run.head_sha == $sha and
+            $run.head_branch == "main" and $run.event == "push" and
+            $run.status == "completed" and $run.conclusion == "success"
+          ' <<<"$ci_runs" >/dev/null || {
+            echo "The latest successful main CI push is not for this core builder SHA." >&2
+            exit 1
+          }
+          main_sha=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$builder_sha" ] || {
+            echo "Main advanced while the CI gate was being checked." >&2
+            exit 1
+          }
+          if ! immutable_settings=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/immutable-releases"); then
+            echo "Cannot read immutable-release settings. Configure IMMUTABLE_RELEASES_READ_TOKEN with Administration:read for this repository." >&2
+            exit 1
+          fi
+          jq -e '.enabled == true' <<<"$immutable_settings" >/dev/null || {
+            echo "Repository immutable releases must be enabled before core builds." >&2
+            exit 1
+          }
+          printf 'builder_sha=%s\n' "$builder_sha" >> "$GITHUB_OUTPUT"
+
+  version:
+    needs: verify-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      release_tag: ${{ steps.release.outputs.release_tag }}
       needed: ${{ steps.release.outputs.needed }}
     steps:
-      - name: Resolve latest stable sing-box release
+      - name: Resolve and validate the latest stable sing-box release
         id: release
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
         run: |
           set -euo pipefail
-          release_json=$(curl -fsSL --retry 3 \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'User-Agent: RR-vps-builder' \
-            https://api.github.com/repos/SagerNet/sing-box/releases/latest)
-          tag=$(jq -r '.tag_name // empty' <<<"$release_json")
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          version=${tag#v}
-          needed=true
-          if [ "$EVENT_NAME" = schedule ]; then
-            current_json=$(curl -fsSL --retry 2 \
+
+          api() {
+            gh api \
               -H 'Accept: application/vnd.github+json' \
-              -H 'User-Agent: RR-vps-builder' \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/rr-nexus-core" \
-              2>/dev/null || printf '{}')
-            info_url=$(jq -r '.assets[]? | select(.name == "BUILD_INFO") | .browser_download_url' \
-              <<<"$current_json" | head -n 1)
-            current_version=""
-            if [[ "$info_url" == https://github.com/${GITHUB_REPOSITORY}/releases/download/rr-nexus-core/* ]]; then
-              current_version=$(curl -fsSL --retry 2 "$info_url" 2>/dev/null | \
-                awk -F= '$1 == "SING_BOX_VERSION" {print $2; exit}' || true)
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$@"
+          }
+
+          version_gt() {
+            local candidate="$1" baseline="$2"
+            [ "$candidate" != "$baseline" ] &&
+              [ "$(printf '%s\n%s\n' "$baseline" "$candidate" | sort -V | tail -n 1)" = "$candidate" ]
+          }
+
+          resolve_remote_tag_sha() {
+            local tag="$1" lines peeled
+            if ! lines=$(git ls-remote --tags \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/${tag}" "refs/tags/${tag}^{}"); then
+              echo "Failed to read remote tag $tag." >&2
+              return 1
             fi
-            for asset in \
-              "rr-sing-box-${version}-linux-amd64.tar.gz" \
-              "rr-sing-box-${version}-linux-arm64.tar.gz" SHA256SUMS BUILD_INFO; do
-              jq -e --arg name "$asset" '.assets[]? | select(.name == $name)' \
-                <<<"$current_json" >/dev/null || current_version=""
+            peeled=$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<<"$lines")
+            if [ -n "$peeled" ]; then
+              printf '%s\n' "$peeled"
+            else
+              awk -v ref="refs/tags/${tag}" '$2 == ref { print $1; exit }' <<<"$lines"
+            fi
+          }
+
+          assert_product_latest() {
+            local max_attempts="${1:-1}" attempt latest_json
+            for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
+                jq -e '
+                  (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+                  (.target_commitish | test("^[0-9a-f]{40}$")) and
+                  .draft == false and .prerelease == false and .immutable == true and
+                  ([.assets[].name] | sort) ==
+                  (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
+                ' <<<"$latest_json" >/dev/null; then
+                return 0
+              fi
+              [ "$attempt" -eq "$max_attempts" ] || sleep 2
             done
-            [ "$current_version" = "$version" ] && needed=false
+            echo "Repository Latest is not an immutable complete product release." >&2
+            return 1
+          }
+
+          release_json=$(api "/repos/SagerNet/sing-box/releases/latest")
+          tag=$(jq -r '.tag_name // empty' <<<"$release_json")
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "Latest stable sing-box tag is not canonical SemVer: $tag" >&2
+            exit 1
+          }
+          version=${tag#v}
+          source_sha=$(git ls-remote https://github.com/SagerNet/sing-box.git \
+            "refs/tags/${tag}" "refs/tags/${tag}^{}" | \
+            awk '/\^\{\}$/ {print $1; found=1} !first {first=$1} END {if (!found) print first}' | tail -n 1)
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "Could not resolve the upstream tag to a commit." >&2
+            exit 1
+          }
+
+          release_tag="rr-nexus-core-${tag}-r1"
+          releases=$(api --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          remote_tags=$(git ls-remote --tags --refs \
+            "https://github.com/${GITHUB_REPOSITORY}.git" \
+            'refs/tags/rr-nexus-core-v*')
+
+          highest=""
+          while IFS= read -r existing; do
+            if [[ "$existing" =~ ^rr-nexus-core-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))(-r[1-9][0-9]*)?$ ]]; then
+              existing_version=${BASH_REMATCH[1]}
+              existing_revision=${BASH_REMATCH[5]}
+              if [ "$existing_version" = "$version" ] &&
+                [ -n "$existing_revision" ] && [ "$existing_revision" != -r1 ]; then
+                echo "Core revision ${existing_revision#-r} is newer than target revision 1 for $version." >&2
+                exit 1
+              fi
+              if [ -z "$highest" ] || version_gt "$existing_version" "$highest"; then
+                highest=$existing_version
+              fi
+            fi
+          done < <(
+            {
+              jq -r 'add | .[].tag_name' <<<"$releases"
+              awk '{ sub("refs/tags/", "", $2); print $2 }' <<<"$remote_tags"
+            } | LC_ALL=C sort -u
+          )
+          if [ -n "$highest" ] && version_gt "$highest" "$version"; then
+            echo "Upstream version $version would downgrade existing core version $highest." >&2
+            exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
+          matches=$(jq -r --arg tag "$release_tag" \
+            'add | map(select(.tag_name == $tag)) | length' <<<"$releases")
+          [ "$matches" -le 1 ] || {
+            echo "Multiple releases unexpectedly use $release_tag." >&2
+            exit 1
+          }
+          needed=true
+          if [ "$matches" -eq 1 ]; then
+            current_json=$(jq -c --arg tag "$release_tag" \
+              'add | map(select(.tag_name == $tag))[0]' <<<"$releases")
+            expected_assets=$(jq -cn --arg version "$version" '[
+              "BUILD_INFO", "SHA256SUMS",
+              "rr-sing-box-\($version)-linux-amd64.tar.gz",
+              "rr-sing-box-\($version)-linux-arm64.tar.gz"
+            ] | sort')
+            actual_assets=$(jq -c '[.assets[].name] | sort' <<<"$current_json")
+            jq -e '.draft == false and .prerelease == false and .immutable == true' \
+              <<<"$current_json" >/dev/null || {
+              echo "Existing core release is not immutable and stable." >&2
+              exit 1
+            }
+            [ "$actual_assets" = "$expected_assets" ] || {
+              echo "Unexpected asset set in $release_tag; it will not be modified." >&2
+              exit 1
+            }
+            info_dir=$(mktemp -d)
+            trap 'rm -rf "$info_dir"' EXIT
+            for asset in BUILD_INFO SHA256SUMS \
+              "rr-sing-box-${version}-linux-amd64.tar.gz" \
+              "rr-sing-box-${version}-linux-arm64.tar.gz"; do
+              curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+                --retry 6 --retry-all-errors --retry-delay 2 \
+                "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}" \
+                -o "$info_dir/$asset"
+            done
+            awk -F= '
+              NF != 2 { exit 1 }
+              $1 !~ /^(SING_BOX_VERSION|SING_BOX_TAG|SOURCE_COMMIT|RR_BUILDER_COMMIT|RR_CORE_RELEASE|BUILD_TAG|SOURCE)$/ { exit 1 }
+              seen[$1]++ { exit 1 }
+              END { if (NR != 7) exit 1 }
+            ' "$info_dir/BUILD_INFO"
+            builder_sha=$(sed -n 's/^RR_BUILDER_COMMIT=//p' "$info_dir/BUILD_INFO")
+            [[ "$builder_sha" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "Existing BUILD_INFO does not identify a builder commit." >&2
+              exit 1
+            }
+            [ "$(jq -r '.target_commitish // empty' <<<"$current_json")" = "$builder_sha" ] || {
+              echo "Existing release target_commitish does not match BUILD_INFO." >&2
+              exit 1
+            }
+            grep -Fxq "SING_BOX_VERSION=${version}" "$info_dir/BUILD_INFO"
+            grep -Fxq "SING_BOX_TAG=${tag}" "$info_dir/BUILD_INFO"
+            grep -Fxq "SOURCE_COMMIT=${source_sha}" "$info_dir/BUILD_INFO"
+            grep -Fxq "RR_BUILDER_COMMIT=${builder_sha}" "$info_dir/BUILD_INFO"
+            grep -Fxq "RR_CORE_RELEASE=${release_tag}" "$info_dir/BUILD_INFO"
+            grep -Fxq 'BUILD_TAG=with_v2ray_api' "$info_dir/BUILD_INFO"
+            grep -Fxq "SOURCE=https://github.com/SagerNet/sing-box/tree/${tag}" "$info_dir/BUILD_INFO"
+            existing_tag_sha=$(resolve_remote_tag_sha "$release_tag")
+            [ "$existing_tag_sha" = "$builder_sha" ] || {
+              echo "Existing core tag does not resolve to its recorded builder commit." >&2
+              exit 1
+            }
+            builder_runs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&head_sha=${builder_sha}&per_page=100")
+            jq -e --arg sha "$builder_sha" '
+              map(.workflow_runs[]) | any(
+                .head_sha == $sha and .head_branch == "main" and
+                .event == "push" and .status == "completed" and
+                .conclusion == "success"
+              )
+            ' <<<"$builder_runs" >/dev/null || {
+              echo "Existing core release was not built from a successful main push." >&2
+              exit 1
+            }
+            awk '
+              NF != 2 || length($1) != 64 || $1 !~ /^[0-9a-f]+$/ ||
+              $2 !~ /^rr-sing-box-[0-9A-Za-z.-]+-linux-(amd64|arm64)\.tar\.gz$/ { exit 1 }
+              seen[$2]++ { exit 1 }
+              END { if (NR != 2) exit 1 }
+            ' "$info_dir/SHA256SUMS"
+            (cd "$info_dir" && sha256sum -c SHA256SUMS)
+            needed=false
+          else
+            existing_tag_sha=$(resolve_remote_tag_sha "$release_tag")
+            if [ -n "$existing_tag_sha" ]; then
+              echo "Remote tag $release_tag exists without its immutable release." >&2
+              exit 1
+            fi
+          fi
+
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'version=%s\n' "$version"
+            printf 'source_sha=%s\n' "$source_sha"
+            printf 'release_tag=%s\n' "$release_tag"
+            printf 'needed=%s\n' "$needed"
+          } >> "$GITHUB_OUTPUT"
+          assert_product_latest
 
   build:
     needs: version
@@ -75,6 +323,7 @@ jobs:
           - arch: arm64
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
     steps:
       - name: Check out official sing-box source
         shell: bash
@@ -82,9 +331,10 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch "${{ needs.version.outputs.tag }}" \
             https://github.com/SagerNet/sing-box.git sing-box
+          test "$(git -C sing-box rev-parse HEAD)" = "${{ needs.version.outputs.source_sha }}"
 
       - name: Set up Go from upstream go.mod
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: sing-box/go.mod
           cache-dependency-path: sing-box/go.sum
@@ -109,78 +359,404 @@ jobs:
           install -m 755 sing-box "../dist/sing-box-${VERSION}-linux-${GOARCH}/sing-box"
           cp LICENSE "../dist/sing-box-${VERSION}-linux-${GOARCH}/LICENSE"
           cd ../dist
-          tar -czf "rr-sing-box-${VERSION}-linux-${GOARCH}.tar.gz" \
-            "sing-box-${VERSION}-linux-${GOARCH}"
+          archive="rr-sing-box-${VERSION}-linux-${GOARCH}.tar.gz"
+          tar -czf "$archive" "sing-box-${VERSION}-linux-${GOARCH}"
+          sha256sum "$archive" > "${archive}.sha256"
+          sha256sum -c "${archive}.sha256"
 
       - name: Upload architecture artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rr-sing-box-${{ matrix.arch }}
-          path: dist/rr-sing-box-*.tar.gz
+          path: |
+            dist/rr-sing-box-*.tar.gz
+            dist/rr-sing-box-*.tar.gz.sha256
           if-no-files-found: error
           retention-days: 1
 
   publish:
-    needs: [version, build]
+    needs: [verify-ci, version, build]
     if: needs.version.outputs.needed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: rr-vps-publish-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: write
+      actions: read
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: rr-sing-box-*
           path: release-assets
           merge-multiple: true
 
-      - name: Create checksums and build metadata
+      - name: Verify artifacts and create release metadata
         shell: bash
+        env:
+          BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          RELEASE_TAG: ${{ needs.version.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           cd release-assets
-          sha256sum rr-sing-box-*.tar.gz | LC_ALL=C sort > SHA256SUMS
-          printf '%s\n' \
-            "SING_BOX_VERSION=${{ needs.version.outputs.version }}" \
-            "SING_BOX_TAG=${{ needs.version.outputs.tag }}" \
-            "BUILD_TAG=with_v2ray_api" \
-            "SOURCE=https://github.com/SagerNet/sing-box/tree/${{ needs.version.outputs.tag }}" \
-            > BUILD_INFO
+          shopt -s nullglob
+          entries=(* .*)
+          for entry in "${entries[@]}"; do
+            [ "$entry" = . ] && continue
+            [ "$entry" = .. ] && continue
+            case "$entry" in
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz"|\
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz.sha256"|\
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz"|\
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz.sha256") ;;
+              *) echo "Unexpected downloaded artifact: $entry" >&2; exit 1 ;;
+            esac
+            [ -f "$entry" ] && [ ! -L "$entry" ] || {
+              echo "Artifact is not a regular non-symlink file: $entry" >&2
+              exit 1
+            }
+          done
+          [ "${#entries[@]}" -eq 4 ] || {
+            echo "Expected exactly four archive and checksum files." >&2
+            exit 1
+          }
 
-      - name: Publish without removing the working release
+          for arch in amd64 arm64; do
+            archive="rr-sing-box-${VERSION}-linux-${arch}.tar.gz"
+            sidecar="${archive}.sha256"
+            grep -Eq "^[0-9a-f]{64}  ${archive}$" "$sidecar"
+            [ "$(wc -l < "$sidecar")" -eq 1 ]
+            sha256sum -c "$sidecar"
+          done
+          sha256sum \
+            "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+            "rr-sing-box-${VERSION}-linux-arm64.tar.gz" | LC_ALL=C sort > SHA256SUMS
+          rm \
+            "rr-sing-box-${VERSION}-linux-amd64.tar.gz.sha256" \
+            "rr-sing-box-${VERSION}-linux-arm64.tar.gz.sha256"
+          printf '%s\n' \
+            "SING_BOX_VERSION=${VERSION}" \
+            "SING_BOX_TAG=${SOURCE_TAG}" \
+            "SOURCE_COMMIT=${SOURCE_SHA}" \
+            "RR_BUILDER_COMMIT=${BUILDER_SHA}" \
+            "RR_CORE_RELEASE=${RELEASE_TAG}" \
+            "BUILD_TAG=with_v2ray_api" \
+            "SOURCE=https://github.com/SagerNet/sing-box/tree/${SOURCE_TAG}" \
+            > BUILD_INFO
+          sha256sum -c SHA256SUMS
+
+          entries=(* .*)
+          [ "${#entries[@]}" -eq 4 ] || {
+            echo "Release payload must contain exactly four files." >&2
+            exit 1
+          }
+          for entry in "${entries[@]}"; do
+            case "$entry" in
+              BUILD_INFO|SHA256SUMS|\
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz"|\
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz") ;;
+              *) echo "Unexpected release payload: $entry" >&2; exit 1 ;;
+            esac
+            [ -f "$entry" ] && [ ! -L "$entry" ]
+          done
+
+      - name: Publish without changing an existing release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
+          TAG: ${{ needs.version.outputs.release_tag }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          tag=rr-nexus-core
-          title="RR Nexus traffic core · sing-box ${{ needs.version.outputs.version }}"
-          notes="Built from the official SagerNet/sing-box ${{ needs.version.outputs.tag }} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand."
 
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" --title "$title" --notes "$notes"
-          fi
+          api() {
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$@"
+          }
 
-          # Upload versioned binaries first. Existing assets and metadata remain
-          # downloadable if a build or upload fails midway.
-          gh release upload "$tag" release-assets/rr-sing-box-*.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          # Switch the verified metadata only after both binaries are present.
-          gh release upload "$tag" release-assets/SHA256SUMS release-assets/BUILD_INFO \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "$title" --notes "$notes"
+          resolve_remote_tag_sha() {
+            local tag="$1" lines peeled
+            if ! lines=$(git ls-remote --tags \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "refs/tags/${tag}" "refs/tags/${tag}^{}"); then
+              echo "Failed to read remote tag $tag." >&2
+              return 1
+            fi
+            peeled=$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<<"$lines")
+            if [ -n "$peeled" ]; then
+              printf '%s\n' "$peeled"
+            else
+              awk -v ref="refs/tags/${tag}" '$2 == ref { print $1; exit }' <<<"$lines"
+            fi
+          }
 
-          current_amd64="rr-sing-box-${{ needs.version.outputs.version }}-linux-amd64.tar.gz"
-          current_arm64="rr-sing-box-${{ needs.version.outputs.version }}-linux-arm64.tar.gz"
-          while IFS= read -r asset; do
-            case "$asset" in
-              "$current_amd64"|"$current_arm64"|SHA256SUMS|BUILD_INFO) continue ;;
-              rr-sing-box-*-linux-*.tar.gz)
-                gh release delete-asset "$tag" "$asset" \
-                  --repo "$GITHUB_REPOSITORY" --yes
-                ;;
-            esac
-          done < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-            --json assets --jq '.assets[].name')
+          version_gt() {
+            local candidate="$1" baseline="$2"
+            [ "$candidate" != "$baseline" ] &&
+              [ "$(printf '%s\n%s\n' "$baseline" "$candidate" | sort -V | tail -n 1)" = "$candidate" ]
+          }
+
+          wait_for_remote_tag_sha() {
+            local tag="$1" expected="$2" attempt actual
+            for attempt in 1 2 3 4 5 6; do
+              if actual=$(resolve_remote_tag_sha "$tag") && [ "$actual" = "$expected" ]; then
+                return 0
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "Remote tag $tag did not resolve to $expected." >&2
+            return 1
+          }
+
+          assert_release_gate() {
+            local main_sha ci_runs
+            main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            [ "$main_sha" = "$BUILDER_SHA" ] || {
+              echo "Main advanced while the core was building." >&2
+              return 1
+            }
+            ci_runs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+            jq -e --arg sha "$BUILDER_SHA" '
+              (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+              $run != null and $run.head_sha == $sha and
+              $run.head_branch == "main" and $run.event == "push" and
+              $run.status == "completed" and $run.conclusion == "success"
+            ' <<<"$ci_runs" >/dev/null || {
+              echo "Latest successful main CI changed while the core was building." >&2
+              return 1
+            }
+            # This must be the gate's final remote read. A new push may arrive
+            # while the paginated CI query is running.
+            main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            [ "$main_sha" = "$BUILDER_SHA" ] || {
+              echo "Main advanced while the CI gate was being checked." >&2
+              return 1
+            }
+          }
+
+          assert_immutable_releases_enabled() {
+            local settings
+            if ! settings=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/${GITHUB_REPOSITORY}/immutable-releases"); then
+              echo "Cannot read immutable-release settings. Configure IMMUTABLE_RELEASES_READ_TOKEN with Administration:read for this repository." >&2
+              return 1
+            fi
+            jq -e '.enabled == true' <<<"$settings" >/dev/null || {
+              echo "Repository immutable releases are not enabled." >&2
+              return 1
+            }
+          }
+
+          assert_product_latest() {
+            local max_attempts="${1:-1}" attempt latest_json
+            for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
+                jq -e '
+                  (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
+                  (.target_commitish | test("^[0-9a-f]{40}$")) and
+                  .draft == false and .prerelease == false and .immutable == true and
+                  ([.assets[].name] | sort) ==
+                  (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
+                ' <<<"$latest_json" >/dev/null; then
+                return 0
+              fi
+              [ "$attempt" -eq "$max_attempts" ] || sleep 2
+            done
+            echo "Repository Latest is not an immutable complete product release." >&2
+            return 1
+          }
+
+          assert_target_absent() {
+            local releases remote_tags existing existing_version highest="" existing_tag_sha
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+            if jq -e --arg tag "$TAG" 'add | any(.tag_name == $tag)' \
+              <<<"$releases" >/dev/null; then
+              echo "Release $TAG already exists and will not be modified." >&2
+              return 1
+            fi
+            if ! remote_tags=$(git ls-remote --tags --refs \
+              "https://github.com/${GITHUB_REPOSITORY}.git" \
+              'refs/tags/rr-nexus-core-v*'); then
+              echo "Failed to list remote core tags." >&2
+              return 1
+            fi
+            while IFS= read -r existing; do
+              if [[ "$existing" =~ ^rr-nexus-core-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))(-r[1-9][0-9]*)?$ ]]; then
+                existing_version=${BASH_REMATCH[1]}
+                existing_revision=${BASH_REMATCH[5]}
+                if [ "$existing_version" = "$VERSION" ] &&
+                  [ -n "$existing_revision" ] && [ "$existing_revision" != -r1 ]; then
+                  echo "Core revision ${existing_revision#-r} is newer than target revision 1 for $VERSION." >&2
+                  return 1
+                fi
+                if [ -z "$highest" ] || version_gt "$existing_version" "$highest"; then
+                  highest=$existing_version
+                fi
+              fi
+            done < <(
+              {
+                jq -r 'add | .[].tag_name' <<<"$releases"
+                awk '{ sub("refs/tags/", "", $2); print $2 }' <<<"$remote_tags"
+              } | LC_ALL=C sort -u
+            )
+            if [ -n "$highest" ] && version_gt "$highest" "$VERSION"; then
+              echo "Core version $VERSION would downgrade existing version $highest." >&2
+              return 1
+            fi
+            existing_tag_sha=$(resolve_remote_tag_sha "$TAG") || return 1
+            [ -z "$existing_tag_sha" ] || {
+              echo "Remote tag $TAG already exists and will not be reused." >&2
+              return 1
+            }
+          }
+
+          assert_immutable_releases_enabled
+          assert_release_gate
+          assert_product_latest
+          assert_target_absent
+
+          # Re-check mutable remote state immediately before the only mutation.
+          assert_product_latest
+          assert_target_absent
+          assert_immutable_releases_enabled
+          # Keep this gate adjacent to the atomic ref creation so a main push
+          # during the release/tag scans cannot publish an obsolete core.
+          assert_release_gate
+          created_ref=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${TAG}" -f "sha=${BUILDER_SHA}")
+          jq -e --arg ref "refs/tags/${TAG}" --arg sha "$BUILDER_SHA" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $sha
+          ' <<<"$created_ref" >/dev/null
+          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
+          gh release create "$TAG" \
+            release-assets/BUILD_INFO \
+            release-assets/SHA256SUMS \
+            "release-assets/rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+            "release-assets/rr-sing-box-${VERSION}-linux-arm64.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$BUILDER_SHA" \
+            --title "RR Nexus traffic core · sing-box ${VERSION}" \
+            --notes "Built from the official SagerNet/sing-box v${VERSION} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This immutable auxiliary release is consumed only by its versioned tag and never owns repository Latest." \
+            --draft
+
+          expected_asset_names=$(jq -cn --arg version "$VERSION" '[
+            "BUILD_INFO", "SHA256SUMS",
+            "rr-sing-box-\($version)-linux-amd64.tar.gz",
+            "rr-sing-box-\($version)-linux-arm64.tar.gz"
+          ] | sort')
+          expected_assets=$(
+            for asset in BUILD_INFO SHA256SUMS \
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz"; do
+              digest="sha256:$(sha256sum "release-assets/$asset" | awk '{print $1}')"
+              size=$(stat -c %s "release-assets/$asset")
+              jq -cn --arg name "$asset" --arg digest "$digest" --argjson size "$size" \
+                '{name: $name, size: $size, digest: $digest}'
+            done | jq -sc 'sort_by(.name)'
+          )
+          draft_verified=false
+          for attempt in 1 2 3 4 5 6; do
+            if draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
+              jq -e --arg tag "$TAG" --arg target "$BUILDER_SHA" --argjson assets "$expected_assets" '
+                .tag_name == $tag and .target_commitish == $target and
+                .draft == true and .prerelease == false and .immutable == false and
+                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
+                all(.assets[]; .state == "uploaded")
+              ' <<<"$draft_json" >/dev/null; then
+              draft_verified=true
+              break
+            fi
+            [ "$attempt" -eq 6 ] || sleep 2
+          done
+          [ "$draft_verified" = true ] || {
+            echo "New core draft does not contain the exact verified payload." >&2
+            exit 1
+          }
+          draft_id=$(jq -r '.id' <<<"$draft_json")
+          [[ "$draft_id" =~ ^[0-9]+$ ]]
+
+          # Only the draft ID created above may be changed. Re-run every remote
+          # safety gate immediately before making it public and immutable.
+          assert_product_latest
+          assert_immutable_releases_enabled
+          assert_release_gate
+          draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
+          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg target "$BUILDER_SHA" \
+            --argjson assets "$expected_assets" '
+            .id == $id and .tag_name == $tag and .target_commitish == $target and
+            .draft == true and .prerelease == false and .immutable == false and
+            ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
+            all(.assets[]; .state == "uploaded")
+          ' <<<"$draft_json" >/dev/null
+          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
+          main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$BUILDER_SHA" ] || {
+            echo "Main advanced immediately before core draft publication." >&2
+            exit 1
+          }
+          published_json=$(api --method PATCH \
+            "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
+            -F draft=false -f make_latest=false)
+          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg target "$BUILDER_SHA" '
+            .id == $id and .tag_name == $tag and .target_commitish == $target and
+            .draft == false and .prerelease == false
+          ' <<<"$published_json" >/dev/null
+
+          release_verified=false
+          for attempt in 1 2 3 4 5 6; do
+            if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
+              jq -e --arg tag "$TAG" --arg target "$BUILDER_SHA" --argjson assets "$expected_asset_names" '
+                .tag_name == $tag and .target_commitish == $target and
+                .draft == false and .prerelease == false and .immutable == true and
+                ([.assets[].name] | sort) == $assets
+              ' <<<"$release_json" >/dev/null; then
+              release_verified=true
+              break
+            fi
+            [ "$attempt" -eq 6 ] || sleep 2
+          done
+          [ "$release_verified" = true ] || {
+            echo "Published core release metadata does not match the verified payload." >&2
+            exit 1
+          }
+          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
+
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          for asset in BUILD_INFO SHA256SUMS \
+            "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+            "rr-sing-box-${VERSION}-linux-arm64.tar.gz"; do
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+                --retry 2 --retry-all-errors --retry-delay 1 \
+                "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}" \
+                -o "$verify_dir/${asset}.part" &&
+                cmp -s "release-assets/$asset" "$verify_dir/${asset}.part"; then
+                mv "$verify_dir/${asset}.part" "$verify_dir/$asset"
+                verified=true
+                break
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            [ "$verified" = true ] || {
+              echo "Published core download differs from builder output: $asset" >&2
+              exit 1
+            }
+          done
+          (cd "$verify_dir" && sha256sum -c SHA256SUMS)
+          assert_product_latest 6

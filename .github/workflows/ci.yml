@@ -18,13 +18,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck python3-cryptography python3-argon2
-          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh
+          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh tests/*.sh
 
       - name: Update guard compatibility contract
         run: |
@@ -75,6 +77,14 @@ jobs:
       - name: Repository regression suite
         run: bash scripts/validate.sh
 
+      - name: Standalone security, firewall and concurrency regressions
+        run: |
+          set -euo pipefail
+          for test_script in tests/test-*.sh; do
+            echo "Running ${test_script}"
+            bash "$test_script"
+          done
+
   os-matrix:
     name: ${{ matrix.name }} clean install / hot update / rollback / uninstall
     runs-on: ubuntu-latest
@@ -92,14 +102,16 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            bash ca-certificates coreutils curl findutils gawk grep gzip jq \
+            bash ca-certificates coreutils curl findutils mawk grep gzip jq \
             openssl procps python3 sed sqlite3 systemd tar util-linux wget \
             python3-cryptography python3-argon2
       - name: Full OS transaction smoke

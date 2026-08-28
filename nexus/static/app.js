@@ -327,7 +327,7 @@ function renderServerPlan(plan, prefix = "") {
   applyBarWidths(form || document);
   const stateEl = id("server-plan-state");
   stateEl.className = `live-badge ${plan.available ? (plan.exhausted ? "offline" : "live") : "pending"}`;
-  stateEl.innerHTML = `<i></i>${plan.available ? `${plan.active_interface || "网卡"} · ${plan.exhausted ? "额度用尽" : "统计中"}` : "等待网卡采样"}`;
+  stateEl.innerHTML = `<i></i>${plan.available ? `${escapeHtml(plan.active_interface || "网卡")} · ${plan.exhausted ? "额度用尽" : "统计中"}` : "等待网卡采样"}`;
 }
 
 async function saveServerPlan(event, remote = false) {
@@ -1085,9 +1085,9 @@ function renderRemoteServers(servers) {
       const svc = s.services["sing-box"] === "active";
       chips.push(`<span class="rs-chip ${svc ? "g" : "r"}">节点 ${svc ? "在线" : "离线"}</span>`);
     }
-    chips.push(`<span class="rs-chip b">${s.active_devices ?? "—"} 实时在线 · ${s.enabled ?? s.devices ?? 0} 启用</span>`);
-    chips.push(`<span class="rs-chip">${s.ver ? "v" + s.ver : "版本未知"}</span>`);
-    if (s.ping) chips.push(`<span class="rs-chip">${s.ping} ms</span>`);
+    chips.push(`<span class="rs-chip b">${escapeHtml(s.active_devices ?? "—")} 实时在线 · ${escapeHtml(s.enabled ?? s.devices ?? 0)} 启用</span>`);
+    chips.push(`<span class="rs-chip">${s.ver ? "v" + escapeHtml(s.ver) : "版本未知"}</span>`);
+    if (s.ping) chips.push(`<span class="rs-chip">${escapeHtml(s.ping)} ms</span>`);
     if (!online) {
       if (s.state === "revoked") chips.push(`<span class="rs-chip r">钥匙已吊销 · 需重新添加</span>`);
       else if (s.state === "locked") chips.push(`<span class="rs-chip r">临时锁定 · 稍后自动恢复</span>`);
@@ -1184,8 +1184,8 @@ async function rsRunUpdate() {
           const tail = st.log_tail ? st.log_tail.split("\n").filter(Boolean).slice(-2).join(" · ") : "";
           let hint = `⏳ 升级进行中（${Math.round((i + 1) * 5 / 60)} 分钟）…副面板重启属正常现象`;
           if (st.stalled) hint = `⚠️ 疑似卡住：升级日志 ${st.heartbeat_seconds ?? "?"} 秒无更新，最多再等 8 分钟将自动中止`;
-          if (tail) hint += `\n📄 ${escapeHtml(tail)}`;
-          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${hint}</span></div>`;
+          if (tail) hint += `\n📄 ${tail}`;
+          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${escapeHtml(hint)}</span></div>`;
         }
       } catch (e) { /* 副面板重启中，连接失败属预期 */ }
     }
@@ -1264,8 +1264,8 @@ async function localRunUpdate() {
           const tail = st.log_tail ? st.log_tail.split("\n").filter(Boolean).slice(-2).join(" · ") : "";
           let hint = `⏳ 升级进行中（${Math.round((i + 1) * 5 / 60)} 分钟）…面板重启属正常现象`;
           if (st.stalled) hint = `⚠️ 疑似卡住：升级日志 ${st.heartbeat_seconds ?? "?"} 秒无更新，最多再等 8 分钟将自动中止`;
-          if (tail) hint += `\n📄 ${escapeHtml(tail)}`;
-          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${hint}</span></div>`;
+          if (tail) hint += `\n📄 ${tail}`;
+          box.innerHTML = `<div class="rs-update-row ${st.stalled ? "warn" : ""}"><span class="preline">${escapeHtml(hint)}</span></div>`;
         }
       } catch (e) { /* 面板重启中，连接失败属预期 */ }
     }

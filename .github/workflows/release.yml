@@ -1,32 +1,100 @@
 name: Publish release
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Full main commit SHA that already passed CI
+        required: true
+        type: string
 
 permissions:
-  contents: write
-
-concurrency:
-  group: release-${{ github.event.workflow_run.head_sha }}
-  cancel-in-progress: false
+  contents: read
+  actions: read
 
 jobs:
   publish:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    # Product and auxiliary releases share this repository-wide publication
+    # lock. A running publication is never cancelled halfway through.
+    concurrency:
+      group: rr-vps-publish-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Require the current main tip and its latest successful CI push
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "sha must be a full lowercase commit SHA." >&2
+            exit 1
+          }
+          [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
+          [ "$GITHUB_REF" = refs/heads/main ] || {
+            echo "Releases must be dispatched from the main workflow ref." >&2
+            exit 1
+          }
+          [ "$GITHUB_SHA" = "$REQUESTED_SHA" ] || {
+            echo "The dispatched workflow revision is not the requested commit." >&2
+            exit 1
+          }
+
+          main_sha=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$REQUESTED_SHA" ] || {
+            echo "Requested SHA is not the current remote main tip." >&2
+            exit 1
+          }
+
+          ci_runs=$(gh api --paginate --slurp \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+          jq -e --arg sha "$REQUESTED_SHA" '
+            (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+            $run != null and $run.head_sha == $sha and
+            $run.head_branch == "main" and $run.event == "push" and
+            $run.status == "completed" and $run.conclusion == "success"
+          ' <<<"$ci_runs" >/dev/null || {
+            echo "The latest successful main CI push is not for the requested SHA." >&2
+            exit 1
+          }
+          main_sha=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$REQUESTED_SHA" ] || {
+            echo "Main advanced while the CI gate was being checked." >&2
+            exit 1
+          }
+
+          if ! immutable_settings=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "/repos/${GITHUB_REPOSITORY}/immutable-releases"); then
+            echo "Cannot read immutable-release settings. Configure IMMUTABLE_RELEASES_READ_TOKEN with Administration:read for this repository." >&2
+            exit 1
+          fi
+          jq -e '.enabled == true' <<<"$immutable_settings" >/dev/null || {
+            echo "Repository immutable releases must be enabled before publishing." >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
+          ref: ${{ inputs.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: ShellCheck
         run: |
@@ -37,16 +105,38 @@ jobs:
       - name: Resolve and verify release
         id: release
         shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' modules/00-runtime.sh)
-          [[ -n "$version" ]]
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_SHA" ]
+          version=$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)"/\1/p' modules/00-runtime.sh)
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo "SCRIPT_VERSION must be a canonical MAJOR.MINOR.PATCH version." >&2
+            exit 1
+          }
           grep -Fq "## ${version} -" CHANGELOG.md
           bash scripts/pre-push-test.sh
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-          printf 'tag=v%s\n' "$version" >> "$GITHUB_OUTPUT"
-          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          sha256sum rr-bundle.tar.gz
+          {
+            printf 'version=%s\n' "$version"
+            printf 'tag=v%s\n' "$version"
+            printf 'sha=%s\n' "$REQUESTED_SHA"
+          } >> "$GITHUB_OUTPUT"
+          grep -Fxq "RR_RELEASE_TAG=\"v${version}\"" install.sh
+          grep -Fxq "RR_RELEASE_TAG=\"v${version}\"" scripts/install-core.sh
+          cat > RELEASE_INFO <<EOF
+          VERSION=${version}
+          TAG=v${version}
+          COMMIT=${REQUESTED_SHA}
+          EOF
+          sha256sum install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+            [ -f "$asset" ] && [ ! -L "$asset" ] || {
+              echo "Release asset is not a regular non-symlink file: $asset" >&2
+              exit 1
+            }
+          done
 
           awk -v prefix="## ${version} " '
             index($0, prefix) == 1 { capture = 1 }
@@ -55,20 +145,257 @@ jobs:
           ' CHANGELOG.md > release-notes.md
           [[ -s release-notes.md ]]
 
-      - name: Publish versioned release
+      - name: Publish a new immutable versioned release
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ steps.release.outputs.sha }}
+          IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "$TAG already exists; keeping the immutable published version."
-            exit 0
-          fi
-          gh release create "$TAG" rr-bundle.tar.gz \
+
+          api() {
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "$@"
+          }
+
+          assert_release_gate() {
+            local main_sha ci_runs
+            main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            [ "$main_sha" = "$EXPECTED_SHA" ] || {
+              echo "Main advanced before publication; refusing an obsolete release." >&2
+              return 1
+            }
+            ci_runs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+            jq -e --arg sha "$EXPECTED_SHA" '
+              (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+              $run != null and $run.head_sha == $sha and
+              $run.head_branch == "main" and $run.event == "push" and
+              $run.status == "completed" and $run.conclusion == "success"
+            ' <<<"$ci_runs" >/dev/null || {
+              echo "Latest successful main CI changed before publication." >&2
+              return 1
+            }
+            # This must be the gate's final remote read. A new push may arrive
+            # while the paginated CI query is running.
+            main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+            [ "$main_sha" = "$EXPECTED_SHA" ] || {
+              echo "Main advanced while the CI gate was being checked." >&2
+              return 1
+            }
+          }
+
+          assert_immutable_releases_enabled() {
+            local settings
+            if ! settings=$(GH_TOKEN="$IMMUTABLE_SETTINGS_TOKEN" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "/repos/${GITHUB_REPOSITORY}/immutable-releases"); then
+              echo "Cannot read immutable-release settings. Configure IMMUTABLE_RELEASES_READ_TOKEN with Administration:read for this repository." >&2
+              return 1
+            fi
+            jq -e '.enabled == true' <<<"$settings" >/dev/null || {
+              echo "Repository immutable releases are not enabled." >&2
+              return 1
+            }
+          }
+
+          resolve_remote_tag_sha() {
+            local tag="$1" lines peeled
+            if ! lines=$(git ls-remote --tags origin \
+              "refs/tags/${tag}" "refs/tags/${tag}^{}"); then
+              echo "Failed to read remote tag $tag." >&2
+              return 1
+            fi
+            peeled=$(awk '$2 ~ /\^\{\}$/ { print $1; exit }' <<<"$lines")
+            if [ -n "$peeled" ]; then
+              printf '%s\n' "$peeled"
+            else
+              awk -v ref="refs/tags/${tag}" '$2 == ref { print $1; exit }' <<<"$lines"
+            fi
+          }
+
+          wait_for_remote_tag_sha() {
+            local tag="$1" expected="$2" attempt actual
+            for attempt in 1 2 3 4 5 6; do
+              if actual=$(resolve_remote_tag_sha "$tag") && [ "$actual" = "$expected" ]; then
+                return 0
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "Remote tag $tag did not resolve to $expected." >&2
+            return 1
+          }
+
+          version_gt() {
+            local candidate="$1" baseline="$2"
+            [ "$candidate" != "$baseline" ] &&
+              [ "$(printf '%s\n%s\n' "$baseline" "$candidate" | sort -V | tail -n 1)" = "$candidate" ]
+          }
+
+          assert_new_monotonic_version() {
+            local releases remote_tags existing highest="" existing_version
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+            if jq -e --arg tag "$TAG" 'add | any(.tag_name == $tag)' \
+              <<<"$releases" >/dev/null; then
+              echo "Release $TAG already exists; existing releases are never modified." >&2
+              return 1
+            fi
+
+            remote_tags=$(git ls-remote --tags --refs origin 'refs/tags/v*')
+            while IFS= read -r existing; do
+              [[ "$existing" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+              existing_version=${existing#v}
+              if [ -z "$highest" ] || version_gt "$existing_version" "$highest"; then
+                highest=$existing_version
+              fi
+            done < <(
+              {
+                jq -r 'add | .[].tag_name' <<<"$releases"
+                awk '{ sub("refs/tags/", "", $2); print $2 }' <<<"$remote_tags"
+              } | LC_ALL=C sort -u
+            )
+            if [ -n "$highest" ] && ! version_gt "$VERSION" "$highest"; then
+              echo "Version $VERSION is not newer than existing product version $highest." >&2
+              return 1
+            fi
+          }
+
+          assert_latest_product() {
+            local attempt latest_json
+            for attempt in 1 2 3 4 5 6; do
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
+            jq -e --arg tag "$TAG" --arg sha "$EXPECTED_SHA" '
+              .tag_name == $tag and .target_commitish == $sha and
+                  .draft == false and .prerelease == false and .immutable == true and
+                  ([.assets[].name] | sort) ==
+                  (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
+                ' <<<"$latest_json" >/dev/null; then
+                return 0
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "$TAG is not immutable repository Latest with the expected assets." >&2
+            return 1
+          }
+
+          assert_immutable_releases_enabled
+          assert_release_gate
+          existing_tag_sha=$(resolve_remote_tag_sha "$TAG")
+          [ -z "$existing_tag_sha" ] || {
+            echo "Remote tag $TAG already exists; refusing to reuse it." >&2
+            exit 1
+          }
+          assert_new_monotonic_version
+
+          # Re-read all mutable remote state before the first release mutation.
+          existing_tag_sha=$(resolve_remote_tag_sha "$TAG")
+          [ -z "$existing_tag_sha" ] || {
+            echo "Remote tag $TAG appeared before publication." >&2
+            exit 1
+          }
+          assert_new_monotonic_version
+          assert_immutable_releases_enabled
+          # Keep this gate adjacent to the atomic ref creation so a main push
+          # during the longer release/tag scans cannot publish an obsolete SHA.
+          assert_release_gate
+          created_ref=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${TAG}" -f "sha=${EXPECTED_SHA}")
+          jq -e --arg ref "refs/tags/${TAG}" --arg sha "$EXPECTED_SHA" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $sha
+          ' <<<"$created_ref" >/dev/null
+          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
+          gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
-            --target "${{ steps.release.outputs.sha }}" \
+            --verify-tag \
+            --target "$EXPECTED_SHA" \
             --title "RR-vps ${VERSION} 正式版" \
-            --notes-file release-notes.md
+            --notes-file release-notes.md \
+            --draft
+
+          expected_assets=$(
+            for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+              digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+              size=$(stat -c %s "$asset")
+              jq -cn --arg name "$asset" --arg digest "$digest" --argjson size "$size" \
+                '{name: $name, size: $size, digest: $digest}'
+            done | jq -sc 'sort_by(.name)'
+          )
+          draft_verified=false
+          for attempt in 1 2 3 4 5 6; do
+            if draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
+              jq -e --arg tag "$TAG" --arg sha "$EXPECTED_SHA" --argjson assets "$expected_assets" '
+                .tag_name == $tag and .target_commitish == $sha and
+                .draft == true and .prerelease == false and .immutable == false and
+                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
+                all(.assets[]; .state == "uploaded")
+              ' <<<"$draft_json" >/dev/null; then
+              draft_verified=true
+              break
+            fi
+            [ "$attempt" -eq 6 ] || sleep 2
+          done
+          [ "$draft_verified" = true ] || {
+            echo "New draft release does not contain the exact verified payload." >&2
+            exit 1
+          }
+          draft_id=$(jq -r '.id' <<<"$draft_json")
+          [[ "$draft_id" =~ ^[0-9]+$ ]]
+
+          # Only the draft ID created above may be changed. Re-run the remote
+          # safety gates immediately before making it public and immutable.
+          assert_immutable_releases_enabled
+          assert_release_gate
+          draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
+          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg sha "$EXPECTED_SHA" \
+            --argjson assets "$expected_assets" '
+            .id == $id and .tag_name == $tag and .target_commitish == $sha and
+            .draft == true and .prerelease == false and .immutable == false and
+            ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
+            all(.assets[]; .state == "uploaded")
+          ' <<<"$draft_json" >/dev/null
+          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
+          main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          [ "$main_sha" = "$EXPECTED_SHA" ] || {
+            echo "Main advanced immediately before draft publication." >&2
+            exit 1
+          }
+          published_json=$(api --method PATCH \
+            "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
+            -F draft=false -f make_latest=true)
+          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg sha "$EXPECTED_SHA" '
+            .id == $id and .tag_name == $tag and .target_commitish == $sha and
+            .draft == false and .prerelease == false
+          ' <<<"$published_json" >/dev/null
+
+          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
+          assert_latest_product
+
+          published_dir=$(mktemp -d)
+          trap 'rm -rf "$published_dir"' EXIT
+          for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+            verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+                --retry 2 --retry-all-errors --retry-delay 1 \
+                "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${asset}" \
+                -o "$published_dir/${asset}.part" &&
+                cmp -s "$asset" "$published_dir/${asset}.part"; then
+                mv "$published_dir/${asset}.part" "$published_dir/$asset"
+                verified=true
+                break
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            [ "$verified" = true ] || {
+              echo "Latest download for $asset differs from the CI-verified source." >&2
+              exit 1
+            }
+          done
+          (cd "$published_dir" && sha256sum -c SHA256SUMS)
