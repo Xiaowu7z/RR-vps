@@ -103,6 +103,17 @@ run_restore_case() (
 
     systemctl() {
         printf 'systemctl:%s\n' "$*" >> "$MOCK_OPERATION_LOG"
+        case "$*" in
+            'show -p LoadState --value argo-rr-health.timer'|\
+            'show -p LoadState --value argo-rr-health.service') printf 'loaded\n' ;;
+            'show -p ActiveState --value argo-rr-health.timer'|\
+            'show -p ActiveState --value argo-rr-health.service') printf 'inactive\n' ;;
+            'show -p UnitFileState --value argo-rr-health.timer') printf 'disabled\n' ;;
+            'show -p UnitFileState --value argo-rr-health.service') printf 'static\n' ;;
+            'show -p LoadState --value '*) printf 'loaded\n' ;;
+            'show -p ActiveState --value '*) printf 'inactive\n' ;;
+            'show -p UnitFileState --value '*) printf 'disabled\n' ;;
+        esac
         return 0
     }
     rr_stop_subscription_servers() {
@@ -164,15 +175,25 @@ commit_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_r
     'rr_write_phase committed')
 keep_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'KEEP_TRANSACTION=true')
+quarantine_clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
+    'clear-quarantine')
 finalize_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     '--post-update-finalize')
 clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'rr_clear_update_maintenance_marker')
-for value in "$commit_line" "$keep_line" "$finalize_line" "$clear_line"; do
+for value in "$commit_line" "$keep_line" "$quarantine_clear_line" "$finalize_line" "$clear_line"; do
     [[ "$value" =~ ^[0-9]+$ ]] || fail 'post-commit finalizer ordering evidence is incomplete'
 done
-[ "$commit_line" -lt "$keep_line" ] && [ "$keep_line" -lt "$finalize_line" ] && \
+[ "$commit_line" -lt "$keep_line" ] && [ "$keep_line" -lt "$quarantine_clear_line" ] && \
+    [ "$quarantine_clear_line" -lt "$finalize_line" ] && \
     [ "$finalize_line" -lt "$clear_line" ] || \
     fail 'finalizer is not protected by durable committed/KEEP state and maintenance'
+install_release_body=$(sed -n '/^rr_install_release() {/,/^}/p' \
+    "$REPO_ROOT/scripts/install-core.sh")
+post_commit_cleanup=${install_release_body#*KEEP_TRANSACTION=true}
+pre_finalize_cleanup=${post_commit_cleanup%%--post-update-finalize*}
+if grep -Fq 'rr_rollback' <<<"$pre_finalize_cleanup"; then
+    fail 'quarantine cleanup can still roll a committed safe candidate back'
+fi
 
 printf '%s\n' 'update external transaction regression: PASS'

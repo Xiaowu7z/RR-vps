@@ -29,6 +29,14 @@ source "$REPO_ROOT/modules/55-resilience.sh"
 source "$REPO_ROOT/modules/60-update.sh"
 
 RR_RESTORE_LOCK_FILE="$TEST_ROOT/locks/update.lock"
+RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/legacy/rr-update.lock"
+RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/bridge/legacy-update-bridge"
+mkdir -p "$(dirname "$RR_LEGACY_UPDATE_LOCK_FILE")"
+: > "$RR_LEGACY_UPDATE_LOCK_FILE"
+chmod 0644 "$RR_LEGACY_UPDATE_LOCK_FILE"
+install -d -m 700 "$(dirname "$RR_LEGACY_UPDATE_BRIDGE_FILE")"
+printf '%s\n' "$RR_LEGACY_UPDATE_BRIDGE_VALUE" > "$RR_LEGACY_UPDATE_BRIDGE_FILE"
+chmod 0600 "$RR_LEGACY_UPDATE_BRIDGE_FILE"
 health_runs="$TEST_ROOT/health-runs"
 health_logs="$TEST_ROOT/health-logs"
 : > "$health_runs"
@@ -42,14 +50,14 @@ ensure_runtime_health() {
     printf '%s\n' "${RR_UPDATE_LOCK_HELD:-0}" >> "$health_runs"
 }
 
-printf '%s\n' '[1/6] a normal health pass owns the root-only shared transaction lock'
+printf '%s\n' '[1/7] a normal health pass owns the root-only shared transaction lock'
 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'normal health pass did not receive delegated lock ownership'
 [ -d "$TEST_ROOT/locks" ] || fail 'root-only lock directory was not created'
 [ "$(stat -c '%u:%g:%a' "$TEST_ROOT/locks")" = 0:0:700 ] || fail 'lock directory mode/owner is unsafe'
 [ "$(stat -c '%u:%g:%a:%h' "$RR_RESTORE_LOCK_FILE")" = 0:0:600:1 ] || fail 'lock file mode/owner/link count is unsafe'
 
-printf '%s\n' '[2/6] a timer firing during update/backup skips without mutating or retry-failing'
+printf '%s\n' '[2/7] a timer firing during update/backup skips without mutating or retry-failing'
 : > "$health_runs"
 (
     exec 8>>"$RR_RESTORE_LOCK_FILE"
@@ -68,14 +76,32 @@ done
 rr_run_health_check || fail 'busy transaction lock should be an expected health skip'
 [ ! -s "$health_runs" ] || fail 'health body ran while another transaction owned the lock'
 
-printf '%s\n' '[3/6] an installer re-entry must explicitly delegate its already-held lock'
+printf '%s\n' '[3/7] an installer re-entry must explicitly delegate its already-held lock'
 RR_UPDATE_LOCK_HELD=1 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'delegated installer re-entry did not run the health body'
 : > "$TEST_ROOT/release-holder"
 wait "$LOCK_HOLDER_PID"
 LOCK_HOLDER_PID=""
 
-printf '%s\n' '[4/6] an unsafe lock path fails closed before health mutations'
+printf '%s\n' '[4/7] a nohup child cannot inherit either transaction lock fd'
+nohup_pid_file="$TEST_ROOT/nohup.pid"
+ensure_runtime_health() {
+    nohup bash -c 'printf "%s\n" "$$" > "$1"; sleep 30' _ "$nohup_pid_file" \
+        >/dev/null 2>&1 &
+}
+rr_run_health_check || fail 'health pass with a nohup child failed'
+for _ in $(seq 1 100); do
+    [ -s "$nohup_pid_file" ] && break
+    sleep 0.02
+done
+[ -s "$nohup_pid_file" ] || fail 'nohup inheritance fixture did not start'
+nohup_pid=$(cat "$nohup_pid_file")
+kill -0 "$nohup_pid" 2>/dev/null || fail 'nohup child exited before lock contention proof'
+flock -n "$RR_RESTORE_LOCK_FILE" -c true || fail 'nohup child inherited the new update lock fd'
+flock -n "$RR_LEGACY_UPDATE_LOCK_FILE" -c true || fail 'nohup child inherited the legacy update lock fd'
+kill "$nohup_pid" >/dev/null 2>&1 || true
+
+printf '%s\n' '[5/7] an unsafe lock path fails closed before health mutations'
 : > "$health_runs"
 mkdir -p "$TEST_ROOT/unsafe"
 ln -s "$TEST_ROOT/attacker-target" "$TEST_ROOT/unsafe/update.lock"
@@ -110,7 +136,7 @@ eval "$(extract_function rr_snapshot_runtime)"
 declare -F rr_freeze_health_monitor >/dev/null || fail 'installer freeze helper is missing'
 declare -F rr_snapshot_runtime >/dev/null || fail 'installer snapshot function is missing'
 
-printf '%s\n' '[5/6] installer stops timer and in-flight service before its first snapshot read'
+printf '%s\n' '[6/7] installer stops timer and in-flight service before its first snapshot read'
 RR_TX_ROOT="$TEST_ROOT/transactions-root"
 RR_ACTIVE_TX="$RR_TX_ROOT/active"
 RR_LIB_DIR="$TEST_ROOT/live-runtime"
@@ -179,14 +205,15 @@ first_backup=$(grep -n '^backup-' "$operation_log" | head -n 1 | cut -d: -f1)
 [ -f "$BACKUP_DIR/health_timer_was_enabled" ] || fail 'snapshot lost the pre-update timer enabled state'
 [ "$RR_HEALTH_MONITOR_FROZEN" = true ] || fail 'snapshot did not retain frozen state through switching'
 
-printf '%s\n' '[6/6] a pre-switch abort restores the timer and production call sites delegate re-entry'
+printf '%s\n' '[7/7] a pre-switch abort restores the timer and production call sites delegate re-entry'
 : > "$RR_HEALTH_TIMER_FILE"
 rr_resume_health_monitor_after_abort || fail 'abort did not restore the enabled health timer'
 [ "$RR_HEALTH_MONITOR_FROZEN" = false ] || fail 'abort left health monitor marked frozen'
 grep -Fxq resume-health "$operation_log" || fail 'abort never re-enabled the saved timer state'
-grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check' "$REPO_ROOT/scripts/install-core.sh" || \
+grep -Fq 'rr_run_with_delegated_update_lock' "$REPO_ROOT/scripts/install-core.sh" && \
+grep -Fq '"$RR_LAUNCHER" --health-check' "$REPO_ROOT/scripts/install-core.sh" || \
     fail 'installer rollback no longer delegates the shared lock to health re-entry'
-grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update' "$REPO_ROOT/scripts/install-core.sh" || \
+grep -Fq '"$RR_LAUNCHER" --post-update' "$REPO_ROOT/scripts/install-core.sh" || \
     fail 'installer migration re-entry no longer declares shared-lock ownership'
 grep -Fq 'rr_run_health_check' "$REPO_ROOT/rr" || fail 'launcher health entry bypasses the lock wrapper'
 

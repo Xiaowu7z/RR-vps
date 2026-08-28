@@ -8,7 +8,7 @@ write_auto_update_worker() {
     worker_tmp=$(mktemp "${worker_path%/*}/.auto_update_sub.py.XXXXXX") || return 1
     cat > "$worker_tmp" <<'PYEOF'
 #!/usr/bin/env python3
-# RR_AUTO_UPDATE_VERSION=8
+# RR_AUTO_UPDATE_VERSION=10
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import fcntl
@@ -27,11 +27,107 @@ LOG_FILE = "/var/log/auto_update_sub.log"
 SUB_ROOT = "/tmp/sub_server"
 MAX_LOG_BYTES = 1024 * 1024
 UPDATE_LOCK_PATH = "/run/rr-vps/locks/update.lock"
+LEGACY_UPDATE_LOCK_PATH = "/run/lock/rr-update.lock"
+LEGACY_UPDATE_BRIDGE_PATH = "/run/rr-vps/legacy-update-bridge"
+LEGACY_UPDATE_BRIDGE_VALUE = b"rr-legacy-update-bridge-v1\n"
+
+
+def _legacy_lock_stat_is_safe(lock_stat):
+    mode = stat.S_IMODE(lock_stat.st_mode)
+    return (
+        stat.S_ISREG(lock_stat.st_mode)
+        and lock_stat.st_uid == 0
+        and lock_stat.st_gid == 0
+        and lock_stat.st_nlink == 1
+        and not mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX | 0o111 | 0o022)
+    )
+
+
+def _legacy_bridge_required():
+    try:
+        marker_stat = os.lstat(LEGACY_UPDATE_BRIDGE_PATH)
+    except FileNotFoundError:
+        return False
+    parent = os.path.dirname(LEGACY_UPDATE_BRIDGE_PATH)
+    parent_stat = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_gid != 0
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+        or os.path.realpath(parent) != parent
+        or not stat.S_ISREG(marker_stat.st_mode)
+        or marker_stat.st_uid != 0
+        or marker_stat.st_gid != 0
+        or marker_stat.st_nlink != 1
+        or stat.S_IMODE(marker_stat.st_mode) != 0o600
+        or marker_stat.st_size != len(LEGACY_UPDATE_BRIDGE_VALUE)
+    ):
+        raise RuntimeError("unsafe legacy update bridge marker")
+    with open(LEGACY_UPDATE_BRIDGE_PATH, "rb") as marker_file:
+        if marker_file.read(len(LEGACY_UPDATE_BRIDGE_VALUE) + 1) != LEGACY_UPDATE_BRIDGE_VALUE:
+            raise RuntimeError("invalid legacy update bridge marker")
+    return True
+
+
+def _open_legacy_update_lock(nofollow, cloexec):
+    required = _legacy_bridge_required()
+    try:
+        path_stat = os.lstat(LEGACY_UPDATE_LOCK_PATH)
+    except FileNotFoundError:
+        if required:
+            raise RuntimeError("required legacy update lock is missing")
+        return None
+    if not required:
+        # Without a trusted root-only same-boot marker, low-privilege
+        # preplacements in shared /run/lock are ignored without being opened,
+        # followed, changed or deleted. Root-owned abnormal evidence remains a
+        # host-integrity failure.
+        if path_stat.st_uid != 0:
+            return None
+        if path_stat.st_gid != 0 or not _legacy_lock_stat_is_safe(path_stat):
+            raise RuntimeError("unsafe root-owned legacy update lock evidence")
+        return None
+    parent = os.path.dirname(LEGACY_UPDATE_LOCK_PATH)
+    parent_stat = os.lstat(parent)
+    parent_mode = stat.S_IMODE(parent_stat.st_mode)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != 0
+        or parent_stat.st_gid != 0
+        or os.path.realpath(parent) != parent
+        or (parent_mode & 0o002 and not parent_mode & stat.S_ISVTX)
+    ):
+        raise RuntimeError("unsafe legacy update lock directory")
+
+    if not _legacy_lock_stat_is_safe(path_stat):
+        raise RuntimeError("unsafe legacy update lock file")
+    descriptor = os.open(
+        LEGACY_UPDATE_LOCK_PATH,
+        os.O_RDONLY | os.O_NONBLOCK | nofollow | cloexec,
+    )
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        current_path_stat = os.lstat(LEGACY_UPDATE_LOCK_PATH)
+        if (
+            not _legacy_lock_stat_is_safe(descriptor_stat)
+            or not _legacy_lock_stat_is_safe(current_path_stat)
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            != (current_path_stat.st_dev, current_path_stat.st_ino)
+        ):
+            raise RuntimeError("legacy update lock changed while opening")
+        legacy_lock = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        return legacy_lock
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 # Do not race update/restore snapshots.  The verified update installer already
-# owns this lock and explicitly delegates it through RR_WORKER_LOCK_HELD; cron
-# and manual standalone runs acquire their own non-blocking lock instead.
+# owns both locks and explicitly delegates them through RR_WORKER_LOCK_HELD;
+# cron and manual standalone runs acquire new then 7.1.0 compatibility locks.
 WORKER_LOCK = None
+LEGACY_WORKER_LOCK = None
 if os.environ.get("RR_WORKER_LOCK_HELD") != "1":
     try:
         lock_parent = os.path.dirname(UPDATE_LOCK_PATH)
@@ -86,11 +182,18 @@ if os.environ.get("RR_WORKER_LOCK_HELD") != "1":
             if descriptor >= 0:
                 os.close(descriptor)
         fcntl.flock(WORKER_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        LEGACY_WORKER_LOCK = _open_legacy_update_lock(nofollow, cloexec)
+        if LEGACY_WORKER_LOCK is not None:
+            fcntl.flock(LEGACY_WORKER_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        if LEGACY_WORKER_LOCK is not None:
+            LEGACY_WORKER_LOCK.close()
         if WORKER_LOCK is not None:
             WORKER_LOCK.close()
         sys.exit(0)
     except (OSError, RuntimeError):
+        if LEGACY_WORKER_LOCK is not None:
+            LEGACY_WORKER_LOCK.close()
         if WORKER_LOCK is not None:
             WORKER_LOCK.close()
         sys.exit(1)

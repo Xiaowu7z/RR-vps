@@ -2,7 +2,7 @@
 
 # RR-vps 稳定 bootstrap。
 # 这里故意不解析 manifest、不读取 bundle 成员，也不维护发布文件白名单。
-# 它只获取当前 main 的核心安装器与更新保险层；发布安全校验、事务安装和
+# 它只获取固定 Release Tag 的核心安装器与更新保险层；发布安全校验、事务安装和
 # 回滚全部交给 scripts/install-core.sh。这样未来发布文件增删不会锁死 8 号更新。
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="2"
@@ -19,7 +19,7 @@ RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"
 RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"
-RR_CORE_SHA256="ebed9eb6587bd5adfd9269c3ec294c9f00f204afdaa4da13425cb1981ff6cac6"
+RR_CORE_SHA256="c4e74ea29f310811cd0f68e632a2d8bbbad67a5b2fed6b48b62a7402bd3c769c"
 RR_GUARD_SHA256="07978192d9ea24891cf0914def41d67437e21841c4a7344c6c16c353bd67c7f0"
 RR_MODE="${1:-install}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
@@ -224,7 +224,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "8a17fe67b5914cb366f73df1299eac0e2b5fce64afd9445ab67b0e5d52540836" ]
+# [ "$actual" = "6a05121ab448932209085fc8b8b9c829473de1dfd5888084961288c85c974150" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

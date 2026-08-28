@@ -205,9 +205,154 @@ _install_prompt_identity() {
 
 # 12. 卸载与清理
 # ==========================================
+_uninstall_quarantine_present() {
+    local marker="${1:-/var/lib/rr-update/subscription-quarantine}"
+    local unit="${2:-/etc/systemd/system/rr-subscription-quarantine.service}"
+    local ready="${3:-/run/rr-subscription-quarantine.ready}"
+    local guard_state="${RR_QUARANTINE_GUARD_STATE:-/var/lib/rr-quarantine/guard-state}"
+    local guard_self="${RR_QUARANTINE_GUARD_SELF:-/usr/local/libexec/rr-vps/subscription-quarantine-guard}"
+    local artifact="" firewall_backend="" firewall_rules=""
+
+    for artifact in "$marker" "$unit" "$ready" "$guard_state" "$guard_self"; do
+        if [ -e "$artifact" ] || [ -L "$artifact" ]; then
+            return 0
+        fi
+    done
+    if systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
+       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+        return 0
+    fi
+    # A previous affected uninstall may have removed the marker while leaving
+    # the exact raw-table rule behind. Detect it, but never broadly flush or
+    # infer a port from unrelated firewall state.
+    for firewall_backend in iptables ip6tables; do
+        command -v "$firewall_backend" >/dev/null 2>&1 || continue
+        if ! firewall_rules=$("$firewall_backend" -w 5 -t raw -S PREROUTING 2>/dev/null); then
+            # Unknown firewall state is still quarantine evidence. Failing
+            # open here could delete the only trusted recovery helper while
+            # an orphan DROP rule remains installed.
+            return 0
+        fi
+        if [[ "$firewall_rules" == *'rr-vps unsafe rollback subscription quarantine'* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_uninstall_recovery_helper_is_trusted() {
+    local helper="$1" helper_dir="" canonical="" current="" parent=""
+    local metadata="" owner="" group="" mode="" links=""
+    local dir_owner="" dir_group="" dir_mode=""
+    [ -f "$helper" ] && [ ! -L "$helper" ] && [ -x "$helper" ] || return 1
+    canonical=$(readlink -f -- "$helper" 2>/dev/null) || return 1
+    [ "$canonical" = "$helper" ] || return 1
+    helper_dir=$(dirname -- "$helper") || return 1
+    [ -d "$helper_dir" ] && [ ! -L "$helper_dir" ] || return 1
+    metadata=$(stat -c '%u %g %a %h' -- "$helper" 2>/dev/null) || return 1
+    read -r owner group mode links <<< "$metadata"
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 0022)) -eq 0 ] && [ $((8#$mode & 0100)) -ne 0 ] &&
+        [ $((8#$mode & 07000)) -eq 0 ] || return 1
+    current="$helper_dir"
+    while :; do
+        [ -d "$current" ] && [ ! -L "$current" ] || return 1
+        metadata=$(stat -c '%u %g %a' -- "$current" 2>/dev/null) || return 1
+        read -r dir_owner dir_group dir_mode <<< "$metadata"
+        [ "$dir_owner" = 0 ] && [ "$dir_group" = 0 ] || return 1
+        [[ "$dir_mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        if [ $((8#$dir_mode & 0022)) -ne 0 ] && \
+           [ $((8#$dir_mode & 01000)) -eq 0 ]; then
+            return 1
+        fi
+        [ "$current" = / ] && break
+        parent=$(dirname -- "$current") || return 1
+        [ "$parent" != "$current" ] || return 1
+        current="$parent"
+    done
+    return 0
+}
+
+_uninstall_clear_subscription_quarantine() {
+    local helper="${1:-/usr/local/sbin/rr-update-recover}"
+    local marker="${2:-/var/lib/rr-update/subscription-quarantine}"
+    local unit="${3:-/etc/systemd/system/rr-subscription-quarantine.service}"
+    local ready="${4:-/run/rr-subscription-quarantine.ready}"
+
+    _uninstall_quarantine_present "$marker" "$unit" "$ready" || return 0
+    if ! _uninstall_recovery_helper_is_trusted "$helper"; then
+        echo -e "${RED}[失败] 检测到订阅隔离仍在生效，但恢复程序不可信；为避免留下端口或防火墙残留，已中止卸载。${RESET}" >&2
+        return 1
+    fi
+    if ! RR_UPDATE_LOCK_HELD=1 "$helper" clear-quarantine; then
+        echo -e "${RED}[失败] 无法安全解除旧版订阅隔离；未继续删除恢复程序和事务证据。${RESET}" >&2
+        return 1
+    fi
+    if _uninstall_quarantine_present "$marker" "$unit" "$ready"; then
+        echo -e "${RED}[失败] 订阅隔离清理后仍有残留；未继续卸载，请先运行 rr-update-recover status 诊断。${RESET}" >&2
+        return 1
+    fi
+    return 0
+}
+
+_uninstall_acquire_existing_legacy_lock() {
+    local lock_file="$1" output_name="$2" lock_dir="" canonical="" metadata=""
+    local owner="" group="" mode="" links="" path_identity="" fd_identity="" candidate_fd=""
+    local shell_pid="${BASHPID:-$$}" fd_path=""
+    printf -v "$output_name" '%s' ''
+    if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        return 0
+    fi
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    [ "$(stat -c '%u:%g' -- "$lock_dir" 2>/dev/null)" = 0:0 ] || return 1
+    metadata=$(stat -c '%u %g %a %h' -- "$lock_file" 2>/dev/null) || return 1
+    read -r owner group mode links <<< "$metadata"
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 07133)) -eq 0 ] || return 1
+    exec {candidate_fd}<"$lock_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$candidate_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$candidate_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || {
+        exec {candidate_fd}>&-
+        return 1
+    }
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || {
+        exec {candidate_fd}>&-
+        return 1
+    }
+    if [ "$path_identity" != "$fd_identity" ] ||
+       [[ "$fd_identity" != *:0:0:*:1 ]] || ! flock -n "$candidate_fd"; then
+        exec {candidate_fd}>&-
+        return 1
+    fi
+    printf -v "$output_name" '%s' "$candidate_fd"
+}
+
+_uninstall_health_unit_is_safely_stopped() {
+    local unit="$1" unit_path="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}/$1"
+    local load_state="" active_state="" unit_file_state=""
+    if [ -e "$unit_path" ] || [ -L "$unit_path" ]; then
+        systemctl stop "$unit" >/dev/null 2>&1 || return 1
+        systemctl disable "$unit" >/dev/null 2>&1 || return 1
+    fi
+    load_state=$(systemctl show --property=LoadState --value "$unit" 2>/dev/null) || return 1
+    active_state=$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null) || return 1
+    unit_file_state=$(systemctl show --property=UnitFileState --value "$unit" 2>/dev/null) || return 1
+    if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+        unit_file_state=not-found
+    fi
+    case "$active_state" in inactive|failed) ;; *) return 1 ;; esac
+    case "$unit_file_state" in disabled|static|masked|not-found) ;; *) return 1 ;; esac
+}
+
 uninstall_all() {
-    local reinstall_url="https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh"
-    local project_url="https://github.com/Xiaowu7z/RR-vps"
+    local result=0
     echo -e "\n${RED}此操作会删除 rr、Sing-box、RR Nexus 数据库、节点配置、证书、订阅及本脚本防火墙规则。${RESET}"
     read -p "确认完全卸载请输入 y: " uninstall_confirm
     if [ "$uninstall_confirm" != "y" ] && [ "$uninstall_confirm" != "Y" ]; then
@@ -216,19 +361,52 @@ uninstall_all() {
         return 0
     fi
     echo -e "\n${RED}正在完全卸载并清理残留...${RESET}"
+    rr_run_with_update_locks direct 0 uninstall_all_locked || result=$?
+    case "$result" in
+        0) exit 0 ;;
+        75)
+            echo -e "${RED}[失败] 更新、恢复、备份或健康修复正在运行，已拒绝并发卸载。${RESET}" >&2
+            return 1
+            ;;
+        76)
+            echo -e "${RED}[失败] 共享事务锁或旧版兼容锁不安全，已拒绝卸载。${RESET}" >&2
+            return 1
+            ;;
+        *) return "$result" ;;
+    esac
+}
+
+uninstall_all_locked() {
+    local reinstall_url="https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh"
+    local project_url="https://github.com/Xiaowu7z/RR-vps"
+    local legacy_restore_lock_file="${RR_LEGACY_RESTORE_LOCK_FILE:-/run/lock/rr-restore-live.lock}"
+    local legacy_restore_lock_fd=""
     [ -f "$CONFIG_FILE" ] && load_config_with_defaults
-    systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
-    systemctl stop argo-rr-health.service >/dev/null 2>&1 || true
+    # The outer supervisor already owns new then legacy-update locks. Keep the
+    # old restore-live compatibility inode too when it exists, without creating
+    # or changing it.
+    if ! _uninstall_acquire_existing_legacy_lock \
+            "$legacy_restore_lock_file" legacy_restore_lock_fd; then
+        [ -z "$legacy_restore_lock_fd" ] || exec {legacy_restore_lock_fd}>&-
+        echo -e "${RED}[失败] 检测到旧版更新或恢复事务仍在运行，已拒绝并发卸载。${RESET}" >&2
+        return 1
+    fi
+    # Freeze every writer before releasing a legacy quarantine. Otherwise a
+    # health pass can restart the old public subscription process in the
+    # interval between removing the raw DROP rule and deleting the runtime.
+    if ! _uninstall_health_unit_is_safely_stopped argo-rr-health.timer ||
+       ! _uninstall_health_unit_is_safely_stopped argo-rr-health.service ||
+       ! stop_subscription_servers >/dev/null 2>&1; then
+        [ -z "$legacy_restore_lock_fd" ] || exec {legacy_restore_lock_fd}>&-
+        echo -e "${RED}[失败] 无法冻结健康检查或订阅进程，隔离尚未解除，已中止卸载。${RESET}" >&2
+        return 1
+    fi
     rm -f /etc/systemd/system/argo-rr-health.timer /etc/systemd/system/argo-rr-health.service
     systemctl disable --now rr-nexus >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/rr-nexus.service
     systemctl disable --now rr-update-recovery.service >/dev/null 2>&1 || true
     systemctl disable --now rr-restore-recovery.service >/dev/null 2>&1 || true
     systemctl disable --now rr-restore-watchdog.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/rr-update-recovery.service \
-        /etc/systemd/system/rr-restore-recovery.service \
-        /etc/systemd/system/rr-restore-watchdog.service \
-        /usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state
     local restore_gate_unit=""
     for restore_gate_unit in sing-box.service rr-nexus.service rr-subscription.service \
         cloudflared.service nginx.service argo-rr-health.service; do
@@ -237,9 +415,8 @@ uninstall_all() {
     done
     rm -f /run/rr-vps/restore-live /run/rr-vps/restore-watch-request \
         /run/rr-vps/update-maintenance \
-        /run/rr-vps/locks/restore-live.lock /run/rr-vps/locks/update.lock \
+        /run/rr-vps/locks/restore-live.lock \
         /run/rr-vps/locks/nexus-sync.lock /run/rr-vps/locks/nexus-security.lock \
-        /run/lock/rr-restore-live.lock /run/lock/rr-update.lock \
         /run/lock/rr-vps-nexus-sync.lock /run/lock/rr-nexus-security.lock
     rmdir /run/rr-vps/locks /run/rr-vps >/dev/null 2>&1 || true
     declare -F nexus_remove_public_proxy >/dev/null 2>&1 && nexus_remove_public_proxy
@@ -288,16 +465,39 @@ uninstall_all() {
         echo -e "${YELLOW}[警告] ${SUB_ROOT} 未通过安全检查，卸载未删除该路径。${RESET}" >&2
     fi
     rm -rf /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
-        /etc/rr-update /var/lib/rr-nexus /var/lib/rr-update /var/lib/rr-backup /var/www/rr-nexus-certbot \
+        /etc/rr-update /var/lib/rr-nexus /var/lib/rr-backup /var/www/rr-nexus-certbot \
         "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
     rm -f /etc/sysctl.d/99-argo-rr.conf "$ARGO_PID_FILE" "$ARGO_LOG_FILE" \
         /tmp/sub_server.pid /tmp/sub_server.bind /tmp/argo_rr_cloudflared.pid /tmp/argo.log
+    # Keep the quarantine until the old launcher/runtime and every health
+    # restart path are durably absent. A SIGKILL before this point therefore
+    # still reboots into the guard instead of exposing the legacy subscription.
+    if [ -e "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ] ||
+       [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] ||
+       ! _uninstall_health_unit_is_safely_stopped argo-rr-health.timer ||
+       ! _uninstall_health_unit_is_safely_stopped argo-rr-health.service ||
+       ! stop_subscription_servers >/dev/null 2>&1 ||
+       ! _uninstall_clear_subscription_quarantine \
+           /usr/local/sbin/rr-update-recover \
+           /var/lib/rr-update/subscription-quarantine \
+           /etc/systemd/system/rr-subscription-quarantine.service \
+           /run/rr-subscription-quarantine.ready; then
+        [ -z "$legacy_restore_lock_fd" ] || exec {legacy_restore_lock_fd}>&-
+        echo -e "${RED}[失败] 旧运行时已停止，但订阅隔离尚未安全解除；恢复程序和证据已保留。${RESET}" >&2
+        return 1
+    fi
+    rm -f /etc/systemd/system/rr-update-recovery.service \
+        /etc/systemd/system/rr-restore-recovery.service \
+        /etc/systemd/system/rr-restore-watchdog.service \
+        /usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state
+    rm -rf -- /var/lib/rr-update
+    systemctl daemon-reload >/dev/null 2>&1 || true
     echo -e "${GREEN}清理完毕，欢迎随时再次使用 RR-vps！${RESET}"
     echo -e "${CYAN}项目地址 / Project:${RESET} ${project_url}"
     echo -e "${YELLOW}重新安装 / Reinstall:${RESET}"
     echo "bash <(curl -fsSL ${reinstall_url})"
     echo ""
-    exit 0
+    return 0
 }
 
 # ==========================================

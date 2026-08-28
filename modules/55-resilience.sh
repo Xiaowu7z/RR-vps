@@ -7,6 +7,9 @@ RR_RESTORE_ACTIVE="${RR_BACKUP_WORK_DIR}/active"
 RR_RESTORE_RUNTIME_READY="${RR_BACKUP_WORK_DIR}/runtime-ready"
 RR_RESTORE_SYSTEMD_DIR="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}"
 RR_RESTORE_LOCK_FILE="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
+RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
+RR_LEGACY_UPDATE_BRIDGE_VALUE="rr-legacy-update-bridge-v1"
 RR_RESTORE_LIVE_LOCK_FILE="${RR_RESTORE_LIVE_LOCK_FILE:-/run/rr-vps/locks/restore-live.lock}"
 RR_NEXUS_SECURITY_LOCK_FILE="${RR_NEXUS_SECURITY_LOCK_FILE:-/run/rr-vps/locks/nexus-security.lock}"
 RR_RESTORE_LIVE_MARKER="${RR_RESTORE_LIVE_MARKER:-/run/rr-vps/restore-live}"
@@ -45,6 +48,263 @@ rr_secure_lock_fd_is_safe() {
     path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
     fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
     [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
+}
+
+rr_legacy_update_lock_mode_is_safe() {
+    local mode="$1" mode_value=0
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # 7.1.0 normally created this inode as 0644. Preserve an existing inode
+    # exactly, but reject special/execute bits and group/other write access.
+    (( (mode_value & 07133) == 0 ))
+}
+
+rr_legacy_update_bridge_required() {
+    local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" directory="" canonical=""
+    local expected_size=$(( ${#RR_LEGACY_UPDATE_BRIDGE_VALUE} + 1 ))
+    local -a marker_lines=()
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    directory=$(dirname -- "$marker") || return 2
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 2
+    canonical=$(readlink -f -- "$directory" 2>/dev/null) || return 2
+    [ "$canonical" = "$directory" ] || return 2
+    [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ] || return 2
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 2
+    [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || return 2
+    [ "$(stat -c %s -- "$marker" 2>/dev/null)" = "$expected_size" ] || return 2
+    mapfile -t marker_lines < "$marker" || return 2
+    [ "${#marker_lines[@]}" -eq 1 ] && \
+        [ "${marker_lines[0]}" = "$RR_LEGACY_UPDATE_BRIDGE_VALUE" ] || return 2
+}
+
+rr_legacy_update_lock_parent_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local lock_dir="" canonical="" owner="" group="" mode="" mode_value=0
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    IFS=: read -r owner group mode < <(
+        stat -c '%u:%g:%a' -- "$lock_dir" 2>/dev/null
+    ) || return 1
+    [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # /run/lock is commonly 1777. A world-writable compatibility directory is
+    # acceptable only with sticky-bit replacement protection.
+    if (( (mode_value & 0002) != 0 && (mode_value & 01000) == 0 )); then
+        return 1
+    fi
+}
+
+rr_legacy_update_lock_path_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local owner="" group="" mode="" links=""
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    IFS=: read -r owner group mode links < <(
+        stat -c '%u:%g:%a:%h' -- "$lock_file" 2>/dev/null
+    ) || return 1
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_legacy_update_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" path_identity_after=""
+    local fd_identity="" owner="" group="" mode="" links=""
+    local shell_pid="${BASHPID:-$$}" fd_path=""
+    fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ -f "$fd_path" ] || return 1
+    [ ! -L "$lock_file" ] || return 1
+    path_identity_after=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && \
+        [ "$path_identity_after" = "$fd_identity" ] || return 1
+    IFS=: read -r _ _ owner group mode links <<<"$fd_identity"
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_acquire_legacy_update_lock_fd() {
+    local output_name="$1" lock_file="${2:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local candidate_fd="" marker_state=0 evidence_owner="" evidence_group=""
+    printf -v "$output_name" '%s' ''
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 1
+    if [ "$marker_state" -eq 1 ]; then
+        # Without a trusted same-boot marker the shared predictable name is not
+        # authoritative. Ignore any demonstrably non-root preplacement without
+        # opening, following, changing or deleting it. Root-owned abnormal
+        # evidence is still a host-integrity failure and remains fail-closed.
+        if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+            return 0
+        fi
+        IFS=: read -r evidence_owner evidence_group < <(
+            stat -c '%u:%g' -- "$lock_file" 2>/dev/null
+        ) || return 1
+        if [ "$evidence_owner" != 0 ]; then
+            return 0
+        fi
+        [ "$evidence_group" = 0 ] || return 1
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+        rr_legacy_update_lock_parent_is_safe "$lock_file" || return 1
+        rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+        return 0
+    fi
+    # A trusted marker means an old process may still exist in this boot. The
+    # public inode is now required: missing, unsafe, replaced or busy all fail.
+    [ -e "$lock_file" ] || [ -L "$lock_file" ] || return 1
+    rr_legacy_update_lock_parent_is_safe "$lock_file" || return 1
+    rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+    # Read-only opening deliberately leaves a trusted 7.1.0 inode's content,
+    # ownership and mode untouched.
+    exec {candidate_fd}<"$lock_file" || return 1
+    if ! rr_legacy_update_lock_fd_is_safe "$lock_file" "$candidate_fd"; then
+        exec {candidate_fd}>&-
+        return 1
+    fi
+    if ! flock -n "$candidate_fd"; then
+        exec {candidate_fd}>&-
+        return 75
+    fi
+    printf -v "$output_name" '%s' "$candidate_fd"
+}
+
+rr_inherited_update_lock_fds_present() {
+    local fd_path="" fd_number="" fd_identity="" lock_file="" lock_identity=""
+    local shell_pid="${BASHPID:-$$}" fd_root=""
+    local marker_state=0
+    local -a lock_identities=()
+    lock_file="$RR_RESTORE_LOCK_FILE"
+    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 2
+        lock_identity=$(stat -c '%d:%i' -- "$lock_file" 2>/dev/null) || return 2
+        lock_identities+=("$lock_identity")
+    fi
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 2
+    if [ "$marker_state" -eq 0 ]; then
+        rr_legacy_update_lock_parent_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 2
+        rr_legacy_update_lock_path_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 2
+        lock_identity=$(stat -c '%d:%i' -- "$RR_LEGACY_UPDATE_LOCK_FILE" 2>/dev/null) || return 2
+        lock_identities+=("$lock_identity")
+    fi
+    [ "${#lock_identities[@]}" -gt 0 ] || return 1
+    fd_root="/proc/$shell_pid/fd"
+    [ -d "$fd_root" ] || fd_root=/dev/fd
+    [ -d "$fd_root" ] || return 2
+    for fd_path in "$fd_root"/*; do
+        fd_number=${fd_path##*/}
+        [[ "$fd_number" =~ ^[0-9]+$ ]] && [ "$fd_number" -gt 2 ] || continue
+        fd_identity=$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null) || continue
+        for lock_identity in "${lock_identities[@]}"; do
+            [ "$fd_identity" != "$lock_identity" ] || return 0
+        done
+    done
+    return 1
+}
+
+rr_close_inherited_update_lock_fds() {
+    local fd_path="" fd_number="" fd_identity="" lock_file="" lock_identity=""
+    local shell_pid="${BASHPID:-$$}" fd_root=""
+    local marker_state=0
+    local -a lock_identities=()
+    lock_file="$RR_RESTORE_LOCK_FILE"
+    if [ -f "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        lock_identity=$(stat -c '%d:%i' -- "$lock_file" 2>/dev/null) || return 1
+        lock_identities+=("$lock_identity")
+    fi
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 1
+    if [ "$marker_state" -eq 0 ]; then
+        rr_legacy_update_lock_parent_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 1
+        rr_legacy_update_lock_path_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 1
+        lock_identity=$(stat -c '%d:%i' -- "$RR_LEGACY_UPDATE_LOCK_FILE" 2>/dev/null) || return 1
+        lock_identities+=("$lock_identity")
+    fi
+    fd_root="/proc/$shell_pid/fd"
+    [ -d "$fd_root" ] || fd_root=/dev/fd
+    [ -d "$fd_root" ] || return 1
+    for fd_path in "$fd_root"/*; do
+        fd_number=${fd_path##*/}
+        [[ "$fd_number" =~ ^[0-9]+$ ]] && [ "$fd_number" -gt 2 ] || continue
+        fd_identity=$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null) || continue
+        for lock_identity in "${lock_identities[@]}"; do
+            [ "$fd_identity" = "$lock_identity" ] || continue
+            # fd_number is regex-validated before brace-fd close expansion.
+            local inherited_fd="$fd_number"
+            exec {inherited_fd}>&-
+            break
+        done
+    done
+}
+
+rr_run_without_inherited_update_lock_fds() {
+    local callback="$1" probe_result=0
+    shift
+    rr_inherited_update_lock_fds_present || probe_result=$?
+    case "$probe_result" in
+        0)
+            (
+                rr_close_inherited_update_lock_fds || return 1
+                RR_UPDATE_LOCK_FDS_CLOSED=1 RR_UPDATE_LOCK_HELD=1 \
+                    RR_RESTORE_LOCK_HELD=1 "$callback" "$@"
+            )
+            ;;
+        1)
+            RR_UPDATE_LOCK_FDS_CLOSED=1 RR_UPDATE_LOCK_HELD=1 \
+                RR_RESTORE_LOCK_HELD=1 "$callback" "$@"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_run_with_update_locks() {
+    local callback_mode="$1" wait_seconds="$2" callback="$3"
+    local new_lock_fd="" legacy_lock_fd="" result=0
+    shift 3
+    case "$callback_mode" in direct|isolated) ;; *) return 76 ;; esac
+    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 76
+    exec {new_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 76
+    if ! rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$new_lock_fd"; then
+        exec {new_lock_fd}>&-
+        return 76
+    fi
+    if [ "$wait_seconds" = 0 ]; then
+        flock -n "$new_lock_fd" || { exec {new_lock_fd}>&-; return 75; }
+    else
+        [[ "$wait_seconds" =~ ^[0-9]+$ ]] && [ "$wait_seconds" -ge 1 ] && \
+            [ "$wait_seconds" -le 86400 ] || { exec {new_lock_fd}>&-; return 76; }
+        flock -w "$wait_seconds" "$new_lock_fd" || { exec {new_lock_fd}>&-; return 75; }
+    fi
+    if rr_acquire_legacy_update_lock_fd legacy_lock_fd "$RR_LEGACY_UPDATE_LOCK_FILE"; then
+        :
+    else
+        result=$?
+        exec {new_lock_fd}>&-
+        [ "$result" -ne 1 ] || result=76
+        return "$result"
+    fi
+    if [ "$callback_mode" = isolated ]; then
+        (
+            [ -z "$legacy_lock_fd" ] || exec {legacy_lock_fd}>&-
+            exec {new_lock_fd}>&-
+            RR_UPDATE_LOCK_OWNER=0 RR_UPDATE_LOCK_FDS_CLOSED=1 \
+                RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+                "$callback" "$@"
+        ) || result=$?
+    else
+        RR_UPDATE_LOCK_OWNER=1 RR_UPDATE_LOCK_FDS_CLOSED=0 \
+            RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+            "$callback" "$@" || result=$?
+    fi
+    [ -z "$legacy_lock_fd" ] || exec {legacy_lock_fd}>&-
+    exec {new_lock_fd}>&-
+    return "$result"
 }
 
 rr_ensure_resilience_dependencies() {
@@ -649,25 +909,30 @@ rr_backup_capture_crontab() {
 }
 
 rr_backup_create() (
-    local output="${1:-}" stage="" archive="" relative="" sha="" now="" backup_lock_fd="" unsupported=""
+    local result=0
+    rr_run_with_update_locks direct 0 rr_backup_create_locked "$@" || result=$?
+    if [ "$result" -eq 75 ]; then
+        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
+        return 1
+    fi
+    [ "$result" -ne 76 ] || result=1
+    return "$result"
+)
+
+rr_backup_create_locked() {
+    local output="${1:-}" stage="" archive="" relative="" sha="" now="" unsupported=""
     rr_backup_create_cleanup() {
         [ -z "$stage" ] || ! rr_backup_stage_is_safe "$stage" create || rm -rf -- "$stage"
     }
     trap rr_backup_create_cleanup EXIT
     trap 'exit 143' HUP INT TERM
     rr_ensure_resilience_dependencies || { printf '无法安装加密备份所需组件。\n' >&2; return 1; }
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {backup_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$backup_lock_fd" || return 1
-    if ! flock -n "$backup_lock_fd"; then
-        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
-        return 1
-    fi
     rr_backup_prepare_work_dir || {
         printf '备份工作目录的所有者、权限或路径不安全。\n' >&2
         return 1
     }
-    RR_RESTORE_LOCK_HELD=1 rr_restore_recover_active || return 1
+    RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+        rr_restore_recover_active || return 1
     rr_backup_prune_stale_stages || return 1
     load_config_with_defaults || return 1
     [ -f "$CONFIG_FILE" ] && [ "$INSTALL_COMPLETE" = true ] || {
@@ -747,7 +1012,7 @@ rr_backup_create() (
     stage=""
     printf '加密备份已生成：%s\n' "$output"
     printf '请把文件与口令分开保存；遗失口令无法恢复。\n'
-)
+}
 
 rr_restore_apply_tree() {
     local root="$1" policy="${2:-portable}" source="" relative="" target="" temporary="" mode=""
@@ -1187,7 +1452,22 @@ rr_restore_service_gate() {
 }
 
 rr_restore_watch_active() {
-    local expected_stage="" current_stage="" lock_fd="" armed_from_request=false result=0
+    local result=0
+    if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ] && \
+       [ ! -e "$RR_RESTORE_WATCH_REQUEST" ] && [ ! -L "$RR_RESTORE_WATCH_REQUEST" ]; then
+        return 0
+    fi
+    [[ "$RR_RESTORE_WATCH_TIMEOUT" =~ ^[0-9]+$ ]] && \
+        [ "$RR_RESTORE_WATCH_TIMEOUT" -ge 1 ] && \
+        [ "$RR_RESTORE_WATCH_TIMEOUT" -le 86400 ] || return 1
+    rr_run_with_update_locks direct "$RR_RESTORE_WATCH_TIMEOUT" \
+        rr_restore_watch_active_locked || result=$?
+    if [ "$result" -eq 75 ] || [ "$result" -eq 76 ]; then result=1; fi
+    return "$result"
+}
+
+rr_restore_watch_active_locked() {
+    local expected_stage="" current_stage="" armed_from_request=false result=0
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         # A restore arms the watcher before publishing `active`, closing the
         # otherwise unavoidable SIGKILL gap between those two operations.
@@ -1203,42 +1483,19 @@ rr_restore_watch_active() {
     else
         expected_stage=$(rr_restore_active_stage) || return 1
     fi
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$lock_fd" || return 1
-    [[ "$RR_RESTORE_WATCH_TIMEOUT" =~ ^[0-9]+$ ]] && \
-        [ "$RR_RESTORE_WATCH_TIMEOUT" -ge 1 ] && \
-        [ "$RR_RESTORE_WATCH_TIMEOUT" -le 86400 ] || return 1
-    if ! flock -w "$RR_RESTORE_WATCH_TIMEOUT" "$lock_fd"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    if ! rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
+    rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST" || return 1
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || true
         # SIGKILL before `active` publication cannot require state rollback,
         # but the decrypted staging tree must not be left behind.
         [ "$armed_from_request" = false ] || rm -rf -- "$expected_stage"
-        exec {lock_fd}>&-
         return 0
     fi
-    current_stage=$(rr_restore_active_stage) || {
-        exec {lock_fd}>&-
-        return 1
-    }
-    if [ "$current_stage" != "$expected_stage" ]; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    if ! rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    RR_RESTORE_LOCK_HELD=1 rr_restore_recover_active || result=$?
-    exec {lock_fd}>&-
+    current_stage=$(rr_restore_active_stage) || return 1
+    [ "$current_stage" = "$expected_stage" ] || return 1
+    rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || return 1
+    RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+        rr_restore_recover_active || result=$?
     return "$result"
 }
 
@@ -1876,13 +2133,15 @@ rr_restore_resume_frozen_writers() {
         systemctl stop sing-box >/dev/null 2>&1 || true
     fi
     if [ -f "$rollback/subscription_was_running" ]; then
-        start_subscription_server >/dev/null 2>&1 || failed=true
+        rr_run_without_inherited_update_lock_fds \
+            start_subscription_server >/dev/null 2>&1 || failed=true
         subscription_server_running || failed=true
     else
         stop_subscription_servers >/dev/null 2>&1 || true
     fi
     if [ -f "$rollback/argo_was_running" ]; then
-        start_argo_tunnel >/dev/null 2>&1 || failed=true
+        rr_run_without_inherited_update_lock_fds \
+            start_argo_tunnel >/dev/null 2>&1 || failed=true
         expected_argo_tunnel_running >/dev/null 2>&1 || failed=true
     else
         stop_quick_argo_tunnel >/dev/null 2>&1 || true
@@ -2058,17 +2317,27 @@ rr_restore_rollback_stage() {
 }
 
 rr_restore_recover_active() {
-    local stage="" phase="" lock_fd=""
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         return 0
     fi
-    stage=$(rr_restore_active_stage) || return 1
-    if [ "${RR_RESTORE_LOCK_HELD:-0}" != 1 ]; then
-        rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-        exec {lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-        rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$lock_fd" || return 1
-        flock -n "$lock_fd" || return 1
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ] || [ "${RR_RESTORE_LOCK_HELD:-0}" = 1 ]; then
+        if [ "${RR_UPDATE_LOCK_OWNER:-0}" = 1 ] || \
+           [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" = 1 ]; then
+            rr_restore_recover_active_locked
+        else
+            rr_run_without_inherited_update_lock_fds rr_restore_recover_active_locked
+        fi
+        return $?
     fi
+    local result=0
+    rr_run_with_update_locks direct 0 rr_restore_recover_active_locked || result=$?
+    if [ "$result" -eq 75 ] || [ "$result" -eq 76 ]; then result=1; fi
+    return "$result"
+}
+
+rr_restore_recover_active_locked() {
+    local stage="" phase=""
+    stage=$(rr_restore_active_stage) || return 1
     phase=$(rr_restore_read_exact_marker "$stage/phase") || return 1
     case "$phase" in
         freezing|frozen|prepared|pre_recovery_failed)
@@ -2155,20 +2424,25 @@ PY
 }
 
 rr_restore_backup() (
-    local input="${1:-}" stage="" archive="" rollback="" result=1 backup_format="" restore_lock_fd="" restore_live_fd="" snapshot_tmp="" rollback_reserve=""
+    local result=0
+    rr_run_with_update_locks direct 0 rr_restore_backup_locked "$@" || result=$?
+    if [ "$result" -eq 75 ]; then
+        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
+        return 1
+    fi
+    [ "$result" -ne 76 ] || result=1
+    return "$result"
+)
+
+rr_restore_backup_locked() {
+    local input="${1:-}" stage="" archive="" rollback="" result=1 backup_format="" restore_live_fd="" snapshot_tmp="" rollback_reserve=""
     [ -r "$input" ] || { printf '找不到备份文件：%s\n' "$input" >&2; return 2; }
     rr_ensure_resilience_dependencies || { printf '无法安装加密恢复所需组件。\n' >&2; return 1; }
     rr_backup_prepare_work_dir || {
         printf '备份工作目录的所有者、权限或路径不安全。\n' >&2
         return 1
     }
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {restore_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$restore_lock_fd" || return 1
-    if ! flock -n "$restore_lock_fd"; then
-        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
-        return 1
-    fi
+    RR_UPDATE_LOCK_HELD=1
     RR_RESTORE_LOCK_HELD=1
     rr_restore_recover_active || return 1
     rr_backup_prune_stale_stages || return 1
@@ -2443,7 +2717,7 @@ rr_restore_backup() (
         printf '自动回滚未完整完成；请保留机器并运行 rr --recover-restore。\n' >&2
     fi
     return 1
-)
+}
 
 rr_update_preflight() {
     local ok=true free_kb="" db_state="not_installed" config_state="not_installed" lock_state="available" summary=""

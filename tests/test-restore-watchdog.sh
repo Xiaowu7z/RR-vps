@@ -17,9 +17,11 @@ RR_RESTORE_RUNTIME_READY="$RR_BACKUP_WORK_DIR/runtime-ready"
 RR_RESTORE_LIVE_MARKER="$test_root/run/restore-live"
 RR_RESTORE_WATCH_REQUEST="$test_root/run/restore-watch-request"
 RR_RESTORE_LOCK_FILE="$test_root/run/rr-update.lock"
+RR_LEGACY_UPDATE_LOCK_FILE="$test_root/legacy/rr-update.lock"
+RR_LEGACY_UPDATE_BRIDGE_FILE="$test_root/run/legacy-update-bridge"
 RR_RESTORE_LIVE_LOCK_FILE="$test_root/run/rr-restore-live.lock"
 RR_RESTORE_WATCH_TIMEOUT=5
-mkdir -p "$RR_BACKUP_WORK_DIR" "$test_root/run"
+mkdir -p "$RR_BACKUP_WORK_DIR" "$test_root/run" "$(dirname "$RR_LEGACY_UPDATE_LOCK_FILE")"
 
 stage="$RR_BACKUP_WORK_DIR/restore.good"
 other_stage="$RR_BACKUP_WORK_DIR/restore.other"
@@ -140,6 +142,8 @@ printf '%s\n' '[6/6] SIGKILL releases the lock and dispatches phase rollback'
 sigkill_state="$test_root/sigkill-state"
 sigkill_run="$test_root/sigkill-run"
 sigkill_lock="$sigkill_run/rr-update.lock"
+sigkill_legacy_lock="$sigkill_run/legacy-rr-update.lock"
+sigkill_bridge="$sigkill_run/legacy-update-bridge"
 sigkill_active="$sigkill_state/active"
 sigkill_ready="$sigkill_state/runtime-ready"
 sigkill_live="$sigkill_run/restore-live"
@@ -157,6 +161,8 @@ chmod 600 "$sigkill_stage/rollback/complete" "$sigkill_stage/phase" "$sigkill_ac
 
 RR_BACKUP_WORK_DIR="$sigkill_state" \
 RR_RESTORE_LOCK_FILE="$sigkill_lock" \
+RR_LEGACY_UPDATE_LOCK_FILE="$sigkill_legacy_lock" \
+RR_LEGACY_UPDATE_BRIDGE_FILE="$sigkill_bridge" \
 RR_RESTORE_LIVE_LOCK_FILE="$sigkill_live_lock" \
 RR_RESTORE_LIVE_MARKER="$sigkill_live" \
 RR_RESTORE_WATCH_REQUEST="$sigkill_request" \
@@ -181,6 +187,8 @@ done
     RR_RESTORE_ACTIVE="$sigkill_active"
     RR_RESTORE_RUNTIME_READY="$sigkill_ready"
     RR_RESTORE_LOCK_FILE="$sigkill_lock"
+    RR_LEGACY_UPDATE_LOCK_FILE="$sigkill_legacy_lock"
+    RR_LEGACY_UPDATE_BRIDGE_FILE="$sigkill_bridge"
     RR_RESTORE_LIVE_LOCK_FILE="$sigkill_live_lock"
     RR_RESTORE_LIVE_MARKER="$sigkill_live"
     RR_RESTORE_WATCH_REQUEST="$sigkill_request"
