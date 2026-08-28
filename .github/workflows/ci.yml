@@ -93,8 +93,10 @@ jobs:
               test-restore-watchdog.sh|\
               test-update-external-state.sh|\
               test-update-external-transaction.sh|\
+              test-update-firewall-finalize.sh|\
               test-update-lock-security.sh|\
-              test-update-rollback-quarantine.sh)
+              test-update-rollback-quarantine.sh|\
+              test-update-writer-freeze.sh)
                 sudo -E bash "$test_script"
                 ;;
               *)
