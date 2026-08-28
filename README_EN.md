@@ -8,23 +8,25 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.1.0** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.1.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### New in 7.1.0: recoverable updates, diagnostics, migration, security, and alerts
+### 7.1.1: security and release-gate maintenance
 
-7.1.0 turns hot updates into durable transactions that survive process termination and reboot. Every update runs preflight checks and a runtime/database snapshot, validates the bundle, launcher, and guard with pinned SHA256 values, switches atomically, then gates the commit on configuration, database, process, and HTTP health. Interrupted work is recovered automatically on boot; failed work rolls back, and `rr update --rollback` restores the previous committed release.
+7.1.1 fixes subscription authorization, SSRF, proxy-source spoofing, backup/restore injection, predictable temporary paths, slow-client resource exhaustion, and rollback failures. Stable now consumes only a CI-verified GitHub Release pinned to the matching version tag; Beta remains isolated on its own branch.
 
-This release also adds `rr doctor` with redacted reports, encrypted `.rrbak` migration backups, Telegram/HTTPS-webhook alerts, TOTP and Passkeys, 24-hour/7-day/30-day charts, device groups/templates/batch actions, Stable/Beta channels, and NaiveProxy HTTP/3 over QUIC. Existing installations retain HTTP/2 for NaiveProxy during migration unless the administrator opts into H3.
+This release also removes public cleartext HTTP subscriptions. A standalone subscription endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Legacy public HTTP URLs stop working after the upgrade.
+
+Existing diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 features remain compatible. See the changelog for the complete list.
 
 ## One-command installation
 
-Supported systems (full test matrix passed, 2026-08):
+Target systems are listed below. CI covers containers for all three distributions; a release is not considered real-VPS verified until the current release report records all three machine gates:
 
 | System | Support | Notes |
 | --- | --- | --- |
-| **Debian 12 (bookworm)** | ⭐ Recommended | Most thoroughly verified; first choice |
-| Ubuntu 22.04 (jammy) | ✅ Supported | Fully tested |
-| Ubuntu 24.04 (noble) | ✅ Supported | Fully tested |
+| **Debian 12 (bookworm)** | ⭐ Recommended | Primary target; must pass the per-release VPS gate |
+| Ubuntu 22.04 (jammy) | ✅ Targeted | Covers legacy upgrade and data-retention gates |
+| Ubuntu 24.04 (noble) | ✅ Targeted | Covers current-system and fault-injection gates |
 
 Other Debian/Ubuntu derivatives are untested and not guaranteed.
 
@@ -37,13 +39,13 @@ sudo -i
 Install with curl (recommended):
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(curl -fsSL "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 Or use wget:
 
 ```bash
-bash <(wget -qO- "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/refs/heads/main/install.sh?t=$(date +%s)")
+bash <(wget -qO- "https://github.com/Xiaowu7z/RR-vps/releases/latest/download/install.sh")
 ```
 
 Open the control panel:
@@ -81,7 +83,7 @@ rr update --rollback
 
 ## Companion tool: RR Edge Atlas
 
-[RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) is now a standalone open-source multi-platform project with desktop **1.0** and Android **2.7.1** editions. Both use native fixed-IP probing, SNI and certificate validation, and layered screening. The Android edition has been field-tested across China Mobile, China Telecom, and China Unicom; the browser panel remains a shortlist fallback when no native test environment is available.
+[RR Edge Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas) is now a standalone open-source multi-platform project with desktop **1.0** and Android **2.7.1** editions. Both use native fixed-IP probing, SNI and certificate validation, and layered screening. Android can screen candidates across China Mobile, China Telecom, and China Unicom, but results must still be retested on the current carrier, time window, and actual client before configuration. The browser panel remains a shortlist fallback when no native test environment is available.
 
 - Project and full source: [Xiaowu7z/RR-Edge-Atlas](https://github.com/Xiaowu7z/RR-Edge-Atlas)
 - Desktop **1.0** for Windows, macOS, and Linux: [release downloads](https://github.com/Xiaowu7z/RR-Edge-Atlas/releases/tag/v1.0)
@@ -100,22 +102,22 @@ rr update --rollback
 - NaiveProxy (sing-box 1.13 native naive inbound with selectable HTTP/2, HTTP/3 over QUIC, or dual mode; configurable QUIC congestion control and a real Let's Encrypt certificate)
 - Independent protocol switches and ports
 - Independent IPv4/IPv6 inbound and outbound preferences
-- Public subscription-port mapping for NAT/LXD VPS instances
+- Public port mapping for trusted-domain HTTPS subscriptions on NAT/LXD; without a trusted certificate, subscriptions remain loopback-only
 - Sing-box validation, health checks, and guarded automatic restart
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Durable Stable/Beta update transactions with multi-source fallback, three pinned SHA256 layers, boot-time recovery, consistent database snapshots, health gates, automatic rollback, and manual rollback
+- Durable Stable/Beta update transactions with multi-source fallback, three pinned SHA256 layers, boot-time recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery
 - `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
-- Password-encrypted `.rrbak` backup/migration with authenticated encryption, scoped restore, and local rollback on health failure
+- Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and local rollback on health failure; it is not a full-machine backup
 - No forced reservation of local port 443 for Argo
 - Optional RR Nexus web console with local-only or public HTTPS access
 - Per-device credentials, protocol links, QR codes, enable/disable state, and expiry
-- Calendar-month automatic quota resets with a first date and renewal count; depleted devices stop immediately and are removed after 35 unattended days
+- Calendar-month automatic quota resets with a first date and renewal count; depleted devices are removed from runtime access on the next roughly five-second collection/sync cycle and are deleted after 35 unattended days
 - A server carrier-package meter with a manually entered allowance and bidirectional, TX-only, or RX-only host-interface accounting
 - Panel live server status page: per-second CPU / memory / disk / network, zero-dependency `/proc` sampling
 - Panel firewall settings page: port toggles, IPv4/IPv6 inbound/outbound split, SSH port protection, and a permission tutorial
 - Panel streaming unlock checker: unlock status and region for Netflix / Disney+ / YouTube Premium and more
 - Panel Edge candidate screener: locally narrows 1,000 domains to a TOP 20 shortlist; its ranking is not real proxy quality, so candidates must be retested with RR Edge Atlas desktop 1.0, Android 2.7.1, or the actual client
-- Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, exponential backoff, persisted state; reset via script menu 14 → 2
+- Panel brute-force protection: dual-dimension IP + account lockout, 5 failures in 30 minutes, progressive response delay, persisted state; reset via script menu 14 → 2
 - TOTP, one-time recovery codes, and origin-bound WebAuthn Passkeys
 - Telegram and HTTPS-webhook alerts for service, disk, allowance, certificate, device quota, Argo domain change, update/backup failure, and security lockout events, with deduplication and optional HMAC signatures
 - Device groups, templates, filters, and batch actions; traffic and system history for 24 hours, 7 days, or 30 days
@@ -124,7 +126,7 @@ rr update --rollback
 
 ## Client tools and protocol support
 
-RR-vps subscriptions work with these mainstream client tools:
+RR-vps generates formats for these mainstream clients. This is a format/protocol capability matrix, not a claim that every current client version completed a real connection test in this release; see the release report for the tested scope:
 
 | Tool | Platform | Download |
 |---|---|---|
@@ -151,6 +153,25 @@ Protocol support matrix:
 
 Tip: for fast recovery after screen lock/suspend, enable the active heartbeat mode (main menu 9 → 11) and prefer clients with sing-box core 1.13+.
 
+## Subscription access security
+
+Public cleartext HTTP subscriptions have been removed. A standalone subscription endpoint has only the two secure states below. `SUB_ACCESS_MODE` describes the subscription service, not the RR Nexus console access mode.
+
+| Subscription state | Address | Security requirement |
+|---|---|---|
+| `SUB_ACCESS_MODE=https` | `https://trusted-domain:subscription-port/...` | `SUB_DOMAIN` must be a valid DNS name with a matching, valid, publicly trusted TLS certificate; the service refuses to start publicly when validation fails |
+| `SUB_ACCESS_MODE=local` (default) | `http://127.0.0.1:subscription-port/...` | Binds only to loopback and does not open the subscription firewall port; HTTP never leaves the SSH tunnel |
+
+Without a trusted certificate, create a forward on the device that runs the client. For example, if RR reports subscription port `39291` and the example server IP is `203.0.113.10`:
+
+```bash
+ssh -N -L 39291:127.0.0.1:39291 root@203.0.113.10
+```
+
+Keep that SSH session open, then add the `http://127.0.0.1:39291/...` URL shown by `rr` to a client on the same device. Do not replace the loopback host with the server's public IP. If the local port is already occupied, choose another local port and change the port in the client URL to match.
+
+> **Upgrade warning:** After upgrading from a release that exposed subscriptions over public HTTP, every old `http://SERVER-IP:SUBSCRIPTION-PORT/...` URL becomes invalid and is not redirected. Tokens/UUIDs in those URLs and node credentials returned in the feed may already have been exposed in transit. Treat them as potentially compromised, manually rotate the affected credentials, and distribute new URLs. The upgrade does not automatically rotate every node and device credential for you.
+
 ## Optional RR Nexus console
 
 Choose menu option `14`, then select one access mode:
@@ -161,15 +182,17 @@ Choose menu option `14`, then select one access mode:
 | Public domain | `https://` on a domain you control | The backend still binds only to loopback; Nginx proxies HTTPS and installation succeeds only after a Let's Encrypt certificate is issued |
 | Public direct | `https://` on the server IP with a self-signed certificate | Browser shows a certificate warning; the user must trust it manually |
 
-Public mode never offers bare-IP login or plain HTTP. RR Nexus uses Argon2id password hashes, application and Nginx login rate limits, CSRF protection, HttpOnly/SameSite sessions, Secure cookies in public mode, eight one-time recovery codes, and an audit log.
+Public login and console content are HTTPS-only. In domain mode, port 80 serves only ACME challenges and, after certificate issuance, redirects to HTTPS; other cleartext requests do not receive console content. Direct-IP mode is HTTPS-only. RR Nexus uses Argon2id password hashes, application and Nginx login rate limits, CSRF protection, 12-hour sessions, eight one-time recovery codes, and an audit log.
 
-Each device is an access identity, not another administrator. It receives an independent UUID and protocol links. Disabling, deleting, expiring, or changing a quota transactionally rebuilds the Sing-box user list. An administrator-only device note can be renamed without restarting the node or refreshing subscriptions; client node names use a stable random alias such as `RR-A1B2C3D4`, so the note is never exposed. Public mode exposes a random-token subscription URL for each device; local mode also syncs each device's personal subscription under the main subscription address (`http://SERVER-IP:SUBSCRIPTION-PORT/nexus/<random-token>.txt`) without exposing the management port.
+Each device is an access identity, not another administrator. It receives an independent UUID and protocol links. Disabling, deleting, expiring, or changing a quota commits the database first and then schedules a background Sing-box/subscription sync, normally taking effect in the next sync cycle. If the audit log reports a sync failure, retry it; a committed database change is not proof that runtime synchronization succeeded. An administrator-only note can be renamed without restarting the node or refreshing subscriptions.
+
+On a public domain console, personal subscriptions always use HTTPS `/sub/...` routes on that trusted domain. Nginx access logging is disabled for these requests, and backend error logs omit the URL, so the token is not written to request-line logs. A public-IP console with a self-signed certificate does not expose subscriptions on that address. If a separate trusted subscription domain exists, device links use its independent HTTPS endpoint; otherwise there is no publicly shareable subscription URL. A local console returns only loopback URLs such as `http://127.0.0.1:subscription-port/nexus/<random-token>.txt`, which require a second SSH port forward.
 
 A device can define a first automatic-reset date and a maximum number of monthly renewals. At each boundary, used/upload/download counters return to zero while the allowance stays unchanged; calendar anchoring prevents a 31st-of-the-month plan from drifting permanently after February. A depleted device remains blocked until the next scheduled or manual reset. After all renewals, it expires on the calculated final date. A quota-depleted device left untouched for 35 days is automatically deleted with its credential.
 
-Both the HTTPS panel route and the standalone HTTP subscription service attach the standard `Subscription-Userinfo` header, plus an hourly refresh recommendation. NekoBox, Clash-family clients, and other compatible apps can show usage, remaining allowance, and expiry. For clients that do not expose this header, all nine personal subscription formats dynamically add a first “used | remaining | expiry” entry on refresh. It is a copy of a working proxy with only its display name changed, so accidentally selecting it does not break connectivity and the stored subscription artifact remains untouched.
+Both the RR Nexus domain HTTPS route and the standalone subscription endpoint (trusted-domain TLS or loopback-only HTTP) attach the standard `Subscription-Userinfo` header, plus an hourly refresh recommendation. NekoBox, Clash-family clients, and other compatible apps can show usage, remaining allowance, and expiry. For clients that do not expose this header, all nine personal subscription formats dynamically add a first “used | remaining | expiry” entry: sing-box JSON and Clash YAML use a real-node copy, while URI/Base64 feeds use an explicitly labelled, non-connectable `127.0.0.1:9` marker. Do not select that marker as a proxy. Stored subscription artifacts remain unchanged.
 
-For local mode, run the command printed by the installer on your **own computer**, enter the server root password when prompted, keep that terminal open, and browse to `http://127.0.0.1:7900`. The command uses an SSH `-L` forward plus a 30-second client keepalive (`ServerAliveInterval=30`, six missed replies) and fails fast when the forward cannot be created; the console displays the exact command for the configured server and port.
+For local mode, run the command printed by the installer on your **own computer**. On first connection, verify the SSH host fingerprint before accepting it; do not disable host-key checking. Enter the server root password when prompted, keep that terminal open, and browse to `http://127.0.0.1:7900`. The command uses an SSH `-L` forward plus a 30-second client keepalive and fails fast when the forward cannot be created. To use personal subscriptions, also forward the subscription port as described above.
 
 RR Nexus downloads a SHA256-verified core built by the project GitHub Actions workflow from the official stable Sing-box source with the additional `with_v2ray_api` tag. It polls counters named by device ID every five seconds, persists upload and download totals, and revokes access when a quota is reached. These per-device figures are application-layer accounting; an abnormal Sing-box exit or the instant around a reload can still lose a small uncollected delta.
 
@@ -186,7 +209,7 @@ The route sets the performance ceiling. A protocol cannot turn a congested route
 | UDP works well and high throughput or loss recovery matters | HY2 | Better tolerance of variable networks; optional port hopping |
 | Stable UDP and latency-sensitive traffic | TUIC v5 | QUIC-based option for responsive connections |
 | UDP is blocked or heavily shaped but TCP is good | Reality or AnyTLS | Does not depend on UDP |
-| NAT/LXD with a small set of mapped ports | Reality/AnyTLS; HY2 only with correct UDP mapping | Easier port planning and troubleshooting |
+| NAT/LXD with a small set of mapped ports | Reality/AnyTLS; HY2 only with correct UDP mapping | Node ports remain independent; a mapped public subscription port is only for trusted-domain HTTPS |
 | IPv6-only public ingress | Reality, AnyTLS, or HY2 as client IPv6 support allows | RR-vps separates ingress and egress address-family choices |
 
 ### Practical selection order
@@ -225,8 +248,8 @@ Temporary Quick Tunnels are convenient for testing and personal use, but the hos
 
 | Item | Support |
 |---|---|
-| Debian | 12 or newer; Debian 12 is a primary target |
-| Ubuntu | 22.04 or newer; 22.04 and 24.04 are primary targets |
+| Debian | Debian 12 is the current verified target; other releases are best-effort and outside this release gate |
+| Ubuntu | Ubuntu 22.04 and 24.04 are the current verified targets; other releases are best-effort and outside this release gate |
 | CPU | amd64/x86_64 and arm64/aarch64 |
 | Virtualization | KVM recommended; NAT/LXD requires correct TCP/UDP mappings |
 | Requirements | root, APT, systemd, and access to GitHub/Cloudflare download endpoints |
@@ -248,7 +271,7 @@ Restricted OpenVZ, container, or NAT environments may block BBR, sysctl, iptable
 /tmp/sub_server/                   generated subscription files
 ```
 
-Option 8 replaces program modules without resetting persistent settings. Updates run in two stages: a release bundle is downloaded first for a fast hot-update (integrity, member count, and version are verified to block stale CDN packages); on failure it falls back to per-file download. New modules are verified with SHA256 and Bash syntax checks, both the launcher and module copies are replaced together, configuration migration runs, and subscriptions plus the auto-optimization worker are refreshed automatically. Any failure restores the previous launcher, modules, configuration, core, services, and subscriptions; node and panel services restart automatically after a successful upgrade.
+Option 8 replaces program modules without resetting persistent settings. Updates run in two stages: a release bundle is downloaded first for a fast hot-update (integrity, member count, and version are verified to block stale CDN packages); on failure it falls back to per-file download. New modules are verified with SHA256 and Bash syntax checks, both the launcher and module copies are replaced together, configuration migration runs, and subscriptions plus the auto-optimization worker are refreshed automatically. Any failure triggers a recovery attempt. If host degradation prevents complete recovery, the persistent transaction preserves evidence and reports the explicit recovery command. A successful upgrade restores services according to their recorded pre-update state.
 
 ## Safety notes
 
