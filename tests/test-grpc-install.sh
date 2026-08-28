@@ -122,6 +122,9 @@ nexus_python_pip() {
         printf 'ARG=%s\n' "$@"
     } > "$pip_log"
 }
+# The production function was sourced above and is intentionally rebound by a
+# later fixture for the post-install cases.
+# shellcheck disable=SC2218
 PIP_INDEX_URL="https://attacker.example/simple" nexus_pip_install_local_wheel "$wheel_payload"
 grep -Fxq 'PIP_CONFIG_FILE=/dev/null' "$pip_log"
 grep -Fxq 'PIP_INDEX_URL=unset' "$pip_log"
@@ -183,6 +186,9 @@ nexus_pip_install_local_wheel() {
         *) return 1 ;;
     esac
 }
+# The production fallback is exercised here before the apt-preference fixture
+# deliberately rebinds the function below.
+# shellcheck disable=SC2218
 nexus_install_grpcio_pip_fallback
 [ "$(<"$grpc_state")" = "$NEXUS_GRPCIO_PIP_VERSION" ]
 
@@ -196,6 +202,7 @@ fi
 
 install_count=$(wc -l < "$pip_install_log")
 printf '%s\n' 1.84.0 > "$grpc_state"
+# shellcheck disable=SC2218
 nexus_install_grpcio_pip_fallback >/dev/null 2>&1
 [ "$(<"$grpc_state")" = 1.84.0 ]
 [ "$(wc -l < "$pip_install_log")" -eq "$install_count" ]
