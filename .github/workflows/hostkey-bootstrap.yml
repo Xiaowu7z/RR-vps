@@ -1,0 +1,50 @@
+name: Bootstrap VPS host-key pins
+
+on:
+  push:
+    branches:
+      - audit/hostkey-bootstrap-v711
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Independent scan ${{ matrix.replica }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        replica: [one, two]
+    env:
+      RR_A_HOST: ${{ secrets.RR_A_HOST }}
+      RR_B_HOST: ${{ secrets.RR_B_HOST }}
+      RR_C_HOST: ${{ secrets.RR_C_HOST }}
+    steps:
+      - name: Scan stable Ed25519 host keys without authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          scan_once() {
+            local host="$1"
+            ssh-keyscan -T 20 -t ed25519 "$host" 2>/dev/null |
+              awk '$2 == "ssh-ed25519" { print $2 " " $3; exit }'
+          }
+          verify_host() {
+            local label="$1" host="$2" first="" second="" fingerprint=""
+            [ -n "$host" ]
+            first=$(scan_once "$host")
+            sleep 2
+            second=$(scan_once "$host")
+            [ -n "$first" ] && [ "$first" = "$second" ]
+            [[ "$first" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+={0,2}$ ]]
+            fingerprint=$(ssh-keygen -lf <(printf '%s\n' "$first"))
+            printf 'PIN_%s=%s\n' "$label" "$first"
+            printf 'FINGERPRINT_%s=%s\n' "$label" "$fingerprint"
+          }
+          verify_host A "$RR_A_HOST"
+          verify_host B "$RR_B_HOST"
+          verify_host C "$RR_C_HOST"
