@@ -323,9 +323,11 @@ printf '%s\n' '[6/8] restore rollback replaces candidate RR rules exactly'
         >> "$MOCK_NETFILTER_ROOT/iptables.nat"
     printf '%s\n' 'allow|63333/tcp|argo-rr-managed' >> "$MOCK_UFW_RULES"
     : > "$rollback/complete"
-    printf '%s\n' "$stage" > "$RR_RESTORE_ACTIVE"
+    (umask 077; printf '%s\n' "$stage" > "$RR_RESTORE_ACTIVE")
 
-    rr_restore_write_phase() { printf '%s\n' "$2" > "$stage/phase"; }
+    rr_restore_write_phase() {
+        (umask 077; printf '%s\n' "$2" > "$stage/phase")
+    }
     rr_restore_stop_managed_runtime() { return 0; }
     rr_restore_set_nexus_enablement() { return 0; }
     rr_restore_remove_managed_fixed_tunnel() { return 0; }

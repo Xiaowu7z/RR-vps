@@ -606,19 +606,18 @@ rr_manual_update_rollback_is_safe() {
 }
 
 rr_run_post_update_finalize() {
-    local mode="${1:-normal}" finalize_lock_file="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
-    local finalize_lock_fd="" result=0
-    if [ "${RR_UPDATE_LOCK_HELD:-0}" != 1 ]; then
-        rr_secure_lock_prepare "$finalize_lock_file" || return 1
-        exec {finalize_lock_fd}>>"$finalize_lock_file" || return 1
-        if ! rr_secure_lock_fd_is_safe "$finalize_lock_file" "$finalize_lock_fd"; then
-            exec {finalize_lock_fd}>&-
-            return 1
+    local mode="${1:-normal}" result=0
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ]; then
+        if [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" = 1 ]; then
+            rr_finalize_committed_firewall "$mode"
+        else
+            rr_run_without_inherited_update_lock_fds \
+                rr_finalize_committed_firewall "$mode"
         fi
-        flock -n "$finalize_lock_fd" || { exec {finalize_lock_fd}>&-; return 1; }
+        return $?
     fi
-    rr_finalize_committed_firewall "$mode" || result=$?
-    [ -z "$finalize_lock_fd" ] || exec {finalize_lock_fd}>&-
+    rr_run_with_update_locks isolated 0 rr_finalize_committed_firewall "$mode" || result=$?
+    if [ "$result" -eq 75 ] || [ "$result" -eq 76 ]; then result=1; fi
     return "$result"
 }
 
@@ -659,6 +658,11 @@ rr_run_post_update_finalize() {
 }
 
 post_update_migrate() {
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ] && \
+       [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" != 1 ]; then
+        rr_run_without_inherited_update_lock_fds post_update_migrate
+        return $?
+    fi
     local update_tx="${RR_UPDATE_TRANSACTION:-0}"
     local singbox_was_running="${RR_UPDATE_SINGBOX_WAS_RUNNING:-true}"
     local nexus_was_running="${RR_UPDATE_NEXUS_WAS_RUNNING:-true}"
@@ -909,8 +913,6 @@ ensure_runtime_health() {
 }
 
 rr_run_health_check() {
-    local health_lock_file="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
-    local health_lock_fd=""
     local health_result=0
 
     # The installer/recovery path already owns the shared transaction lock and
@@ -918,28 +920,24 @@ rr_run_health_check() {
     # Normal timer/manual invocations take the same lock as update, backup and
     # restore so they can never repair services or rewrite subscriptions while
     # a transaction snapshot is in progress.
-    if [ "${RR_UPDATE_LOCK_HELD:-0}" != 1 ]; then
-        rr_secure_lock_prepare "$health_lock_file" || {
-            rr_health_log "共享事务锁文件不安全，健康检查已拒绝运行"
-            return 1
-        }
-        exec {health_lock_fd}>>"$health_lock_file" || return 1
-        if ! rr_secure_lock_fd_is_safe "$health_lock_file" "$health_lock_fd"; then
-            exec {health_lock_fd}>&-
-            rr_health_log "共享事务锁在打开时发生变化，健康检查已拒绝运行"
-            return 1
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ]; then
+        if [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" = 1 ]; then
+            ensure_runtime_health
+        else
+            rr_run_without_inherited_update_lock_fds ensure_runtime_health
         fi
-        if ! flock -n "$health_lock_fd"; then
-            # A timer firing during an update/backup is expected.  Skipping is
-            # success so systemd does not enter a retry/failure loop; the next
-            # timer pass will perform the check after the transaction exits.
-            exec {health_lock_fd}>&-
-            return 0
-        fi
+        return $?
     fi
-
-    RR_UPDATE_LOCK_HELD=1 ensure_runtime_health || health_result=$?
-    [ -z "$health_lock_fd" ] || exec {health_lock_fd}>&-
+    rr_run_with_update_locks isolated 0 ensure_runtime_health || health_result=$?
+    if [ "$health_result" -eq 75 ]; then
+        # A timer firing during either a current or 7.1.0 transaction is an
+        # expected skip. The next timer pass will run after both locks release.
+        return 0
+    fi
+    if [ "$health_result" -eq 76 ]; then
+        rr_health_log "共享事务锁或 7.1.0 兼容锁不安全，健康检查已拒绝运行"
+        health_result=1
+    fi
     return "$health_result"
 }
 

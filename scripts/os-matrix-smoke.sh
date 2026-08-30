@@ -17,14 +17,186 @@ trap 'rm -rf "$mock_bin"' EXIT
 cat > "$mock_bin/systemctl" <<'EOF'
 #!/bin/sh
 # Container CI has no PID-1 systemd.  Service semantics are covered by the
-# regression suite; the OS matrix exercises filesystem transactions.
-case "${1:-}" in
-    is-active|is-enabled) exit 1 ;;
+# regression suite; the OS matrix exercises filesystem transactions.  Keep a
+# small state model because production transaction code deliberately treats an
+# empty or inconsistent `systemctl show` response as unsafe.
+set -eu
+
+state_dir=${0%/*}/systemctl-state
+mkdir -p "$state_dir/active" "$state_dir/enabled"
+
+normalize_unit() {
+    case "$1" in
+        *.*) printf '%s\n' "$1" ;;
+        *) printf '%s.service\n' "$1" ;;
+    esac
+}
+
+unit_is_safe() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_.@-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+unit_file() {
+    unit=$1
+    if [ -n "${RR_MOCK_SYSTEMD_UNIT_DIR:-}" ]; then
+        candidate="$RR_MOCK_SYSTEMD_UNIT_DIR/$unit"
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+    for candidate in \
+        "/etc/systemd/system/$unit" \
+        "/lib/systemd/system/$unit" \
+        "/usr/lib/systemd/system/$unit"; do
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+unit_is_masked() {
+    path=$(unit_file "$1" 2>/dev/null) || return 1
+    [ -L "$path" ] && [ "$(readlink "$path" 2>/dev/null || true)" = /dev/null ]
+}
+
+command=${1:-}
+[ -n "$command" ] || exit 1
+shift
+
+case "$command" in
+    daemon-reload|reset-failed)
+        exit 0
+        ;;
+    show)
+        property=
+        requested_unit=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -p|--property)
+                    [ "$#" -ge 2 ] || exit 1
+                    property=$2
+                    shift 2
+                    ;;
+                --property=*) property=${1#*=}; shift ;;
+                --value) shift ;;
+                --*) shift ;;
+                *) requested_unit=$1; shift ;;
+            esac
+        done
+        [ -n "$requested_unit" ] && [ -n "$property" ] || exit 1
+        unit=$(normalize_unit "$requested_unit")
+        unit_is_safe "$unit" || exit 1
+        fragment=$(unit_file "$unit" 2>/dev/null || true)
+        case "$property" in
+            LoadState)
+                if unit_is_masked "$unit"; then
+                    printf '%s\n' masked
+                elif [ -n "$fragment" ]; then
+                    printf '%s\n' loaded
+                else
+                    printf '%s\n' not-found
+                fi
+                ;;
+            ActiveState)
+                if [ -e "$state_dir/active/$unit" ]; then
+                    printf '%s\n' active
+                else
+                    printf '%s\n' inactive
+                fi
+                ;;
+            UnitFileState)
+                if unit_is_masked "$unit"; then
+                    printf '%s\n' masked
+                elif [ -e "$state_dir/enabled/$unit" ]; then
+                    printf '%s\n' enabled
+                elif [ -n "$fragment" ]; then
+                    printf '%s\n' disabled
+                else
+                    printf '%s\n' not-found
+                fi
+                ;;
+            FragmentPath) printf '%s\n' "$fragment" ;;
+            DropInPaths) printf '\n' ;;
+            MainPID) printf '0\n' ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    is-active|is-enabled)
+        units=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --*) shift ;;
+                *) units="$units $(normalize_unit "$1")"; shift ;;
+            esac
+        done
+        [ -n "$units" ] || exit 1
+        for unit in $units; do
+            unit_is_safe "$unit" || exit 1
+            case "$command" in
+                is-active) [ -e "$state_dir/active/$unit" ] || exit 1 ;;
+                is-enabled) [ -e "$state_dir/enabled/$unit" ] || exit 1 ;;
+            esac
+        done
+        ;;
+    enable|disable|start|stop|restart)
+        now=false
+        units=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --now) now=true; shift ;;
+                --*) shift ;;
+                *) units="$units $(normalize_unit "$1")"; shift ;;
+            esac
+        done
+        [ -n "$units" ] || exit 1
+        for unit in $units; do
+            unit_is_safe "$unit" || exit 1
+            case "$command" in
+                enable)
+                    : > "$state_dir/enabled/$unit"
+                    [ "$now" = false ] || : > "$state_dir/active/$unit"
+                    ;;
+                disable)
+                    rm -f -- "$state_dir/enabled/$unit"
+                    [ "$now" = false ] || rm -f -- "$state_dir/active/$unit"
+                    ;;
+                start|restart) : > "$state_dir/active/$unit" ;;
+                stop) rm -f -- "$state_dir/active/$unit" ;;
+            esac
+        done
+        ;;
     *) exit 0 ;;
 esac
 EOF
 chmod 755 "$mock_bin/systemctl"
+install -d -m 755 "$mock_bin/units"
+export RR_MOCK_SYSTEMD_UNIT_DIR="$mock_bin/units"
 export PATH="$mock_bin:$PATH"
+
+# Fail immediately if the container shim cannot provide the strict, coherent
+# state tuples consumed by install, recovery and uninstall transactions.
+mock_unit=rr-os-matrix-mock.service
+install -m 644 /dev/null "$RR_MOCK_SYSTEMD_UNIT_DIR/$mock_unit"
+test "$(systemctl show --property=LoadState --value "$mock_unit")" = loaded
+test "$(systemctl show -p ActiveState --value "$mock_unit")" = inactive
+test "$(systemctl show --property=UnitFileState --value "$mock_unit")" = disabled
+systemctl enable --now "$mock_unit"
+systemctl is-active --quiet "$mock_unit"
+systemctl is-enabled --quiet "$mock_unit"
+test "$(systemctl show -p ActiveState --value "$mock_unit")" = active
+test "$(systemctl show -p UnitFileState --value "$mock_unit")" = enabled
+systemctl disable --now "$mock_unit"
+test "$(systemctl show -p ActiveState --value "$mock_unit")" = inactive
+test "$(systemctl show -p UnitFileState --value "$mock_unit")" = disabled
+rm -f -- "$RR_MOCK_SYSTEMD_UNIT_DIR/$mock_unit"
+test "$(systemctl show -p LoadState --value "$mock_unit")" = not-found
+test "$(systemctl show -p UnitFileState --value "$mock_unit")" = not-found
 
 # True clean runtime install, then a second in-place hot update.  No node
 # configuration exists in the container, so post-update correctly avoids

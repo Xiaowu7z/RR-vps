@@ -37,6 +37,7 @@ RR_UPDATE_EXTERNAL_HELPER="${RR_UPDATE_EXTERNAL_HELPER:-/usr/local/sbin/rr-updat
 TX_DIR=""
 KEEP_TRANSACTION=false
 UPDATE_LOCK_FD=""
+LEGACY_UPDATE_LOCK_FD=""
 RR_HEALTH_MONITOR_FROZEN=false
 RR_HEALTH_TIMER_WAS_ENABLED=false
 RR_HEALTH_TIMER_WAS_ACTIVE=false
@@ -51,6 +52,8 @@ RR_NEXUS_WAS_ENABLED=false
 RR_SUBSCRIPTION_WAS_ACTIVE=false
 RR_HEALTH_TIMER_FILE="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
 RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
+RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
 RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
 
 rr_error() {
@@ -92,18 +95,410 @@ rr_update_lock_fd_is_safe() {
     [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
 }
 
+rr_legacy_update_lock_mode_is_safe() {
+    local mode="$1" mode_value=0
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # 7.1.0 normally left this file as 0644.  Preserve that inode exactly,
+    # but reject special bits, execute bits, and group/other write access.
+    (( (mode_value & 07133) == 0 ))
+}
+
+rr_legacy_update_lock_parent_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local lock_dir="" canonical="" owner="" group="" mode="" mode_value=0
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    IFS=: read -r owner group mode < <(
+        stat -c '%u:%g:%a' -- "$lock_dir" 2>/dev/null
+    ) || return 1
+    [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # /run/lock may be 1777.  A world-writable compatibility directory is
+    # acceptable only when the sticky bit prevents unprivileged replacement.
+    (( (mode_value & 06000) == 0 )) || return 1
+    if (( (mode_value & 0002) != 0 && (mode_value & 01000) == 0 )); then
+        return 1
+    fi
+}
+
+rr_legacy_update_lock_path_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local owner_uid="" owner_gid="" mode="" links=""
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    IFS=: read -r owner_uid owner_gid mode links < <(
+        stat -c '%u:%g:%a:%h' -- "$lock_file" 2>/dev/null
+    ) || return 1
+    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_legacy_update_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" path_identity_after=""
+    local fd_identity="" owner_uid="" owner_gid="" mode="" links=""
+    local shell_pid="${BASHPID:-$$}" fd_path=""
+    fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ -f "$fd_path" ] || return 1
+    [ ! -L "$lock_file" ] || return 1
+    path_identity_after=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && \
+        [ "$path_identity_after" = "$fd_identity" ] || return 1
+    IFS=: read -r _ _ owner_uid owner_gid mode links <<<"$fd_identity"
+    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_trusted_installed_runtime_version() {
+  (
+    local runtime_file="$RR_LIB_DIR/modules/00-runtime.sh"
+    local directory="" canonical="" owner="" group="" mode="" mode_value=0
+    local runtime_fd="" shell_pid="${BASHPID:-$$}" fd_path=""
+    local path_identity="" fd_identity="" line="" count=0 version=""
+    local -a runtime_lines=()
+    for directory in "$RR_LIB_DIR" "$RR_LIB_DIR/modules"; do
+        [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+        canonical=$(readlink -f -- "$directory" 2>/dev/null) || return 1
+        [ "$canonical" = "$directory" ] || return 1
+        IFS=: read -r owner group mode < <(
+            stat -c '%u:%g:%a' -- "$directory" 2>/dev/null
+        ) || return 1
+        [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        mode_value=$((8#$mode))
+        (( (mode_value & 07022) == 0 )) || return 1
+    done
+    [ -f "$runtime_file" ] && [ ! -L "$runtime_file" ] || return 1
+    exec {runtime_fd}<"$runtime_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$runtime_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$runtime_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$runtime_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$runtime_file" ] || return 1
+    IFS=: read -r _ _ owner group mode _ <<<"$fd_identity"
+    [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode" || return 1
+    [[ "$fd_identity" == *:1 ]] || return 1
+    mapfile -t runtime_lines <&"$runtime_fd"
+    for line in "${runtime_lines[@]}"; do
+        case "$line" in
+            SCRIPT_VERSION=*) count=$((count + 1)); version="$line" ;;
+        esac
+    done
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$runtime_file" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$runtime_file" ] || return 1
+    [ "$count" -eq 1 ] || return 1
+    case "$version" in 'SCRIPT_VERSION="'*'"') ;; *) return 1 ;; esac
+    version="${version#SCRIPT_VERSION=\"}"
+    version="${version%\"}"
+    [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || return 1
+    printf '%s\n' "$version"
+  )
+}
+
+rr_prepare_legacy_update_bridge_parent() {
+    local marker="${1:-$RR_LEGACY_UPDATE_BRIDGE_FILE}" parent="" canonical=""
+    parent=$(dirname -- "$marker") || return 1
+    if [ -e "$parent" ] || [ -L "$parent" ]; then
+        [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+        [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+    else
+        (umask 077; mkdir -p -- "$parent") || return 1
+    fi
+    canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+    [ "$canonical" = "$parent" ] || return 1
+    [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+    chmod 0700 -- "$parent" || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ]
+}
+
+rr_legacy_update_bridge_marker_is_safe() {
+    (
+        local marker="${1:-$RR_LEGACY_UPDATE_BRIDGE_FILE}" marker_fd=""
+        local shell_pid="${BASHPID:-$$}" fd_path="" path_identity="" fd_identity=""
+        local -a marker_lines=()
+        rr_prepare_legacy_update_bridge_parent "$marker" || return 1
+        [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+        exec {marker_fd}<"$marker" || return 1
+        fd_path="/proc/$shell_pid/fd/$marker_fd"
+        [ -e "$fd_path" ] || fd_path="/dev/fd/$marker_fd"
+        path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$marker" 2>/dev/null) || return 1
+        fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+        [ "$path_identity" = "$fd_identity" ] && \
+            [[ "$fd_identity" == *:0:0:600:1 ]] && [ ! -L "$marker" ] || return 1
+        mapfile -t marker_lines <&"$marker_fd"
+        [ "${#marker_lines[@]}" -eq 1 ] && \
+            [ "${marker_lines[0]}" = rr-legacy-update-bridge-v1 ] || return 1
+        path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$marker" 2>/dev/null) || return 1
+        [ "$path_identity" = "$fd_identity" ] && [ ! -L "$marker" ]
+    )
+}
+
+rr_publish_legacy_update_bridge_marker() {
+    local marker="${1:-$RR_LEGACY_UPDATE_BRIDGE_FILE}" parent="" temporary=""
+    rr_prepare_legacy_update_bridge_parent "$marker" || return 1
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        rr_legacy_update_bridge_marker_is_safe "$marker"
+        return
+    fi
+    parent=$(dirname -- "$marker") || return 1
+    temporary=$(mktemp "$parent/.legacy-update-bridge.XXXXXX") || return 1
+    if ! printf '%s\n' rr-legacy-update-bridge-v1 > "$temporary" || \
+       ! chmod 0600 -- "$temporary" || \
+       [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] || \
+       ! sync -f "$temporary" || ! mv -f -- "$temporary" "$marker" || \
+       ! sync -f "$parent"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    rr_legacy_update_bridge_marker_is_safe "$marker"
+}
+
+rr_legacy_public_lock_is_nonroot_noise() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}" owner=""
+    [ -e "$lock_file" ] || [ -L "$lock_file" ] || return 1
+    # GNU stat without -L inspects the directory entry itself.  Do not open,
+    # read, follow, chmod, unlink, or otherwise treat public-path noise as
+    # authoritative when no private bridge marker requires compatibility.
+    owner=$(stat -c '%u' -- "$lock_file" 2>/dev/null) || return 1
+    [ "$owner" != 0 ]
+}
+
+rr_promote_trusted_legacy_preoccupation() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    # This path is used only after a root-owned 7.1.0 runtime has been proven.
+    # Bind every check and mutation to one opened inode: path-based chown/rm/mv
+    # could race a genuine legacy updater and split the flock domain.
+    python3 -I -S - "$lock_file" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+parent = os.path.dirname(path)
+name = os.path.basename(path)
+
+def fail(code=1):
+    raise SystemExit(code)
+
+def same_inode(left, right):
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+def safe_root_lock(value):
+    mode = stat.S_IMODE(value.st_mode)
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_uid == 0
+        and value.st_gid == 0
+        and value.st_nlink == 1
+        and mode & 0o7133 == 0
+    )
+
+if not parent or not name or not hasattr(os, "O_PATH"):
+    fail()
+
+directory_fd = os.open(
+    parent,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+)
+entry_fd = exact_fd = None
+try:
+    directory_state = os.fstat(directory_fd)
+    directory_mode = stat.S_IMODE(directory_state.st_mode)
+    if (
+        not stat.S_ISDIR(directory_state.st_mode)
+        or directory_state.st_uid != 0
+        or directory_state.st_gid != 0
+        or directory_mode & 0o6000
+        or (directory_mode & 0o002 and not directory_mode & 0o1000)
+    ):
+        fail()
+
+    entry_fd = os.open(
+        name,
+        os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=directory_fd,
+    )
+    entry_state = os.fstat(entry_fd)
+    path_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not same_inode(entry_state, path_state)
+        or not stat.S_ISREG(entry_state.st_mode)
+        or entry_state.st_nlink != 1
+        or entry_state.st_uid == 0
+    ):
+        fail()
+
+    exact_fd = os.open(
+        f"/proc/self/fd/{entry_fd}",
+        os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC,
+    )
+    exact_state = os.fstat(exact_fd)
+    if not same_inode(entry_state, exact_state):
+        fail()
+    try:
+        fcntl.flock(exact_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail()
+
+    current_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not same_inode(current_state, exact_state):
+        # Even a root-safe replacement is a different flock domain.  A legacy
+        # process may already have opened the original inode and acquire it as
+        # soon as this helper closes exact_fd, while Bash locks the replacement.
+        # Fail closed and retry the complete acquisition instead.
+        fail()
+
+    os.fchmod(exact_fd, 0o600)
+    os.fchown(exact_fd, 0, 0)
+    os.fsync(exact_fd)
+    os.fsync(directory_fd)
+    final_fd_state = os.fstat(exact_fd)
+    final_path_state = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not same_inode(final_fd_state, final_path_state) or not safe_root_lock(final_fd_state):
+        fail()
+finally:
+    if exact_fd is not None:
+        os.close(exact_fd)
+    if entry_fd is not None:
+        os.close(entry_fd)
+    os.close(directory_fd)
+PY
+}
+
+rr_acquire_legacy_update_lock() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local installed_version="" bridge_required=false marker_present=false
+    local trusted_legacy_runtime=false
+    LEGACY_UPDATE_LOCK_FD=""
+    rr_prepare_legacy_update_bridge_parent "$RR_LEGACY_UPDATE_BRIDGE_FILE" || return 1
+    if [ -e "$RR_LEGACY_UPDATE_BRIDGE_FILE" ] || \
+       [ -L "$RR_LEGACY_UPDATE_BRIDGE_FILE" ]; then
+        rr_legacy_update_bridge_marker_is_safe "$RR_LEGACY_UPDATE_BRIDGE_FILE" || {
+            rr_error "7.1.0 兼容锁私有标记不安全，已拒绝安装/更新。"
+            return 1
+        }
+        marker_present=true
+        bridge_required=true
+    elif installed_version=$(rr_trusted_installed_runtime_version 2>/dev/null); then
+        if ! rr_version_ge "$installed_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
+            bridge_required=true
+            trusted_legacy_runtime=true
+        fi
+    elif [ -e "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ] || \
+         [ -e "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ]; then
+        rr_error "检测到无法可信识别版本的既有安装，拒绝推断兼容锁状态。"
+        return 1
+    fi
+    rr_legacy_update_lock_parent_is_safe "$lock_file" || return 1
+    if [ "$bridge_required" = true ] && [ "$marker_present" != true ] &&
+       [ "$trusted_legacy_runtime" = true ] &&
+       rr_legacy_public_lock_is_nonroot_noise "$lock_file"; then
+        if ! rr_promote_trusted_legacy_preoccupation "$lock_file"; then
+            rr_error "无法安全接管低权限用户预占的 7.1.0 兼容锁，已拒绝安装/更新。"
+            return 1
+        fi
+    fi
+    if [ "$bridge_required" != true ]; then
+        if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+            return 0
+        fi
+        if rr_legacy_public_lock_is_nonroot_noise "$lock_file"; then
+            return 0
+        fi
+        # A safe/root-owned existing inode is authoritative evidence that an
+        # old updater may still participate this boot.  Acquire it and publish
+        # the private marker so every later runtime path keeps bridging it.
+        bridge_required=true
+    elif [ "$marker_present" = true ] && \
+         [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        rr_error "7.1.0 兼容锁私有标记存在，但公共锁缺失；已安全拒绝。"
+        return 1
+    elif [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        # Closing the absent->legacy-start race requires publishing the old
+        # name only while an old/unknown installed runtime requires the bridge.
+        # Noclobber never truncates a concurrent creator; strict checks below
+        # decide whether the winning inode is trustworthy.
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || true
+    fi
+    rr_legacy_update_lock_path_is_safe "$lock_file" || {
+        rr_error "检测到不安全的 7.1.0 兼容锁，已拒绝安装/更新。"
+        return 1
+    }
+    # Read-only opening is deliberate: an existing compatibility inode is
+    # never truncated, chmodded, chowned, replaced, or unlinked.
+    exec {LEGACY_UPDATE_LOCK_FD}<"$lock_file" || {
+        LEGACY_UPDATE_LOCK_FD=""
+        return 1
+    }
+    if ! rr_legacy_update_lock_fd_is_safe "$lock_file" "$LEGACY_UPDATE_LOCK_FD"; then
+        exec {LEGACY_UPDATE_LOCK_FD}>&-
+        LEGACY_UPDATE_LOCK_FD=""
+        rr_error "7.1.0 兼容锁在打开时发生变化，已拒绝安装/更新。"
+        return 1
+    fi
+    if ! flock -n "$LEGACY_UPDATE_LOCK_FD"; then
+        exec {LEGACY_UPDATE_LOCK_FD}>&-
+        LEGACY_UPDATE_LOCK_FD=""
+        rr_error "另一个 7.1.0 安装/更新任务正在运行，本次未改动系统。"
+        return 1
+    fi
+    if [ "$bridge_required" = true ] && [ "$marker_present" != true ] && \
+       ! rr_publish_legacy_update_bridge_marker "$RR_LEGACY_UPDATE_BRIDGE_FILE"; then
+        exec {LEGACY_UPDATE_LOCK_FD}>&-
+        LEGACY_UPDATE_LOCK_FD=""
+        rr_error "无法可信发布 7.1.0 兼容锁私有标记，已安全拒绝。"
+        return 1
+    fi
+}
+
+rr_close_inherited_installer_lock_fds() {
+    local lock_fd=""
+    lock_fd="${LEGACY_UPDATE_LOCK_FD:-}"
+    if [[ "$lock_fd" =~ ^[0-9]+$ ]]; then
+        exec {lock_fd}>&-
+    fi
+    LEGACY_UPDATE_LOCK_FD=""
+    lock_fd="${UPDATE_LOCK_FD:-}"
+    if [[ "$lock_fd" =~ ^[0-9]+$ ]]; then
+        exec {lock_fd}>&-
+    fi
+    UPDATE_LOCK_FD=""
+}
+
+rr_run_with_delegated_update_lock() {
+    (
+        # The installer parent remains the sole lock owner for the whole
+        # transaction.  Delegated helpers are told not to reacquire, but their
+        # process tree must not inherit either flock fd: a nohup child could
+        # otherwise keep the transaction locked after the installer exits.
+        rr_close_inherited_installer_lock_fds
+        RR_UPDATE_LOCK_HELD=1 "$@"
+    )
+}
+
 rr_freeze_health_monitor() {
-    local attempt=0
+    local attempt=0 timer_result=0 service_result=0
+    local captured_timer_enabled="${RR_HEALTH_TIMER_WAS_ENABLED:-false}"
+    local captured_timer_active="${RR_HEALTH_TIMER_WAS_ACTIVE:-false}"
+    local captured_service_active="${RR_HEALTH_SERVICE_WAS_ACTIVE:-false}"
     if [ "${RR_HEALTH_STATE_CAPTURED:-false}" != true ]; then
-        RR_HEALTH_TIMER_WAS_ENABLED=false
-        RR_HEALTH_TIMER_WAS_ACTIVE=false
-        RR_HEALTH_SERVICE_WAS_ACTIVE=false
-        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
-            RR_HEALTH_TIMER_WAS_ENABLED=true
-        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
-            RR_HEALTH_TIMER_WAS_ACTIVE=true
-        systemctl is-active --quiet argo-rr-health.service 2>/dev/null && \
-            RR_HEALTH_SERVICE_WAS_ACTIVE=true
+        rr_capture_unit_file_state argo-rr-health.timer \
+            captured_timer_enabled || return 1
+        rr_capture_unit_activity_state argo-rr-health.timer \
+            captured_timer_active || return 1
+        rr_capture_unit_activity_state argo-rr-health.service \
+            captured_service_active || return 1
+        RR_HEALTH_TIMER_WAS_ENABLED="$captured_timer_enabled"
+        RR_HEALTH_TIMER_WAS_ACTIVE="$captured_timer_active"
+        RR_HEALTH_SERVICE_WAS_ACTIVE="$captured_service_active"
         RR_HEALTH_STATE_CAPTURED=true
     fi
     RR_HEALTH_MONITOR_FROZEN=true
@@ -113,18 +508,24 @@ rr_freeze_health_monitor() {
     # recovery or snapshot work, and wait until systemd confirms both exited.
     systemctl stop argo-rr-health.timer argo-rr-health.service >/dev/null 2>&1 || true
     while [ "$attempt" -lt 30 ]; do
-        if ! systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
-           ! systemctl is-active --quiet argo-rr-health.service 2>/dev/null; then
+        rr_unit_activity_matches argo-rr-health.timer inactive
+        timer_result=$?
+        rr_unit_activity_matches argo-rr-health.service inactive
+        service_result=$?
+        if [ "$timer_result" -eq 0 ] && [ "$service_result" -eq 0 ]; then
             return 0
+        fi
+        # Result 2 means the query failed or returned an unknown state.  That
+        # is never proof that a writer stopped, so do not retry it as though it
+        # were a normal activating/deactivating transition.
+        if [ "$timer_result" -eq 2 ] || [ "$service_result" -eq 2 ]; then
+            break
         fi
         sleep 0.1
         attempt=$((attempt + 1))
     done
-    if systemctl is-active --quiet argo-rr-health.timer 2>/dev/null || \
-       systemctl is-active --quiet argo-rr-health.service 2>/dev/null; then
-        rr_error "无法冻结健康检查服务，已拒绝创建并发更新快照。"
-        return 1
-    fi
+    rr_error "无法冻结健康检查服务，已拒绝创建并发更新快照。"
+    return 1
 }
 
 rr_resume_health_monitor_after_abort() {
@@ -139,16 +540,144 @@ rr_resume_health_monitor_after_abort() {
 }
 
 rr_wait_unit_state() {
-    local unit="$1" wanted="$2" attempt=0
+    local unit="$1" wanted="$2" attempt=0 state=0
     while [ "$attempt" -lt 50 ]; do
-        if [ "$wanted" = active ]; then
-            systemctl is-active --quiet "$unit" 2>/dev/null && return 0
-        else
-            systemctl is-active --quiet "$unit" 2>/dev/null || return 0
+        rr_unit_activity_matches "$unit" "$wanted" && return 0
+        state=$?
+        # A valid but not-yet-final state may be retried.  A systemd bus/query
+        # error or an unrecognised state is not evidence of inactivity.
+        [ "$state" -eq 1 ] || return 1
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+rr_unit_activity_matches() {
+    local unit="$1" wanted="$2" load_state="" active_state=""
+    load_state=$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null) || return 2
+    active_state=$(systemctl show --property=ActiveState --value \
+        "$unit" 2>/dev/null) || return 2
+    case "$load_state:$active_state" in
+        loaded:active|loaded:inactive|loaded:failed|loaded:activating|loaded:deactivating|\
+        loaded:reloading|masked:inactive|masked:failed|not-found:inactive) ;;
+        *) return 2 ;;
+    esac
+    case "$wanted:$load_state:$active_state" in
+        active:loaded:active|\
+        inactive:loaded:inactive|inactive:loaded:failed|\
+        inactive:masked:inactive|inactive:masked:failed|\
+        inactive:not-found:inactive) return 0 ;;
+        active:*|inactive:*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+rr_unit_file_state_matches() {
+    local unit="$1" wanted="$2" load_state="" unit_file_state=""
+    load_state=$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null) || return 2
+    unit_file_state=$(systemctl show --property=UnitFileState --value \
+        "$unit" 2>/dev/null) || return 2
+    if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+        unit_file_state=not-found
+    fi
+    case "$wanted:$load_state:$unit_file_state" in
+        enabled:loaded:enabled|enabled:loaded:enabled-runtime|\
+        disabled:loaded:disabled|disabled:loaded:static|\
+        disabled:masked:masked|disabled:not-found:not-found) return 0 ;;
+        enabled:loaded:*|enabled:masked:*|enabled:not-found:*|\
+        disabled:loaded:*|disabled:masked:*|disabled:not-found:*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+rr_capture_unit_activity_state() {
+    local unit="$1" output_name="$2" state=0
+    if rr_unit_activity_matches "$unit" active; then
+        printf -v "$output_name" '%s' true
+        return 0
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ] || return 1
+    rr_unit_activity_matches "$unit" inactive || return 1
+    printf -v "$output_name" '%s' false
+}
+
+rr_capture_unit_file_state() {
+    local unit="$1" output_name="$2" state=0
+    if rr_unit_file_state_matches "$unit" enabled; then
+        printf -v "$output_name" '%s' true
+        return 0
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ] || return 1
+    rr_unit_file_state_matches "$unit" disabled || return 1
+    printf -v "$output_name" '%s' false
+}
+
+rr_quiesce_health_monitor_for_rollback() {
+    local attempt=0 timer_load="" service_load="" timer_state=""
+    local service_state="" timer_enabled_state="" service_enabled_state=""
+    # Candidate migration may have re-enabled the timer after the original
+    # snapshot freeze.  Revoke both scheduling and an in-flight oneshot before
+    # touching any old runtime file; only observed final state is authoritative.
+    timer_load=$(systemctl show --property=LoadState --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    service_load=$(systemctl show --property=LoadState --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    case "$timer_load" in loaded|masked|not-found) ;; *) return 1 ;; esac
+    case "$service_load" in loaded|masked|not-found) ;; *) return 1 ;; esac
+    case "$timer_load" in
+        loaded) systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || return 1 ;;
+        masked) systemctl stop argo-rr-health.timer >/dev/null 2>&1 || return 1 ;;
+    esac
+    case "$service_load" in
+        loaded|masked) systemctl stop argo-rr-health.service >/dev/null 2>&1 || return 1 ;;
+    esac
+    while [ "$attempt" -lt 30 ]; do
+        timer_load=$(systemctl show --property=LoadState --value \
+            argo-rr-health.timer 2>/dev/null) || return 1
+        service_load=$(systemctl show --property=LoadState --value \
+            argo-rr-health.service 2>/dev/null) || return 1
+        timer_state=$(systemctl show --property=ActiveState --value \
+            argo-rr-health.timer 2>/dev/null) || return 1
+        service_state=$(systemctl show --property=ActiveState --value \
+            argo-rr-health.service 2>/dev/null) || return 1
+        timer_enabled_state=$(systemctl show --property=UnitFileState --value \
+            argo-rr-health.timer 2>/dev/null) || return 1
+        service_enabled_state=$(systemctl show --property=UnitFileState --value \
+            argo-rr-health.service 2>/dev/null) || return 1
+        if [ "$timer_load" = not-found ] && [ -z "$timer_enabled_state" ]; then
+            timer_enabled_state=not-found
+        fi
+        if [ "$service_load" = not-found ] && [ -z "$service_enabled_state" ]; then
+            service_enabled_state=not-found
+        fi
+        case "$timer_load:$timer_state:$timer_enabled_state" in
+            loaded:inactive:disabled|loaded:inactive:static|\
+            loaded:failed:disabled|loaded:failed:static|\
+            masked:inactive:masked|masked:failed:masked|\
+            not-found:inactive:not-found) timer_state=safe ;;
+            *) timer_state=unsafe ;;
+        esac
+        case "$service_load:$service_state:$service_enabled_state" in
+            loaded:inactive:disabled|loaded:inactive:static|\
+            loaded:failed:disabled|loaded:failed:static|\
+            masked:inactive:masked|masked:failed:masked|\
+            not-found:inactive:not-found) service_state=safe ;;
+            *) service_state=unsafe ;;
+        esac
+        if [ "$timer_state" = safe ] && [ "$service_state" = safe ]; then
+            return 0
         fi
         sleep 0.1
         attempt=$((attempt + 1))
     done
+    rr_error "无法严格冻结健康检查 timer/service，拒绝切回旧运行文件。"
     return 1
 }
 
@@ -228,28 +757,39 @@ rr_install_restore_external_state_if_required() {
 }
 
 rr_capture_update_writer_state() {
+    local health_timer_enabled="${RR_HEALTH_TIMER_WAS_ENABLED:-false}"
+    local health_timer_active="${RR_HEALTH_TIMER_WAS_ACTIVE:-false}"
+    local health_service_active="${RR_HEALTH_SERVICE_WAS_ACTIVE:-false}"
+    local singbox_active=false singbox_enabled=false
+    local nexus_active=false nexus_enabled=false subscription_active=false
+
     if [ "${RR_HEALTH_STATE_CAPTURED:-false}" != true ]; then
-        RR_HEALTH_TIMER_WAS_ENABLED=false
-        RR_HEALTH_TIMER_WAS_ACTIVE=false
-        RR_HEALTH_SERVICE_WAS_ACTIVE=false
-        systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && \
-            RR_HEALTH_TIMER_WAS_ENABLED=true
-        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
-            RR_HEALTH_TIMER_WAS_ACTIVE=true
-        systemctl is-active --quiet argo-rr-health.service 2>/dev/null && \
-            RR_HEALTH_SERVICE_WAS_ACTIVE=true
-        RR_HEALTH_STATE_CAPTURED=true
+        rr_capture_unit_file_state argo-rr-health.timer \
+            health_timer_enabled || return 1
+        rr_capture_unit_activity_state argo-rr-health.timer \
+            health_timer_active || return 1
+        rr_capture_unit_activity_state argo-rr-health.service \
+            health_service_active || return 1
     fi
-    RR_SINGBOX_WAS_ACTIVE=false
-    RR_SINGBOX_WAS_ENABLED=false
-    RR_NEXUS_WAS_ACTIVE=false
-    RR_NEXUS_WAS_ENABLED=false
-    RR_SUBSCRIPTION_WAS_ACTIVE=false
-    systemctl is-active --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ACTIVE=true
-    systemctl is-enabled --quiet sing-box 2>/dev/null && RR_SINGBOX_WAS_ENABLED=true
-    systemctl is-active --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ACTIVE=true
-    systemctl is-enabled --quiet rr-nexus 2>/dev/null && RR_NEXUS_WAS_ENABLED=true
-    rr_subscription_running && RR_SUBSCRIPTION_WAS_ACTIVE=true
+
+    rr_capture_unit_activity_state sing-box singbox_active || return 1
+    rr_capture_unit_file_state sing-box singbox_enabled || return 1
+    rr_capture_unit_activity_state rr-nexus nexus_active || return 1
+    rr_capture_unit_file_state rr-nexus nexus_enabled || return 1
+    rr_subscription_running && subscription_active=true
+
+    # Publish the snapshot only after every systemd query was proved valid.
+    # A late D-Bus failure must not leave a partially captured false state that
+    # a retry could persist as authoritative recovery evidence.
+    RR_HEALTH_TIMER_WAS_ENABLED="$health_timer_enabled"
+    RR_HEALTH_TIMER_WAS_ACTIVE="$health_timer_active"
+    RR_HEALTH_SERVICE_WAS_ACTIVE="$health_service_active"
+    RR_HEALTH_STATE_CAPTURED=true
+    RR_SINGBOX_WAS_ACTIVE="$singbox_active"
+    RR_SINGBOX_WAS_ENABLED="$singbox_enabled"
+    RR_NEXUS_WAS_ACTIVE="$nexus_active"
+    RR_NEXUS_WAS_ENABLED="$nexus_enabled"
+    RR_SUBSCRIPTION_WAS_ACTIVE="$subscription_active"
     return 0
 }
 
@@ -319,26 +859,41 @@ rr_freeze_update_writers() {
 }
 
 rr_restore_unit_state() {
-    local unit="$1" active_marker="$2" enabled_marker="$3"
+    local unit="$1" active_marker="$2" enabled_marker="$3" load_state=""
+    load_state=$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null) || return 1
+    case "$load_state" in loaded|masked|not-found) ;; *) return 1 ;; esac
     if [ -f "$enabled_marker" ]; then
+        [ "$load_state" = loaded ] || return 1
         systemctl enable "$unit" >/dev/null 2>&1 || return 1
-        systemctl is-enabled --quiet "$unit" 2>/dev/null || return 1
+        rr_unit_file_state_matches "$unit" enabled || return 1
     else
-        systemctl disable "$unit" >/dev/null 2>&1 || true
-        systemctl is-enabled --quiet "$unit" 2>/dev/null && return 1
+        if [ "$load_state" = loaded ]; then
+            systemctl disable "$unit" >/dev/null 2>&1 || return 1
+        fi
+        rr_unit_file_state_matches "$unit" disabled || return 1
     fi
     if [ -f "$active_marker" ]; then
+        [ "$load_state" = loaded ] || return 1
         systemctl restart "$unit" >/dev/null 2>&1 || return 1
         rr_wait_unit_state "$unit" active
     else
-        systemctl stop "$unit" >/dev/null 2>&1 || true
+        case "$load_state" in
+            loaded|masked) systemctl stop "$unit" >/dev/null 2>&1 || return 1 ;;
+        esac
         rr_wait_unit_state "$unit" inactive
     fi
 }
 
 rr_run_health_check_bounded() {
     local pid="" attempt=0 status=0
-    RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check >/dev/null 2>&1 &
+    (
+        # This outer group is the process placed in the background.  Close
+        # both flock descriptors here so an installer SIGKILL cannot leave an
+        # orphaned wrapper holding the transaction locks.
+        rr_close_inherited_installer_lock_fds
+        RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check
+    ) >/dev/null 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
         sleep 0.1
@@ -355,7 +910,10 @@ rr_run_health_check_bounded() {
 
 rr_restart_health_service_bounded() {
     local pid="" attempt=0 status=0
-    systemctl start argo-rr-health.service >/dev/null 2>&1 &
+    (
+        rr_close_inherited_installer_lock_fds
+        systemctl start argo-rr-health.service
+    ) >/dev/null 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
         sleep 0.1
@@ -385,10 +943,17 @@ rr_restore_update_writer_state() {
         "$backup/singbox_was_enabled" || failed=true
     rr_restore_unit_state rr-nexus "$backup/nexus_was_running" \
         "$backup/nexus_was_enabled" || failed=true
-    rr_restore_unit_state argo-rr-health.timer "$backup/health_timer_was_running" \
-        "$backup/health_timer_was_enabled" || failed=true
-    if [ -f "$backup/health_service_was_running" ]; then
-        rr_restart_health_service_bounded || failed=true
+    if [ "$subscription_policy" = normal ]; then
+        rr_restore_unit_state argo-rr-health.timer "$backup/health_timer_was_running" \
+            "$backup/health_timer_was_enabled" || failed=true
+        if [ -f "$backup/health_service_was_running" ]; then
+            rr_restart_health_service_bounded || failed=true
+        fi
+    else
+        # A degraded/quarantined rollback must never revive the legacy health
+        # writer.  Reuse the fail-closed postcondition verifier after the old
+        # unit files have been restored.
+        rr_quiesce_health_monitor_for_rollback || failed=true
     fi
     [ "$failed" = false ] || return 1
     RR_UPDATE_WRITERS_FROZEN=false
@@ -409,9 +974,9 @@ rr_verify_update_writer_state() {
             rr_wait_unit_state "$unit" inactive || return 1
         fi
         if [ -f "$backup/$enabled_marker" ]; then
-            systemctl is-enabled --quiet "$unit" 2>/dev/null || return 1
+            rr_unit_file_state_matches "$unit" enabled || return 1
         else
-            systemctl is-enabled --quiet "$unit" 2>/dev/null && return 1
+            rr_unit_file_state_matches "$unit" disabled || return 1
         fi
     done
     if [ -f "$backup/subscription_was_running" ]; then
@@ -900,6 +1465,241 @@ rr_write_phase() {
         sync -f "$temporary" && mv -f "$temporary" "$TX_DIR/phase" && sync -f "$TX_DIR"
 }
 
+rr_sync_host_state_before_terminal() {
+    if sync; then
+        return 0
+    fi
+    # A failed global flush makes either the candidate or restored host state
+    # non-durable.  Keep every recovery pointer and freeze writers instead of
+    # publishing a terminal phase that boot recovery could wrongly discard.
+    if declare -F rr_freeze_update_writers >/dev/null; then
+        rr_freeze_update_writers >/dev/null 2>&1 || true
+    fi
+    TRANSACTION_ACTIVE=false
+    ROLLBACK_FAILED=true
+    KEEP_TRANSACTION=true
+    RR_UPDATE_WRITERS_FROZEN=true
+    RR_HEALTH_MONITOR_FROZEN=true
+    rr_write_phase recovery_failed >/dev/null 2>&1 || true
+    rr_error "主机状态无法完成全局持久化；写入器保持冻结，事务证据已保留。"
+    return 1
+}
+
+rr_transaction_path_is_direct_child() {
+    local transaction="$1" parent="" name="" canonical=""
+    [ -n "$transaction" ] && [[ "$transaction" == /* ]] || return 1
+    parent=$(dirname -- "$transaction") || return 1
+    [ "$parent" = "$RR_TX_ROOT/transactions" ] || return 1
+    name=$(basename -- "$transaction") || return 1
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+    canonical=$(readlink -m -- "$transaction" 2>/dev/null) || return 1
+    [ "$canonical" = "$transaction" ]
+}
+
+rr_transaction_dir_is_strict() {
+    local transaction="$1"
+    rr_transaction_path_is_direct_child "$transaction" || return 1
+    [ -d "$transaction" ] && [ ! -L "$transaction" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$transaction" 2>/dev/null)" = 0:0:700 ]
+}
+
+rr_read_trusted_phase() {
+    local transaction="${1:-$TX_DIR}" phase_file="" phase="" phase_fd=""
+    local shell_pid="${BASHPID:-$$}" fd_path="" path_identity="" fd_identity=""
+    local -a phase_lines=()
+    rr_transaction_dir_is_strict "$transaction" || return 1
+    phase_file="$transaction/phase"
+    [ -f "$phase_file" ] && [ ! -L "$phase_file" ] || return 1
+    exec {phase_fd}<"$phase_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$phase_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$phase_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$phase_file" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    if [ "$path_identity" != "$fd_identity" ] || \
+       [[ "$fd_identity" != *:0:0:600:1 ]] || [ -L "$phase_file" ]; then
+        exec {phase_fd}>&-
+        return 1
+    fi
+    mapfile -t phase_lines <&"$phase_fd"
+    if [ "${#phase_lines[@]}" -ne 1 ]; then
+        exec {phase_fd}>&-
+        return 1
+    fi
+    phase="${phase_lines[0]}"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$phase_file" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    exec {phase_fd}>&-
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$phase_file" ] || return 1
+    case "$phase" in
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|\
+        committed|rolled_back|rolled_back_degraded|recovery_failed|aborted) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$phase"
+}
+
+rr_read_trusted_legacy_phase() {
+    local transaction="$1" phase_file="" phase="" phase_fd=""
+    local shell_pid="${BASHPID:-$$}" fd_path="" path_identity="" fd_identity=""
+    local owner="" group="" mode="" links=""
+    local -a phase_lines=()
+    rr_transaction_dir_is_strict "$transaction" || return 1
+    phase_file="$transaction/phase"
+    [ -f "$phase_file" ] && [ ! -L "$phase_file" ] || return 1
+    exec {phase_fd}<"$phase_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$phase_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$phase_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$phase_file" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    IFS=: read -r _ _ owner group mode links <<<"$fd_identity"
+    if [ "$path_identity" != "$fd_identity" ] || [ -L "$phase_file" ] ||
+       [ "$owner" != 0 ] || [ "$group" != 0 ] || [ "$links" != 1 ] ||
+       ! rr_legacy_update_lock_mode_is_safe "$mode"; then
+        exec {phase_fd}>&-
+        return 1
+    fi
+    mapfile -t phase_lines <&"$phase_fd"
+    if [ "${#phase_lines[@]}" -ne 1 ]; then
+        exec {phase_fd}>&-
+        return 1
+    fi
+    phase="${phase_lines[0]}"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$phase_file" 2>/dev/null) || {
+        exec {phase_fd}>&-
+        return 1
+    }
+    exec {phase_fd}>&-
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$phase_file" ] || return 1
+    case "$phase" in
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|\
+        committed|rolled_back|rolled_back_degraded|recovery_failed|aborted) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$phase"
+}
+
+rr_read_previous_transaction_phase() {
+    local transaction="$1" format_state=0
+    if rr_transaction_format_state "$transaction"; then
+        format_state=0
+    else
+        format_state=$?
+    fi
+    case "$format_state" in
+        0) rr_read_trusted_phase "$transaction" ;;
+        1) rr_read_trusted_legacy_phase "$transaction" ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_read_trusted_active_transaction() {
+    local active_fd="" shell_pid="${BASHPID:-$$}" fd_path=""
+    local path_identity="" fd_identity="" owner="" group="" mode="" links=""
+    local tx="" format_state=0
+    local -a active_lines=()
+    [ -f "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ] || return 1
+    exec {active_fd}<"$RR_ACTIVE_TX" || return 1
+    fd_path="/proc/$shell_pid/fd/$active_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$active_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$RR_ACTIVE_TX" 2>/dev/null) || {
+        exec {active_fd}>&-
+        return 1
+    }
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || {
+        exec {active_fd}>&-
+        return 1
+    }
+    IFS=: read -r _ _ owner group mode links <<<"$fd_identity"
+    if [ "$path_identity" != "$fd_identity" ] || [ -L "$RR_ACTIVE_TX" ] ||
+       [ "$owner" != 0 ] || [ "$group" != 0 ] || [ "$links" != 1 ] ||
+       ! rr_legacy_update_lock_mode_is_safe "$mode"; then
+        exec {active_fd}>&-
+        return 1
+    fi
+    mapfile -t active_lines <&"$active_fd"
+    [ "${#active_lines[@]}" -eq 1 ] || {
+        exec {active_fd}>&-
+        return 1
+    }
+    tx="${active_lines[0]}"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$RR_ACTIVE_TX" 2>/dev/null) || {
+        exec {active_fd}>&-
+        return 1
+    }
+    exec {active_fd}>&-
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$RR_ACTIVE_TX" ] || return 1
+    rr_transaction_path_is_direct_child "$tx" || return 1
+    if [ -e "$tx" ] || [ -L "$tx" ]; then
+        rr_transaction_dir_is_strict "$tx" || return 1
+        if rr_transaction_format_state "$tx"; then
+            format_state=0
+        else
+            format_state=$?
+        fi
+        [ "$format_state" -ne 2 ] || return 1
+        [ "$format_state" -ne 0 ] || [ "$mode" = 600 ] || return 1
+    fi
+    printf '%s\n' "$tx"
+}
+
+rr_republish_active_pointer_for_retry() {
+    local expected="$1" parent="" temporary="" actual=""
+    parent=$(dirname -- "$RR_ACTIVE_TX") || return 1
+    [ "$parent" = "$RR_TX_ROOT" ] && [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+    rr_transaction_dir_is_strict "$expected" || return 1
+    if [ -e "$RR_ACTIVE_TX" ] || [ -L "$RR_ACTIVE_TX" ]; then
+        actual=$(rr_read_trusted_active_transaction) || return 1
+        [ "$actual" = "$expected" ] || return 1
+        sync -f "$parent"
+        return
+    fi
+    temporary=$(umask 077; mktemp "${RR_ACTIVE_TX}.retry.XXXXXX") || return 1
+    if [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+       ! printf '%s\n' "$expected" > "$temporary" || ! sync -f "$temporary" ||
+       ! mv -f -- "$temporary" "$RR_ACTIVE_TX"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! sync -f "$parent"; then
+        sync || true
+        return 1
+    fi
+    actual=$(rr_read_trusted_active_transaction) || return 1
+    [ "$actual" = "$expected" ]
+}
+
+rr_clear_active_transaction_pointer() {
+    local expected="$1" actual="" parent=""
+    parent=$(dirname -- "$RR_ACTIVE_TX") || return 1
+    if [ ! -e "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ]; then
+        sync -f "$parent"
+        return
+    fi
+    actual=$(rr_read_trusted_active_transaction) || return 1
+    [ "$actual" = "$expected" ] || return 1
+    rm -f -- "$RR_ACTIVE_TX" || return 1
+    if sync -f "$parent"; then
+        return 0
+    fi
+    rr_republish_active_pointer_for_retry "$expected" || true
+    return 1
+}
+
 rr_prepare_recovery_runtime() {
     local recovery_source="$PAYLOAD_DIR/scripts/update-recover.sh"
     local recovery_target="$RR_RECOVERY_HELPER"
@@ -946,11 +1746,18 @@ EOF
 
 rr_discard_previous_transaction() {
     local previous="" phase="" format_state=0
-    [ -r "$RR_ACTIVE_TX" ] || return 0
-    previous=$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null)
-    case "$previous" in "$RR_TX_ROOT"/transactions/*) ;; *) return 1 ;; esac
-    [ -d "$previous" ] || { rm -f "$RR_ACTIVE_TX"; return 0; }
-    phase=$(head -n 1 "$previous/phase" 2>/dev/null || true)
+    if [ ! -e "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ]; then
+        return 0
+    fi
+    previous=$(rr_read_trusted_active_transaction) || return 1
+    if [ ! -d "$previous" ]; then
+        rr_clear_active_transaction_pointer "$previous"
+        return
+    fi
+    phase=$(rr_read_previous_transaction_phase "$previous") || {
+        rr_error "旧事务阶段元数据不可信，已保留活动指针和全部恢复证据。"
+        return 1
+    }
     case "$phase" in
         committed)
             if rr_transaction_format_state "$previous"; then
@@ -964,36 +1771,46 @@ rr_discard_previous_transaction() {
             fi
             if [ "$format_state" -eq 0 ]; then
                 rr_create_update_maintenance_marker "$previous" || return 1
-                RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" \
+                rr_run_with_delegated_update_lock "$RR_LAUNCHER" \
                     --post-update-finalize --retire-rollback || return 1
             fi
-            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
+            rr_run_with_delegated_update_lock \
+                "$RR_RECOVERY_HELPER" recover || return 1
             RR_UPDATE_MAINTENANCE_ACTIVE=false
+            rr_clear_active_transaction_pointer "$previous" || return 1
             rm -rf -- "$previous" || return 1
-            rm -f "$RR_ACTIVE_TX"
             ;;
         rolled_back|rolled_back_degraded)
-            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
+            rr_run_with_delegated_update_lock \
+                "$RR_RECOVERY_HELPER" recover || return 1
+            rr_clear_active_transaction_pointer "$previous" || return 1
             rm -rf -- "$previous" || return 1
-            rm -f "$RR_ACTIVE_TX"
             ;;
         aborted)
+            rr_clear_active_transaction_pointer "$previous" || return 1
             rm -rf -- "$previous" || return 1
-            rm -f "$RR_ACTIVE_TX"
             ;;
         *)
-            RR_UPDATE_LOCK_HELD=1 "$RR_RECOVERY_HELPER" recover || return 1
+            rr_run_with_delegated_update_lock \
+                "$RR_RECOVERY_HELPER" recover || return 1
             ;;
     esac
 }
 
 rr_prune_stale_transactions() {
     local transaction="" phase="" active=""
-    [ -r "$RR_ACTIVE_TX" ] && active=$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null || true)
+    if [ -e "$RR_ACTIVE_TX" ] || [ -L "$RR_ACTIVE_TX" ]; then
+        active=$(rr_read_trusted_active_transaction) || return 1
+    fi
     while IFS= read -r transaction; do
         [ "$transaction" = "$active" ] && continue
-        case "$transaction" in "$RR_TX_ROOT"/transactions/*) ;; *) continue ;; esac
-        phase=$(head -n 1 "$transaction/phase" 2>/dev/null || true)
+        rr_transaction_dir_is_strict "$transaction" || continue
+        # A SIGKILL can leave an inactive directory between mkdir/format and
+        # phase publication. Preserve any unreadable or incomplete orphan, but
+        # never let it block a later transaction or classify it as terminal.
+        if ! phase=$(rr_read_previous_transaction_phase "$transaction"); then
+            continue
+        fi
         case "$phase" in rolled_back|rolled_back_degraded|aborted) rm -rf -- "$transaction" || return 1 ;; esac
     done < <(find "$RR_TX_ROOT/transactions" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
 }
@@ -1073,6 +1890,37 @@ rr_snapshot_runtime() {
 
 rr_rollback() {
     [ "$TRANSACTION_ACTIVE" = true ] || return 0
+    local rollback_phase=""
+    if ! rollback_phase=$(rr_read_trusted_phase "$TX_DIR"); then
+        TRANSACTION_ACTIVE=false
+        ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_error "事务阶段记录不可信，拒绝自动回滚并保留现场。"
+        return 1
+    fi
+    if [ "$rollback_phase" = committed ]; then
+        TRANSACTION_ACTIVE=false
+        KEEP_TRANSACTION=true
+        rr_error "安全版本已提交；保留事务证据并等待收尾重试，绝不自动回滚。"
+        return 0
+    fi
+    case "$rollback_phase" in
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating) ;;
+        *)
+            TRANSACTION_ACTIVE=false
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            rr_error "事务已处于终态，拒绝再次自动回滚并保留现场。"
+            return 1
+            ;;
+    esac
+    if ! rr_quiesce_health_monitor_for_rollback; then
+        TRANSACTION_ACTIVE=false
+        ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_write_phase recovery_failed >/dev/null 2>&1 || true
+        return 1
+    fi
     TRANSACTION_ACTIVE=false
     local rollback_failed=false
     local subscription_policy="normal"
@@ -1133,7 +1981,8 @@ rr_rollback() {
     case "$TX_DIR" in
         "$RR_TX_ROOT"/transactions/*)
             if [ -x "$RR_RECOVERY_HELPER" ] &&
-               "$RR_RECOVERY_HELPER" apply-rollback-policy "$TX_DIR"; then
+               rr_run_with_delegated_update_lock "$RR_RECOVERY_HELPER" \
+                   apply-rollback-policy "$TX_DIR"; then
                 subscription_policy=$(head -n 1 "$TX_DIR/rollback-subscription-status" 2>/dev/null || printf degraded)
             else
                 subscription_policy=degraded
@@ -1169,7 +2018,8 @@ rr_rollback() {
         fi
         if [ "$subscription_policy" = normal ] && \
            [ -f "$BACKUP_DIR/subscription_was_running" ] && [ -x "$RR_LAUNCHER" ]; then
-            RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || rollback_failed=true
+            rr_run_with_delegated_update_lock \
+                "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || rollback_failed=true
         fi
     fi
     if [ "$rollback_failed" = true ]; then
@@ -1180,6 +2030,7 @@ rr_rollback() {
         [ -n "$OLD_RUNTIME" ] && rr_error "旧运行目录仍保留在 ${OLD_RUNTIME}。"
         return 1
     fi
+    rr_sync_host_state_before_terminal || return 1
     if [ "$subscription_policy" = normal ]; then
         rr_write_phase rolled_back || {
             ROLLBACK_FAILED=true
@@ -1195,12 +2046,16 @@ rr_rollback() {
     if declare -F rr_clear_update_maintenance_marker >/dev/null && \
        ! rr_clear_update_maintenance_marker "$TX_DIR"; then
         ROLLBACK_FAILED=true
-        rr_write_phase recovery_failed >/dev/null 2>&1 || true
+        KEEP_TRANSACTION=true
         rr_error "严重：维护状态标记未能安全清理；事务证据已保留。"
         return 1
     fi
-    rm -f "$RR_ACTIVE_TX"
-    sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+    if ! rr_clear_active_transaction_pointer "$TX_DIR"; then
+        ROLLBACK_FAILED=true
+        KEEP_TRANSACTION=true
+        rr_error "严重：活动事务指针未能持久清理；终态与事务证据已保留。"
+        return 1
+    fi
     if [ -f "$BACKUP_DIR/runtime_did_not_exist" ]; then
         systemctl disable rr-update-recovery.service >/dev/null 2>&1 || true
         rm -f -- /etc/systemd/system/rr-update-recovery.service \
@@ -1220,34 +2075,57 @@ rr_rollback() {
 rr_cleanup() {
     local result="${1:-0}" cleanup_phase=""
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
-        rr_rollback || result=1
+        if cleanup_phase=$(rr_read_trusted_phase "$TX_DIR"); then
+            if [ "$cleanup_phase" = committed ]; then
+                TRANSACTION_ACTIVE=false
+                KEEP_TRANSACTION=true
+            else
+                rr_rollback || result=1
+            fi
+        else
+            TRANSACTION_ACTIVE=false
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            rr_error "事务阶段记录不可信，清理器拒绝自动回滚并保留现场。"
+            result=1
+        fi
     fi
-    [ -n "$TX_DIR" ] && cleanup_phase=$(head -n 1 "$TX_DIR/phase" 2>/dev/null || true)
+    if [ -n "$TX_DIR" ]; then
+        cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
+    fi
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" != true ] && \
        [ "$RR_UPDATE_WRITERS_FROZEN" = true ] && \
        [[ "$cleanup_phase" =~ ^(freezing|snapshotting|prepared)$ ]]; then
         if rr_restore_update_writer_state "$BACKUP_DIR" normal && \
+           rr_sync_host_state_before_terminal && \
            rr_write_phase aborted && \
-           rr_clear_update_maintenance_marker "$TX_DIR"; then
-            rm -f -- "$RR_ACTIVE_TX"
-            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+           rr_clear_update_maintenance_marker "$TX_DIR" && \
+           rr_clear_active_transaction_pointer "$TX_DIR"; then
+            :
         else
-            rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
+            [ "$cleanup_phase" = aborted ] || \
+                rr_write_phase recovery_failed >/dev/null 2>&1 || true
             ROLLBACK_FAILED=true
             KEEP_TRANSACTION=true
             result=1
         fi
     fi
-    [ -n "$TX_DIR" ] && cleanup_phase=$(head -n 1 "$TX_DIR/phase" 2>/dev/null || true)
+    if [ -n "$TX_DIR" ]; then
+        cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
+    fi
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" != true ] && \
        [ "$RR_UPDATE_WRITERS_FROZEN" != true ] && \
        [ "$RR_UPDATE_MAINTENANCE_ACTIVE" = true ] && \
        [ "$ROLLBACK_FAILED" != true ] && [ "$cleanup_phase" = state_recorded ]; then
-        if rr_write_phase aborted && rr_clear_update_maintenance_marker "$TX_DIR"; then
-            rm -f -- "$RR_ACTIVE_TX"
-            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+        if rr_sync_host_state_before_terminal && \
+           rr_write_phase aborted && rr_clear_update_maintenance_marker "$TX_DIR" && \
+           rr_clear_active_transaction_pointer "$TX_DIR"; then
+            :
         else
-            rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
+            [ "$cleanup_phase" = aborted ] || \
+                rr_write_phase recovery_failed >/dev/null 2>&1 || true
             ROLLBACK_FAILED=true
             KEEP_TRANSACTION=true
             result=1
@@ -1257,10 +2135,15 @@ rr_cleanup() {
     [ -n "$NEW_RUNTIME" ] && [ -e "$NEW_RUNTIME" ] && rm -rf "$NEW_RUNTIME"
     [ -n "$NEW_LAUNCHER" ] && [ -e "$NEW_LAUNCHER" ] && rm -f "$NEW_LAUNCHER"
     if [ "$ROLLBACK_FAILED" != true ] && [ "$KEEP_TRANSACTION" != true ]; then
-        [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
-        [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
-        [ -n "$TX_DIR" ] && [ -d "$TX_DIR" ] && rm -rf "$TX_DIR"
-        [ -n "$TX_DIR" ] && [ "$(head -n 1 "$RR_ACTIVE_TX" 2>/dev/null || true)" = "$TX_DIR" ] && rm -f "$RR_ACTIVE_TX"
+        if [ -n "$TX_DIR" ] && ! rr_clear_active_transaction_pointer "$TX_DIR"; then
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            result=1
+        else
+            [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ] && rm -rf "$OLD_RUNTIME"
+            [ -n "$BACKUP_DIR" ] && rm -rf "$BACKUP_DIR"
+            [ -n "$TX_DIR" ] && [ -d "$TX_DIR" ] && rm -rf "$TX_DIR"
+        fi
     fi
     if [ "$RR_UPDATE_WRITERS_FROZEN" != true ] && \
        [ "$RR_HEALTH_MONITOR_FROZEN" = true ] && \
@@ -1288,7 +2171,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "8a17fe67b5914cb366f73df1299eac0e2b5fce64afd9445ab67b0e5d52540836" ] && \
+        if [ "$actual" = "0ca95dabff397da055226fbe9727c27ada900ea11596864f8ff0ae42c7449976" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -1394,7 +2277,8 @@ rr_install_release() {
         rr_error "无法完整备份当前安装，已取消更新。"
         return 1
     }
-    "$RR_RECOVERY_HELPER" snapshot-metadata "$TX_DIR" || {
+    rr_run_with_delegated_update_lock \
+        "$RR_RECOVERY_HELPER" snapshot-metadata "$TX_DIR" || {
         rr_error "无法可信记录回滚目标版本与订阅端口，已在切换运行文件前取消更新。"
         return 1
     }
@@ -1466,7 +2350,8 @@ rr_install_release() {
     # keep the marker/firewall until the safe candidate has fully migrated so
     # a crash still causes boot recovery to re-apply the quarantine.
     if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
-        "$RR_RECOVERY_HELPER" suspend-quarantine || return 1
+        rr_run_with_delegated_update_lock \
+            "$RR_RECOVERY_HELPER" suspend-quarantine || return 1
     fi
 
     rr_write_phase migrating || return 1
@@ -1476,7 +2361,7 @@ rr_install_release() {
         RR_UPDATE_SUBSCRIPTION_WAS_RUNNING="$([ -f "$BACKUP_DIR/subscription_was_running" ] && printf true || printf false)" \
         RR_UPDATE_ARGO_WAS_RUNNING="$([ -f "$BACKUP_DIR/argo_was_running" ] && printf true || printf false)" \
         RR_UPDATE_HEALTH_TIMER_WAS_ENABLED="$([ -f "$BACKUP_DIR/health_timer_was_enabled" ] && printf true || printf false)" \
-        RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update; then
+        rr_run_with_delegated_update_lock "$RR_LAUNCHER" --post-update; then
         rr_rollback
         return 1
     fi
@@ -1488,13 +2373,11 @@ rr_install_release() {
     fi
     rr_test_fault migrated || return 1
 
-    if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
-        "$RR_RECOVERY_HELPER" clear-quarantine || {
-            rr_rollback
-            return 1
-        }
-    fi
-
+    # Once migration and writer-state verification have succeeded, make the
+    # safe candidate durable before attempting quarantine retirement. A later
+    # cleanup failure must retain the candidate/evidence, never resurrect the
+    # vulnerable runtime that the barrier was protecting.
+    rr_sync_host_state_before_terminal || return 1
     if ! rr_write_phase committed; then
         rr_rollback
         return 1
@@ -1503,7 +2386,14 @@ rr_install_release() {
     RR_HEALTH_MONITOR_FROZEN=false
     RR_UPDATE_WRITERS_FROZEN=false
     KEEP_TRANSACTION=true
-    if ! RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update-finalize; then
+    if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION" &&
+       ! rr_run_with_delegated_update_lock \
+           "$RR_RECOVERY_HELPER" clear-quarantine; then
+        rr_error "安全版本已提交，但旧版订阅隔离尚未完整清理；事务与维护标记已保留，绝不回滚到旧版。"
+        return 1
+    fi
+    if ! rr_run_with_delegated_update_lock \
+        "$RR_LAUNCHER" --post-update-finalize; then
         rr_error "版本已提交，但订阅防火墙收尾失败；事务与维护标记已保留，绝不回滚已提交版本。"
         return 1
     fi
@@ -1537,6 +2427,11 @@ if ! flock -n "$UPDATE_LOCK_FD"; then
     rr_error "另一个安装/更新任务正在运行，本次未改动系统。"
     exit 1
 fi
+if ! rr_acquire_legacy_update_lock "$RR_LEGACY_UPDATE_LOCK_FILE"; then
+    exec {UPDATE_LOCK_FD}>&-
+    UPDATE_LOCK_FD=""
+    exit 1
+fi
 rr_fetch_release || exit 1
 rr_install_release || exit 1
 
@@ -1550,6 +2445,15 @@ echo "[RR-vps] 安装/迁移完成，原有节点配置（如有）已保留。"
 rr_cleanup 0
 trap - EXIT
 if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    # The management shell must not inherit the transaction lock forever.
+    # Release in reverse acquisition order, only after cleanup and immediately
+    # before exec.
+    if [ -n "$LEGACY_UPDATE_LOCK_FD" ]; then
+        exec {LEGACY_UPDATE_LOCK_FD}>&-
+        LEGACY_UPDATE_LOCK_FD=""
+    fi
+    exec {UPDATE_LOCK_FD}>&-
+    UPDATE_LOCK_FD=""
     exec "$RR_LAUNCHER" </dev/tty >/dev/tty
 fi
 echo "请输入 rr 打开管理面板。"

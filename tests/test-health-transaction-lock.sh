@@ -29,6 +29,14 @@ source "$REPO_ROOT/modules/55-resilience.sh"
 source "$REPO_ROOT/modules/60-update.sh"
 
 RR_RESTORE_LOCK_FILE="$TEST_ROOT/locks/update.lock"
+RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/legacy/rr-update.lock"
+RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/bridge/legacy-update-bridge"
+mkdir -p "$(dirname "$RR_LEGACY_UPDATE_LOCK_FILE")"
+: > "$RR_LEGACY_UPDATE_LOCK_FILE"
+chmod 0644 "$RR_LEGACY_UPDATE_LOCK_FILE"
+install -d -m 700 "$(dirname "$RR_LEGACY_UPDATE_BRIDGE_FILE")"
+printf '%s\n' "$RR_LEGACY_UPDATE_BRIDGE_VALUE" > "$RR_LEGACY_UPDATE_BRIDGE_FILE"
+chmod 0600 "$RR_LEGACY_UPDATE_BRIDGE_FILE"
 health_runs="$TEST_ROOT/health-runs"
 health_logs="$TEST_ROOT/health-logs"
 : > "$health_runs"
@@ -42,14 +50,14 @@ ensure_runtime_health() {
     printf '%s\n' "${RR_UPDATE_LOCK_HELD:-0}" >> "$health_runs"
 }
 
-printf '%s\n' '[1/6] a normal health pass owns the root-only shared transaction lock'
+printf '%s\n' '[1/8] a normal health pass owns the root-only shared transaction lock'
 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'normal health pass did not receive delegated lock ownership'
 [ -d "$TEST_ROOT/locks" ] || fail 'root-only lock directory was not created'
 [ "$(stat -c '%u:%g:%a' "$TEST_ROOT/locks")" = 0:0:700 ] || fail 'lock directory mode/owner is unsafe'
 [ "$(stat -c '%u:%g:%a:%h' "$RR_RESTORE_LOCK_FILE")" = 0:0:600:1 ] || fail 'lock file mode/owner/link count is unsafe'
 
-printf '%s\n' '[2/6] a timer firing during update/backup skips without mutating or retry-failing'
+printf '%s\n' '[2/8] a timer firing during update/backup skips without mutating or retry-failing'
 : > "$health_runs"
 (
     exec 8>>"$RR_RESTORE_LOCK_FILE"
@@ -68,14 +76,32 @@ done
 rr_run_health_check || fail 'busy transaction lock should be an expected health skip'
 [ ! -s "$health_runs" ] || fail 'health body ran while another transaction owned the lock'
 
-printf '%s\n' '[3/6] an installer re-entry must explicitly delegate its already-held lock'
+printf '%s\n' '[3/8] an installer re-entry must explicitly delegate its already-held lock'
 RR_UPDATE_LOCK_HELD=1 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'delegated installer re-entry did not run the health body'
 : > "$TEST_ROOT/release-holder"
 wait "$LOCK_HOLDER_PID"
 LOCK_HOLDER_PID=""
 
-printf '%s\n' '[4/6] an unsafe lock path fails closed before health mutations'
+printf '%s\n' '[4/8] a nohup child cannot inherit either transaction lock fd'
+nohup_pid_file="$TEST_ROOT/nohup.pid"
+ensure_runtime_health() {
+    nohup bash -c 'printf "%s\n" "$$" > "$1"; sleep 30' _ "$nohup_pid_file" \
+        >/dev/null 2>&1 &
+}
+rr_run_health_check || fail 'health pass with a nohup child failed'
+for _ in $(seq 1 100); do
+    [ -s "$nohup_pid_file" ] && break
+    sleep 0.02
+done
+[ -s "$nohup_pid_file" ] || fail 'nohup inheritance fixture did not start'
+nohup_pid=$(cat "$nohup_pid_file")
+kill -0 "$nohup_pid" 2>/dev/null || fail 'nohup child exited before lock contention proof'
+flock -n "$RR_RESTORE_LOCK_FILE" -c true || fail 'nohup child inherited the new update lock fd'
+flock -n "$RR_LEGACY_UPDATE_LOCK_FILE" -c true || fail 'nohup child inherited the legacy update lock fd'
+kill "$nohup_pid" >/dev/null 2>&1 || true
+
+printf '%s\n' '[5/8] an unsafe lock path fails closed before health mutations'
 : > "$health_runs"
 mkdir -p "$TEST_ROOT/unsafe"
 ln -s "$TEST_ROOT/attacker-target" "$TEST_ROOT/unsafe/update.lock"
@@ -104,13 +130,17 @@ extract_function() {
 
 # Load just the installer helpers; sourcing install-core.sh itself would run an
 # install.  This also makes accidental removal/renaming of the functions fail.
+eval "$(extract_function rr_unit_activity_matches)"
+eval "$(extract_function rr_unit_file_state_matches)"
+eval "$(extract_function rr_capture_unit_activity_state)"
+eval "$(extract_function rr_capture_unit_file_state)"
 eval "$(extract_function rr_freeze_health_monitor)"
 eval "$(extract_function rr_resume_health_monitor_after_abort)"
 eval "$(extract_function rr_snapshot_runtime)"
 declare -F rr_freeze_health_monitor >/dev/null || fail 'installer freeze helper is missing'
 declare -F rr_snapshot_runtime >/dev/null || fail 'installer snapshot function is missing'
 
-printf '%s\n' '[5/6] installer stops timer and in-flight service before its first snapshot read'
+printf '%s\n' '[6/8] installer stops timer and in-flight service before its first snapshot read'
 RR_TX_ROOT="$TEST_ROOT/transactions-root"
 RR_ACTIVE_TX="$RR_TX_ROOT/active"
 RR_LIB_DIR="$TEST_ROOT/live-runtime"
@@ -126,15 +156,19 @@ mock_timer_active=true
 mock_service_active=true
 
 systemctl() {
-    case "${1:-} ${2:-} ${3:-}" in
-        'is-enabled --quiet argo-rr-health.timer')
-            [ "$mock_timer_enabled" = true ]
+    case "$*" in
+        'show --property=LoadState --value argo-rr-health.timer'|\
+        'show --property=LoadState --value argo-rr-health.service')
+            printf '%s\n' loaded
             ;;
-        'is-active --quiet argo-rr-health.timer')
-            [ "$mock_timer_active" = true ]
+        'show --property=UnitFileState --value argo-rr-health.timer')
+            [ "$mock_timer_enabled" = true ] && printf '%s\n' enabled || printf '%s\n' disabled
             ;;
-        'is-active --quiet argo-rr-health.service')
-            [ "$mock_service_active" = true ]
+        'show --property=ActiveState --value argo-rr-health.timer')
+            [ "$mock_timer_active" = true ] && printf '%s\n' active || printf '%s\n' inactive
+            ;;
+        'show --property=ActiveState --value argo-rr-health.service')
+            [ "$mock_service_active" = true ] && printf '%s\n' active || printf '%s\n' inactive
             ;;
         'stop argo-rr-health.timer argo-rr-health.service')
             printf '%s\n' stop-health >> "$operation_log"
@@ -179,15 +213,105 @@ first_backup=$(grep -n '^backup-' "$operation_log" | head -n 1 | cut -d: -f1)
 [ -f "$BACKUP_DIR/health_timer_was_enabled" ] || fail 'snapshot lost the pre-update timer enabled state'
 [ "$RR_HEALTH_MONITOR_FROZEN" = true ] || fail 'snapshot did not retain frozen state through switching'
 
-printf '%s\n' '[6/6] a pre-switch abort restores the timer and production call sites delegate re-entry'
+printf '%s\n' '[7/8] a pre-switch abort restores the timer and production call sites delegate re-entry'
 : > "$RR_HEALTH_TIMER_FILE"
 rr_resume_health_monitor_after_abort || fail 'abort did not restore the enabled health timer'
 [ "$RR_HEALTH_MONITOR_FROZEN" = false ] || fail 'abort left health monitor marked frozen'
 grep -Fxq resume-health "$operation_log" || fail 'abort never re-enabled the saved timer state'
-grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check' "$REPO_ROOT/scripts/install-core.sh" || \
+grep -Fq 'rr_run_with_delegated_update_lock' "$REPO_ROOT/scripts/install-core.sh" && \
+grep -Fq '"$RR_LAUNCHER" --health-check' "$REPO_ROOT/scripts/install-core.sh" || \
     fail 'installer rollback no longer delegates the shared lock to health re-entry'
-grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --post-update' "$REPO_ROOT/scripts/install-core.sh" || \
+grep -Fq '"$RR_LAUNCHER" --post-update' "$REPO_ROOT/scripts/install-core.sh" || \
     fail 'installer migration re-entry no longer declares shared-lock ownership'
 grep -Fq 'rr_run_health_check' "$REPO_ROOT/rr" || fail 'launcher health entry bypasses the lock wrapper'
+
+printf '%s\n' '[8/8] bounded background workers cannot orphan installer lock descriptors'
+eval "$(extract_function rr_close_inherited_installer_lock_fds)"
+eval "$(extract_function rr_run_health_check_bounded)"
+eval "$(extract_function rr_restart_health_service_bounded)"
+async_root="$TEST_ROOT/installer-async"
+async_new_lock="$async_root/update.lock"
+async_legacy_lock="$async_root/legacy.lock"
+async_launcher="$async_root/launcher"
+mkdir -p "$async_root"
+: > "$async_new_lock"
+: > "$async_legacy_lock"
+chmod 600 "$async_new_lock" "$async_legacy_lock"
+printf '%s\n' '#!/bin/bash' \
+    'printf "%s\n" "$$" > "$RR_ASYNC_CHILD_PID"' \
+    ': > "$RR_ASYNC_STARTED"' \
+    'while [ ! -e "$RR_ASYNC_RELEASE" ]; do sleep 0.05; done' \
+    > "$async_launcher"
+chmod 700 "$async_launcher"
+
+run_async_lock_case() {
+    local mode="$1" started="" release="" child_pid_file=""
+    local parent_pid="" child_pid="" parent_status=0
+    local new_released=false legacy_released=false
+    started="$async_root/${mode}.started"
+    release="$async_root/${mode}.release"
+    child_pid_file="$async_root/${mode}.pid"
+    rm -f -- "$started" "$release" "$child_pid_file"
+    export RR_ASYNC_STARTED="$started" RR_ASYNC_RELEASE="$release" \
+        RR_ASYNC_CHILD_PID="$child_pid_file"
+    (
+        exec {UPDATE_LOCK_FD}>>"$async_new_lock"
+        flock "$UPDATE_LOCK_FD"
+        exec {LEGACY_UPDATE_LOCK_FD}<"$async_legacy_lock"
+        flock "$LEGACY_UPDATE_LOCK_FD"
+        if [ "$mode" = health ]; then
+            RR_LAUNCHER="$async_launcher"
+            rr_run_health_check_bounded
+        else
+            rr_restart_health_service_bounded
+        fi
+    ) &
+    parent_pid=$!
+    for _ in $(seq 1 200); do
+        [ -e "$started" ] && [ -s "$child_pid_file" ] && break
+        sleep 0.02
+    done
+    [ -e "$started" ] && [ -s "$child_pid_file" ] || {
+        kill "$parent_pid" >/dev/null 2>&1 || true
+        fail "$mode bounded worker did not start"
+    }
+    child_pid=$(cat "$child_pid_file")
+    kill -KILL "$parent_pid"
+    set +e
+    wait "$parent_pid" 2>/dev/null
+    parent_status=$?
+    set -e
+    [ "$parent_status" -eq 137 ] || fail "$mode parent was not killed at the intended boundary"
+    # A polling sleep already forked by the killed wrapper may live for at
+    # most one 0.1-second interval.  The actual delegated worker remains
+    # blocked until release, so a bounded retry distinguishes the two.
+    for _ in $(seq 1 50); do
+        flock -n "$async_new_lock" -c true && new_released=true
+        flock -n "$async_legacy_lock" -c true && legacy_released=true
+        [ "$new_released" = true ] && [ "$legacy_released" = true ] && break
+        sleep 0.02
+    done
+    [ "$new_released" = true ] || fail "$mode orphan retained the new transaction lock"
+    [ "$legacy_released" = true ] || fail "$mode orphan retained the legacy transaction lock"
+    : > "$release"
+    for _ in $(seq 1 200); do
+        kill -0 "$child_pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    kill "$child_pid" >/dev/null 2>&1 || true
+}
+
+run_async_lock_case health
+systemctl() {
+    case "$*" in
+        'start argo-rr-health.service')
+            printf '%s\n' "$BASHPID" > "$RR_ASYNC_CHILD_PID"
+            : > "$RR_ASYNC_STARTED"
+            while [ ! -e "$RR_ASYNC_RELEASE" ]; do sleep 0.05; done
+            ;;
+        *) return 0 ;;
+    esac
+}
+run_async_lock_case systemctl
 
 printf '%s\n' 'health transaction lock regression: PASS'

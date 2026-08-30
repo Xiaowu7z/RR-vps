@@ -561,6 +561,10 @@ rollback_function=$(awk '
     rr_restore_dir() { return 0; }
     rr_restore_sqlite() { return 0; }
     rr_install_restore_external_state_if_required() { return 0; }
+    rr_read_trusted_phase() { printf '%s\n' runtime_swapped; }
+    rr_quiesce_health_monitor_for_rollback() { return 0; }
+    rr_sync_host_state_before_terminal() { return 0; }
+    rr_clear_active_transaction_pointer() { return 0; }
     rr_write_phase() { return 0; }
 
     rr_rollback
@@ -725,6 +729,65 @@ echo "[5/13] Fresh-install crypto material regression"
     rr_restore_apply_tree "$backup_guard_tmp/private-tree"
 )
 
+# Portable restore keeps the destination subscription access plane.  A source
+# HTTPS domain and listener must not be imported onto a local-only target.
+(
+    load_modules_for_tests
+    network_restore_tmp=$(mktemp -d)
+    trap 'rm -rf "$network_restore_tmp"' EXIT
+    rollback="$network_restore_tmp/rollback"
+    CONFIG_FILE="$network_restore_tmp/argo_vmess.conf"
+    mkdir -p "$rollback"
+    cat > "$CONFIG_FILE" <<'EOF'
+CONFIG_VERSION=7
+INSTALL_COMPLETE=true
+SUB_PORT=19090
+SUB_ACCESS_MODE=local
+SUB_DOMAIN=''
+SUB_PUBLIC_PORT_IPV4=29090
+SUB_PUBLIC_PORT_IPV6=39090
+ENTRY_IP_MODE=ipv4
+OUTBOUND_IP_MODE=prefer_ipv4
+ENTRY_IPV4_ADDRESS=192.0.2.10
+ENTRY_IPV6_ADDRESS=''
+EOF
+    rr_restore_capture_target_network "$rollback"
+
+    cat > "$CONFIG_FILE" <<'EOF'
+CONFIG_VERSION=7
+INSTALL_COMPLETE=true
+SUB_PORT=8443
+SUB_ACCESS_MODE=https
+SUB_DOMAIN=source-sub.example.com
+SUB_PUBLIC_PORT_IPV4=443
+SUB_PUBLIC_PORT_IPV6=443
+ENTRY_IP_MODE=ipv6
+OUTBOUND_IP_MODE=ipv6_only
+ENTRY_IPV4_ADDRESS=''
+ENTRY_IPV6_ADDRESS=2001:db8::20
+EOF
+    rr_restore_apply_target_network_config "$rollback"
+    load_config_with_defaults
+    [ "$SUB_PORT" = 19090 ] && [ "$SUB_ACCESS_MODE" = local ] && \
+        [ -z "$SUB_DOMAIN" ] && [ "$SUB_PUBLIC_PORT_IPV4" = 29090 ] && \
+        [ "$SUB_PUBLIC_PORT_IPV6" = 39090 ] && [ "$ENTRY_IP_MODE" = ipv4 ] && \
+        [ "$OUTBOUND_IP_MODE" = prefer_ipv4 ] && \
+        [ "$ENTRY_IPV4_ADDRESS" = 192.0.2.10 ] && \
+        [ -z "$ENTRY_IPV6_ADDRESS" ] || {
+            echo "A portable restore replaced the target subscription access plane." >&2
+            exit 1
+        }
+
+    sed -i 's/^TARGET_SUB_ACCESS_MODE=.*/TARGET_SUB_ACCESS_MODE=https/' \
+        "$rollback/target-network"
+    sed -i 's/^TARGET_SUB_DOMAIN=.*/TARGET_SUB_DOMAIN=not-a-domain/' \
+        "$rollback/target-network"
+    if rr_restore_apply_target_network_config "$rollback"; then
+        echo "An invalid target subscription access snapshot was accepted." >&2
+        exit 1
+    fi
+)
+
 # Portable Nexus restore keeps the destination access plane.  A public source
 # must neither expose a blank target nor replace a local target's access
 # settings, and a newly restored Nexus must remain enabled after reboot.
@@ -755,16 +818,41 @@ echo "[5/13] Fresh-install crypto material regression"
     printf '%s\n' source-certificate > "$payload/rootfs/etc/rr-nexus/certs/ip.crt"
 
     nexus_enabled=false
+    nexus_running=false
     systemctl_enable_works=true
     systemctl() {
         printf '%s\n' "$*" >> "$systemctl_log"
-        case "${1:-}" in
-            enable)
+        case "$*" in
+            "enable rr-nexus")
                 [ "$systemctl_enable_works" = true ] && nexus_enabled=true
                 return 0
                 ;;
-            disable) nexus_enabled=false; return 0 ;;
-            is-enabled) [ "$nexus_enabled" = true ] ;;
+            "disable rr-nexus") nexus_enabled=false; return 0 ;;
+            "start rr-nexus") nexus_running=true; return 0 ;;
+            "stop rr-nexus") nexus_running=false; return 0 ;;
+            "is-enabled --quiet rr-nexus") [ "$nexus_enabled" = true ] ;;
+            "show --property=LoadState --value rr-nexus")
+                if [ -e "$NEXUS_SERVICE_FILE" ]; then
+                    printf '%s\n' loaded
+                else
+                    printf '%s\n' not-found
+                fi
+                return 0
+                ;;
+            "show --property=ActiveState --value rr-nexus")
+                [ "$nexus_running" = true ] && printf '%s\n' active || printf '%s\n' inactive
+                return 0
+                ;;
+            "show --property=UnitFileState --value rr-nexus")
+                if [ ! -e "$NEXUS_SERVICE_FILE" ]; then
+                    printf '\n'
+                elif [ "$nexus_enabled" = true ]; then
+                    printf '%s\n' enabled
+                else
+                    printf '%s\n' disabled
+                fi
+                return 0
+                ;;
             *) return 0 ;;
         esac
     }
@@ -811,9 +899,9 @@ echo "[5/13] Fresh-install crypto material regression"
 
     : > "$NEXUS_SERVICE_FILE"
     rr_restore_finalize_nexus_enablement "$blank_rollback"
-    [ "$nexus_enabled" = true ]
+    [ "$nexus_enabled" = true ] && [ "$nexus_running" = true ]
     grep -Fxq 'enable rr-nexus' "$systemctl_log"
-    grep -Fxq 'is-enabled --quiet rr-nexus' "$systemctl_log"
+    grep -Fxq 'show --property=UnitFileState --value rr-nexus' "$systemctl_log"
     # Simulate the boot decision: an enabled restored unit is selected again
     # after all transient running state is lost.
     nexus_running=false
@@ -838,6 +926,7 @@ echo "[5/13] Fresh-install crypto material regression"
         acme_email:"target-acme@example.net"
     }' > "$NEXUS_CONFIG_FILE"
     nexus_enabled=false
+    nexus_running=false
     rr_restore_capture_target_nexus_state "$local_rollback"
     cp "$NEXUS_CONFIG_FILE" "$local_rollback/rootfs/etc/rr-nexus/nexus.json"
     rm -f "$NEXUS_CONFIG_FILE"
@@ -856,8 +945,8 @@ echo "[5/13] Fresh-install crypto material regression"
     }
 
     # Rollback restores both possible original enable states exactly, and an
-    # enable operation that does not survive is rejected by the is-enabled
-    # verification gate.
+    # enable operation that does not survive is rejected by the strict
+    # UnitFileState verification gate.
     nexus_enabled=true
     rr_restore_restore_nexus_enablement "$local_rollback"
     [ "$nexus_enabled" = false ]
@@ -2781,7 +2870,7 @@ grep -Fq 'rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true' modules/6
 grep -Fq 'rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true' scripts/install-core.sh
 grep -Fq 'RR_RELEASE_TAG="v' install.sh scripts/install-core.sh
 grep -Fq 'gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS' .github/workflows/release.yml
-grep -Fq -- '--notes-file release-notes.md \' .github/workflows/release.yml
+grep -Fq -- '--notes-file release-draft-notes.md \' .github/workflows/release.yml
 grep -Fq -- '--draft' .github/workflows/release.yml
 grep -Fq 'assert_latest_product' .github/workflows/release.yml
 grep -Fq 'assert_release_gate' .github/workflows/release.yml
@@ -2791,7 +2880,7 @@ grep -Fq 'IMMUTABLE_RELEASES_READ_TOKEN' .github/workflows/release.yml
 grep -Fq 'X-GitHub-Api-Version: 2026-03-10' .github/workflows/release.yml
 grep -Fq 'group: rr-vps-publish-${{ github.repository }}' .github/workflows/release.yml
 grep -Fq -- '-F draft=false -f make_latest=true' .github/workflows/release.yml
-grep -Fq '.draft == false and .prerelease == false and .immutable == true' .github/workflows/release.yml
+grep -Fq "jq -e '.immutable == true'" .github/workflows/release.yml
 grep -Fq '["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"]' .github/workflows/release.yml
 if grep -Fq 'RR_GITHUB_MIRROR' scripts/update-guard.sh; then
     echo "Update guard still allows a user mirror to provide executable trust anchors." >&2

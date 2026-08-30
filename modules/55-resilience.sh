@@ -7,6 +7,9 @@ RR_RESTORE_ACTIVE="${RR_BACKUP_WORK_DIR}/active"
 RR_RESTORE_RUNTIME_READY="${RR_BACKUP_WORK_DIR}/runtime-ready"
 RR_RESTORE_SYSTEMD_DIR="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}"
 RR_RESTORE_LOCK_FILE="${RR_RESTORE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
+RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
+RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
+RR_LEGACY_UPDATE_BRIDGE_VALUE="rr-legacy-update-bridge-v1"
 RR_RESTORE_LIVE_LOCK_FILE="${RR_RESTORE_LIVE_LOCK_FILE:-/run/rr-vps/locks/restore-live.lock}"
 RR_NEXUS_SECURITY_LOCK_FILE="${RR_NEXUS_SECURITY_LOCK_FILE:-/run/rr-vps/locks/nexus-security.lock}"
 RR_RESTORE_LIVE_MARKER="${RR_RESTORE_LIVE_MARKER:-/run/rr-vps/restore-live}"
@@ -45,6 +48,263 @@ rr_secure_lock_fd_is_safe() {
     path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
     fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
     [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
+}
+
+rr_legacy_update_lock_mode_is_safe() {
+    local mode="$1" mode_value=0
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # 7.1.0 normally created this inode as 0644. Preserve an existing inode
+    # exactly, but reject special/execute bits and group/other write access.
+    (( (mode_value & 07133) == 0 ))
+}
+
+rr_legacy_update_bridge_required() {
+    local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" directory="" canonical=""
+    local expected_size=$(( ${#RR_LEGACY_UPDATE_BRIDGE_VALUE} + 1 ))
+    local -a marker_lines=()
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    directory=$(dirname -- "$marker") || return 2
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 2
+    canonical=$(readlink -f -- "$directory" 2>/dev/null) || return 2
+    [ "$canonical" = "$directory" ] || return 2
+    [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ] || return 2
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 2
+    [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || return 2
+    [ "$(stat -c %s -- "$marker" 2>/dev/null)" = "$expected_size" ] || return 2
+    mapfile -t marker_lines < "$marker" || return 2
+    [ "${#marker_lines[@]}" -eq 1 ] && \
+        [ "${marker_lines[0]}" = "$RR_LEGACY_UPDATE_BRIDGE_VALUE" ] || return 2
+}
+
+rr_legacy_update_lock_parent_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local lock_dir="" canonical="" owner="" group="" mode="" mode_value=0
+    lock_dir=$(dirname -- "$lock_file") || return 1
+    [ -d "$lock_dir" ] && [ ! -L "$lock_dir" ] || return 1
+    canonical=$(readlink -f -- "$lock_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$lock_dir" ] || return 1
+    IFS=: read -r owner group mode < <(
+        stat -c '%u:%g:%a' -- "$lock_dir" 2>/dev/null
+    ) || return 1
+    [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    # /run/lock is commonly 1777. A world-writable compatibility directory is
+    # acceptable only with sticky-bit replacement protection.
+    if (( (mode_value & 0002) != 0 && (mode_value & 01000) == 0 )); then
+        return 1
+    fi
+}
+
+rr_legacy_update_lock_path_is_safe() {
+    local lock_file="${1:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local owner="" group="" mode="" links=""
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    IFS=: read -r owner group mode links < <(
+        stat -c '%u:%g:%a:%h' -- "$lock_file" 2>/dev/null
+    ) || return 1
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_legacy_update_lock_fd_is_safe() {
+    local lock_file="$1" lock_fd="$2" path_identity="" path_identity_after=""
+    local fd_identity="" owner="" group="" mode="" links=""
+    local shell_pid="${BASHPID:-$$}" fd_path=""
+    fd_path="/proc/$shell_pid/fd/$lock_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$lock_fd"
+    rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ -f "$fd_path" ] || return 1
+    [ ! -L "$lock_file" ] || return 1
+    path_identity_after=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$lock_file" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && \
+        [ "$path_identity_after" = "$fd_identity" ] || return 1
+    IFS=: read -r _ _ owner group mode links <<<"$fd_identity"
+    [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
+    rr_legacy_update_lock_mode_is_safe "$mode"
+}
+
+rr_acquire_legacy_update_lock_fd() {
+    local output_name="$1" lock_file="${2:-$RR_LEGACY_UPDATE_LOCK_FILE}"
+    local candidate_fd="" marker_state=0 evidence_owner="" evidence_group=""
+    printf -v "$output_name" '%s' ''
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 1
+    if [ "$marker_state" -eq 1 ]; then
+        # Without a trusted same-boot marker the shared predictable name is not
+        # authoritative. Ignore any demonstrably non-root preplacement without
+        # opening, following, changing or deleting it. Root-owned abnormal
+        # evidence is still a host-integrity failure and remains fail-closed.
+        if [ ! -e "$lock_file" ] && [ ! -L "$lock_file" ]; then
+            return 0
+        fi
+        IFS=: read -r evidence_owner evidence_group < <(
+            stat -c '%u:%g' -- "$lock_file" 2>/dev/null
+        ) || return 1
+        if [ "$evidence_owner" != 0 ]; then
+            return 0
+        fi
+        [ "$evidence_group" = 0 ] || return 1
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+        rr_legacy_update_lock_parent_is_safe "$lock_file" || return 1
+        rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+        return 0
+    fi
+    # A trusted marker means an old process may still exist in this boot. The
+    # public inode is now required: missing, unsafe, replaced or busy all fail.
+    [ -e "$lock_file" ] || [ -L "$lock_file" ] || return 1
+    rr_legacy_update_lock_parent_is_safe "$lock_file" || return 1
+    rr_legacy_update_lock_path_is_safe "$lock_file" || return 1
+    # Read-only opening deliberately leaves a trusted 7.1.0 inode's content,
+    # ownership and mode untouched.
+    exec {candidate_fd}<"$lock_file" || return 1
+    if ! rr_legacy_update_lock_fd_is_safe "$lock_file" "$candidate_fd"; then
+        exec {candidate_fd}>&-
+        return 1
+    fi
+    if ! flock -n "$candidate_fd"; then
+        exec {candidate_fd}>&-
+        return 75
+    fi
+    printf -v "$output_name" '%s' "$candidate_fd"
+}
+
+rr_inherited_update_lock_fds_present() {
+    local fd_path="" fd_number="" fd_identity="" lock_file="" lock_identity=""
+    local shell_pid="${BASHPID:-$$}" fd_root=""
+    local marker_state=0
+    local -a lock_identities=()
+    lock_file="$RR_RESTORE_LOCK_FILE"
+    if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+        [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 2
+        lock_identity=$(stat -c '%d:%i' -- "$lock_file" 2>/dev/null) || return 2
+        lock_identities+=("$lock_identity")
+    fi
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 2
+    if [ "$marker_state" -eq 0 ]; then
+        rr_legacy_update_lock_parent_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 2
+        rr_legacy_update_lock_path_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 2
+        lock_identity=$(stat -c '%d:%i' -- "$RR_LEGACY_UPDATE_LOCK_FILE" 2>/dev/null) || return 2
+        lock_identities+=("$lock_identity")
+    fi
+    [ "${#lock_identities[@]}" -gt 0 ] || return 1
+    fd_root="/proc/$shell_pid/fd"
+    [ -d "$fd_root" ] || fd_root=/dev/fd
+    [ -d "$fd_root" ] || return 2
+    for fd_path in "$fd_root"/*; do
+        fd_number=${fd_path##*/}
+        [[ "$fd_number" =~ ^[0-9]+$ ]] && [ "$fd_number" -gt 2 ] || continue
+        fd_identity=$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null) || continue
+        for lock_identity in "${lock_identities[@]}"; do
+            [ "$fd_identity" != "$lock_identity" ] || return 0
+        done
+    done
+    return 1
+}
+
+rr_close_inherited_update_lock_fds() {
+    local fd_path="" fd_number="" fd_identity="" lock_file="" lock_identity=""
+    local shell_pid="${BASHPID:-$$}" fd_root=""
+    local marker_state=0
+    local -a lock_identities=()
+    lock_file="$RR_RESTORE_LOCK_FILE"
+    if [ -f "$lock_file" ] && [ ! -L "$lock_file" ]; then
+        lock_identity=$(stat -c '%d:%i' -- "$lock_file" 2>/dev/null) || return 1
+        lock_identities+=("$lock_identity")
+    fi
+    rr_legacy_update_bridge_required || marker_state=$?
+    [ "$marker_state" -ne 2 ] || return 1
+    if [ "$marker_state" -eq 0 ]; then
+        rr_legacy_update_lock_parent_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 1
+        rr_legacy_update_lock_path_is_safe "$RR_LEGACY_UPDATE_LOCK_FILE" || return 1
+        lock_identity=$(stat -c '%d:%i' -- "$RR_LEGACY_UPDATE_LOCK_FILE" 2>/dev/null) || return 1
+        lock_identities+=("$lock_identity")
+    fi
+    fd_root="/proc/$shell_pid/fd"
+    [ -d "$fd_root" ] || fd_root=/dev/fd
+    [ -d "$fd_root" ] || return 1
+    for fd_path in "$fd_root"/*; do
+        fd_number=${fd_path##*/}
+        [[ "$fd_number" =~ ^[0-9]+$ ]] && [ "$fd_number" -gt 2 ] || continue
+        fd_identity=$(stat -Lc '%d:%i' -- "$fd_path" 2>/dev/null) || continue
+        for lock_identity in "${lock_identities[@]}"; do
+            [ "$fd_identity" = "$lock_identity" ] || continue
+            # fd_number is regex-validated before brace-fd close expansion.
+            local inherited_fd="$fd_number"
+            exec {inherited_fd}>&-
+            break
+        done
+    done
+}
+
+rr_run_without_inherited_update_lock_fds() {
+    local callback="$1" probe_result=0
+    shift
+    rr_inherited_update_lock_fds_present || probe_result=$?
+    case "$probe_result" in
+        0)
+            (
+                rr_close_inherited_update_lock_fds || return 1
+                RR_UPDATE_LOCK_FDS_CLOSED=1 RR_UPDATE_LOCK_HELD=1 \
+                    RR_RESTORE_LOCK_HELD=1 "$callback" "$@"
+            )
+            ;;
+        1)
+            RR_UPDATE_LOCK_FDS_CLOSED=1 RR_UPDATE_LOCK_HELD=1 \
+                RR_RESTORE_LOCK_HELD=1 "$callback" "$@"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_run_with_update_locks() {
+    local callback_mode="$1" wait_seconds="$2" callback="$3"
+    local new_lock_fd="" legacy_lock_fd="" result=0
+    shift 3
+    case "$callback_mode" in direct|isolated) ;; *) return 76 ;; esac
+    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 76
+    exec {new_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 76
+    if ! rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$new_lock_fd"; then
+        exec {new_lock_fd}>&-
+        return 76
+    fi
+    if [ "$wait_seconds" = 0 ]; then
+        flock -n "$new_lock_fd" || { exec {new_lock_fd}>&-; return 75; }
+    else
+        [[ "$wait_seconds" =~ ^[0-9]+$ ]] && [ "$wait_seconds" -ge 1 ] && \
+            [ "$wait_seconds" -le 86400 ] || { exec {new_lock_fd}>&-; return 76; }
+        flock -w "$wait_seconds" "$new_lock_fd" || { exec {new_lock_fd}>&-; return 75; }
+    fi
+    if rr_acquire_legacy_update_lock_fd legacy_lock_fd "$RR_LEGACY_UPDATE_LOCK_FILE"; then
+        :
+    else
+        result=$?
+        exec {new_lock_fd}>&-
+        [ "$result" -ne 1 ] || result=76
+        return "$result"
+    fi
+    if [ "$callback_mode" = isolated ]; then
+        (
+            [ -z "$legacy_lock_fd" ] || exec {legacy_lock_fd}>&-
+            exec {new_lock_fd}>&-
+            RR_UPDATE_LOCK_OWNER=0 RR_UPDATE_LOCK_FDS_CLOSED=1 \
+                RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+                "$callback" "$@"
+        ) || result=$?
+    else
+        RR_UPDATE_LOCK_OWNER=1 RR_UPDATE_LOCK_FDS_CLOSED=0 \
+            RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+            "$callback" "$@" || result=$?
+    fi
+    [ -z "$legacy_lock_fd" ] || exec {legacy_lock_fd}>&-
+    exec {new_lock_fd}>&-
+    return "$result"
 }
 
 rr_ensure_resilience_dependencies() {
@@ -649,25 +909,30 @@ rr_backup_capture_crontab() {
 }
 
 rr_backup_create() (
-    local output="${1:-}" stage="" archive="" relative="" sha="" now="" backup_lock_fd="" unsupported=""
+    local result=0
+    rr_run_with_update_locks direct 0 rr_backup_create_locked "$@" || result=$?
+    if [ "$result" -eq 75 ]; then
+        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
+        return 1
+    fi
+    [ "$result" -ne 76 ] || result=1
+    return "$result"
+)
+
+rr_backup_create_locked() {
+    local output="${1:-}" stage="" archive="" relative="" sha="" now="" unsupported=""
     rr_backup_create_cleanup() {
         [ -z "$stage" ] || ! rr_backup_stage_is_safe "$stage" create || rm -rf -- "$stage"
     }
     trap rr_backup_create_cleanup EXIT
     trap 'exit 143' HUP INT TERM
     rr_ensure_resilience_dependencies || { printf '无法安装加密备份所需组件。\n' >&2; return 1; }
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {backup_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$backup_lock_fd" || return 1
-    if ! flock -n "$backup_lock_fd"; then
-        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
-        return 1
-    fi
     rr_backup_prepare_work_dir || {
         printf '备份工作目录的所有者、权限或路径不安全。\n' >&2
         return 1
     }
-    RR_RESTORE_LOCK_HELD=1 rr_restore_recover_active || return 1
+    RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+        rr_restore_recover_active || return 1
     rr_backup_prune_stale_stages || return 1
     load_config_with_defaults || return 1
     [ -f "$CONFIG_FILE" ] && [ "$INSTALL_COMPLETE" = true ] || {
@@ -747,7 +1012,7 @@ rr_backup_create() (
     stage=""
     printf '加密备份已生成：%s\n' "$output"
     printf '请把文件与口令分开保存；遗失口令无法恢复。\n'
-)
+}
 
 rr_restore_apply_tree() {
     local root="$1" policy="${2:-portable}" source="" relative="" target="" temporary="" mode=""
@@ -837,12 +1102,44 @@ rr_restore_crontab() {
 }
 
 rr_restore_regenerate_runtime_files() {
+    local singbox_service="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local health_service="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
+    local health_timer="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+    local unit_load_state=""
     # Portable backups contain data/config only. Recreate privileged units and
-    # executable workers from the already verified local RR runtime.
+    # executable workers from the already verified local RR runtime. These
+    # writers only materialize trusted files; enable/start decisions stay at
+    # the transaction finalization boundary.
+    if [ -r "$CONFIG_FILE" ]; then
+        declare -F write_singbox_systemd_unit >/dev/null 2>&1 || return 1
+        declare -F write_health_monitor_units >/dev/null 2>&1 || return 1
+        write_singbox_systemd_unit || return 1
+        write_health_monitor_units || return 1
+    fi
     if [ -r "$NEXUS_CONFIG_FILE" ]; then
         nexus_write_service || return 1
     fi
-    return 0
+    # Unit removal and recreation must become visible as one explicit manager
+    # transition. Never depend on an incidental reload inside another writer.
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    if [ -r "$CONFIG_FILE" ]; then
+        [ -f "$singbox_service" ] && [ ! -L "$singbox_service" ] || return 1
+        [ -f "$health_service" ] && [ ! -L "$health_service" ] || return 1
+        [ -f "$health_timer" ] && [ ! -L "$health_timer" ] || return 1
+        for unit in sing-box.service argo-rr-health.service argo-rr-health.timer; do
+            rr_restore_unit_load_state_read "$unit" unit_load_state || return 1
+            [ "$unit_load_state" = loaded ] || return 1
+        done
+    fi
+    if [ -r "$NEXUS_CONFIG_FILE" ]; then
+        [ -f "$NEXUS_SERVICE_FILE" ] && [ ! -L "$NEXUS_SERVICE_FILE" ] || return 1
+        rr_restore_unit_load_state_read rr-nexus.service unit_load_state || return 1
+        [ "$unit_load_state" = loaded ] || return 1
+    else
+        [ ! -e "$NEXUS_SERVICE_FILE" ] && [ ! -L "$NEXUS_SERVICE_FILE" ] || return 1
+        rr_restore_unit_load_state_read rr-nexus.service unit_load_state || return 1
+        [ "$unit_load_state" = not-found ] || return 1
+    fi
 }
 
 rr_restore_verify_manifest() {
@@ -1050,7 +1347,8 @@ rr_restore_publish_marker() {
     install -d -m 700 "$directory" || return 1
     temporary=$(mktemp "$directory/.rr-restore-marker.XXXXXX") || return 1
     if ! printf '%s\n' "$stage" > "$temporary" || ! chmod 600 "$temporary" || \
-       ! mv -f -- "$temporary" "$marker" || ! sync -f "$directory"; then
+       ! sync -f "$temporary" || ! mv -f -- "$temporary" "$marker" || \
+       ! sync -f "$directory"; then
         rm -f -- "$temporary"
         return 1
     fi
@@ -1076,10 +1374,65 @@ rr_restore_write_phase() {
     rr_restore_stage_is_safe "$stage" || return 1
     temporary=$(mktemp "$stage/.phase.XXXXXX") || return 1
     if ! printf '%s\n' "$phase" > "$temporary" || ! chmod 600 "$temporary" || \
-       ! mv -f -- "$temporary" "$stage/phase" || ! sync -f "$stage"; then
+       ! sync -f "$temporary" || ! mv -f -- "$temporary" "$stage/phase" || \
+       ! sync -f "$stage"; then
         rm -f -- "$temporary"
         return 1
     fi
+}
+
+rr_restore_publish_terminal_phase() {
+    local stage="$1" phase="$2"
+    case "$phase" in committed|rolled_back|aborted) ;; *) return 1 ;; esac
+    # Runtime/configuration state spans several filesystems.  A directory
+    # fsync on the small phase file cannot make that host state durable.
+    sync || return 1
+    rr_restore_write_phase "$stage" "$phase"
+}
+
+rr_restore_finalize_terminal_stage() {
+    local stage="$1" phase=""
+    rr_restore_marker_matches_stage "$RR_RESTORE_ACTIVE" "$stage" || return 1
+    phase=$(rr_restore_read_exact_marker "$stage/phase") || return 1
+    case "$phase" in committed|rolled_back|aborted) ;; *) return 1 ;; esac
+    # Re-publish the same phase so a prior rename-success/directory-fsync
+    # failure cannot be followed by removal of the only recovery pointer.
+    rr_restore_write_phase "$stage" "$phase" || return 1
+    rr_restore_publish_marker "$RR_RESTORE_RUNTIME_READY" "$stage" || return 1
+    rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST" || return 1
+    rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || return 1
+    if ! rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY"; then
+        rr_restore_publish_marker "$RR_RESTORE_RUNTIME_READY" "$stage" || true
+        return 1
+    fi
+    # ACTIVE is the durable rollback/recovery pointer and is always the last
+    # critical marker removed.  If its directory fsync fails after unlink,
+    # restore both the pointer and ready gate whenever possible.
+    if ! rr_restore_clear_marker "$RR_RESTORE_ACTIVE"; then
+        rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$stage" || true
+        rr_restore_publish_marker "$RR_RESTORE_RUNTIME_READY" "$stage" || true
+        return 1
+    fi
+}
+
+rr_restore_commit_candidate() {
+    local stage="$1" phase=""
+    # Return 1 only while rollback is still safe.  Return 2 once committed may
+    # have become visible, even if its final directory fsync was interrupted.
+    sync || return 1
+    if rr_restore_write_phase "$stage" committed; then
+        rr_restore_finalize_terminal_stage "$stage" || return 2
+        return 0
+    fi
+    phase=$(rr_restore_read_exact_marker "$stage/phase") || return 2
+    case "$phase" in
+        migrating) return 1 ;;
+        committed)
+            rr_restore_finalize_terminal_stage "$stage" || return 2
+            return 0
+            ;;
+        *) return 2 ;;
+    esac
 }
 
 rr_restore_write_gate_dropins() {
@@ -1097,7 +1450,7 @@ EOF
             rm -f -- "$temporary"
             return 1
         fi
-        chmod 644 "$temporary" && \
+        chmod 644 "$temporary" && sync -f "$temporary" && \
             mv -f -- "$temporary" "$dropin_dir/40-rr-restore-gate.conf" && \
             sync -f "$dropin_dir" || {
                 rm -f -- "$temporary"
@@ -1149,6 +1502,7 @@ EOF
         return 1
     fi
     chmod 644 "$recovery_tmp" "$watchdog_tmp" && \
+        sync -f "$recovery_tmp" && sync -f "$watchdog_tmp" && \
         mv -f -- "$recovery_tmp" "$RR_RESTORE_SYSTEMD_DIR/rr-restore-recovery.service" && \
         mv -f -- "$watchdog_tmp" "$RR_RESTORE_SYSTEMD_DIR/rr-restore-watchdog.service" && \
         sync -f "$RR_RESTORE_SYSTEMD_DIR" || {
@@ -1158,6 +1512,8 @@ EOF
     rr_restore_write_gate_dropins || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
     systemctl enable rr-restore-recovery.service >/dev/null 2>&1 || return 1
+    rr_restore_unit_file_state_matches rr-restore-recovery.service enabled || return 1
+    sync
 }
 
 rr_restore_service_gate() {
@@ -1187,7 +1543,22 @@ rr_restore_service_gate() {
 }
 
 rr_restore_watch_active() {
-    local expected_stage="" current_stage="" lock_fd="" armed_from_request=false result=0
+    local result=0
+    if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ] && \
+       [ ! -e "$RR_RESTORE_WATCH_REQUEST" ] && [ ! -L "$RR_RESTORE_WATCH_REQUEST" ]; then
+        return 0
+    fi
+    [[ "$RR_RESTORE_WATCH_TIMEOUT" =~ ^[0-9]+$ ]] && \
+        [ "$RR_RESTORE_WATCH_TIMEOUT" -ge 1 ] && \
+        [ "$RR_RESTORE_WATCH_TIMEOUT" -le 86400 ] || return 1
+    rr_run_with_update_locks direct "$RR_RESTORE_WATCH_TIMEOUT" \
+        rr_restore_watch_active_locked || result=$?
+    if [ "$result" -eq 75 ] || [ "$result" -eq 76 ]; then result=1; fi
+    return "$result"
+}
+
+rr_restore_watch_active_locked() {
+    local expected_stage="" current_stage="" armed_from_request=false result=0
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         # A restore arms the watcher before publishing `active`, closing the
         # otherwise unavoidable SIGKILL gap between those two operations.
@@ -1203,49 +1574,128 @@ rr_restore_watch_active() {
     else
         expected_stage=$(rr_restore_active_stage) || return 1
     fi
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$lock_fd" || return 1
-    [[ "$RR_RESTORE_WATCH_TIMEOUT" =~ ^[0-9]+$ ]] && \
-        [ "$RR_RESTORE_WATCH_TIMEOUT" -ge 1 ] && \
-        [ "$RR_RESTORE_WATCH_TIMEOUT" -le 86400 ] || return 1
-    if ! flock -w "$RR_RESTORE_WATCH_TIMEOUT" "$lock_fd"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    if ! rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
+    rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST" || return 1
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || true
         # SIGKILL before `active` publication cannot require state rollback,
         # but the decrypted staging tree must not be left behind.
         [ "$armed_from_request" = false ] || rm -rf -- "$expected_stage"
-        exec {lock_fd}>&-
         return 0
     fi
-    current_stage=$(rr_restore_active_stage) || {
-        exec {lock_fd}>&-
-        return 1
-    }
-    if [ "$current_stage" != "$expected_stage" ]; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    if ! rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER"; then
-        exec {lock_fd}>&-
-        return 1
-    fi
-    RR_RESTORE_LOCK_HELD=1 rr_restore_recover_active || result=$?
-    exec {lock_fd}>&-
+    current_stage=$(rr_restore_active_stage) || return 1
+    [ "$current_stage" = "$expected_stage" ] || return 1
+    rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || return 1
+    RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 \
+        rr_restore_recover_active || result=$?
     return "$result"
+}
+
+RR_RESTORE_UNIT_LOAD_STATE=""
+RR_RESTORE_UNIT_ACTIVE_STATE=""
+RR_RESTORE_UNIT_FILE_STATE=""
+
+rr_restore_unit_state_read() {
+    local unit="$1"
+    RR_RESTORE_UNIT_LOAD_STATE=$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null) || return 2
+    RR_RESTORE_UNIT_ACTIVE_STATE=$(systemctl show --property=ActiveState --value \
+        "$unit" 2>/dev/null) || return 2
+    RR_RESTORE_UNIT_FILE_STATE=$(systemctl show --property=UnitFileState --value \
+        "$unit" 2>/dev/null) || return 2
+    if [ "$RR_RESTORE_UNIT_LOAD_STATE" = not-found ] && \
+       [ -z "$RR_RESTORE_UNIT_FILE_STATE" ]; then
+        RR_RESTORE_UNIT_FILE_STATE=not-found
+    fi
+    case "$RR_RESTORE_UNIT_LOAD_STATE:$RR_RESTORE_UNIT_ACTIVE_STATE:$RR_RESTORE_UNIT_FILE_STATE" in
+        loaded:active:enabled|loaded:active:enabled-runtime|loaded:active:disabled|loaded:active:static|\
+        loaded:inactive:enabled|loaded:inactive:enabled-runtime|loaded:inactive:disabled|loaded:inactive:static|\
+        loaded:failed:enabled|loaded:failed:enabled-runtime|loaded:failed:disabled|loaded:failed:static|\
+        loaded:activating:enabled|loaded:activating:enabled-runtime|loaded:activating:disabled|loaded:activating:static|\
+        loaded:deactivating:enabled|loaded:deactivating:enabled-runtime|loaded:deactivating:disabled|loaded:deactivating:static|\
+        loaded:reloading:enabled|loaded:reloading:enabled-runtime|loaded:reloading:disabled|loaded:reloading:static|\
+        masked:inactive:masked|masked:failed:masked|not-found:inactive:not-found) return 0 ;;
+        *) return 2 ;;
+    esac
+}
+
+rr_restore_unit_load_state_read() {
+    local unit="$1" output_name="$2" load_state=""
+    load_state=$(systemctl show --property=LoadState --value \
+        "$unit" 2>/dev/null) || return 1
+    case "$load_state" in loaded|masked|not-found) ;; *) return 1 ;; esac
+    printf -v "$output_name" '%s' "$load_state"
+}
+
+rr_restore_unit_activity_matches() {
+    local unit="$1" wanted="$2"
+    rr_restore_unit_state_read "$unit" || return 2
+    case "$wanted:$RR_RESTORE_UNIT_LOAD_STATE:$RR_RESTORE_UNIT_ACTIVE_STATE" in
+        active:loaded:active|\
+        inactive:loaded:inactive|inactive:loaded:failed|\
+        inactive:masked:inactive|inactive:masked:failed|\
+        inactive:not-found:inactive) return 0 ;;
+        active:*|inactive:*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+rr_restore_unit_file_state_matches() {
+    local unit="$1" wanted="$2"
+    rr_restore_unit_state_read "$unit" || return 2
+    case "$wanted:$RR_RESTORE_UNIT_LOAD_STATE:$RR_RESTORE_UNIT_FILE_STATE" in
+        enabled:loaded:enabled|\
+        disabled:loaded:disabled|disabled:loaded:static|\
+        disabled:masked:masked|disabled:not-found:not-found) return 0 ;;
+        enabled:*|disabled:*) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+rr_restore_capture_unit_activity_state() {
+    local unit="$1" output_name="$2"
+    rr_restore_unit_state_read "$unit" || return 1
+    case "$RR_RESTORE_UNIT_LOAD_STATE:$RR_RESTORE_UNIT_ACTIVE_STATE" in
+        loaded:active) printf -v "$output_name" '%s' true ;;
+        loaded:inactive|loaded:failed|not-found:inactive)
+            printf -v "$output_name" '%s' false
+            ;;
+        # A mask is a persistent administrator decision, not merely an
+        # inactive state. Portable restore cannot silently flatten it.
+        masked:*|*) return 1 ;;
+    esac
+}
+
+rr_restore_capture_unit_file_state() {
+    local unit="$1" output_name="$2"
+    rr_restore_unit_state_read "$unit" || return 1
+    case "$RR_RESTORE_UNIT_LOAD_STATE:$RR_RESTORE_UNIT_FILE_STATE" in
+        loaded:enabled) printf -v "$output_name" '%s' true ;;
+        loaded:disabled|loaded:static|not-found:not-found)
+            printf -v "$output_name" '%s' false
+            ;;
+        masked:*|*) return 1 ;;
+    esac
+}
+
+rr_restore_reject_unrestorable_unit_states() {
+    local unit=""
+    for unit in sing-box.service rr-nexus.service \
+        argo-rr-health.service argo-rr-health.timer cloudflared.service \
+        rr-restore-recovery.service rr-restore-watchdog.service; do
+        rr_restore_unit_state_read "$unit" || return 1
+        if [ "$RR_RESTORE_UNIT_LOAD_STATE" = masked ] || \
+           [ "$RR_RESTORE_UNIT_FILE_STATE" = masked ]; then
+            printf '目标 Unit %s 已被 masked；为避免不可逆覆盖，恢复未开始。\n' \
+                "$unit" >&2
+            return 1
+        fi
+    done
 }
 
 rr_restore_start_watchdog() {
     systemctl reset-failed rr-restore-watchdog.service >/dev/null 2>&1 || true
     systemctl restart rr-restore-watchdog.service >/dev/null 2>&1 || return 1
-    systemctl is-active --quiet rr-restore-watchdog.service >/dev/null 2>&1
+    rr_restore_unit_activity_matches rr-restore-watchdog.service active
 }
 
 rr_restore_filter_managed_firewall_rules() {
@@ -1368,7 +1818,8 @@ rr_restore_capture_firewall_snapshot() {
 
     marker_tmp="$snapshot/.complete.$$"
     printf '%s\n' firewall-snapshot-v1 > "$marker_tmp" && chmod 600 "$marker_tmp" && \
-        mv -f "$marker_tmp" "$snapshot/complete" && sync -f "$snapshot" || {
+        sync -f "$marker_tmp" && mv -f "$marker_tmp" "$snapshot/complete" && \
+        sync -f "$snapshot" || {
             rm -f "$marker_tmp"
             return 1
         }
@@ -1585,7 +2036,7 @@ rr_restore_restore_firewall_snapshot() {
 }
 
 rr_restore_snapshot_nginx() {
-    local rollback="$1" source=""
+    local rollback="$1" source="" was_running=false was_enabled=false
     mkdir -p "$rollback/nginx/sites-available" "$rollback/nginx/sites-enabled" || return 1
     for source in \
         /etc/nginx/sites-available/rr-nexus.conf \
@@ -1601,8 +2052,14 @@ rr_restore_snapshot_nginx() {
         [ -e "$source" ] || [ -L "$source" ] || continue
         cp -a -- "$source" "$rollback/nginx/sites-enabled/" || return 1
     done
-    systemctl is-active --quiet nginx 2>/dev/null && : > "$rollback/nginx_was_running"
-    systemctl is-enabled --quiet nginx 2>/dev/null && : > "$rollback/nginx_was_enabled"
+    rr_restore_capture_unit_activity_state nginx was_running || return 1
+    rr_restore_capture_unit_file_state nginx was_enabled || return 1
+    if [ "$was_running" = true ]; then
+        : > "$rollback/nginx_was_running" || return 1
+    fi
+    if [ "$was_enabled" = true ]; then
+        : > "$rollback/nginx_was_enabled" || return 1
+    fi
     return 0
 }
 
@@ -1610,6 +2067,7 @@ rr_restore_capture_target_network() {
     local rollback="$1"
     local target_entry_mode=auto target_outbound_mode=auto
     local target_entry_v4="" target_entry_v6="" target_sub_v4="" target_sub_v6=""
+    local target_sub_port="" target_sub_access_mode=local target_sub_domain=""
     if [ -r "$CONFIG_FILE" ]; then
         : > "$rollback/target_rr_was_present" || return 1
         load_config_with_defaults || return 1
@@ -1617,6 +2075,9 @@ rr_restore_capture_target_network() {
         target_outbound_mode="${OUTBOUND_IP_MODE:-auto}"
         target_entry_v4="${ENTRY_IPV4_ADDRESS:-}"
         target_entry_v6="${ENTRY_IPV6_ADDRESS:-}"
+        target_sub_port="${SUB_PORT:-}"
+        target_sub_access_mode="${SUB_ACCESS_MODE:-local}"
+        target_sub_domain="${SUB_DOMAIN:-}"
         target_sub_v4="${SUB_PUBLIC_PORT_IPV4:-${SUB_PORT:-}}"
         target_sub_v6="${SUB_PUBLIC_PORT_IPV6:-${SUB_PORT:-}}"
     fi
@@ -1625,6 +2086,9 @@ rr_restore_capture_target_network() {
         printf 'TARGET_OUTBOUND_IP_MODE=%q\n' "$target_outbound_mode"
         printf 'TARGET_ENTRY_IPV4_ADDRESS=%q\n' "$target_entry_v4"
         printf 'TARGET_ENTRY_IPV6_ADDRESS=%q\n' "$target_entry_v6"
+        printf 'TARGET_SUB_PORT=%q\n' "$target_sub_port"
+        printf 'TARGET_SUB_ACCESS_MODE=%q\n' "$target_sub_access_mode"
+        printf 'TARGET_SUB_DOMAIN=%q\n' "$target_sub_domain"
         printf 'TARGET_SUB_PUBLIC_PORT_IPV4=%q\n' "$target_sub_v4"
         printf 'TARGET_SUB_PUBLIC_PORT_IPV6=%q\n' "$target_sub_v6"
     } > "$rollback/target-network" || return 1
@@ -1632,7 +2096,7 @@ rr_restore_capture_target_network() {
 }
 
 rr_restore_capture_target_nexus_state() {
-    local rollback="$1" access_tmp=""
+    local rollback="$1" access_tmp="" was_enabled=false
     mkdir -p "$rollback" || return 1
     access_tmp="$rollback/.target-nexus-access.$$"
     if [ -e "$NEXUS_CONFIG_FILE" ] || [ -L "$NEXUS_CONFIG_FILE" ]; then
@@ -1657,7 +2121,8 @@ rr_restore_capture_target_nexus_state() {
         rm -f "$access_tmp"
         return 1
     }
-    if systemctl is-enabled --quiet rr-nexus 2>/dev/null; then
+    rr_restore_capture_unit_file_state rr-nexus was_enabled || return 1
+    if [ "$was_enabled" = true ]; then
         : > "$rollback/nexus_was_enabled" || return 1
     fi
     return 0
@@ -1725,27 +2190,36 @@ rr_restore_set_nexus_enablement() {
     if [ "$enabled" = true ]; then
         [ -r "$NEXUS_CONFIG_FILE" ] && [ -f "$NEXUS_SERVICE_FILE" ] || return 1
         systemctl enable rr-nexus >/dev/null 2>&1 || return 1
-        systemctl is-enabled --quiet rr-nexus 2>/dev/null || return 1
+        rr_restore_unit_file_state_matches rr-nexus enabled || return 1
         return 0
     fi
     [ "$enabled" = false ] || return 1
     systemctl disable rr-nexus >/dev/null 2>&1 || true
-    ! systemctl is-enabled --quiet rr-nexus 2>/dev/null
+    rr_restore_unit_file_state_matches rr-nexus disabled
 }
 
 rr_restore_finalize_nexus_enablement() {
-    local rollback="$1" enabled=false
+    local rollback="$1" enabled=false running=false
     if [ -r "$NEXUS_CONFIG_FILE" ] || [ -f "$NEXUS_SERVICE_FILE" ]; then
         [ -r "$NEXUS_CONFIG_FILE" ] && [ -f "$NEXUS_SERVICE_FILE" ] || return 1
         if [ -f "$rollback/target_nexus_was_present" ]; then
             [ -f "$rollback/nexus_was_enabled" ] && enabled=true
+            [ -f "$rollback/nexus_was_running" ] && running=true
         else
             # A valid Nexus imported onto a machine without Nexus is a new
-            # managed service.  It must survive the first reboot.
+            # managed service. It must be live now and survive the first boot.
             enabled=true
+            running=true
         fi
     fi
-    rr_restore_set_nexus_enablement "$enabled"
+    rr_restore_set_nexus_enablement "$enabled" || return 1
+    if [ "$running" = true ]; then
+        systemctl start rr-nexus >/dev/null 2>&1 || return 1
+        rr_restore_unit_activity_matches rr-nexus active
+    else
+        systemctl stop rr-nexus >/dev/null 2>&1 || true
+        rr_restore_unit_activity_matches rr-nexus inactive
+    fi
 }
 
 rr_restore_restore_nexus_enablement() {
@@ -1754,26 +2228,51 @@ rr_restore_restore_nexus_enablement() {
     rr_restore_set_nexus_enablement "$enabled"
 }
 
-rr_restore_apply_target_network() {
+rr_restore_apply_target_network_config() {
     local rollback="$1"
+    local TARGET_ENTRY_IP_MODE=auto TARGET_OUTBOUND_IP_MODE=auto
+    local TARGET_ENTRY_IPV4_ADDRESS="" TARGET_ENTRY_IPV6_ADDRESS=""
+    local TARGET_SUB_PORT="" TARGET_SUB_ACCESS_MODE=local TARGET_SUB_DOMAIN=""
+    local TARGET_SUB_PUBLIC_PORT_IPV4="" TARGET_SUB_PUBLIC_PORT_IPV6=""
     [ -r "$rollback/target-network" ] || return 1
     # This file was generated locally with printf %q before the mutation and
     # is never accepted from the imported archive.
     # shellcheck disable=SC1090
     source "$rollback/target-network" || return 1
     load_config_with_defaults || return 1
+    case "$TARGET_ENTRY_IP_MODE" in auto|ipv4|ipv6) ;; *) return 1 ;; esac
+    case "$TARGET_OUTBOUND_IP_MODE" in
+        auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;;
+        *) return 1 ;;
+    esac
+    case "$TARGET_SUB_ACCESS_MODE" in
+        local) [ -z "$TARGET_SUB_DOMAIN" ] || return 1 ;;
+        https) is_valid_domain "$TARGET_SUB_DOMAIN" || return 1 ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$TARGET_SUB_PORT" ]; then
+        is_valid_port "$TARGET_SUB_PORT" || return 1
+        safe_sed SUB_PORT "$TARGET_SUB_PORT" || return 1
+    fi
     is_valid_port "$TARGET_SUB_PUBLIC_PORT_IPV4" || TARGET_SUB_PUBLIC_PORT_IPV4="$SUB_PORT"
     is_valid_port "$TARGET_SUB_PUBLIC_PORT_IPV6" || TARGET_SUB_PUBLIC_PORT_IPV6="$SUB_PORT"
     safe_sed ENTRY_IP_MODE "$TARGET_ENTRY_IP_MODE" || return 1
     safe_sed OUTBOUND_IP_MODE "$TARGET_OUTBOUND_IP_MODE" || return 1
     safe_sed ENTRY_IPV4_ADDRESS "$TARGET_ENTRY_IPV4_ADDRESS" || return 1
     safe_sed ENTRY_IPV6_ADDRESS "$TARGET_ENTRY_IPV6_ADDRESS" || return 1
+    safe_sed SUB_ACCESS_MODE "$TARGET_SUB_ACCESS_MODE" || return 1
+    safe_sed SUB_DOMAIN "$TARGET_SUB_DOMAIN" || return 1
     if is_valid_port "$TARGET_SUB_PUBLIC_PORT_IPV4"; then
         safe_sed SUB_PUBLIC_PORT_IPV4 "$TARGET_SUB_PUBLIC_PORT_IPV4" || return 1
     fi
     if is_valid_port "$TARGET_SUB_PUBLIC_PORT_IPV6"; then
         safe_sed SUB_PUBLIC_PORT_IPV6 "$TARGET_SUB_PUBLIC_PORT_IPV6" || return 1
     fi
+}
+
+rr_restore_apply_target_network() {
+    local rollback="$1"
+    rr_restore_apply_target_network_config "$rollback" || return 1
     install -d -m 700 /etc/rr-update || return 1
     if [ -s "$rollback/rootfs/etc/rr-update/channel" ]; then
         install -m 600 "$rollback/rootfs/etc/rr-update/channel" /etc/rr-update/channel || return 1
@@ -1811,13 +2310,17 @@ rr_restore_activate_nginx_state() {
     if command -v nginx >/dev/null 2>&1; then
         if [ -f "$rollback/nginx_was_enabled" ]; then
             systemctl enable nginx >/dev/null 2>&1 || return 1
+            rr_restore_unit_file_state_matches nginx enabled || return 1
         else
             systemctl disable nginx >/dev/null 2>&1 || true
+            rr_restore_unit_file_state_matches nginx disabled || return 1
         fi
         if [ -f "$rollback/nginx_was_running" ]; then
             systemctl restart nginx >/dev/null 2>&1 || return 1
+            rr_restore_unit_activity_matches nginx active || return 1
         else
             systemctl stop nginx >/dev/null 2>&1 || true
+            rr_restore_unit_activity_matches nginx inactive || return 1
         fi
     fi
 }
@@ -1844,25 +2347,30 @@ rr_restore_stop_managed_runtime() {
         # uninstall it only after the durable transaction reaches `mutating`.
         systemctl stop cloudflared >/dev/null 2>&1 || true
     fi
-    systemctl is-active --quiet rr-nexus 2>/dev/null && failed=true
-    systemctl is-active --quiet sing-box 2>/dev/null && failed=true
-    systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && failed=true
-    systemctl is-active --quiet argo-rr-health.service 2>/dev/null && failed=true
+    rr_restore_unit_activity_matches rr-nexus inactive || failed=true
+    rr_restore_unit_activity_matches sing-box inactive || failed=true
+    rr_restore_unit_activity_matches argo-rr-health.timer inactive || failed=true
+    rr_restore_unit_activity_matches argo-rr-health.service inactive || failed=true
+    if [ "${TUNNEL_MODE:-1}" = 2 ] && [ -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ]; then
+        rr_restore_unit_activity_matches cloudflared inactive || failed=true
+    fi
     subscription_server_running && failed=true
     expected_argo_tunnel_running >/dev/null 2>&1 && failed=true
     [ "$failed" = false ]
 }
 
 rr_restore_freeze_writers() {
+    local failed=false
     # Nexus is the authoritative SQLite/key writer.  The health timer can
     # trigger a sync while the snapshot is being assembled.  Other data-plane
     # services do not write the portable state and stay online until the
     # rollback snapshot is durably committed.
     systemctl stop rr-nexus >/dev/null 2>&1 || true
     systemctl stop argo-rr-health.timer argo-rr-health.service >/dev/null 2>&1 || true
-    ! systemctl is-active --quiet rr-nexus 2>/dev/null && \
-        ! systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && \
-        ! systemctl is-active --quiet argo-rr-health.service 2>/dev/null
+    rr_restore_unit_activity_matches rr-nexus inactive || failed=true
+    rr_restore_unit_activity_matches argo-rr-health.timer inactive || failed=true
+    rr_restore_unit_activity_matches argo-rr-health.service inactive || failed=true
+    [ "$failed" = false ]
 }
 
 rr_restore_resume_frozen_writers() {
@@ -1871,45 +2379,65 @@ rr_restore_resume_frozen_writers() {
     select_entry_ip >/dev/null 2>&1 || failed=true
     if [ -f "$rollback/singbox_was_running" ]; then
         systemctl start sing-box >/dev/null 2>&1 || failed=true
-        systemctl is-active --quiet sing-box 2>/dev/null || failed=true
+        rr_restore_unit_activity_matches sing-box active || failed=true
     else
         systemctl stop sing-box >/dev/null 2>&1 || true
+        rr_restore_unit_activity_matches sing-box inactive || failed=true
     fi
     if [ -f "$rollback/subscription_was_running" ]; then
-        start_subscription_server >/dev/null 2>&1 || failed=true
+        rr_run_without_inherited_update_lock_fds \
+            start_subscription_server >/dev/null 2>&1 || failed=true
         subscription_server_running || failed=true
     else
         stop_subscription_servers >/dev/null 2>&1 || true
     fi
     if [ -f "$rollback/argo_was_running" ]; then
-        start_argo_tunnel >/dev/null 2>&1 || failed=true
+        rr_run_without_inherited_update_lock_fds \
+            start_argo_tunnel >/dev/null 2>&1 || failed=true
         expected_argo_tunnel_running >/dev/null 2>&1 || failed=true
     else
         stop_quick_argo_tunnel >/dev/null 2>&1 || true
         systemctl stop cloudflared >/dev/null 2>&1 || true
+        if [ "${TUNNEL_MODE:-1}" = 2 ] && [ -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ]; then
+            rr_restore_unit_activity_matches cloudflared inactive || failed=true
+        fi
     fi
     if [ -f "$rollback/nexus_was_running" ]; then
         systemctl start rr-nexus >/dev/null 2>&1 || failed=true
-        systemctl is-active --quiet rr-nexus 2>/dev/null || failed=true
+        rr_restore_unit_activity_matches rr-nexus active || failed=true
     else
         systemctl stop rr-nexus >/dev/null 2>&1 || true
+        rr_restore_unit_activity_matches rr-nexus inactive || failed=true
     fi
     if [ -f "$rollback/health_timer_was_running" ]; then
         systemctl start argo-rr-health.timer >/dev/null 2>&1 || failed=true
-        systemctl is-active --quiet argo-rr-health.timer 2>/dev/null || failed=true
+        rr_restore_unit_activity_matches argo-rr-health.timer active || failed=true
     else
         systemctl stop argo-rr-health.timer >/dev/null 2>&1 || true
+        rr_restore_unit_activity_matches argo-rr-health.timer inactive || failed=true
     fi
+    rr_restore_unit_activity_matches argo-rr-health.service inactive || failed=true
     [ "$failed" = false ]
 }
 
 rr_restore_remove_managed_fixed_tunnel() {
+    local cloud_load_state=""
     load_config_with_defaults >/dev/null 2>&1 || true
     if [ "${TUNNEL_MODE:-1}" = 2 ] && [ -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ]; then
-        systemctl disable --now cloudflared >/dev/null 2>&1 || true
-        if systemctl cat cloudflared >/dev/null 2>&1; then
-            cloudflared service uninstall >/dev/null 2>&1 || return 1
-        fi
+        rr_restore_unit_load_state_read cloudflared cloud_load_state || return 1
+        case "$cloud_load_state" in
+            loaded|masked)
+                systemctl disable --now cloudflared >/dev/null 2>&1 || return 1
+                rr_restore_unit_activity_matches cloudflared inactive || return 1
+                rr_restore_unit_file_state_matches cloudflared disabled || return 1
+                cloudflared service uninstall >/dev/null 2>&1 || return 1
+                ;;
+            not-found)
+                [ ! -e /etc/systemd/system/cloudflared.service ] && \
+                    [ ! -L /etc/systemd/system/cloudflared.service ] || return 1
+                ;;
+            *) return 1 ;;
+        esac
     fi
 }
 
@@ -1920,8 +2448,10 @@ rr_restore_apply_cloudflared_snapshot() {
     systemctl daemon-reload >/dev/null 2>&1 || return 1
     if [ -f "$rollback/cloudflared_was_enabled" ]; then
         systemctl enable cloudflared >/dev/null 2>&1 || return 1
+        rr_restore_unit_file_state_matches cloudflared enabled || return 1
     else
         systemctl disable cloudflared >/dev/null 2>&1 || true
+        rr_restore_unit_file_state_matches cloudflared disabled || return 1
     fi
 }
 
@@ -1942,34 +2472,34 @@ rr_restore_finalize_original_service_state() {
     if [ -f /etc/systemd/system/sing-box.service ]; then
         if [ -f "$rollback/singbox_was_enabled" ]; then
             systemctl enable sing-box >/dev/null 2>&1 || failed=true
-            systemctl is-enabled --quiet sing-box 2>/dev/null || failed=true
+            rr_restore_unit_file_state_matches sing-box enabled || failed=true
         else
             systemctl disable sing-box >/dev/null 2>&1 || true
-            systemctl is-enabled --quiet sing-box 2>/dev/null && failed=true
+            rr_restore_unit_file_state_matches sing-box disabled || failed=true
         fi
         if [ -f "$rollback/singbox_was_running" ]; then
             systemctl start sing-box >/dev/null 2>&1 || failed=true
-            systemctl is-active --quiet sing-box 2>/dev/null || failed=true
+            rr_restore_unit_activity_matches sing-box active || failed=true
         else
             systemctl stop sing-box >/dev/null 2>&1 || true
-            systemctl is-active --quiet sing-box 2>/dev/null && failed=true
+            rr_restore_unit_activity_matches sing-box inactive || failed=true
         fi
     fi
 
     if [ -f /etc/systemd/system/argo-rr-health.timer ]; then
         if [ -f "$rollback/health_timer_was_enabled" ]; then
             systemctl enable argo-rr-health.timer >/dev/null 2>&1 || failed=true
-            systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null || failed=true
+            rr_restore_unit_file_state_matches argo-rr-health.timer enabled || failed=true
         else
             systemctl disable argo-rr-health.timer >/dev/null 2>&1 || true
-            systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && failed=true
+            rr_restore_unit_file_state_matches argo-rr-health.timer disabled || failed=true
         fi
         if [ -f "$rollback/health_timer_was_running" ]; then
             systemctl start argo-rr-health.timer >/dev/null 2>&1 || failed=true
-            systemctl is-active --quiet argo-rr-health.timer 2>/dev/null || failed=true
+            rr_restore_unit_activity_matches argo-rr-health.timer active || failed=true
         else
             systemctl stop argo-rr-health.timer >/dev/null 2>&1 || true
-            systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && failed=true
+            rr_restore_unit_activity_matches argo-rr-health.timer inactive || failed=true
         fi
     fi
 
@@ -1992,9 +2522,13 @@ rr_restore_abort_pre_mutation_stage() {
         printf '恢复事务在写入前中断，自动恢复服务失败；证据已保留在 %s。\n' "$stage" >&2
         return 1
     fi
-    rr_restore_write_phase "$stage" aborted || return 1
-    rr_restore_clear_marker "$RR_RESTORE_ACTIVE" || return 1
-    rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || return 1
+    if ! rr_restore_publish_terminal_phase "$stage" aborted; then
+        # READY is valid only for a durably terminal transaction. Re-isolate
+        # if the host-wide sync or terminal phase publication fails.
+        rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || true
+        return 1
+    fi
+    rr_restore_finalize_terminal_stage "$stage"
 }
 
 rr_restore_rollback_stage() {
@@ -2042,8 +2576,10 @@ rr_restore_rollback_stage() {
     if [ -f "$rollback/cloudflared_service_was_present" ]; then
         if [ -f "$rollback/cloudflared_was_running" ]; then
             systemctl start cloudflared >/dev/null 2>&1 || failed=true
+            rr_restore_unit_activity_matches cloudflared active || failed=true
         else
             systemctl stop cloudflared >/dev/null 2>&1 || true
+            rr_restore_unit_activity_matches cloudflared inactive || failed=true
         fi
     fi
     if [ "$failed" = true ]; then
@@ -2052,23 +2588,35 @@ rr_restore_rollback_stage() {
         printf '恢复原机状态时发生二次故障；证据已保留在 %s。\n' "$stage" >&2
         return 1
     fi
-    rr_restore_write_phase "$stage" rolled_back || return 1
-    rr_restore_clear_marker "$RR_RESTORE_ACTIVE" || return 1
-    rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || return 1
+    if ! rr_restore_publish_terminal_phase "$stage" rolled_back; then
+        rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || true
+        return 1
+    fi
+    rr_restore_finalize_terminal_stage "$stage"
 }
 
 rr_restore_recover_active() {
-    local stage="" phase="" lock_fd=""
     if [ ! -e "$RR_RESTORE_ACTIVE" ] && [ ! -L "$RR_RESTORE_ACTIVE" ]; then
         return 0
     fi
-    stage=$(rr_restore_active_stage) || return 1
-    if [ "${RR_RESTORE_LOCK_HELD:-0}" != 1 ]; then
-        rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-        exec {lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-        rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$lock_fd" || return 1
-        flock -n "$lock_fd" || return 1
+    if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ] || [ "${RR_RESTORE_LOCK_HELD:-0}" = 1 ]; then
+        if [ "${RR_UPDATE_LOCK_OWNER:-0}" = 1 ] || \
+           [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" = 1 ]; then
+            rr_restore_recover_active_locked
+        else
+            rr_run_without_inherited_update_lock_fds rr_restore_recover_active_locked
+        fi
+        return $?
     fi
+    local result=0
+    rr_run_with_update_locks direct 0 rr_restore_recover_active_locked || result=$?
+    if [ "$result" -eq 75 ] || [ "$result" -eq 76 ]; then result=1; fi
+    return "$result"
+}
+
+rr_restore_recover_active_locked() {
+    local stage="" phase=""
+    stage=$(rr_restore_active_stage) || return 1
     phase=$(rr_restore_read_exact_marker "$stage/phase") || return 1
     case "$phase" in
         freezing|frozen|prepared|pre_recovery_failed)
@@ -2076,9 +2624,7 @@ rr_restore_recover_active() {
             rm -rf -- "$stage"
             ;;
         committed|rolled_back|aborted)
-            rr_restore_publish_marker "$RR_RESTORE_RUNTIME_READY" "$stage" || return 1
-            rr_restore_clear_marker "$RR_RESTORE_ACTIVE" || return 1
-            rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || return 1
+            rr_restore_finalize_terminal_stage "$stage" || return 1
             rm -rf -- "$stage"
             ;;
         mutating|cleared|applied|migrating|rolling_back|recovery_failed)
@@ -2155,20 +2701,30 @@ PY
 }
 
 rr_restore_backup() (
-    local input="${1:-}" stage="" archive="" rollback="" result=1 backup_format="" restore_lock_fd="" restore_live_fd="" snapshot_tmp="" rollback_reserve=""
+    local result=0
+    rr_run_with_update_locks direct 0 rr_restore_backup_locked "$@" || result=$?
+    if [ "$result" -eq 75 ]; then
+        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
+        return 1
+    fi
+    [ "$result" -ne 76 ] || result=1
+    return "$result"
+)
+
+rr_restore_backup_locked() {
+    local input="${1:-}" stage="" archive="" rollback="" result=1 backup_format=""
+    local restore_live_fd="" snapshot_tmp="" rollback_reserve="" cloud_load_state=""
+    local commit_result=1
+    local singbox_was_running=false singbox_was_enabled=false nexus_was_running=false
+    local health_timer_was_enabled=false health_timer_was_running=false
+    local cloudflared_was_running=false cloudflared_was_enabled=false
     [ -r "$input" ] || { printf '找不到备份文件：%s\n' "$input" >&2; return 2; }
     rr_ensure_resilience_dependencies || { printf '无法安装加密恢复所需组件。\n' >&2; return 1; }
     rr_backup_prepare_work_dir || {
         printf '备份工作目录的所有者、权限或路径不安全。\n' >&2
         return 1
     }
-    rr_secure_lock_prepare "$RR_RESTORE_LOCK_FILE" || return 1
-    exec {restore_lock_fd}>>"$RR_RESTORE_LOCK_FILE" || return 1
-    rr_secure_lock_fd_is_safe "$RR_RESTORE_LOCK_FILE" "$restore_lock_fd" || return 1
-    if ! flock -n "$restore_lock_fd"; then
-        printf '另一个更新、备份恢复或迁移事务正在运行。\n' >&2
-        return 1
-    fi
+    RR_UPDATE_LOCK_HELD=1
     RR_RESTORE_LOCK_HELD=1
     rr_restore_recover_active || return 1
     rr_backup_prune_stale_stages || return 1
@@ -2220,6 +2776,10 @@ rr_restore_backup() (
             "$stage/payload/rootfs/var/lib/rr-nexus/nexus.db" || { rm -rf "$stage"; return 1; }
     fi
     rr_restore_validate_target_ownership || { rm -rf "$stage"; return 1; }
+    # These fragments are deleted or replaced later in the transaction. A
+    # persistent administrator mask cannot be represented by the portable
+    # data archive, so reject it before any target token/config is migrated.
+    rr_restore_reject_unrestorable_unit_states || { rm -rf "$stage"; return 1; }
     if [ -e "$NEXUS_CONFIG_FILE" ] || [ -L "$NEXUS_CONFIG_FILE" ]; then
         rr_backup_sqlite_validate "$NEXUS_DB_FILE" || {
             printf '目标 Nexus 数据库缺失、损坏或结构不匹配，恢复未开始。\n' >&2
@@ -2228,32 +2788,52 @@ rr_restore_backup() (
         }
     fi
     rr_restore_migrate_legacy_fixed_token || { rm -rf "$stage"; return 1; }
-    if [ -s "$stage/payload/rootfs/etc/rr-cloudflared/token" ] && \
-       systemctl cat cloudflared >/dev/null 2>&1 && \
-       [ ! -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ]; then
-        printf '目标服务器已有非 RR 管理的 cloudflared 服务；为避免覆盖其他隧道，恢复已停止。\n' >&2
-        rm -rf "$stage"
-        return 1
+    if [ -s "$stage/payload/rootfs/etc/rr-cloudflared/token" ]; then
+        rr_restore_unit_load_state_read cloudflared cloud_load_state || {
+            rm -rf "$stage"
+            return 1
+        }
+        if { [ "$cloud_load_state" != not-found ] || \
+             [ -e /etc/systemd/system/cloudflared.service ] || \
+             [ -L /etc/systemd/system/cloudflared.service ]; } && \
+           [ ! -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ]; then
+            printf '目标服务器已有非 RR 管理的 cloudflared 服务；为避免覆盖其他隧道，恢复已停止。\n' >&2
+            rm -rf "$stage"
+            return 1
+        fi
     fi
 
     mkdir -p "$rollback/rootfs" || { rm -rf "$stage"; return 1; }
-    systemctl is-active --quiet sing-box 2>/dev/null && : > "$rollback/singbox_was_running"
-    systemctl is-enabled --quiet sing-box 2>/dev/null && : > "$rollback/singbox_was_enabled"
-    systemctl is-active --quiet rr-nexus 2>/dev/null && : > "$rollback/nexus_was_running"
-    subscription_server_running && : > "$rollback/subscription_was_running"
+    rr_restore_capture_unit_activity_state sing-box singbox_was_running || { rm -rf "$stage"; return 1; }
+    rr_restore_capture_unit_file_state sing-box singbox_was_enabled || { rm -rf "$stage"; return 1; }
+    rr_restore_capture_unit_activity_state rr-nexus nexus_was_running || { rm -rf "$stage"; return 1; }
+    [ "$singbox_was_running" = false ] || : > "$rollback/singbox_was_running" || { rm -rf "$stage"; return 1; }
+    [ "$singbox_was_enabled" = false ] || : > "$rollback/singbox_was_enabled" || { rm -rf "$stage"; return 1; }
+    [ "$nexus_was_running" = false ] || : > "$rollback/nexus_was_running" || { rm -rf "$stage"; return 1; }
+    if subscription_server_running; then
+        : > "$rollback/subscription_was_running" || { rm -rf "$stage"; return 1; }
+    fi
     load_config_with_defaults >/dev/null 2>&1 || true
-    expected_argo_tunnel_running >/dev/null 2>&1 && : > "$rollback/argo_was_running"
-    systemctl is-enabled --quiet argo-rr-health.timer 2>/dev/null && : > "$rollback/health_timer_was_enabled"
-    systemctl is-active --quiet argo-rr-health.timer 2>/dev/null && : > "$rollback/health_timer_was_running"
+    if expected_argo_tunnel_running >/dev/null 2>&1; then
+        : > "$rollback/argo_was_running" || { rm -rf "$stage"; return 1; }
+    fi
+    rr_restore_capture_unit_file_state argo-rr-health.timer health_timer_was_enabled || { rm -rf "$stage"; return 1; }
+    rr_restore_capture_unit_activity_state argo-rr-health.timer health_timer_was_running || { rm -rf "$stage"; return 1; }
+    [ "$health_timer_was_enabled" = false ] || : > "$rollback/health_timer_was_enabled" || { rm -rf "$stage"; return 1; }
+    [ "$health_timer_was_running" = false ] || : > "$rollback/health_timer_was_running" || { rm -rf "$stage"; return 1; }
     rr_restore_capture_target_network "$rollback" || { rm -rf "$stage"; return 1; }
     rr_restore_capture_target_nexus_state "$rollback" || { rm -rf "$stage"; return 1; }
     rr_restore_snapshot_nginx "$rollback" || { rm -rf "$stage"; return 1; }
     if [ -r "${RR_CF_TOKEN_FILE:-/etc/rr-cloudflared/token}" ] && \
        [ -f /etc/systemd/system/cloudflared.service ]; then
+        rr_restore_unit_load_state_read cloudflared cloud_load_state || { rm -rf "$stage"; return 1; }
+        [ "$cloud_load_state" != not-found ] || { rm -rf "$stage"; return 1; }
+        rr_restore_capture_unit_activity_state cloudflared cloudflared_was_running || { rm -rf "$stage"; return 1; }
+        rr_restore_capture_unit_file_state cloudflared cloudflared_was_enabled || { rm -rf "$stage"; return 1; }
         cp -p /etc/systemd/system/cloudflared.service "$rollback/cloudflared.service" || { rm -rf "$stage"; return 1; }
-        : > "$rollback/cloudflared_service_was_present"
-        systemctl is-active --quiet cloudflared 2>/dev/null && : > "$rollback/cloudflared_was_running"
-        systemctl is-enabled --quiet cloudflared 2>/dev/null && : > "$rollback/cloudflared_was_enabled"
+        : > "$rollback/cloudflared_service_was_present" || { rm -rf "$stage"; return 1; }
+        [ "$cloudflared_was_running" = false ] || : > "$rollback/cloudflared_was_running" || { rm -rf "$stage"; return 1; }
+        [ "$cloudflared_was_enabled" = false ] || : > "$rollback/cloudflared_was_enabled" || { rm -rf "$stage"; return 1; }
     fi
 
     # Install recovery and publish the active transaction before stopping a
@@ -2333,9 +2913,15 @@ rr_restore_backup() (
         rr_restore_capture_firewall_snapshot "$rollback" || result=1
     fi
     if [ "$result" -eq 0 ]; then
+        # The rollback tree spans configuration, databases and firewall
+        # evidence.  Publish `complete` only after all of it is durable.
+        sync || result=1
+    fi
+    if [ "$result" -eq 0 ]; then
         snapshot_tmp="$rollback/.complete.$$"
         printf '%s\n' snapshot-v1 > "$snapshot_tmp" && chmod 600 "$snapshot_tmp" && \
-            mv -f "$snapshot_tmp" "$rollback/complete" && sync -f "$rollback" || result=1
+            sync -f "$snapshot_tmp" && mv -f "$snapshot_tmp" "$rollback/complete" && \
+            sync -f "$rollback" || result=1
         rm -f "$snapshot_tmp"
     fi
     if [ "$result" -eq 0 ]; then
@@ -2407,25 +2993,30 @@ rr_restore_backup() (
         rr_restore_test_phase migrated || result=1
     fi
     if [ "$result" -ne 1 ]; then
-        rr_restore_write_phase "$stage" committed || result=1
-        [ "$result" -ne 1 ] && \
-            rr_restore_publish_marker "$RR_RESTORE_RUNTIME_READY" "$stage" || result=1
+        if rr_restore_commit_candidate "$stage"; then
+            commit_result=0
+        else
+            commit_result=$?
+        fi
     fi
 
-    if [ "$result" -ne 1 ]; then
-        rr_restore_clear_marker "$RR_RESTORE_ACTIVE" || result=1
-        rr_restore_clear_marker "$RR_RESTORE_RUNTIME_READY" || result=1
-    fi
-    if [ "$result" -ne 1 ]; then
-        rr_restore_clear_marker "$RR_RESTORE_WATCH_REQUEST" || result=1
-        rr_restore_clear_marker "$RR_RESTORE_LIVE_MARKER" || result=1
+    if [ "$commit_result" -eq 0 ]; then
         exec {restore_live_fd}>&-
-    fi
-    if [ "$result" -ne 1 ]; then
         trap - HUP INT TERM
-        rm -rf -- "$stage"
+        if ! rm -rf -- "$stage"; then
+            printf '恢复已提交，但临时目录清理失败；下次备份/恢复会重试清理：%s。\n' \
+                "$stage" >&2
+            return 1
+        fi
         printf '恢复完成：已根据目标服务器网络、端口、证书和防火墙重新生成运行配置。\n'
         return 0
+    fi
+    if [ "$commit_result" -eq 2 ]; then
+        exec {restore_live_fd}>&-
+        trap - HUP INT TERM
+        printf '恢复候选可能已经提交；已禁止回滚并保留证据。请运行 rr --recover-restore：%s。\n' \
+            "$stage" >&2
+        return 1
     fi
 
     printf '恢复后健康检查失败，正在恢复本机原状态…\n' >&2
@@ -2443,7 +3034,7 @@ rr_restore_backup() (
         printf '自动回滚未完整完成；请保留机器并运行 rr --recover-restore。\n' >&2
     fi
     return 1
-)
+}
 
 rr_update_preflight() {
     local ok=true free_kb="" db_state="not_installed" config_state="not_installed" lock_state="available" summary=""
