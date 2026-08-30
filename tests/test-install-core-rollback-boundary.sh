@@ -68,10 +68,19 @@ printf '%s\n' '[1/9] cleanup preserves a committed transaction even if the activ
     OLD_RUNTIME=""
 
     set +e
+    phase_before=$(rr_read_trusted_phase "$TX_DIR")
+    phase_before_status=$?
+    set -e
+    if [ "$phase_before_status" -ne 0 ] || [ "$phase_before" != committed ]; then
+        fail "committed phase preflight failed: rc=${phase_before_status} value=${phase_before:-<empty>} euid=$(id -u) tx=$(stat -c '%u:%g:%a:%h' "$TX_DIR" 2>&1) phase=$(stat -c '%u:%g:%a:%h' "$TX_DIR/phase" 2>&1)"
+    fi
+
+    set +e
     rr_cleanup 23
     cleanup_status=$?
     set -e
-    [ "$cleanup_status" -eq 23 ] || fail 'cleanup lost the original committed finalizer failure'
+    [ "$cleanup_status" -eq 23 ] || \
+        fail "cleanup lost the original committed finalizer failure: rc=${cleanup_status} phase=$(rr_read_trusted_phase "$TX_DIR" 2>&1 || true)"
     [ ! -e "$rollback_log" ] || fail 'cleanup rolled a committed candidate back'
     [ "$TRANSACTION_ACTIVE" = false ] && [ "$KEEP_TRANSACTION" = true ] || \
         fail 'cleanup did not retain committed transaction state for finalizer retry'
