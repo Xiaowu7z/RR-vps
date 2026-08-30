@@ -170,7 +170,7 @@ run_restore_case legacy-success legacy restore
 legacy_log="$TEST_ROOT/legacy-success/operations"
 ! grep -q '^external:' "$legacy_log" || fail 'legacy recovery unexpectedly required a new helper'
 
-printf '%s\n' '[5/5] committed finalization is post-commit and cannot enter rollback cleanup'
+printf '%s\n' '[5/5] committed finalization restores writers before settling and cannot roll back'
 commit_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'rr_write_phase committed')
 keep_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
@@ -179,6 +179,12 @@ quarantine_clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr
     'clear-quarantine')
 finalize_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     '--post-update-finalize')
+writer_reconcile_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" \
+    rr_install_release 'rr_reconcile_committed_writer_state')
+subscription_restore_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" \
+    rr_reconcile_committed_writer_state 'rr_restore_committed_subscription_state')
+writer_verify_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" \
+    rr_reconcile_committed_writer_state 'rr_verify_update_writer_state')
 settle_sync_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'if ! sync')
 settled_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
@@ -186,21 +192,23 @@ settled_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_
 clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'rr_clear_update_maintenance_marker')
 for value in "$commit_line" "$keep_line" "$quarantine_clear_line" "$finalize_line" \
-    "$settle_sync_line" "$settled_line" "$clear_line"; do
+    "$writer_reconcile_line" "$subscription_restore_line" "$writer_verify_line" "$settle_sync_line" \
+    "$settled_line" "$clear_line"; do
     [[ "$value" =~ ^[0-9]+$ ]] || fail 'post-commit finalizer ordering evidence is incomplete'
 done
 [ "$commit_line" -lt "$keep_line" ] && [ "$keep_line" -lt "$quarantine_clear_line" ] && \
     [ "$quarantine_clear_line" -lt "$finalize_line" ] && \
-    [ "$finalize_line" -lt "$settle_sync_line" ] && \
+    [ "$finalize_line" -lt "$writer_reconcile_line" ] && \
+    [ "$writer_reconcile_line" -lt "$settle_sync_line" ] && \
+    [ "$subscription_restore_line" -lt "$writer_verify_line" ] && \
     [ "$settle_sync_line" -lt "$settled_line" ] && \
     [ "$settled_line" -lt "$clear_line" ] || \
     fail 'finalizer is not protected by durable committed/KEEP state and maintenance'
 install_release_body=$(sed -n '/^rr_install_release() {/,/^}/p' \
     "$REPO_ROOT/scripts/install-core.sh")
 post_commit_cleanup=${install_release_body#*KEEP_TRANSACTION=true}
-pre_finalize_cleanup=${post_commit_cleanup%%--post-update-finalize*}
-if grep -Fq 'rr_rollback' <<<"$pre_finalize_cleanup"; then
-    fail 'quarantine cleanup can still roll a committed safe candidate back'
+if grep -Fq 'rr_rollback' <<<"$post_commit_cleanup"; then
+    fail 'post-commit cleanup can still roll a committed safe candidate back'
 fi
 
 printf '%s\n' 'update external transaction regression: PASS'

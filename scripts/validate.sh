@@ -200,6 +200,12 @@ run_nexus_ip_nginx_case() (
     local case_name="$1"
     local nginx_test_rc="$2"
     local expect_success="$3"
+    local update_transaction="${4:-0}"
+    local cert_mode="${5:-644}"
+    local key_mode="${6:-600}"
+    local cert_identity_before=""
+    local key_identity_before=""
+    local fixture_stat_bin=""
     load_modules_for_tests
     nexus_nginx_tmp=$(mktemp -d)
     trap 'rm -rf "$nexus_nginx_tmp"' EXIT
@@ -217,8 +223,8 @@ run_nexus_ip_nginx_case() (
     printf '%s\n' "old ip site $case_name" > "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
     printf '%s\n' "old certificate $case_name" > "$NEXUS_CERT_DIR/ip.crt"
     printf '%s\n' "old private key $case_name" > "$NEXUS_CERT_DIR/ip.key"
-    chmod 644 "$NEXUS_CERT_DIR/ip.crt"
-    chmod 600 "$NEXUS_CERT_DIR/ip.key"
+    chmod "$cert_mode" "$NEXUS_CERT_DIR/ip.crt"
+    chmod "$key_mode" "$NEXUS_CERT_DIR/ip.key"
     ln -s "$NEXUS_NGINX_AVAILABLE_DIR/default" "$NEXUS_NGINX_ENABLED_DIR/default"
     ln -s "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf" \
         "$NEXUS_NGINX_ENABLED_DIR/unrelated.conf"
@@ -233,7 +239,8 @@ run_nexus_ip_nginx_case() (
 
     nginx_active=true
     nginx_enabled=false
-    [ "$expect_success" = true ] && nginx_active=false
+    [ "$update_transaction" != 1 ] && [ "$expect_success" = true ] && nginx_active=false
+    RR_UPDATE_TRANSACTION="$update_transaction"
     apt-get() { :; }
     openssl() {
         local output=""
@@ -277,10 +284,52 @@ run_nexus_ip_nginx_case() (
         esac
     }
     open_protocol_firewall() { :; }
+    if [ "$update_transaction" = 1 ]; then
+        # The production contract is root:root, while pre-push validation may
+        # run as an unprivileged developer.  Map only these private fixtures'
+        # uid/gid fields; preserve their real type, inode, mode, and link count.
+        fixture_stat_bin=$(type -P stat)
+        stat() {
+            local target="${!#}" value="" device="" inode="" mode="" links=""
+            if [ "$target" = "$NEXUS_CERT_DIR/ip.crt" ] || \
+               [ "$target" = "$NEXUS_CERT_DIR/ip.key" ]; then
+                case "${2:-}" in
+                    '%u:%g:%a:%h')
+                        value=$("$fixture_stat_bin" "$@") || return 1
+                        IFS=: read -r _ _ mode links <<< "$value"
+                        printf '0:0:%s:%s\n' "$mode" "$links"
+                        return
+                        ;;
+                    '%d:%i:%u:%g:%a:%h')
+                        value=$("$fixture_stat_bin" "$@") || return 1
+                        IFS=: read -r device inode _ _ mode links <<< "$value"
+                        printf '%s:%s:0:0:%s:%s\n' "$device" "$inode" "$mode" "$links"
+                        return
+                        ;;
+                esac
+            fi
+            "$fixture_stat_bin" "$@"
+        }
+        certificate_identity_matches() { return 0; }
+        certificate_private_key_matches() { return 0; }
+        cert_identity_before=$(stat -c '%d:%i:%u:%g:%a:%h' "$NEXUS_CERT_DIR/ip.crt")
+        key_identity_before=$(stat -c '%d:%i:%u:%g:%a:%h' "$NEXUS_CERT_DIR/ip.key")
+    fi
 
     if [ "$expect_success" = true ]; then
         nexus_enable_public_ip_https 192.0.2.10 18443
-        [ "$nginx_active" = true ] && [ "$nginx_enabled" = true ]
+        [ "$nginx_active" = true ]
+        if [ "$update_transaction" = 1 ]; then
+            [ "$nginx_enabled" = false ]
+            [ "$(stat -c %a "$NEXUS_CERT_DIR/ip.crt")" = "$cert_mode" ]
+            [ "$(stat -c %a "$NEXUS_CERT_DIR/ip.key")" = "$key_mode" ]
+            [ "$(stat -c '%d:%i:%u:%g:%a:%h' "$NEXUS_CERT_DIR/ip.crt")" = \
+                "$cert_identity_before" ]
+            [ "$(stat -c '%d:%i:%u:%g:%a:%h' "$NEXUS_CERT_DIR/ip.key")" = \
+                "$key_identity_before" ]
+        else
+            [ "$nginx_enabled" = true ]
+        fi
         [ ! -e "$NEXUS_NGINX_ENABLED_DIR/rr-nexus.conf" ]
         [ ! -e "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-port.conf" ]
         [ "$(readlink "$NEXUS_NGINX_ENABLED_DIR/rr-nexus-ip.conf")" = \
@@ -322,6 +371,88 @@ run_nexus_ip_nginx_case() (
 )
 run_nexus_ip_nginx_case success 0 true
 run_nexus_ip_nginx_case nginx-test-failure 1 false
+run_nexus_ip_nginx_case legacy-0600-update 0 true 1 600 600
+run_nexus_ip_nginx_case current-0644-update 0 true 1 644 600
+run_nexus_ip_nginx_case unsafe-cert-mode 0 false 1 640 600
+run_nexus_ip_nginx_case unsafe-key-mode 0 false 1 644 644
+
+# 更新候选只能复用 root 所有的普通单链接证书文件。证书兼容 7.1.0
+# 的 0600 与当前 0644；私钥始终只能是 0600。
+(
+    load_modules_for_tests
+    certificate_root=$(mktemp -d)
+    trap 'rm -rf "$certificate_root"' EXIT
+    cert="$certificate_root/ip.crt"
+    key="$certificate_root/ip.key"
+    real_stat_bin=$(type -P stat)
+    mocked_nonroot=""
+
+    stat() {
+        local target="${!#}" value="" mode="" links=""
+        if { [ "$target" = "$cert" ] || [ "$target" = "$key" ]; } && \
+           [ "${2:-}" = '%u:%g:%a:%h' ]; then
+            value=$("$real_stat_bin" "$@") || return 1
+            IFS=: read -r _ _ mode links <<< "$value"
+            if [ "$target" = "$mocked_nonroot" ]; then
+                printf '65534:65534:%s:%s\n' "$mode" "$links"
+            else
+                printf '0:0:%s:%s\n' "$mode" "$links"
+            fi
+            return
+        fi
+        "$real_stat_bin" "$@"
+    }
+
+    make_safe_pair() {
+        rm -f -- "$cert" "$key" "$certificate_root/extra-link" \
+            "$certificate_root/cert-target" "$certificate_root/key-target"
+        printf '%s\n' certificate > "$cert"
+        printf '%s\n' private-key > "$key"
+        chmod 644 "$cert"
+        chmod 600 "$key"
+    }
+
+    make_safe_pair
+    nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    chmod 600 "$cert"
+    nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+
+    chmod 640 "$cert"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    chmod 644 "$key"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    ln "$cert" "$certificate_root/extra-link"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    mv "$cert" "$certificate_root/cert-target"
+    ln -s "$certificate_root/cert-target" "$cert"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    ln "$key" "$certificate_root/extra-link"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    mv "$key" "$certificate_root/key-target"
+    ln -s "$certificate_root/key-target" "$key"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    rm -f -- "$cert"
+    mkfifo "$cert"
+    chmod 644 "$cert"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    rm -f -- "$key"
+    mkfifo "$key"
+    chmod 600 "$key"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    make_safe_pair
+    mocked_nonroot="$cert"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    mocked_nonroot="$key"
+    ! nexus_update_ip_certificate_files_are_safe "$cert" "$key"
+    unset -f stat
+)
 
 # 更新/回滚后的订阅 worker 可能没有 PID 文件，旧目录也可能已经被删除。
 # 进程回收必须同时证明 root UID、精确 argv，以及 live cwd 或内核可证明的
