@@ -1,0 +1,119 @@
+name: VPS diagnostic
+
+on:
+  push:
+    branches:
+      - audit/vps-diagnostic-v711
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RR_A_HOST: ${{ secrets.RR_A_HOST }}
+      RR_A_PASS: ${{ secrets.RR_A_PASS }}
+      RR_B_HOST: ${{ secrets.RR_B_HOST }}
+      RR_B_PASS: ${{ secrets.RR_B_PASS }}
+    steps:
+      - name: Install SSH client helper
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+      - name: Collect sanitized audit evidence
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +x
+          pin_a='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm'
+          pin_b='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A'
+          probe() {
+            local label="$1" host="$2" pass="$3" pin="$4" known=""
+            known="$RUNNER_TEMP/diagnostic-known-hosts-$label"
+            (umask 077; printf '%s %s\n' "$host" "$pin" > "$known")
+            export SSHPASS="$pass"
+            sshpass -e ssh \
+              -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2 \
+              -o LogLevel=ERROR -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519 \
+              -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+              -o UserKnownHostsFile="$known" "root@$host" bash -s -- "$label" <<'REMOTE'
+          set -uo pipefail
+          label="$1"
+          . /etc/os-release
+          rr_version=absent
+          [ ! -x /usr/local/bin/rr ] || \
+            rr_version=$(/usr/local/bin/rr --version 2>/dev/null | head -n 1 || true)
+          stage=$(cat /root/rr-audit-stage 2>/dev/null || printf none)
+          printf 'AUTH_OK slot=%s os=%s version=%s rr=%s stage=%s\n' \
+            "$label" "$ID" "$VERSION_ID" "$rr_version" "$stage"
+          for unit in sing-box.service rr-nexus.service nginx.service \
+            rr-subscription-quarantine.service argo-rr-health.timer; do
+            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
+            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
+            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
+            printf 'UNIT slot=%s name=%s state=%s:%s:%s\n' \
+              "$label" "$unit" "$load" "$active" "$enabled"
+          done
+          for port in 8443 10443 18080 18081 21443 22443 24443 28443; do
+            pids=$(ss -H -ltnp "sport = :${port}" 2>/dev/null |
+              sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)
+            [ -n "$pids" ] || continue
+            for pid in $pids; do
+              comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+              exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+              cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
+              printf 'PORT_OWNER slot=%s port=%s pid=%s comm=%s exe=%s cwd=%s\n' \
+                "$label" "$port" "$pid" "$comm" "$exe" "$cwd" |
+                sed -E 's#[[:alnum:]_+/=-]{24,}#<token>#g'
+            done
+          done
+          while IFS= read -r log_file; do
+            base=$(basename "$log_file")
+            size=$(stat -c %s "$log_file" 2>/dev/null || printf 0)
+            lines=$(wc -l < "$log_file" 2>/dev/null || printf 0)
+            printf 'LOG_META slot=%s file=%s size=%s lines=%s\n' \
+              "$label" "$base" "$size" "$lines"
+            grep -Eai 'error|failed|failure|invalid|missing|not found|unable|timeout|denied|refus|404|403|traceback|exception|失败|错误|拒绝' \
+              "$log_file" 2>/dev/null | tail -n 16 |
+              sed -E \
+                -e 's#https?://[^[:space:]]+#<url>#g' \
+                -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
+                -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+                -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' |
+              grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|订阅地址|subscription[ _-]?url' |
+              while IFS= read -r line; do
+                printf 'LOG_ERROR slot=%s file=%s text=%s\n' "$label" "$base" "$line"
+              done
+          done < <(find /root -maxdepth 1 -type f -name 'rr-audit-*.log' -print | sort)
+          case "$label" in
+            A) detail_logs='rr-audit-preclean.log rr-audit-core.log rr-audit-deps.log rr-audit-ufw-prepare.log rr-audit-ufw-enable.log rr-audit-install.log rr-audit-nexus.log' ;;
+            B) detail_logs='rr-audit-preclean.log rr-audit-old-core.log rr-audit-old-deps.log rr-audit-old-install.log rr-audit-old-nexus.log rr-audit-upgrade.log' ;;
+            *) detail_logs='' ;;
+          esac
+          for base in $detail_logs; do
+            log_file="/root/$base"
+            [ -f "$log_file" ] || continue
+            sed -E \
+              -e 's#https?://[^[:space:]]+#<url>#g' \
+              -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
+              -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+              -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
+              grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|订阅地址|subscription[ _-]?url' |
+              tail -n 180 |
+              while IFS= read -r line; do
+                printf 'LOG_DETAIL slot=%s file=%s text=%s\n' "$label" "$base" "$line"
+              done
+          done
+          exit 0
+          REMOTE
+            rc=$?
+            unset SSHPASS
+            if [ "$rc" -ne 0 ]; then
+              printf 'PROBE_FAILED slot=%s rc=%s\n' "$label" "$rc"
+            fi
+          }
+          probe A "$RR_A_HOST" "$RR_A_PASS" "$pin_a"
+          probe B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
