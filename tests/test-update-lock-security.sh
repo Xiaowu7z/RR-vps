@@ -1331,9 +1331,11 @@ installer_source_flat=$(tr '\n' ' ' < scripts/install-core.sh)
 grep -Eq 'rr_run_with_delegated_update_lock[[:space:]]*\\[[:space:]]*"\$RR_RECOVERY_HELPER" recover' \
     <<<"$installer_source_flat" || \
     fail 'installer recovery delegation marker is missing'
-grep -Eq 'rr_run_with_delegated_update_lock[[:space:]\\]+"\$RR_LAUNCHER" --health-check' \
-    <<<"$installer_source_flat" || \
-    fail 'installer health-check delegation marker is missing'
+grep -Fq 'rr_resume_subscription_bounded || rollback_failed=true' \
+    scripts/install-core.sh || \
+    fail 'installer bounded subscription fallback marker is missing'
+grep -Fq '"$RR_LAUNCHER" --refresh-subscription' scripts/install-core.sh || \
+    fail 'installer subscription refresh launcher contract is missing'
 grep -Fq 'rr_run_with_delegated_update_lock "$RR_LAUNCHER" --post-update' \
     scripts/install-core.sh || \
     fail 'installer post-update delegation marker is missing'

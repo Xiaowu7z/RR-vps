@@ -57,7 +57,7 @@ rr_run_delegated_without_lock_fds() (
     if [ "$deadline" = 0 ]; then
         env RR_UPDATE_LOCK_HELD=1 "$@"
     else
-        timeout "$deadline" env RR_UPDATE_LOCK_HELD=1 "$@"
+        timeout --kill-after=5 "$deadline" env RR_UPDATE_LOCK_HELD=1 "$@"
     fi
 )
 
@@ -618,8 +618,19 @@ rr_finalize_committed_candidate() {
     rr_run_delegated_without_lock_fds 60 "$RR_LAUNCHER" --post-update-finalize
 }
 
+rr_resume_subscription_bounded() {
+    if [ ! -f "$RR_LAUNCHER" ] || [ ! -x "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ] ||
+       ! rr_run_delegated_without_lock_fds 30 \
+           "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1 ||
+       ! rr_subscription_running; then
+        rr_stop_subscription_servers >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
 rr_restore_recorded_writer_state() {
     local backup="$1" subscription_policy="${2:-normal}" failed=false
+    local resume_subscription=false
     if [ ! -f "$backup/writer_state_complete" ]; then
         if [ "$subscription_policy" != normal ]; then
             rr_freeze_health_writers_strict || failed=true
@@ -649,9 +660,7 @@ rr_restore_recorded_writer_state() {
         return
     fi
     if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
-        [ -x "$RR_LAUNCHER" ] && rr_run_delegated_without_lock_fds 30 \
-            "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || failed=true
-        rr_subscription_running || failed=true
+        resume_subscription=true
     else
         rr_stop_subscription_servers || failed=true
         rr_subscription_running && failed=true
@@ -668,6 +677,13 @@ rr_restore_recorded_writer_state() {
         fi
     else
         rr_freeze_health_writers_strict || failed=true
+    fi
+    if [ "$resume_subscription" = true ]; then
+        if [ "$failed" = false ]; then
+            rr_resume_subscription_bounded || failed=true
+        else
+            rr_stop_subscription_servers >/dev/null 2>&1 || true
+        fi
     fi
     [ "$failed" = false ]
 }

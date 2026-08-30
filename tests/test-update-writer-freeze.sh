@@ -27,7 +27,7 @@ extract_function() {
     ' "$REPO_ROOT/scripts/install-core.sh"
 }
 
-printf '%s\n' '[1/13] an all-inactive writer snapshot is a successful state capture'
+printf '%s\n' '[1/14] an all-inactive writer snapshot is a successful state capture'
 eval "$(extract_function rr_unit_activity_matches)"
 eval "$(extract_function rr_unit_file_state_matches)"
 eval "$(extract_function rr_capture_unit_activity_state)"
@@ -63,7 +63,7 @@ fi
 [ "$RR_HEALTH_STATE_CAPTURED" = false ] || \
     fail 'failed writer capture published partial health evidence'
 
-printf '%s\n' '[2/13] repeated health freezes preserve the first observed enabled state'
+printf '%s\n' '[2/14] repeated health freezes preserve the first observed enabled state'
 eval "$(extract_function rr_freeze_health_monitor)"
 RR_HEALTH_MONITOR_FROZEN=false
 RR_HEALTH_TIMER_WAS_ENABLED=false
@@ -295,13 +295,13 @@ run_recovery_case() (
     [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'successful recovery left maintenance marker'
 )
 
-printf '%s\n' '[3/13] state-record crash recovery touches no service before freezing begins'
+printf '%s\n' '[3/14] state-record crash recovery touches no service before freezing begins'
 run_recovery_case state-recorded false state_recorded
 
-printf '%s\n' '[4/13] pre-mutation crash recovery restores exact active/enabled state'
+printf '%s\n' '[4/14] pre-mutation crash recovery restores exact active/enabled state'
 run_recovery_case restore-success false
 
-printf '%s\n' '[5/13] a real SIGKILL leaves durable state that standalone recovery consumes'
+printf '%s\n' '[5/14] a real SIGKILL leaves durable state that standalone recovery consumes'
 sig_root="$TEST_ROOT/sigkill"
 sig_tx="$sig_root/update/transactions/tx"
 sig_marker="$sig_root/run/update-maintenance"
@@ -332,7 +332,7 @@ set -e
 [ -f "$sig_root/update/active" ] && [ -f "$sig_marker" ] || fail 'SIGKILL lost durable recovery pointers'
 run_recovery_case sigkill false freezing true
 
-printf '%s\n' '[6/13] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
+printf '%s\n' '[6/14] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
 kill_root="$TEST_ROOT/recovery-sigkill"
 kill_tx="$kill_root/update/transactions/tx"
 kill_timer_active="$kill_root/health-timer-active"
@@ -400,13 +400,13 @@ set -e
 [ -e "$kill_root/update/active" ] && [ -e "$kill_root/run/update-maintenance" ] || \
     fail 'runtime-restore SIGKILL discarded transaction evidence'
 
-printf '%s\n' '[7/13] restart failure is fail-closed and retains transaction evidence'
+printf '%s\n' '[7/14] restart failure is fail-closed and retains transaction evidence'
 run_recovery_case restore-failure true
 run_recovery_case restore-query-error query-error
 run_recovery_case restore-absent absent
 run_recovery_case restore-incoherent incoherent
 
-printf '%s\n' '[8/13] a committed crash retries finalization before clearing maintenance'
+printf '%s\n' '[8/14] a committed crash retries finalization before clearing maintenance'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -808,7 +808,7 @@ printf '%s\n' '[8/13] a committed crash retries finalization before clearing mai
         fail 'rolling_back boot recovery skipped its durable gate or restore'
 )
 
-printf '%s\n' '[9/13] aborted recovery is idempotent and requires a durable active unlink'
+printf '%s\n' '[9/14] aborted recovery is idempotent and requires a durable active unlink'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -913,7 +913,7 @@ printf '%s\n' '[9/13] aborted recovery is idempotent and requires a durable acti
         fail 'republished aborted recovery regressed into rollback'
 )
 
-printf '%s\n' '[10/13] normal terminal cleanup retries restore the recorded writer state'
+printf '%s\n' '[10/14] normal terminal cleanup retries restore the recorded writer state'
 for terminal_phase in committed rolled_back aborted; do
     (
         export RR_UPDATE_RECOVER_SOURCE_ONLY=1
@@ -1028,7 +1028,7 @@ active_line=$(grep -n 'rr_clear_active_transaction_pointer' <<<"$terminal_branch
     [ "$marker_line" -lt "$active_line" ] ||
     fail 'terminal cleanup is not ordered writer-restore, global-sync, maintenance, active'
 
-printf '%s\n' '[11/13] invalid evidence and systemd query errors fail closed with health writers frozen'
+printf '%s\n' '[11/14] invalid evidence and systemd query errors fail closed with health writers frozen'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -1299,7 +1299,79 @@ printf '%s\n' '[11/13] invalid evidence and systemd query errors fail closed wit
     assert_health_frozen 'systemd query-error handling'
 )
 
-printf '%s\n' '[12/13] recovery bridges legacy locks and delegates both flock descriptors safely'
+printf '%s\n' '[12/14] recorded subscription state resumes through the narrow bounded entry point'
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    export RR_TX_ROOT="$TEST_ROOT/subscription-resume/update"
+    export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    export RR_LIB_DIR="$TEST_ROOT/subscription-resume/runtime"
+    export RR_LAUNCHER="$TEST_ROOT/subscription-resume/rr"
+    export RR_CONFIG_FILE="$TEST_ROOT/subscription-resume/config"
+    export RR_TEST_REFRESH_LOG="$TEST_ROOT/subscription-resume/refresh.log"
+    export RR_TEST_SUBSCRIPTION_RUNNING="$TEST_ROOT/subscription-resume/running"
+    export RR_TEST_SUBSCRIPTION_STOPPED="$TEST_ROOT/subscription-resume/stopped"
+    backup="$RR_TX_ROOT/transactions/tx/backup"
+    mkdir -p "$backup" "$RR_LIB_DIR"
+    : > "$backup/writer_state_complete"
+    : > "$backup/subscription_was_running"
+    printf '%s\n' '#!/bin/bash' \
+        'printf "%s|%s\n" "${RR_UPDATE_LOCK_HELD:-0}" "$*" > "$RR_TEST_REFRESH_LOG"' \
+        'case "${1:-}" in' \
+        '  --health-check) exit 0 ;;' \
+        '  --refresh-subscription)' \
+        '    case "${RR_TEST_REFRESH_RESULT:-success}" in' \
+        '      success) : > "$RR_TEST_SUBSCRIPTION_RUNNING" ;;' \
+        '      partial-failure) : > "$RR_TEST_SUBSCRIPTION_RUNNING"; exit 124 ;;' \
+        '      false-success) : ;;' \
+        '      *) exit 64 ;;' \
+        '    esac' \
+        '    ;;' \
+        '  *) exit 64 ;;' \
+        'esac' > "$RR_LAUNCHER"
+    chmod 700 "$RR_LAUNCHER"
+    # shellcheck source=../scripts/update-recover.sh
+    source "$REPO_ROOT/scripts/update-recover.sh"
+
+    rr_restore_unit_state() { :; }
+    rr_restart_health_service_bounded() { :; }
+    rr_subscription_running() { [ -e "$RR_TEST_SUBSCRIPTION_RUNNING" ]; }
+    rr_stop_subscription_servers() {
+        : > "$RR_TEST_SUBSCRIPTION_STOPPED"
+        rm -f -- "$RR_TEST_SUBSCRIPTION_RUNNING"
+    }
+
+    export RR_TEST_REFRESH_RESULT=success
+    rr_restore_recorded_writer_state "$backup" normal ||
+        fail 'standalone recovery did not resume a recorded subscription writer'
+    [ "$(cat "$RR_TEST_REFRESH_LOG")" = '1|--refresh-subscription' ] ||
+        fail 'standalone recovery used a broad or unlocked subscription entry point'
+    [ -e "$RR_TEST_SUBSCRIPTION_RUNNING" ] ||
+        fail 'successful subscription refresh did not satisfy the running postcondition'
+    [ ! -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] ||
+        fail 'successful subscription refresh was stopped unexpectedly'
+
+    rm -f -- "$RR_TEST_REFRESH_LOG" "$RR_TEST_SUBSCRIPTION_RUNNING" \
+        "$RR_TEST_SUBSCRIPTION_STOPPED"
+    export RR_TEST_REFRESH_RESULT=false-success
+    if rr_restore_recorded_writer_state "$backup" normal; then
+        fail 'a zero-exit refresh with no managed worker was accepted'
+    fi
+    [ "$(cat "$RR_TEST_REFRESH_LOG")" = '1|--refresh-subscription' ] &&
+        [ -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] ||
+        fail 'a false-success refresh did not converge to the frozen failure state'
+
+    rm -f -- "$RR_TEST_REFRESH_LOG" "$RR_TEST_SUBSCRIPTION_RUNNING" \
+        "$RR_TEST_SUBSCRIPTION_STOPPED"
+    export RR_TEST_REFRESH_RESULT=partial-failure
+    if rr_restore_recorded_writer_state "$backup" normal; then
+        fail 'a nonzero partial subscription refresh was accepted'
+    fi
+    [ -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] &&
+        [ ! -e "$RR_TEST_SUBSCRIPTION_RUNNING" ] ||
+        fail 'a partial subscription refresh left its managed worker alive'
+)
+
+printf '%s\n' '[13/14] recovery bridges legacy locks and delegates both flock descriptors safely'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=0
@@ -1463,7 +1535,7 @@ printf '%s\n' '[12/13] recovery bridges legacy locks and delegates both flock de
     trap - EXIT
 )
 
-printf '%s\n' '[13/13] maintenance state is root-only and bound to one transaction'
+printf '%s\n' '[14/14] maintenance state is root-only and bound to one transaction'
 grep -Fq "0:0:600:1" "$REPO_ROOT/scripts/install-core.sh" || fail 'installer lacks strict maintenance marker mode check'
 grep -Fq '[ "$owner" = "$marker_tx" ]' "$REPO_ROOT/scripts/install-core.sh" || fail 'installer marker is not transaction-bound'
 grep -Fq '[ "$value" = "$tx" ]' "$REPO_ROOT/scripts/update-recover.sh" || fail 'recovery marker is not transaction-bound'

@@ -982,27 +982,25 @@ rr_restore_unit_state() {
     fi
 }
 
-rr_run_health_check_bounded() {
-    local pid="" attempt=0 status=0
-    (
-        # This outer group is the process placed in the background.  Close
-        # both flock descriptors here so an installer SIGKILL cannot leave an
-        # orphaned wrapper holding the transaction locks.
-        rr_close_inherited_installer_lock_fds
-        RR_UPDATE_LOCK_HELD=1 "$RR_LAUNCHER" --health-check
-    ) >/dev/null 2>&1 &
-    pid=$!
-    while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 300 ]; do
-        sleep 0.1
-        attempt=$((attempt + 1))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" >/dev/null 2>&1 || true
-        wait "$pid" 2>/dev/null || true
+rr_resume_subscription_bounded() {
+    local status=0
+    if [ ! -f "$RR_LAUNCHER" ] || [ ! -x "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ]; then
+        rr_stop_subscription_servers >/dev/null 2>&1 || true
+        rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
         return 1
     fi
-    wait "$pid" || status=$?
-    [ "$status" -eq 0 ]
+    (
+        # Close both flock descriptors before exec so a surviving managed
+        # subscription worker can never retain the install transaction locks.
+        rr_close_inherited_installer_lock_fds
+        timeout --kill-after=5 30 env RR_UPDATE_LOCK_HELD=1 \
+            "$RR_LAUNCHER" --refresh-subscription
+    ) >/dev/null 2>&1 || status=$?
+    if [ "$status" -ne 0 ] || ! rr_subscription_running; then
+        rr_stop_subscription_servers >/dev/null 2>&1 || true
+        rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
+        return 1
+    fi
 }
 
 rr_restart_health_service_bounded() {
@@ -1029,9 +1027,9 @@ rr_restart_health_service_bounded() {
 
 rr_restore_update_writer_state() {
     local backup="${1:-$BACKUP_DIR}" subscription_policy="${2:-normal}" failed=false
+    local resume_subscription=false
     if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
-        [ -x "$RR_LAUNCHER" ] && rr_run_health_check_bounded || failed=true
-        rr_subscription_running || failed=true
+        resume_subscription=true
     else
         rr_stop_subscription_servers || failed=true
         rr_subscription_running && failed=true
@@ -1052,7 +1050,18 @@ rr_restore_update_writer_state() {
         # unit files have been restored.
         rr_quiesce_health_monitor_for_rollback || failed=true
     fi
-    [ "$failed" = false ] || return 1
+    if [ "$resume_subscription" = true ]; then
+        if [ "$failed" = false ]; then
+            rr_resume_subscription_bounded || failed=true
+        else
+            rr_stop_subscription_servers >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ "$failed" != false ]; then
+        rr_stop_subscription_servers >/dev/null 2>&1 || true
+        rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
+        return 1
+    fi
     RR_UPDATE_WRITERS_FROZEN=false
     RR_HEALTH_MONITOR_FROZEN=false
 }
@@ -2157,9 +2166,8 @@ rr_rollback() {
             systemctl stop rr-nexus >/dev/null 2>&1 || true
         fi
         if [ "$subscription_policy" = normal ] && \
-           [ -f "$BACKUP_DIR/subscription_was_running" ] && [ -x "$RR_LAUNCHER" ]; then
-            rr_run_with_delegated_update_lock \
-                "$RR_LAUNCHER" --health-check >/dev/null 2>&1 || rollback_failed=true
+           [ -f "$BACKUP_DIR/subscription_was_running" ]; then
+            rr_resume_subscription_bounded || rollback_failed=true
         fi
     fi
     if [ "$rollback_failed" = true ]; then
@@ -2311,7 +2319,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "1f3bbb3a95ce751957f6ae0a49eeabcbade92b42bae2a44c049baf73d5a3e7bb" ] && \
+        if [ "$actual" = "4d77ab1fbb99d732a1e13f92bc2780ab659234d20534daf00d7badf90eed05c0" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
