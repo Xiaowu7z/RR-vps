@@ -144,6 +144,24 @@ b_start, b_end = job_ranges["B"]
 b_job = vps[vps.index(b_start):vps.index(b_end, vps.index(b_start))]
 a_start, a_end = job_ranges["A"]
 a_job = vps[vps.index(a_start):vps.index(a_end, vps.index(a_start))]
+assert "openssl x509 -checkhost" not in a_job
+assert "declare -F certificate_identity_matches >/dev/null" in a_job
+for certificate, identity in (
+    ('${panel_domain}', '$panel_domain'),
+    ('${naive_domain}', '$naive_domain'),
+):
+    assert (
+        f'"/etc/letsencrypt/live/{certificate}/fullchain.pem" "{identity}"'
+        in a_job
+    )
+for certificate, wrong_identity in (
+    ('${panel_domain}', '$naive_domain'),
+    ('${naive_domain}', '$panel_domain'),
+):
+    assert (
+        f'"/etc/letsencrypt/live/{certificate}/fullchain.pem" "{wrong_identity}"'
+        in a_job
+    )
 for fragment in (
     "[ -e /etc/rr-nexus ]",
     "[ -e /var/lib/rr-nexus ]",
@@ -153,6 +171,63 @@ for fragment in (
     'systemctl show -p LoadState --value rr-nexus.service',
 ):
     assert fragment in b_job
+candidate_cleanup_if = b_job.index("          if [ -e /usr/local/bin/rr ]")
+candidate_cleanup_call = b_job.index("                uninstall_all", candidate_cleanup_if)
+candidate_cleanup_stage = b_job.index("          printf 'preclean-complete", candidate_cleanup_call)
+quarantine_contract_start = b_job.index("          quarantine_fully_absent() {")
+quarantine_contract_end = b_job.index(
+    '          test "$(id -u)" -eq 0', quarantine_contract_start
+)
+quarantine_contract = b_job[quarantine_contract_start:quarantine_contract_end]
+for artifact in (
+    "/var/lib/rr-update/subscription-quarantine",
+    "/run/rr-subscription-quarantine.ready",
+    "/etc/systemd/system/rr-subscription-quarantine.service",
+    "/var/lib/rr-quarantine/guard-state",
+    "/usr/local/libexec/rr-vps/subscription-quarantine-guard",
+):
+    assert artifact in quarantine_contract
+assert '[ ! -e "$artifact" ] && [ ! -L "$artifact" ]' in quarantine_contract
+assert "not-found:inactive:not-found || return 1" in quarantine_contract
+assert '"$backend" -w 5 -t raw -S PREROUTING' in quarantine_contract
+assert "rr-vps unsafe rollback subscription quarantine" in quarantine_contract
+for fragment in (
+    "[ -e /var/lib/rr-update ]",
+    "[ -L /var/lib/rr-update ]",
+    "[ -e /run/rr-vps/update-maintenance ]",
+    "[ -L /run/rr-vps/update-maintenance ]",
+):
+    position = b_job.index(fragment, candidate_cleanup_if, candidate_cleanup_call)
+    assert candidate_cleanup_if < position < candidate_cleanup_call
+for fragment in (
+    "test ! -e /var/lib/rr-update",
+    "test ! -L /var/lib/rr-update",
+    "test ! -e /run/rr-vps/update-maintenance",
+    "test ! -L /run/rr-vps/update-maintenance",
+):
+    position = b_job.index(fragment, candidate_cleanup_call, candidate_cleanup_stage)
+    assert candidate_cleanup_call < position < candidate_cleanup_stage
+quarantine_wait = b_job.index("          quarantine_absent=false", candidate_cleanup_call)
+quarantine_probe = b_job.index(
+    "            if quarantine_fully_absent; then", quarantine_wait
+)
+quarantine_final = b_job.index(
+    '          if [ "$quarantine_absent" != true ] || ! quarantine_fully_absent; then',
+    quarantine_probe,
+)
+assert candidate_cleanup_call < quarantine_wait < quarantine_probe
+assert quarantine_probe < quarantine_final < candidate_cleanup_stage
+lock_wait = b_job.index("          update_locks_released=false", quarantine_final)
+lock_probe = b_job.index(
+    "            rr_run_with_update_locks direct 0 true", lock_wait
+)
+lock_busy_retry = b_job.index("              75) sleep 1 ;;", lock_probe)
+lock_timeout = b_job.index(
+    '          if [ "$update_locks_released" != true ]; then', lock_busy_retry
+)
+assert quarantine_final < lock_wait < lock_probe < lock_busy_retry
+assert lock_busy_retry < lock_timeout < candidate_cleanup_stage
+assert "B pre-clean update lock probe failed safely" in b_job[lock_probe:lock_timeout]
 for fragment in (
     "run_old_install_deps() {",
     "attempt <= 30",
@@ -175,6 +250,11 @@ c_job = vps[vps.index(c_start):vps.index(c_end, vps.index(c_start))]
 assert "printf '%s\\n' 0 '' '' '' | bash -c" in c_job
 assert "committed-settled" in c_job
 assert "rr-update-committed-settled-v1" in c_job
+assert "if any_node_protocol_enabled; then" in c_job
+assert "C no-protocol recovery fixture unexpectedly has an enabled node." in c_job
+assert "for writer_marker in writer_state_complete subscription_was_running; do" in c_job
+assert 'test -f "$active_tx/backup/$writer_marker"' in c_job
+assert "subscription_server_running" in c_job
 assert 'ufw --force allow' not in a_job
 ufw_reset = a_job.index('ufw --force reset')
 ufw_inactive = a_job.index("grep -qx 'Status: inactive'", ufw_reset)

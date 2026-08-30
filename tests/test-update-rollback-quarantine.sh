@@ -478,6 +478,11 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
         capture { print }
         capture && /^}$/ { exit }
     ' "$REPO_ROOT/scripts/install-core.sh")
+    resume_function=$(awk '
+        /^rr_resume_subscription_bounded\(\) \{/ { capture = 1 }
+        capture { print }
+        capture && /^}$/ { exit }
+    ' "$REPO_ROOT/scripts/install-core.sh")
     rollback_function=$(awk '
         /^rr_rollback\(\) \{/ { capture = 1 }
         capture { print }
@@ -485,6 +490,7 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
     ' "$REPO_ROOT/scripts/install-core.sh")
     eval "$delegate_close_function"
     eval "$delegate_function"
+    eval "$resume_function"
     eval "$rollback_function"
     immediate_root="$TEST_ROOT/immediate"
     RR_TX_ROOT="$immediate_root/update"
@@ -494,17 +500,23 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
     RR_LAUNCHER="$immediate_root/rr"
     RR_SUBSCRIPTION_SAFE_VERSION=7.1.1
     launch_log="$immediate_root/launcher.log"
+    subscription_running_marker="$immediate_root/subscription-running"
     mkdir -p "$RR_TX_ROOT/transactions" "$immediate_root"
-    printf '%s\n' '#!/bin/bash' 'printf "health\n" >> "$RR_TEST_LAUNCH_LOG"' > "$RR_LAUNCHER"
+    printf '%s\n' '#!/bin/bash' \
+        'printf "%s|%s\n" "${RR_UPDATE_LOCK_HELD:-0}" "$*" >> "$RR_TEST_LAUNCH_LOG"' \
+        '[ "${1:-}" = --refresh-subscription ] || exit 64' \
+        ': > "$RR_TEST_SUBSCRIPTION_RUNNING"' > "$RR_LAUNCHER"
     chmod 700 "$RR_LAUNCHER"
     export RR_TEST_LAUNCH_LOG="$launch_log"
+    export RR_TEST_SUBSCRIPTION_RUNNING="$subscription_running_marker"
     printf '%s\n' '#!/bin/bash' \
         'status=$(cat "$2/test-policy")' \
         'printf "%s\n" "$status" > "$2/rollback-subscription-status"' > "$RR_RECOVERY_HELPER"
     chmod 700 "$RR_RECOVERY_HELPER"
 
     systemctl() { :; }
-    rr_stop_subscription_servers() { :; }
+    rr_stop_subscription_servers() { rm -f -- "$subscription_running_marker"; }
+    rr_subscription_running() { [ -e "$subscription_running_marker" ]; }
     rr_error() { :; }
     rr_restore_file() { :; }
     rr_restore_dir() { :; }
@@ -532,7 +544,7 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
         RUNTIME_REPLACED=true
         ROLLBACK_FAILED=false
         KEEP_TRANSACTION=false
-        : > "$launch_log"
+        rm -f -- "$launch_log" "$subscription_running_marker"
     }
 
     prepare_immediate unsafe quarantined
@@ -545,7 +557,8 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
     prepare_immediate safe normal
     rr_rollback
     [ "$(cat "$TX_DIR/phase")" = rolled_back ]
-    grep -Fxq health "$launch_log"
+    grep -Fxq '1|--refresh-subscription' "$launch_log"
+    [ -e "$subscription_running_marker" ]
     [ "$KEEP_TRANSACTION" = false ]
 )
 

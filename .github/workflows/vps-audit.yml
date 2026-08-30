@@ -308,17 +308,18 @@ jobs:
           openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
             -untrusted "/etc/letsencrypt/live/${naive_domain}/chain.pem" \
             "/etc/letsencrypt/live/${naive_domain}/cert.pem" >/dev/null
-          openssl x509 -checkhost "$panel_domain" -noout \
-            -in "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" >/dev/null
-          openssl x509 -checkhost "$naive_domain" -noout \
-            -in "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" >/dev/null
-          if openssl x509 -checkhost "$naive_domain" -noout \
-            -in "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" >/dev/null 2>&1; then
+          declare -F certificate_identity_matches >/dev/null
+          certificate_identity_matches \
+            "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" "$panel_domain"
+          certificate_identity_matches \
+            "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" "$naive_domain"
+          if certificate_identity_matches \
+            "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" "$naive_domain"; then
             echo 'A panel certificate unexpectedly matches the Naive domain.' >&2
             exit 1
           fi
-          if openssl x509 -checkhost "$panel_domain" -noout \
-            -in "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" >/dev/null 2>&1; then
+          if certificate_identity_matches \
+            "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" "$panel_domain"; then
             echo 'A Naive certificate unexpectedly matches the panel domain.' >&2
             exit 1
           fi
@@ -464,6 +465,24 @@ jobs:
             fi
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
+          quarantine_fully_absent() {
+            local artifact="" backend="" rules=""
+            for artifact in \
+              /var/lib/rr-update/subscription-quarantine \
+              /run/rr-subscription-quarantine.ready \
+              /etc/systemd/system/rr-subscription-quarantine.service \
+              /var/lib/rr-quarantine/guard-state \
+              /usr/local/libexec/rr-vps/subscription-quarantine-guard; do
+              [ ! -e "$artifact" ] && [ ! -L "$artifact" ] || return 1
+            done
+            assert_unit_state rr-subscription-quarantine.service \
+              not-found:inactive:not-found || return 1
+            for backend in iptables ip6tables; do
+              command -v "$backend" >/dev/null 2>&1 || continue
+              rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null) || return 1
+              [[ "$rules" != *'rr-vps unsafe rollback subscription quarantine'* ]] || return 1
+            done
+          }
           test "$(id -u)" -eq 0
           # shellcheck disable=SC1091
           . /etc/os-release
@@ -513,6 +532,9 @@ jobs:
           if [ -e /usr/local/bin/rr ] || [ -e /usr/local/lib/rr ] || \
              [ -e /etc/argo_vmess.conf ] || [ -e /etc/rr-nexus ] || \
              [ -e /var/lib/rr-nexus ] || \
+             [ -e /var/lib/rr-update ] || [ -L /var/lib/rr-update ] || \
+             [ -e /run/rr-vps/update-maintenance ] || \
+             [ -L /run/rr-vps/update-maintenance ] || \
              systemctl list-unit-files rr-nexus.service --no-legend 2>/dev/null \
                | grep -q '^rr-nexus\.service'; then
             CLEANUP_RUNTIME="$cleanup_runtime" printf 'y\n' | \
@@ -536,11 +558,49 @@ jobs:
             echo 'B pre-clean left a managed subscription server running.' >&2
             exit 1
           fi
+          quarantine_absent=false
+          for _ in $(seq 1 30); do
+            if quarantine_fully_absent; then
+              quarantine_absent=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$quarantine_absent" != true ] || ! quarantine_fully_absent; then
+            echo 'B pre-clean did not converge legacy quarantine cleanup.' >&2
+            exit 1
+          fi
+          update_locks_released=false
+          for _ in $(seq 1 30); do
+            set +e
+            rr_run_with_update_locks direct 0 true
+            update_lock_rc=$?
+            set -e
+            case "$update_lock_rc" in
+              0)
+                update_locks_released=true
+                break
+                ;;
+              75) sleep 1 ;;
+              *)
+                echo "B pre-clean update lock probe failed safely (rc=${update_lock_rc})." >&2
+                exit 1
+                ;;
+            esac
+          done
+          if [ "$update_locks_released" != true ]; then
+            echo 'B pre-clean timed out waiting for both update locks.' >&2
+            exit 1
+          fi
           test ! -e /usr/local/bin/rr
           test ! -e /usr/local/lib/rr
           test ! -e /etc/argo_vmess.conf
           test ! -e /etc/rr-nexus
           test ! -e /var/lib/rr-nexus
+          test ! -e /var/lib/rr-update
+          test ! -L /var/lib/rr-update
+          test ! -e /run/rr-vps/update-maintenance
+          test ! -L /run/rr-vps/update-maintenance
           test "$(systemctl show -p LoadState --value rr-nexus.service 2>/dev/null)" = not-found
           unset stale_subscription_pids
           rm -rf "$cleanup_runtime"
@@ -1452,12 +1512,30 @@ jobs:
           }
 
           assert_local_nexus
+          bash -c '
+            set -e
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            if any_node_protocol_enabled; then
+              echo "C no-protocol recovery fixture unexpectedly has an enabled node." >&2
+              exit 1
+            fi
+            subscription_server_running
+          ' >/dev/null
           runtime_marker=$(openssl rand -hex 24)
           printf '%s\n' "$runtime_marker" > /usr/local/lib/rr/.rr-audit-runtime-instance
           chmod 600 /usr/local/lib/rr/.rr-audit-runtime-instance
           crash_at old_runtime_moved /root/rr-audit-crash-old-runtime.log
           active_tx=$(active_transaction)
           test "$(cat "$active_tx/phase")" = switching
+          for writer_marker in writer_state_complete subscription_was_running; do
+            test -f "$active_tx/backup/$writer_marker"
+            test ! -L "$active_tx/backup/$writer_marker"
+            test "$(stat -c '%U:%G:%a:%h' "$active_tx/backup/$writer_marker")" = \
+              root:root:600:1
+          done
           test -e /run/rr-vps/update-maintenance
           assert_unit_state rr-nexus.service loaded:inactive:enabled
           /usr/local/sbin/rr-update-recover recover \
