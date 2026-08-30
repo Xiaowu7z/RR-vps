@@ -119,6 +119,87 @@ jobs:
               rm -rf "$probe_root"
             fi
           fi
+          if [ "$label" = A ] && [ -r /etc/rr-nexus/nexus.json ] && \
+             [ -r /etc/argo_vmess.conf ]; then
+            panel_domain=$(jq -r '.domain // empty' /etc/rr-nexus/nexus.json 2>/dev/null || true)
+            naive_domain=$(sed -n 's/^NAIVE_DOMAIN=//p' /etc/argo_vmess.conf | head -n 1)
+            panel_cert="/etc/letsencrypt/live/${panel_domain}/fullchain.pem"
+            naive_cert="/etc/letsencrypt/live/${naive_domain}/fullchain.pem"
+            panel_cross=na naive_cross=na same_bytes=na panel_sans=0 naive_sans=0
+            if [ -s "$panel_cert" ] && [ -s "$naive_cert" ] && \
+               [ -n "$panel_domain" ] && [ -n "$naive_domain" ]; then
+              openssl x509 -checkhost "$naive_domain" -noout -in "$panel_cert" \
+                >/dev/null 2>&1 && panel_cross=yes || panel_cross=no
+              openssl x509 -checkhost "$panel_domain" -noout -in "$naive_cert" \
+                >/dev/null 2>&1 && naive_cross=yes || naive_cross=no
+              cmp -s "$panel_cert" "$naive_cert" && same_bytes=yes || same_bytes=no
+              panel_sans=$(openssl x509 -in "$panel_cert" -noout -ext subjectAltName \
+                2>/dev/null | grep -o 'DNS:' | wc -l)
+              naive_sans=$(openssl x509 -in "$naive_cert" -noout -ext subjectAltName \
+                2>/dev/null | grep -o 'DNS:' | wc -l)
+            fi
+            printf 'CERT_STATE slot=A panel_cross=%s naive_cross=%s same_bytes=%s panel_sans=%s naive_sans=%s\n' \
+              "$panel_cross" "$naive_cross" "$same_bytes" "$panel_sans" "$naive_sans"
+          fi
+          if [ "$label" = B ]; then
+            for log_file in /root/rr-audit-upgrade.log /root/rr-audit-manual-rollback.log; do
+              [ -f "$log_file" ] || continue
+              base=$(basename "$log_file")
+              sed -E \
+                -e 's#https?://[^[:space:]]+#<url>#g' \
+                -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
+                -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+                -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
+                grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|恢复码|订阅地址|subscription[ _-]?url' |
+                tail -n 100 |
+                while IFS= read -r line; do
+                  printf 'B_DETAIL slot=B file=%s text=%s\n' "$base" "$line"
+                done
+            done
+            if [ -x /usr/local/sbin/rr-update-recover ]; then
+              status_json=$(/usr/local/sbin/rr-update-recover status 2>/dev/null || printf '{}')
+              printf 'RECOVERY_STATUS slot=B active=%s phase=%s quarantine_active=%s quarantine_state=%s\n' \
+                "$(jq -r '.active // "unknown"' <<<"$status_json")" \
+                "$(jq -r '.phase // "none"' <<<"$status_json")" \
+                "$(jq -r '.subscription_quarantine.active // false' <<<"$status_json")" \
+                "$(jq -r '.subscription_quarantine.state // "none"' <<<"$status_json")"
+            fi
+          fi
+          if [ "$label" = C ] && [ -x /usr/local/sbin/rr-update-recover ]; then
+            export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+            # shellcheck disable=SC1091
+            source /usr/local/sbin/rr-update-recover
+            unset RR_UPDATE_RECOVER_SOURCE_ONLY
+            tx=$(rr_transaction_path 2>/dev/null || true)
+            if [ -n "$tx" ] && [ -d "$tx" ]; then
+              control_rc=0; rr_transaction_v2_control_metadata_is_safe "$tx" >/dev/null 2>&1 || control_rc=$?
+              backup_rc=0; rr_transaction_v2_backup_metadata_is_safe "$tx" >/dev/null 2>&1 || backup_rc=$?
+              maintenance_rc=0; rr_update_maintenance_marker_state "$tx" >/dev/null 2>&1 || maintenance_rc=$?
+              external_rc=na
+              if [ -x /usr/local/sbin/rr-update-external-state ]; then
+                external_rc=0
+                /usr/local/sbin/rr-update-external-state verify "$tx/backup" \
+                  --tx-root /var/lib/rr-update >/dev/null 2>&1 || external_rc=$?
+              fi
+              printf 'TX_VALIDATION slot=C control=%s backup=%s maintenance=%s external=%s old_runtime=%s failed_runtime_count=%s\n' \
+                "$control_rc" "$backup_rc" "$maintenance_rc" "$external_rc" \
+                "$([ -d "$tx/old-runtime" ] && printf present || printf absent)" \
+                "$(find "$tx" -maxdepth 1 -type d -name 'failed-runtime-*' | wc -l)"
+              for state_name in writer_state_complete subscription_was_running \
+                singbox_was_running singbox_was_enabled nexus_was_running \
+                nexus_was_enabled health_timer_was_running health_timer_was_enabled \
+                health_service_was_running runtime_did_not_exist; do
+                if [ -f "$tx/backup/$state_name" ]; then
+                  printf 'WRITER_MARKER slot=C name=%s state=present stat=%s\n' \
+                    "$state_name" "$(stat -c '%U:%G:%a:%h:%s' "$tx/backup/$state_name" 2>/dev/null || true)"
+                else
+                  printf 'WRITER_MARKER slot=C name=%s state=absent\n' "$state_name"
+                fi
+              done
+              subscription_rc=0; rr_subscription_running >/dev/null 2>&1 || subscription_rc=$?
+              printf 'WRITER_PROBE slot=C subscription_running_rc=%s\n' "$subscription_rc"
+            fi
+          fi
           for unit in sing-box.service rr-nexus.service nginx.service \
             rr-subscription-quarantine.service argo-rr-health.timer; do
             load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
