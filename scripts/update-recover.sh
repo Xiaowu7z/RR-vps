@@ -2014,15 +2014,27 @@ rr_clear_subscription_quarantine() {
     rr_quarantine_guard_unit_state_read || return 1
     if [ -e "$RR_QUARANTINE_UNIT" ] || [ -L "$RR_QUARANTINE_UNIT" ] ||
        ! rr_quarantine_guard_unit_state_is_absent; then
-        systemctl disable --now rr-subscription-quarantine.service >/dev/null 2>&1 || return 1
+        # A retry can legitimately see a not-found:failed:not-found cache after
+        # the prior attempt removed the unit but could not reset its failed
+        # state. systemctl then reports disable failure because no unit file
+        # remains; rely on the strict postcondition below instead of its rc.
+        systemctl disable --now rr-subscription-quarantine.service \
+            >/dev/null 2>&1 || true
     fi
     rr_quarantine_guard_unit_state_read || return 1
     rr_quarantine_guard_unit_state_is_disabled || return 1
     rm -f -- "$RR_QUARANTINE_READY" || return 1
     # Remove the unit and make that removal visible before releasing the
-    # firewall. Any failure here leaves the durable rule/state untouched.
+    # firewall. A Type=notify guard stopped by disable --now can remain in
+    # systemd's failed cache after its unit file disappears; clear that cache
+    # and prove the exact absent state before releasing the durable barrier.
+    # Any failure here leaves the durable rule/state untouched.
     rm -f -- "$RR_QUARANTINE_UNIT" || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
+    systemctl reset-failed rr-subscription-quarantine.service \
+        >/dev/null 2>&1 || true
+    rr_quarantine_guard_unit_state_read || return 1
+    rr_quarantine_guard_unit_state_is_absent || return 1
     [ "$port" = 0 ] || rr_quarantine_remove_firewall_rules "$port" || failed=true
     # Older affected uninstalls may have removed the marker before the exact
     # raw-table rule. Sweep only rules that can be re-derived as RR's precise
