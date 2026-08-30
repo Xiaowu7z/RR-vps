@@ -17,6 +17,8 @@ jobs:
       RR_A_PASS: ${{ secrets.RR_A_PASS }}
       RR_B_HOST: ${{ secrets.RR_B_HOST }}
       RR_B_PASS: ${{ secrets.RR_B_PASS }}
+      RR_C_HOST: ${{ secrets.RR_C_HOST }}
+      RR_C_PASS: ${{ secrets.RR_C_PASS }}
     steps:
       - name: Install SSH client helper
         run: |
@@ -29,6 +31,7 @@ jobs:
           set +x
           pin_a='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm'
           pin_b='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A'
+          pin_c='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3'
           probe() {
             local label="$1" host="$2" pass="$3" pin="$4" known=""
             known="$RUNNER_TEMP/diagnostic-known-hosts-$label"
@@ -49,6 +52,26 @@ jobs:
           stage=$(cat /root/rr-audit-stage 2>/dev/null || printf none)
           printf 'AUTH_OK slot=%s os=%s version=%s rr=%s stage=%s\n' \
             "$label" "$ID" "$VERSION_ID" "$rr_version" "$stage"
+          if [ "$label" = A ]; then
+            probe_http() {
+              local kind="$1" url="$2" code="" rc=0
+              if code=$(curl -sS -L --proto '=https' --proto-redir '=https' \
+                --tlsv1.2 --connect-timeout 10 --max-time 40 \
+                -o /dev/null --write-out '%{http_code}' "$url"); then
+                rc=0
+              else
+                rc=$?
+              fi
+              printf 'HTTP_PROBE slot=A kind=%s rc=%s code=%s\n' \
+                "$kind" "$rc" "$code"
+            }
+            probe_http upstream-api \
+              'https://api.github.com/repos/SagerNet/sing-box/releases/latest'
+            probe_http exact-api \
+              'https://api.github.com/repos/Xiaowu7z/RR-vps/releases/tags/rr-nexus-core-v1.13.20-r1'
+            probe_http exact-page \
+              'https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.20-r1'
+          fi
           for unit in sing-box.service rr-nexus.service nginx.service \
             rr-subscription-quarantine.service argo-rr-health.timer; do
             load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
@@ -88,25 +111,6 @@ jobs:
                 printf 'LOG_ERROR slot=%s file=%s text=%s\n' "$label" "$base" "$line"
               done
           done < <(find /root -maxdepth 1 -type f -name 'rr-audit-*.log' -print | sort)
-          case "$label" in
-            A) detail_logs='rr-audit-preclean.log rr-audit-core.log rr-audit-deps.log rr-audit-ufw-prepare.log rr-audit-ufw-enable.log rr-audit-install.log rr-audit-nexus.log' ;;
-            B) detail_logs='rr-audit-preclean.log rr-audit-old-core.log rr-audit-old-deps.log rr-audit-old-install.log rr-audit-old-nexus.log rr-audit-upgrade.log' ;;
-            *) detail_logs='' ;;
-          esac
-          for base in $detail_logs; do
-            log_file="/root/$base"
-            [ -f "$log_file" ] || continue
-            sed -E \
-              -e 's#https?://[^[:space:]]+#<url>#g' \
-              -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
-              -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
-              -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
-              grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|订阅地址|subscription[ _-]?url' |
-              tail -n 180 |
-              while IFS= read -r line; do
-                printf 'LOG_DETAIL slot=%s file=%s text=%s\n' "$label" "$base" "$line"
-              done
-          done
           exit 0
           REMOTE
             rc=$?
@@ -117,3 +121,4 @@ jobs:
           }
           probe A "$RR_A_HOST" "$RR_A_PASS" "$pin_a"
           probe B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
+          probe C "$RR_C_HOST" "$RR_C_PASS" "$pin_c"
