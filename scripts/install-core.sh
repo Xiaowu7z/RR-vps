@@ -1892,6 +1892,8 @@ ConditionPathExists=/var/lib/rr-update/active
 
 [Service]
 Type=oneshot
+Environment=RR_UPDATE_RECOVERY_SERVICE=1
+UMask=0077
 ExecStart=/usr/local/sbin/rr-update-recover recover
 
 [Install]
@@ -2336,7 +2338,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "60f938008bade3084ed50846fcde8f282e09d4efea01d744f59e4456863aa889" ] && \
+        if [ "$actual" = "d332fa747db7f0ec6339c0e820d6c2230884cb3b2c7d8d637fa723ebcd07fa12" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \

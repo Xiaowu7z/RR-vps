@@ -401,7 +401,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/rebuild-bundle.py --check
           sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass
+          sudo apt-get install -y -qq sshpass netcat-openbsd
       - name: Build old state, update, rollback, update again
         shell: bash
         env:
@@ -845,8 +845,16 @@ jobs:
             assert_unit_state nginx.service loaded:active:enabled
             candidate_subscription_running
             test -s /run/rr-vps-subscription.pid
-            grep -qx 'SUB_ACCESS_MODE=local' /etc/argo_vmess.conf
-            grep -qx 'SUB_DOMAIN=' /etc/argo_vmess.conf
+            bash -c '
+              set -e
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                # shellcheck disable=SC1090
+                source "$module_file"
+              done
+              load_config_with_defaults
+              test "$SUB_ACCESS_MODE" = local
+              test -z "$SUB_DOMAIN"
+            ' >/dev/null
             IFS='|' read -r candidate_sub_port candidate_sub_bind \
               candidate_sub_mode candidate_sub_domain _ \
               < /run/rr-vps-subscription.bind
@@ -860,7 +868,12 @@ jobs:
                 # shellcheck disable=SC1090
                 source "$module_file"
               done
-              rr_validate_protocol_firewall 18081 tcp closed
+              load_config_with_defaults
+              # Active UFW keeps the exact 7.1.0 ACCEPT until the manual
+              # rollback window below is retired.  Accept either the final
+              # DROP state or that one attributable legacy state, but only
+              # while the live worker is proven loopback-only.
+              rr_validate_local_subscription_firewall_transition 18081
             ' >/dev/null
             assert_persisted_data
             panel_port=$(jq -r '.public_port' /etc/rr-nexus/nexus.json)
@@ -947,6 +960,10 @@ jobs:
           printf 'RR_AUDIT_UPGRADE_RUNTIME role=B os=%s version=%s old=7.1.0 new=%s rollback=ok device_config=preserved\n' \
             "$ID" "$VERSION_ID" "$expected_version"
           REMOTE
+          if nc -z -w 8 "$host" 18081 >/dev/null 2>&1; then
+            echo 'B local-only subscription unexpectedly accepted a public connection.' >&2
+            exit 1
+          fi
           # Prove that the upgraded panel is reachable from outside the VPS
           # before the destructive legacy-uninstall compatibility check.
           curl -kfsS --connect-timeout 5 --max-time 20 \
@@ -1570,6 +1587,11 @@ jobs:
           /usr/local/sbin/rr-update-external-state verify "$active_tx/backup" \
             --tx-root /var/lib/rr-update \
             >>/root/rr-audit-crash-runtime-swapped.log 2>&1
+          subscription_pid=$(cat /run/rr-vps-subscription.pid)
+          [[ "$subscription_pid" =~ ^[0-9]+$ ]]
+          grep -Eq '(^|/)rr-subscription-recovery-[0-9]+-[0-9]+\.scope($|/)' \
+            "/proc/$subscription_pid/cgroup"
+          unset subscription_pid
           assert_local_nexus
           test "$(cat /usr/local/lib/rr/.rr-audit-runtime-instance)" = "$runtime_marker"
           rm -f /usr/local/lib/rr/.rr-audit-runtime-instance
