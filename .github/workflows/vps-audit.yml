@@ -117,13 +117,33 @@ jobs:
           test "$ssh_control_port" -ge 1
           test "$ssh_control_port" -le 65535
           if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
-            if ! printf '%s\n' y | bash -c '
+            if ! bash -c '
                 set -o pipefail
                 for module_file in /usr/local/lib/rr/modules/*.sh; do
                   # shellcheck disable=SC1090
                   source "$module_file"
                 done
-                uninstall_all
+                if declare -F rr_run_with_update_locks >/dev/null 2>&1 &&
+                   declare -F uninstall_all_locked >/dev/null 2>&1; then
+                  rr_audit_waited_uninstall() {
+                    local deadline=$((SECONDS + 180)) remaining=0 result=0
+                    while :; do
+                      remaining=$((deadline - SECONDS))
+                      [ "$remaining" -ge 1 ] || return 75
+                      if rr_run_with_update_locks direct "$remaining" \
+                          uninstall_all_locked; then
+                        return 0
+                      else
+                        result=$?
+                      fi
+                      [ "$result" = 75 ] || return "$result"
+                      sleep 1
+                    done
+                  }
+                  rr_audit_waited_uninstall
+                else
+                  printf "%s\n" y | uninstall_all
+                fi
               ' >/root/rr-audit-preclean.log 2>&1; then
               echo 'A pre-clean failed; root-only log retained on VPS.' >&2
               exit 1
@@ -147,15 +167,32 @@ jobs:
           done
           if [ -e /usr/local/bin/rr ] || [ -e /usr/local/lib/rr ] || \
              [ -e /etc/argo_vmess.conf ]; then
-            CLEANUP_RUNTIME="$cleanup_runtime" printf 'y\n' | \
-              CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
+            if ! CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
                 set -o pipefail
                 for module_file in "$CLEANUP_RUNTIME"/modules/*.sh; do
                   # shellcheck disable=SC1090
                   source "$module_file"
                 done
-                uninstall_all
-              ' >>/root/rr-audit-preclean.log 2>&1
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              ' >>/root/rr-audit-preclean.log 2>&1; then
+              echo 'A candidate pre-clean failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
           fi
           stop_subscription_servers >/root/rr-audit-orphan-cleanup.log 2>&1 || true
           rm -rf -- "$cleanup_runtime"
@@ -483,6 +520,19 @@ jobs:
               [[ "$rules" != *'rr-vps unsafe rollback subscription quarantine'* ]] || return 1
             done
           }
+          assert_product_quarantine_firewall() (
+            export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+            # shellcheck disable=SC1091
+            source /usr/local/sbin/rr-update-recover
+            rr_quarantine_firewall_inventory_is_exact 18081
+          )
+          assert_product_quarantine_firewall_absent() (
+            export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+            # shellcheck disable=SC1091
+            source /usr/local/sbin/rr-update-recover
+            rr_quarantine_firewall_backend_inventory_is_exact iptables 18081 0 &&
+              rr_quarantine_firewall_backend_inventory_is_exact ip6tables 18081 0
+          )
           test "$(id -u)" -eq 0
           # shellcheck disable=SC1091
           . /etc/os-release
@@ -505,13 +555,33 @@ jobs:
           # host.  Use the product's own full uninstaller before constructing
           # the exact 7.1.0 baseline; the downgrade guard must stay enabled.
           if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
-            if ! printf '%s\n' y | bash -c '
+            if ! bash -c '
                 set -o pipefail
                 for module_file in /usr/local/lib/rr/modules/*.sh; do
                   # shellcheck disable=SC1090
                   source "$module_file"
                 done
-                uninstall_all
+                if declare -F rr_run_with_update_locks >/dev/null 2>&1 &&
+                   declare -F uninstall_all_locked >/dev/null 2>&1; then
+                  rr_audit_waited_uninstall() {
+                    local deadline=$((SECONDS + 180)) remaining=0 result=0
+                    while :; do
+                      remaining=$((deadline - SECONDS))
+                      [ "$remaining" -ge 1 ] || return 75
+                      if rr_run_with_update_locks direct "$remaining" \
+                          uninstall_all_locked; then
+                        return 0
+                      else
+                        result=$?
+                      fi
+                      [ "$result" = 75 ] || return "$result"
+                      sleep 1
+                    done
+                  }
+                  rr_audit_waited_uninstall
+                else
+                  printf "%s\n" y | uninstall_all
+                fi
               ' >/root/rr-audit-preclean.log 2>&1; then
               echo 'B pre-clean failed; root-only log retained on VPS.' >&2
               exit 1
@@ -537,15 +607,32 @@ jobs:
              [ -L /run/rr-vps/update-maintenance ] || \
              systemctl list-unit-files rr-nexus.service --no-legend 2>/dev/null \
                | grep -q '^rr-nexus\.service'; then
-            CLEANUP_RUNTIME="$cleanup_runtime" printf 'y\n' | \
-              CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
+            if ! CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
                 set -o pipefail
                 for module_file in "$CLEANUP_RUNTIME"/modules/*.sh; do
                   # shellcheck disable=SC1090
                   source "$module_file"
                 done
-                uninstall_all
-              ' >>/root/rr-audit-preclean.log 2>&1
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              ' >>/root/rr-audit-preclean.log 2>&1; then
+              echo 'B candidate pre-clean failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
           fi
           mapfile -t stale_subscription_pids < <(managed_subscription_pids)
           if [ "${#stale_subscription_pids[@]}" -gt 0 ]; then
@@ -916,9 +1003,9 @@ jobs:
           finally:
               sock.close()
           PY
-            iptables -w 5 -t raw -C PREROUTING ! -i lo -p tcp --dport 18081 \
-              -m addrtype --dst-type LOCAL -m comment \
-              --comment 'rr-vps unsafe rollback subscription quarantine' -j DROP
+            # Product semantics require one exact IPv4 rule and require the
+            # IPv6 twin only when the kernel has an enabled IPv6 interface.
+            assert_product_quarantine_firewall
           }
 
           install_candidate >/root/rr-audit-upgrade.log 2>&1
@@ -943,17 +1030,7 @@ jobs:
           test ! -e /usr/local/libexec/rr-vps/subscription-quarantine-guard
           assert_unit_state rr-subscription-quarantine.service \
             not-found:inactive:not-found
-          for backend in iptables ip6tables; do
-            command -v "$backend" >/dev/null 2>&1 || continue
-            set +e
-            "$backend" -w 5 -t raw -C PREROUTING ! -i lo -p tcp --dport 18081 \
-              -m addrtype --dst-type LOCAL -m comment \
-              --comment 'rr-vps unsafe rollback subscription quarantine' -j DROP \
-              >/dev/null 2>&1
-            stale_rule_rc=$?
-            set -e
-            test "$stale_rule_rc" -eq 1
-          done
+          assert_product_quarantine_firewall_absent
           printf 'second-upgrade-complete\n' > /root/rr-audit-stage
           test "$(stat -c %a /etc/argo_vmess.conf)" = 600
           test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
@@ -996,6 +1073,30 @@ jobs:
             fi
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
+          assert_product_quarantine_firewall() (
+            export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+            # shellcheck disable=SC1091
+            source /usr/local/sbin/rr-update-recover
+            rr_quarantine_firewall_inventory_is_exact 18081
+          )
+          legacy_quarantine_fully_absent() {
+            local artifact="" backend="" rules=""
+            for artifact in \
+              /var/lib/rr-update/subscription-quarantine \
+              /run/rr-subscription-quarantine.ready \
+              /etc/systemd/system/rr-subscription-quarantine.service \
+              /var/lib/rr-quarantine/guard-state \
+              /usr/local/libexec/rr-vps/subscription-quarantine-guard; do
+              [ ! -e "$artifact" ] && [ ! -L "$artifact" ] || return 1
+            done
+            assert_unit_state rr-subscription-quarantine.service \
+              not-found:inactive:not-found || return 1
+            for backend in iptables ip6tables; do
+              command -v "$backend" >/dev/null 2>&1 || continue
+              rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null) || return 1
+              [[ "$rules" != *'rr-vps unsafe rollback subscription quarantine'* ]] || return 1
+            done
+          }
           test "$(id -u)" -eq 0
           # Re-enter the unsafe rollback once more and invoke the actual
           # restored 7.1.0 menu uninstaller. It knows nothing about quarantine
@@ -1022,12 +1123,7 @@ jobs:
           test "$(stat -c '%U:%G:%a' /var/lib/rr-quarantine/guard-state)" = root:root:600
           test "$(stat -c '%U:%G:%a' /usr/local/libexec/rr-vps/subscription-quarantine-guard)" = root:root:700
           assert_unit_state rr-subscription-quarantine.service loaded:active:enabled
-          for backend in iptables ip6tables; do
-            command -v "$backend" >/dev/null 2>&1 || continue
-            "$backend" -w 5 -t raw -C PREROUTING ! -i lo -p tcp --dport 18081 \
-              -m addrtype --dst-type LOCAL -m comment \
-              --comment 'rr-vps unsafe rollback subscription quarantine' -j DROP
-          done
+          assert_product_quarantine_firewall
           printf 'y\n' | bash -c '
             set -o pipefail
             for module_file in /usr/local/lib/rr/modules/*.sh; do
@@ -1036,30 +1132,25 @@ jobs:
             done
             uninstall_all
           ' >/root/rr-audit-710-uninstall.log 2>&1
-          for _ in $(seq 1 100); do
-            [ -e /etc/systemd/system/rr-subscription-quarantine.service ] || break
-            sleep 0.1
+          legacy_quarantine_absent=false
+          for _ in $(seq 1 30); do
+            if legacy_quarantine_fully_absent; then
+              legacy_quarantine_absent=true
+              break
+            fi
+            sleep 1
           done
-          test ! -e /var/lib/rr-update/subscription-quarantine
-          test ! -e /run/rr-subscription-quarantine.ready
-          test ! -e /etc/systemd/system/rr-subscription-quarantine.service
-          test ! -e /var/lib/rr-quarantine/guard-state
-          test ! -e /usr/local/libexec/rr-vps/subscription-quarantine-guard
+          legacy_quarantine_final=false
+          if legacy_quarantine_fully_absent; then
+            legacy_quarantine_final=true
+          fi
+          if [ "$legacy_quarantine_absent" != true ] ||
+             [ "$legacy_quarantine_final" != true ]; then
+            echo 'B legacy uninstall did not converge quarantine cleanup.' >&2
+            exit 1
+          fi
           test ! -e /usr/local/sbin/rr-update-recover
           test ! -e /usr/local/bin/rr
-          assert_unit_state rr-subscription-quarantine.service \
-            not-found:inactive:not-found
-          for backend in iptables ip6tables; do
-            command -v "$backend" >/dev/null 2>&1 || continue
-            if ! rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null); then
-              echo "B could not inspect ${backend} after legacy uninstall." >&2
-              exit 1
-            fi
-            if [[ "$rules" == *'rr-vps unsafe rollback subscription quarantine'* ]]; then
-              echo "B legacy uninstall left a quarantine rule in ${backend}." >&2
-              exit 1
-            fi
-          done
           assert_unit_state rr-nexus.service not-found:inactive:not-found
           test ! -e /etc/systemd/system/rr-nexus.service
           test ! -e /etc/rr-nexus
@@ -1195,14 +1286,37 @@ jobs:
           # This is an owner-authorized disposable host.  First use the
           # product uninstaller, then remove only enumerated RR-owned residue.
           if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
-            printf 'y\n' | bash -c '
+            if ! bash -c '
               set -o pipefail
               for module_file in /usr/local/lib/rr/modules/*.sh; do
                 # shellcheck disable=SC1090
                 source "$module_file"
               done
-              uninstall_all
-            ' >/root/rr-audit-preclean.log 2>&1
+              if declare -F rr_run_with_update_locks >/dev/null 2>&1 &&
+                 declare -F uninstall_all_locked >/dev/null 2>&1; then
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              else
+                printf "%s\n" y | uninstall_all
+              fi
+            ' >/root/rr-audit-preclean.log 2>&1; then
+              echo 'C pre-clean failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
           fi
 
           cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
@@ -1214,15 +1328,32 @@ jobs:
             source "$module_file"
           done
           if [ -e /etc/argo_vmess.conf ] && [ ! -x /usr/local/bin/rr ]; then
-            CLEANUP_RUNTIME="$cleanup_runtime" printf 'y\n' | \
-              CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
+            if ! CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
                 set -o pipefail
                 for module_file in "$CLEANUP_RUNTIME"/modules/*.sh; do
                   # shellcheck disable=SC1090
                   source "$module_file"
                 done
-                uninstall_all
-              ' >/root/rr-audit-candidate-preclean.log 2>&1
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              ' >/root/rr-audit-candidate-preclean.log 2>&1; then
+              echo 'C candidate pre-clean failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
           fi
           stop_subscription_servers >/root/rr-audit-orphan-cleanup.log 2>&1 || true
           rm -rf -- "$cleanup_runtime"
