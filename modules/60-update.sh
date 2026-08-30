@@ -657,6 +657,26 @@ rr_run_post_update_finalize() {
     rm -f "$remote_manifest"
 }
 
+rr_wait_nexus_local_health() {
+    local port="${1:-}" deadline=0
+    is_valid_port "$port" || return 1
+    deadline=$((SECONDS + 30))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        # rr-nexus.service is Type=simple: active means the Python process was
+        # started, not that it has finished opening its database and binding
+        # the HTTP listener.  A process exit is terminal; connection refusal
+        # while it is still active is a bounded readiness condition.
+        systemctl is-active --quiet rr-nexus || return 1
+        if curl -fsS --connect-timeout 1 --max-time 3 \
+            "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$SECONDS" -lt "$deadline" ] || break
+        sleep 1
+    done
+    return 1
+}
+
 post_update_migrate() {
     if [ "${RR_UPDATE_LOCK_HELD:-0}" = 1 ] && \
        [ "${RR_UPDATE_LOCK_FDS_CLOSED:-0}" != 1 ]; then
@@ -808,10 +828,12 @@ finally:
 PY
     fi
     if [ -f "$NEXUS_SERVICE_FILE" ] && { [ "$update_tx" != 1 ] || [ "$nexus_was_running" = true ]; }; then
-        systemctl is-active --quiet rr-nexus || return 1
         local nexus_health_port=""
         nexus_health_port=$(jq -r '.port // 7900' "$NEXUS_CONFIG_FILE" 2>/dev/null || printf 7900)
-        curl -fsS --connect-timeout 3 --max-time 8 "http://127.0.0.1:${nexus_health_port}/healthz" >/dev/null || return 1
+        if ! rr_wait_nexus_local_health "$nexus_health_port"; then
+            printf '%s\n' '[安全拒绝] RR Nexus 未在有界等待内通过本地健康检查；准备回滚。' >&2
+            return 1
+        fi
         nexus_public_proxy_health_check || return 1
     fi
     if [ "$update_tx" = 1 ] && [ "$subscription_was_running" != true ]; then
