@@ -1,4 +1,4 @@
-name: VPS A and B fixed-output diagnostic
+name: A migration fixed-output diagnostic
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
-    runs-on: ubuntu-latest
+  diagnose-a-migration:
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Install SSH client helper
@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
-      - name: Classify A pre-clean state
+      - name: Classify source-side migration residue
         shell: bash
         env:
           RR_A_HOST: ${{ secrets.RR_A_HOST }}
@@ -38,77 +38,109 @@ jobs:
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
             -o UserKnownHostsFile="$known_hosts"
           )
-          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_A_HOST" bash -s \
-            2>/dev/null <<'REMOTE'
+          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_A_HOST" bash -s             2>/dev/null <<'REMOTE'
           set -u
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
 
-          classify_path() {
-            local label="$1" path="$2"
-            if [ -e "$path" ] || [ -L "$path" ]; then
-              printf 'A_PATH name=%s state=present\n' "$label"
-            else
-              printf 'A_PATH name=%s state=absent\n' "$label"
-            fi
-          }
           classify_unit() {
             local label="$1" unit="$2" load="" active="" enabled=""
             load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
             active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
             enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
             if [ "$load:$active:$enabled" = loaded:active:enabled ]; then
-              printf 'A_UNIT name=%s state=loaded_active_enabled\n' "$label"
-            elif [ "$load" = not-found ] && [ "$active" = inactive ] && [ -z "$enabled" ]; then
-              printf 'A_UNIT name=%s state=strictly_absent\n' "$label"
+              printf 'A_DIAG_UNIT name=%s class=loaded_active_enabled\n' "$label"
+            elif [ "$load:$active:$enabled" = loaded:inactive:enabled ]; then
+              printf 'A_DIAG_UNIT name=%s class=loaded_inactive_enabled\n' "$label"
+            elif [ "$load:$active:$enabled" = loaded:inactive:static ]; then
+              printf 'A_DIAG_UNIT name=%s class=loaded_inactive_static\n' "$label"
             elif [ "$active" = failed ]; then
-              printf 'A_UNIT name=%s state=failed_cache\n' "$label"
+              printf 'A_DIAG_UNIT name=%s class=failed\n' "$label"
             elif [ "$active" = active ]; then
-              printf 'A_UNIT name=%s state=active_other\n' "$label"
-            elif [ "$active" = activating ] || [ "$active" = deactivating ]; then
-              printf 'A_UNIT name=%s state=transitioning\n' "$label"
+              printf 'A_DIAG_UNIT name=%s class=active_other\n' "$label"
             else
-              printf 'A_UNIT name=%s state=other\n' "$label"
+              printf 'A_DIAG_UNIT name=%s class=other\n' "$label"
             fi
           }
 
-          log_class=unclassified
-          if [ ! -r /root/rr-audit-preclean.log ]; then
-            log_class=missing
-          elif grep -Fq '更新、恢复、备份或健康修复正在运行' /root/rr-audit-preclean.log; then
-            log_class=outer_lock_busy
-          elif grep -Fq '共享事务锁或旧版兼容锁不安全' /root/rr-audit-preclean.log; then
-            log_class=outer_lock_unsafe
-          elif grep -Fq '检测到旧版更新或恢复事务仍在运行' /root/rr-audit-preclean.log; then
-            log_class=legacy_restore_lock
-          elif grep -Fq '无法冻结健康检查或订阅进程' /root/rr-audit-preclean.log; then
-            log_class=writer_freeze_failed
-          elif grep -Fq '订阅隔离尚未安全解除' /root/rr-audit-preclean.log; then
-            log_class=quarantine_release_failed
-          fi
-          printf 'A_PRECLEAN class=%s\n' "$log_class"
+          classify_log() {
+            local path=/root/rr-audit-cross-backup.log class=unclassified_nonempty
+            if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+              class=missing
+            elif [ ! -f "$path" ] || [ -L "$path" ]; then
+              class=unsafe_type
+            elif [ ! -s "$path" ]; then
+              class=empty
+            elif grep -Fq '加密备份已生成' "$path"; then
+              class=success
+            elif grep -Fq '另一个更新、备份恢复或迁移事务正在运行' "$path"; then
+              class=lock_busy
+            elif grep -Fq '无法安装加密备份所需组件' "$path"; then
+              class=dependency_failure
+            elif grep -Fq '备份工作目录的所有者、权限或路径不安全' "$path"; then
+              class=unsafe_workdir
+            elif grep -Fq '当前没有完整的 RR-vps 安装' "$path"; then
+              class=incomplete_install
+            elif grep -Fq '备份目标已存在' "$path"; then
+              class=target_exists
+            elif grep -Fq '备份源中包含不支持的链接或特殊文件' "$path"; then
+              class=unsupported_source
+            elif grep -Fq '无法从当前固定 Argo 服务提取 Token' "$path"; then
+              class=fixed_tunnel_token
+            elif grep -Fq '检测到非标准 RR 自动更新 cron' "$path"; then
+              class=nonstandard_cron
+            elif grep -Fq 'Nexus 已配置但数据库缺失或为空' "$path"; then
+              class=nexus_database_missing
+            elif grep -Fq 'backup source member exceeds its size limit' "$path"; then
+              class=member_size_limit
+            elif grep -Fq 'backup source contains a link or special file' "$path"; then
+              class=preflight_unsafe_source
+            elif grep -Fq 'backup source has too many members' "$path"; then
+              class=member_count_limit
+            elif grep -Fq 'backup source exceeds the expanded-size limit' "$path"; then
+              class=expanded_size_limit
+            elif grep -Fq 'insufficient free space to create and encrypt backup' "$path"; then
+              class=free_space
+            elif grep -Fq 'Traceback (most recent call last)' "$path"; then
+              class=python_exception
+            fi
+            printf 'A_DIAG_BACKUP_LOG class=%s\n' "$class"
+          }
 
-          stage=absent
-          if [ -r /root/rr-audit-stage ]; then
-            case "$(cat /root/rr-audit-stage 2>/dev/null)" in
-              '') stage=empty ;;
-              *) stage=unknown ;;
-            esac
-          fi
-          printf 'A_STAGE class=%s\n' "$stage"
-
-          classify_path launcher /usr/local/bin/rr
-          classify_path runtime /usr/local/lib/rr
-          classify_path config /etc/argo_vmess.conf
-          classify_path nexus_config /etc/rr-nexus
-          classify_path nexus_data /var/lib/rr-nexus
-          classify_path update_state /var/lib/rr-update
-          classify_path quarantine_marker /var/lib/rr-update/subscription-quarantine
-          classify_path quarantine_ready /run/rr-subscription-quarantine.ready
-          classify_path quarantine_guard /usr/local/libexec/rr-vps/subscription-quarantine-guard
           classify_unit health_timer argo-rr-health.timer
           classify_unit health_service argo-rr-health.service
           classify_unit nexus rr-nexus.service
-          classify_unit quarantine rr-subscription-quarantine.service
+          classify_log
+
+          config_class=other
+          if [ -f /etc/argo_vmess.conf ] && [ ! -L /etc/argo_vmess.conf ]; then
+            if [ "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf 2>/dev/null)" -eq 1 ]; then
+              config_class=naive_true
+            elif [ "$(grep -c '^NAIVE_ENABLED=false$' /etc/argo_vmess.conf 2>/dev/null)" -eq 1 ]; then
+              config_class=naive_false
+            fi
+          fi
+          printf 'A_DIAG_CONFIG class=%s\n' "$config_class"
+
+          for entry in source_config:/root/rr-audit-cross-source-config                        backup_archive:/root/rr-audit-cross.rrbak                        fingerprint:/root/rr-audit-cross-fingerprint.json; do
+            label=${entry%%:*}
+            path=${entry#*:}
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              printf 'A_DIAG_PATH name=%s class=present\n' "$label"
+            else
+              printf 'A_DIAG_PATH name=%s class=absent\n' "$label"
+            fi
+          done
+
+          db_class=invalid
+          if [ "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;' 2>/dev/null)" = ok ] &&
+             [ -z "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA foreign_key_check;' 2>/dev/null)" ]; then
+            if [ "$(sqlite3 /var/lib/rr-nexus/nexus.db 'SELECT COUNT(*) FROM devices;' 2>/dev/null)" -eq 500 ]; then
+              db_class=valid_500
+            else
+              db_class=valid_other_count
+            fi
+          fi
+          printf 'A_DIAG_DATABASE class=%s\n' "$db_class"
 
           lock_class=runtime_unavailable
           if [ -d /usr/local/lib/rr/modules ]; then
@@ -129,264 +161,6 @@ jobs:
               *) lock_class=other ;;
             esac
           fi
-          printf 'A_UPDATE_LOCK class=%s\n' "$lock_class"
+          printf 'A_DIAG_UPDATE_LOCK class=%s\n' "$lock_class"
           REMOTE
-          unset SSHPASS
-
-      - name: Classify B public Nexus state
-        shell: bash
-        env:
-          RR_B_HOST: ${{ secrets.RR_B_HOST }}
-          RR_B_PASS: ${{ secrets.RR_B_PASS }}
-        run: |
-          set -euo pipefail
-          set +x
-          pin_b='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A'
-          known_hosts="$RUNNER_TEMP/diagnostic-known-hosts-B"
-          (umask 077; printf '%s %s\n' "$RR_B_HOST" "$pin_b" > "$known_hosts")
-          ssh-keygen -F "$RR_B_HOST" -f "$known_hosts" >/dev/null
-          export SSHPASS="$RR_B_PASS"
-          ssh_opts=(
-            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
-            -o LogLevel=ERROR -o PreferredAuthentications=password
-            -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
-            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
-            -o UserKnownHostsFile="$known_hosts"
-          )
-          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_B_HOST" bash -s -- \
-            "$RR_B_HOST" 2>/dev/null <<'REMOTE'
-          set -u
-          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-          public_host="$1"
-
-          classify_unit() {
-            local label="$1" unit="$2" load="" active="" enabled=""
-            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
-            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
-            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
-            if [ "$load:$active:$enabled" = loaded:active:enabled ]; then
-              printf 'B_UNIT name=%s state=loaded_active_enabled\n' "$label"
-            elif [ "$load" = not-found ] && [ "$active" = inactive ] && [ -z "$enabled" ]; then
-              printf 'B_UNIT name=%s state=strictly_absent\n' "$label"
-            elif [ "$active" = failed ]; then
-              printf 'B_UNIT name=%s state=failed_cache\n' "$label"
-            elif [ "$active" = active ]; then
-              printf 'B_UNIT name=%s state=active_other\n' "$label"
-            elif [ "$active" = activating ] || [ "$active" = deactivating ]; then
-              printf 'B_UNIT name=%s state=transitioning\n' "$label"
-            else
-              printf 'B_UNIT name=%s state=other\n' "$label"
-            fi
-          }
-
-          stage=absent
-          if [ -r /root/rr-audit-stage ]; then
-            case "$(cat /root/rr-audit-stage 2>/dev/null)" in
-              preclean-complete) stage=preclean_complete ;;
-              old-state-built) stage=old_state_built ;;
-              first-upgrade-complete) stage=first_upgrade_complete ;;
-              manual-rollback-complete) stage=manual_rollback_complete ;;
-              second-upgrade-complete) stage=second_upgrade_complete ;;
-              '') stage=empty ;;
-              *) stage=unknown ;;
-            esac
-          fi
-          printf 'B_STAGE class=%s\n' "$stage"
-
-          for entry in \
-            pre710_rollback:/root/rr-audit-pre710-uninstall-rollback.log \
-            legacy_uninstall:/root/rr-audit-710-uninstall.log; do
-            label=${entry%%:*}
-            path=${entry#*:}
-            if [ -f "$path" ] && [ ! -L "$path" ]; then
-              printf 'B_PHASE_LOG name=%s state=present\n' "$label"
-            else
-              printf 'B_PHASE_LOG name=%s state=absent\n' "$label"
-            fi
-          done
-
-          runtime=absent
-          if [ -x /usr/local/bin/rr ]; then
-            if /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.1'; then
-              runtime=candidate
-            elif /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.0'; then
-              runtime=legacy
-            else
-              runtime=other
-            fi
-          fi
-          printf 'B_RUNTIME class=%s\n' "$runtime"
-          classify_unit nexus rr-nexus.service
-          classify_unit nginx nginx.service
-          classify_unit quarantine rr-subscription-quarantine.service
-          classify_unit health_timer argo-rr-health.timer
-          classify_unit health_service argo-rr-health.service
-          classify_unit recovery rr-update-recovery.service
-
-          recovery=unavailable
-          quarantine=unavailable
-          if [ -x /usr/local/sbin/rr-update-recover ] && command -v jq >/dev/null; then
-            set +e
-            status_json=$(timeout 10 /usr/local/sbin/rr-update-recover status 2>/dev/null)
-            status_rc=$?
-            set -e
-            if [ "$status_rc" -eq 0 ] && jq -e 'type == "object"' \
-              <<<"$status_json" >/dev/null 2>&1; then
-              if jq -e '.active == false' <<<"$status_json" >/dev/null 2>&1; then
-                recovery=inactive
-              elif jq -e '.active == true' <<<"$status_json" >/dev/null 2>&1; then
-                recovery=active
-              else
-                recovery=invalid
-              fi
-              if jq -e '.subscription_quarantine.active == false' \
-                <<<"$status_json" >/dev/null 2>&1; then
-                quarantine=inactive
-              elif jq -e '.subscription_quarantine.active == true and .subscription_quarantine.state == "quarantined"' \
-                <<<"$status_json" >/dev/null 2>&1; then
-                quarantine=quarantined
-              elif jq -e '.subscription_quarantine.active == true' \
-                <<<"$status_json" >/dev/null 2>&1; then
-                quarantine=active_other
-              else
-                quarantine=invalid
-              fi
-            else
-              recovery=probe_error
-              quarantine=probe_error
-            fi
-          fi
-          printf 'B_RECOVERY class=%s\n' "$recovery"
-          printf 'B_QUARANTINE class=%s\n' "$quarantine"
-
-          rollback_log=unknown
-          if [ ! -r /root/rr-audit-pre710-uninstall-rollback.log ]; then
-            rollback_log=missing
-          elif grep -Fq 'rollback completed in DEGRADED mode' \
-            /root/rr-audit-pre710-uninstall-rollback.log; then
-            rollback_log=degraded_complete
-          elif grep -Fq 'rollback completed' \
-            /root/rr-audit-pre710-uninstall-rollback.log; then
-            rollback_log=normal_complete
-          elif grep -Fq 'recovery was incomplete' \
-            /root/rr-audit-pre710-uninstall-rollback.log; then
-            rollback_log=incomplete
-          elif grep -Fq 'failed' /root/rr-audit-pre710-uninstall-rollback.log; then
-            rollback_log=failure_marker
-          fi
-          printf 'B_ROLLBACK_LOG class=%s\n' "$rollback_log"
-
-          metadata=unexpected
-          if [ -x /usr/local/sbin/rr-update-recover ] && command -v jq >/dev/null; then
-            set +e
-            status_json=$(timeout 10 /usr/local/sbin/rr-update-recover status 2>/dev/null)
-            status_rc=$?
-            set -e
-            if [ "$status_rc" -eq 0 ] && jq -e '
-              .active == false and
-              .subscription_quarantine.active == true and
-              .subscription_quarantine.state == "quarantined" and
-              .subscription_quarantine.target_version == "7.1.0" and
-              .subscription_quarantine.port == 18081 and
-              .subscription_quarantine.resume_subscription == 1
-            ' <<<"$status_json" >/dev/null 2>&1; then
-              metadata=expected
-            fi
-          fi
-          printf 'B_QUARANTINE_METADATA state=%s\n' "$metadata"
-
-          for entry in \
-            marker:/var/lib/rr-update/subscription-quarantine:600 \
-            ready:/run/rr-subscription-quarantine.ready:600 \
-            guard_state:/var/lib/rr-quarantine/guard-state:600 \
-            guard_helper:/usr/local/libexec/rr-vps/subscription-quarantine-guard:700; do
-            label=${entry%%:*}
-            rest=${entry#*:}
-            expected_mode=${rest##*:}
-            path=${rest%:*}
-            state=unexpected
-            if [ -f "$path" ] && [ ! -L "$path" ] && \
-               [ "$(stat -c '%U:%G:%a' "$path" 2>/dev/null)" = \
-                 "root:root:${expected_mode}" ]; then
-              state=expected
-            fi
-            printf 'B_QUARANTINE_FILE name=%s state=%s\n' "$label" "$state"
-          done
-          rules=expected
-          for backend in iptables ip6tables; do
-            command -v "$backend" >/dev/null 2>&1 || continue
-            if ! "$backend" -w 5 -t raw -C PREROUTING ! -i lo -p tcp \
-              --dport 18081 -m addrtype --dst-type LOCAL -m comment \
-              --comment 'rr-vps unsafe rollback subscription quarantine' \
-              -j DROP >/dev/null 2>&1; then
-              rules=unexpected
-            fi
-          done
-          printf 'B_QUARANTINE_RULES state=%s\n' "$rules"
-
-          if ss -H -ltn 'sport = :10443' 2>/dev/null | grep -q .; then
-            printf 'B_LISTEN_10443 state=present\n'
-          else
-            printf 'B_LISTEN_10443 state=absent\n'
-          fi
-          if curl -kfsS --connect-timeout 5 --max-time 15 \
-            https://127.0.0.1:10443/healthz >/dev/null 2>&1; then
-            printf 'B_LOCAL_HEALTH state=pass\n'
-          else
-            printf 'B_LOCAL_HEALTH state=fail\n'
-          fi
-          if curl -kfsS --connect-timeout 5 --max-time 15 \
-            "https://${public_host}:10443/healthz" >/dev/null 2>&1; then
-            printf 'B_SELF_PUBLIC_HEALTH state=pass\n'
-          else
-            printf 'B_SELF_PUBLIC_HEALTH state=fail\n'
-          fi
-          if [ -r /etc/rr-nexus/nexus.json ] && \
-             jq -e '.public_port == 10443' /etc/rr-nexus/nexus.json >/dev/null 2>&1; then
-            printf 'B_PUBLIC_PORT_CONFIG state=expected\n'
-          else
-            printf 'B_PUBLIC_PORT_CONFIG state=unexpected\n'
-          fi
-          if [ -e /etc/nginx/sites-enabled/rr-nexus.conf ] || \
-             [ -L /etc/nginx/sites-enabled/rr-nexus.conf ]; then
-            printf 'B_NGINX_SITE state=present\n'
-          else
-            printf 'B_NGINX_SITE state=absent\n'
-          fi
-          if nginx -t >/dev/null 2>&1; then
-            printf 'B_NGINX_CONFIG state=valid\n'
-          else
-            printf 'B_NGINX_CONFIG state=invalid\n'
-          fi
-          if command -v ufw >/dev/null 2>&1; then
-            if LC_ALL=C ufw status 2>/dev/null | grep -qx 'Status: active'; then
-              printf 'B_UFW state=active\n'
-            elif LC_ALL=C ufw status 2>/dev/null | grep -qx 'Status: inactive'; then
-              printf 'B_UFW state=inactive\n'
-            else
-              printf 'B_UFW state=other\n'
-            fi
-            if LC_ALL=C ufw status 2>/dev/null | grep -Eq '(^|[[:space:]])10443/tcp([[:space:]]|$)'; then
-              printf 'B_UFW_10443 state=rule_present\n'
-            else
-              printf 'B_UFW_10443 state=rule_absent\n'
-            fi
-          else
-            printf 'B_UFW state=unavailable\n'
-            printf 'B_UFW_10443 state=unavailable\n'
-          fi
-          if iptables -w 5 -C INPUT -p tcp --dport 10443 -j ACCEPT \
-            >/dev/null 2>&1; then
-            printf 'B_IPTABLES_10443 state=direct_accept\n'
-          else
-            printf 'B_IPTABLES_10443 state=no_direct_accept\n'
-          fi
-          REMOTE
-
-          if curl -kfsS --connect-timeout 5 --max-time 20 \
-            "https://${RR_B_HOST}:10443/healthz" >/dev/null 2>&1; then
-            printf 'B_RUNNER_PUBLIC_HEALTH state=pass\n'
-          else
-            printf 'B_RUNNER_PUBLIC_HEALTH state=fail\n'
-          fi
           unset SSHPASS
