@@ -1,4 +1,4 @@
-# diagnostic rerun: main audit 38 B/C failure
+# Temporary, read-only-output diagnostic for audit 38 B/C failures.
 name: VPS diagnostic
 
 on:
@@ -12,10 +12,8 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
-      RR_A_HOST: ${{ secrets.RR_A_HOST }}
-      RR_A_PASS: ${{ secrets.RR_A_PASS }}
       RR_B_HOST: ${{ secrets.RR_B_HOST }}
       RR_B_PASS: ${{ secrets.RR_B_PASS }}
       RR_C_HOST: ${{ secrets.RR_C_HOST }}
@@ -25,17 +23,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Collect sanitized audit evidence
+
+      - name: Trace B candidate and probe C subscription
         shell: bash
         run: |
           set -uo pipefail
           set +x
-          pin_a='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm'
           pin_b='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A'
           pin_c='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3'
-          probe() {
+          run_remote() {
             local label="$1" host="$2" pass="$3" pin="$4" known=""
-            known="$RUNNER_TEMP/diagnostic-known-hosts-$label"
+            known="$RUNNER_TEMP/diagnostic-repro-known-hosts-$label"
             (umask 077; printf '%s %s\n' "$host" "$pin" > "$known")
             export SSHPASS="$pass"
             sshpass -e ssh \
@@ -46,190 +44,60 @@ jobs:
               -o UserKnownHostsFile="$known" "root@$host" bash -s -- "$label" <<'REMOTE'
           set -uo pipefail
           label="$1"
-          . /etc/os-release
-          rr_version=absent
-          [ ! -x /usr/local/bin/rr ] || \
-            rr_version=$(/usr/local/bin/rr --version 2>/dev/null | head -n 1 || true)
-          stage=$(cat /root/rr-audit-stage 2>/dev/null || printf none)
-          printf 'AUTH_OK slot=%s os=%s version=%s rr=%s stage=%s\n' \
-            "$label" "$ID" "$VERSION_ID" "$rr_version" "$stage"
-          if [ "$label" = C ]; then
-            for path in /usr/local/bin/rr /usr/local/lib/rr \
-              /var/lib/rr-update/active /run/rr-vps/update-maintenance; do
-              if [ -e "$path" ] || [ -L "$path" ]; then
-                printf 'PATH_STATE slot=C path=%s stat=%s target=%s\n' \
-                  "$path" "$(stat -c '%F:%U:%G:%a:%s:%h' "$path" 2>/dev/null || true)" \
-                  "$(readlink "$path" 2>/dev/null || true)"
-              else
-                printf 'PATH_STATE slot=C path=%s state=absent\n' "$path"
-              fi
-            done
-            for tx in /var/lib/rr-update/transactions/*; do
-              [ -d "$tx" ] || continue
-              printf 'TX_STATE slot=C tx=%s phase=%s format=%s\n' \
-                "${tx##*/}" "$(cat "$tx/phase" 2>/dev/null || printf missing)" \
-                "$(cat "$tx/transaction-format" 2>/dev/null || printf missing)"
-            done
-          fi
-          if [ "$label" = A ]; then
-            probe_http() {
-              local kind="$1" url="$2" code="" rc=0
-              if code=$(curl -sS -L --proto '=https' --proto-redir '=https' \
-                --tlsv1.2 --connect-timeout 10 --max-time 40 \
-                -o /dev/null --write-out '%{http_code}' "$url"); then
-                rc=0
-              else
-                rc=$?
-              fi
-              printf 'HTTP_PROBE slot=A kind=%s rc=%s code=%s\n' \
-                "$kind" "$rc" "$code"
-            }
-            probe_http upstream-api \
-              'https://api.github.com/repos/SagerNet/sing-box/releases/latest'
-            probe_http exact-api \
-              'https://api.github.com/repos/Xiaowu7z/RR-vps/releases/tags/rr-nexus-core-v1.13.20-r1'
-            probe_http exact-page \
-              'https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.20-r1'
-            if [ -d /usr/local/lib/rr/modules ]; then
-              for module_file in /usr/local/lib/rr/modules/*.sh; do
-                # shellcheck disable=SC1090
-                source "$module_file"
-              done
-              probe_root=$(mktemp -d /root/rr-nexus-probe.XXXXXX)
-              mkdir -m 700 "$probe_root/download"
-              if nexus_validate_pinned_core_constants; then
-                constants_rc=0
-              else
-                constants_rc=$?
-              fi
-              if nexus_fetch_traffic_core_release "$probe_root/release.json" \
-                >/dev/null 2>&1; then
-                fetch_rc=0
-              else
-                fetch_rc=$?
-              fi
-              if nexus_download_traffic_core "$probe_root/download" \
-                >/dev/null 2>&1; then
-                download_rc=0
-              else
-                download_rc=$?
-              fi
-              printf 'NEXUS_PROBE slot=A product=%s arch=%s constants=%s fetch=%s download=%s\n' \
-                "${SCRIPT_VERSION:-unset}" "${SYS_ARCH:-unset}" \
-                "$constants_rc" "$fetch_rc" "$download_rc"
-              rm -rf "$probe_root"
-            fi
-          fi
-          if [ "$label" = A ] && [ -r /etc/rr-nexus/nexus.json ] && \
-             [ -r /etc/argo_vmess.conf ]; then
-            panel_domain=$(jq -r '.domain // empty' /etc/rr-nexus/nexus.json 2>/dev/null || true)
-            naive_domain=$(sed -n 's/^NAIVE_DOMAIN=//p' /etc/argo_vmess.conf | head -n 1)
-            panel_cert="/etc/letsencrypt/live/${panel_domain}/fullchain.pem"
-            naive_cert="/etc/letsencrypt/live/${naive_domain}/fullchain.pem"
-            panel_cross=na naive_cross=na same_bytes=na panel_sans=0 naive_sans=0
-            if [ -s "$panel_cert" ] && [ -s "$naive_cert" ] && \
-               [ -n "$panel_domain" ] && [ -n "$naive_domain" ]; then
-              openssl x509 -checkhost "$naive_domain" -noout -in "$panel_cert" \
-                >/dev/null 2>&1 && panel_cross=yes || panel_cross=no
-              openssl x509 -checkhost "$panel_domain" -noout -in "$naive_cert" \
-                >/dev/null 2>&1 && naive_cross=yes || naive_cross=no
-              cmp -s "$panel_cert" "$naive_cert" && same_bytes=yes || same_bytes=no
-              panel_sans=$(openssl x509 -in "$panel_cert" -noout -ext subjectAltName \
-                2>/dev/null | grep -o 'DNS:' | wc -l)
-              naive_sans=$(openssl x509 -in "$naive_cert" -noout -ext subjectAltName \
-                2>/dev/null | grep -o 'DNS:' | wc -l)
-            fi
-            printf 'CERT_STATE slot=A panel_cross=%s naive_cross=%s same_bytes=%s panel_sans=%s naive_sans=%s\n' \
-              "$panel_cross" "$naive_cross" "$same_bytes" "$panel_sans" "$naive_sans"
-          fi
           if [ "$label" = B ]; then
-            for log_file in /root/rr-audit-upgrade.log /root/rr-audit-manual-rollback.log; do
-              [ -f "$log_file" ] || continue
-              base=$(basename "$log_file")
-              sed -E \
-                -e 's#https?://[^[:space:]]+#<url>#g' \
-                -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
-                -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
-                -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
-                grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|恢复码|订阅地址|subscription[ _-]?url' |
-                tail -n 100 |
-                while IFS= read -r line; do
-                  printf 'B_DETAIL slot=B file=%s text=%s\n' "$base" "$line"
-                done
-            done
-            if [ -x /usr/local/sbin/rr-update-recover ]; then
-              status_json=$(/usr/local/sbin/rr-update-recover status 2>/dev/null || printf '{}')
-              printf 'RECOVERY_STATUS slot=B active=%s phase=%s quarantine_active=%s quarantine_state=%s\n' \
-                "$(jq -r '.active // "unknown"' <<<"$status_json")" \
-                "$(jq -r '.phase // "none"' <<<"$status_json")" \
-                "$(jq -r '.subscription_quarantine.active // false' <<<"$status_json")" \
-                "$(jq -r '.subscription_quarantine.state // "none"' <<<"$status_json")"
-            fi
-          fi
-          if [ "$label" = C ] && [ -x /usr/local/sbin/rr-update-recover ]; then
-            export RR_UPDATE_RECOVER_SOURCE_ONLY=1
-            # shellcheck disable=SC1091
-            source /usr/local/sbin/rr-update-recover
-            unset RR_UPDATE_RECOVER_SOURCE_ONLY
-            tx=$(rr_transaction_path 2>/dev/null || true)
-            if [ -n "$tx" ] && [ -d "$tx" ]; then
-              control_rc=0; rr_transaction_v2_control_metadata_is_safe "$tx" >/dev/null 2>&1 || control_rc=$?
-              backup_rc=0; rr_transaction_v2_backup_metadata_is_safe "$tx" >/dev/null 2>&1 || backup_rc=$?
-              maintenance_rc=0; rr_update_maintenance_marker_state "$tx" >/dev/null 2>&1 || maintenance_rc=$?
-              external_rc=na
-              if [ -x /usr/local/sbin/rr-update-external-state ]; then
-                external_rc=0
-                /usr/local/sbin/rr-update-external-state verify "$tx/backup" \
-                  --tx-root /var/lib/rr-update >/dev/null 2>&1 || external_rc=$?
-              fi
-              printf 'TX_VALIDATION slot=C control=%s backup=%s maintenance=%s external=%s old_runtime=%s failed_runtime_count=%s\n' \
-                "$control_rc" "$backup_rc" "$maintenance_rc" "$external_rc" \
-                "$([ -d "$tx/old-runtime" ] && printf present || printf absent)" \
-                "$(find "$tx" -maxdepth 1 -type d -name 'failed-runtime-*' | wc -l)"
-              for state_name in writer_state_complete subscription_was_running \
-                singbox_was_running singbox_was_enabled nexus_was_running \
-                nexus_was_enabled health_timer_was_running health_timer_was_enabled \
-                health_service_was_running runtime_did_not_exist; do
-                if [ -f "$tx/backup/$state_name" ]; then
-                  printf 'WRITER_MARKER slot=C name=%s state=present stat=%s\n' \
-                    "$state_name" "$(stat -c '%U:%G:%a:%h:%s' "$tx/backup/$state_name" 2>/dev/null || true)"
-                else
-                  printf 'WRITER_MARKER slot=C name=%s state=absent\n' "$state_name"
-                fi
+            stage=/root/rr-audit-candidate
+            trace=/root/rr-audit-b-function-trace.log
+            repro=/root/rr-audit-b-reproduce.log
+            bash_env=/root/rr-audit-bash-env
+            : > "$trace"
+            cat > "$bash_env" <<'TRACE_ENV'
+          set -o functrace
+          trap 'printf "TRACE source=%s line=%s function=%s\n" "${BASH_SOURCE[0]##*/}" "${LINENO}" "${FUNCNAME[0]:-toplevel}" >> /root/rr-audit-b-function-trace.log' DEBUG
+          TRACE_ENV
+            chmod 600 "$trace" "$bash_env"
+            set +e
+            BASH_ENV="$bash_env" \
+              RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" \
+              RR_GUARD_FILE="$stage/update-guard.sh" \
+              bash "$stage/install-core.sh" --upgrade >"$repro" 2>&1
+            rc=$?
+            set -e
+            printf 'B_REPRO rc=%s\n' "$rc"
+            awk '$0 != previous { print; previous=$0 }' "$trace" | tail -n 260
+            sed -E \
+              -e 's#https?://[^[:space:]]+#<url>#g' \
+              -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
+              -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+              -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$repro" |
+              grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|恢复码|订阅地址|subscription[ _-]?url' |
+              tail -n 80 |
+              while IFS= read -r line; do
+                printf 'B_REPRO_DETAIL text=%s\n' "$line"
               done
-              subscription_rc=0; rr_subscription_running >/dev/null 2>&1 || subscription_rc=$?
-              printf 'WRITER_PROBE slot=C subscription_running_rc=%s\n' "$subscription_rc"
-            fi
-          fi
-          for unit in sing-box.service rr-nexus.service nginx.service \
-            rr-subscription-quarantine.service argo-rr-health.timer; do
-            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
-            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
-            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
-            printf 'UNIT slot=%s name=%s state=%s:%s:%s\n' \
-              "$label" "$unit" "$load" "$active" "$enabled"
-          done
-          for port in 8443 10443 18080 18081 21443 22443 24443 28443; do
-            pids=$(ss -H -ltnp "sport = :${port}" 2>/dev/null |
-              sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)
-            [ -n "$pids" ] || continue
-            for pid in $pids; do
-              comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
-              exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-              cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)
-              printf 'PORT_OWNER slot=%s port=%s pid=%s comm=%s exe=%s cwd=%s\n' \
-                "$label" "$port" "$pid" "$comm" "$exe" "$cwd" |
-                sed -E 's#[[:alnum:]_+/=-]{24,}#<token>#g'
+          else
+            set +e
+            /usr/local/bin/rr --refresh-subscription \
+              >/root/rr-audit-c-refresh.log 2>&1
+            rc=$?
+            set -e
+            printf 'C_REFRESH rc=%s\n' "$rc"
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
             done
-          done
-          while IFS= read -r log_file; do
-            base=$(basename "$log_file")
-            size=$(stat -c %s "$log_file" 2>/dev/null || printf 0)
-            lines=$(wc -l < "$log_file" 2>/dev/null || printf 0)
-            printf 'LOG_META slot=%s file=%s size=%s lines=%s\n' \
-              "$label" "$base" "$size" "$lines"
-            grep -Eai 'error|failed|failure|invalid|missing|not found|unable|timeout|denied|refus|404|403|traceback|exception|失败|错误|拒绝' \
-              "$log_file" 2>/dev/null | tail -n 16 |
+            for second in 0 1 2 3 4 5 6 7 8 9 10; do
+              running=false
+              subscription_server_running && running=true
+              pid_state=absent
+              if [ -f "$SUB_PID_FILE" ] && [ ! -L "$SUB_PID_FILE" ]; then
+                pid_state=present
+              fi
+              printf 'C_SUB_SAMPLE second=%s running=%s pid_file=%s\n' \
+                "$second" "$running" "$pid_state"
+              [ "$second" -eq 10 ] || sleep 1
+            done
+            grep -Eai 'error|failed|failure|invalid|missing|not found|unable|timeout|denied|refus|traceback|exception|失败|错误|拒绝' \
+              /root/rr-audit-c-refresh.log 2>/dev/null | tail -n 20 |
               sed -E \
                 -e 's#https?://[^[:space:]]+#<url>#g' \
                 -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
@@ -237,34 +105,13 @@ jobs:
                 -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' |
               grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|订阅地址|subscription[ _-]?url' |
               while IFS= read -r line; do
-                printf 'LOG_ERROR slot=%s file=%s text=%s\n' "$label" "$base" "$line"
+                printf 'C_REFRESH_DETAIL text=%s\n' "$line"
               done
-          done < <(find /root -maxdepth 1 -type f -name 'rr-audit-*.log' -print | sort)
-          if [ "$label" = C ]; then
-            for base in rr-audit-crash-old-runtime.log \
-              rr-audit-between-crashes.log; do
-              log_file="/root/$base"
-              [ -f "$log_file" ] || continue
-              sed -E \
-                -e 's#https?://[^[:space:]]+#<url>#g' \
-                -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
-                -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
-                -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
-                grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|恢复码|订阅地址|subscription[ _-]?url' |
-                tail -n 80 |
-                while IFS= read -r line; do
-                  printf 'RECOVERY_DETAIL slot=C file=%s text=%s\n' "$base" "$line"
-                done
-            done
           fi
-          exit 0
           REMOTE
             rc=$?
             unset SSHPASS
-            if [ "$rc" -ne 0 ]; then
-              printf 'PROBE_FAILED slot=%s rc=%s\n' "$label" "$rc"
-            fi
+            printf 'REPRO_PROBE slot=%s rc=%s\n' "$label" "$rc"
           }
-          probe A "$RR_A_HOST" "$RR_A_PASS" "$pin_a"
-          probe B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
-          probe C "$RR_C_HOST" "$RR_C_PASS" "$pin_c"
+          run_remote B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
+          run_remote C "$RR_C_HOST" "$RR_C_PASS" "$pin_c"
