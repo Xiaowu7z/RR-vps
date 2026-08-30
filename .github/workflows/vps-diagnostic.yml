@@ -52,6 +52,24 @@ jobs:
           stage=$(cat /root/rr-audit-stage 2>/dev/null || printf none)
           printf 'AUTH_OK slot=%s os=%s version=%s rr=%s stage=%s\n' \
             "$label" "$ID" "$VERSION_ID" "$rr_version" "$stage"
+          if [ "$label" = C ]; then
+            for path in /usr/local/bin/rr /usr/local/lib/rr \
+              /var/lib/rr-update/active /run/rr-vps/update-maintenance; do
+              if [ -e "$path" ] || [ -L "$path" ]; then
+                printf 'PATH_STATE slot=C path=%s stat=%s target=%s\n' \
+                  "$path" "$(stat -c '%F:%U:%G:%a:%s:%h' "$path" 2>/dev/null || true)" \
+                  "$(readlink "$path" 2>/dev/null || true)"
+              else
+                printf 'PATH_STATE slot=C path=%s state=absent\n' "$path"
+              fi
+            done
+            for tx in /var/lib/rr-update/transactions/*; do
+              [ -d "$tx" ] || continue
+              printf 'TX_STATE slot=C tx=%s phase=%s format=%s\n' \
+                "${tx##*/}" "$(cat "$tx/phase" 2>/dev/null || printf missing)" \
+                "$(cat "$tx/transaction-format" 2>/dev/null || printf missing)"
+            done
+          fi
           if [ "$label" = A ]; then
             probe_http() {
               local kind="$1" url="$2" code="" rc=0
