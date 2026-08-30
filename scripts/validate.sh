@@ -1305,6 +1305,21 @@ EOF
     [ "$NEXUS_CORE_PINNED_SOURCE_COMMIT" = \
         b5ebaa1fc0f2b94256180b95468e73ef53caa27d ]
     [ "$NEXUS_CORE_PINNED_AUDIT_RUN" = 33071792235 ]
+    [ "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS" = \
+        "v1.13.20 v1.13.21" ]
+    for allowed_upstream_tag in v1.13.20 v1.13.21; do
+        printf '{"tag_name":"%s"}\n' "$allowed_upstream_tag" > \
+            "$checksum_tmp/allowed-upstream.json"
+        nexus_pinned_core_fallback_allowed \
+            "$checksum_tmp/allowed-upstream.json"
+    done
+    printf '%s\n' '{"tag_name":"v1.13.22"}' > \
+        "$checksum_tmp/unknown-upstream.json"
+    if nexus_pinned_core_fallback_allowed \
+        "$checksum_tmp/unknown-upstream.json"; then
+        echo "Unknown upstream version selected the pinned Nexus core." >&2
+        exit 1
+    fi
     if nexus_pinned_core_asset_field 386 sha256 >/dev/null 2>&1; then
         echo "Unsupported architecture received a pinned Nexus digest." >&2
         exit 1
@@ -1314,6 +1329,13 @@ EOF
         NEXUS_CORE_PINNED_AMD64_SHA256="${bad_sha%?}g"
         if nexus_validate_pinned_core_constants; then
             echo "Malformed pinned Nexus digest was accepted." >&2
+            exit 1
+        fi
+    )
+    (
+        NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS="v1.13.20 v1.13.21 v1.13.22"
+        if nexus_validate_pinned_core_constants; then
+            echo "Widened pinned Nexus upstream allowlist was accepted." >&2
             exit 1
         fi
     )
@@ -1397,7 +1419,7 @@ EOF
         NEXUS_CORE_PINNED_AMD64_SHA256=$(sha256sum "$payload_root/core.tar.gz" | awk '{print $1}')
         SYS_ARCH=amd64
         nexus_fetch_traffic_core_release() {
-            printf '%s\n' '{"tag_name":"v1.13.20"}' > "${1}.upstream"
+            printf '%s\n' '{"tag_name":"v1.13.21"}' > "${1}.upstream"
             return 44
         }
         curl() {
@@ -1492,7 +1514,7 @@ EOF
     )
     (
         nexus_fetch_traffic_core_release() {
-            printf '%s\n' '{"tag_name":"v1.13.21"}' > "${1}.upstream"
+            printf '%s\n' '{"tag_name":"v1.13.22"}' > "${1}.upstream"
             return 44
         }
         if nexus_traffic_core_version >/dev/null 2>&1; then
