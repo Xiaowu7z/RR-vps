@@ -188,6 +188,20 @@ jobs:
             jq -e '.active == false and .subscription_quarantine.active == false' \
               <<<"$status_json"
           }
+          recovery_transaction_inactive() {
+            /usr/local/sbin/rr-update-recover status \
+              | jq -e '.active == false'
+          }
+          recovery_quarantine_inactive() {
+            /usr/local/sbin/rr-update-recover status \
+              | jq -e '.subscription_quarantine.active == false'
+          }
+          quarantine_unit_property_is() {
+            local property="$1" expected="$2" actual=""
+            actual=$(systemctl show -p "$property" --value \
+              rr-subscription-quarantine.service 2>/dev/null) || return 1
+            test "$actual" = "$expected"
+          }
           recovery_status_readable() {
             /usr/local/sbin/rr-update-recover status | jq -e 'type == "object"'
           }
@@ -237,6 +251,8 @@ jobs:
           report nexus_config_preserved nexus_config_preserved
           report panel_health panel_health
           report recovery_status_readable recovery_status_readable
+          report recovery_transaction_inactive recovery_transaction_inactive
+          report recovery_quarantine_inactive recovery_quarantine_inactive
           report quarantine_status_inactive quarantine_status_inactive
           report quarantine_marker_absent path_absent /var/lib/rr-update/subscription-quarantine
           report quarantine_ready_absent path_absent /run/rr-subscription-quarantine.ready
@@ -245,6 +261,13 @@ jobs:
           report quarantine_guard_absent path_absent /usr/local/libexec/rr-vps/subscription-quarantine-guard
           report quarantine_unit_absent assert_unit_state rr-subscription-quarantine.service \
             not-found:inactive:not-found
+          report quarantine_unit_load_not_found quarantine_unit_property_is LoadState not-found
+          report quarantine_unit_load_loaded quarantine_unit_property_is LoadState loaded
+          report quarantine_unit_active_inactive quarantine_unit_property_is ActiveState inactive
+          report quarantine_unit_active_failed quarantine_unit_property_is ActiveState failed
+          report quarantine_unit_file_not_found quarantine_unit_property_is UnitFileState not-found
+          report quarantine_unit_file_disabled quarantine_unit_property_is UnitFileState disabled
+          report quarantine_unit_fragment_empty quarantine_unit_property_is FragmentPath ''
           report quarantine_ipv4_rule_absent raw_quarantine_rule_absent iptables
           report quarantine_ipv6_rule_absent raw_quarantine_rule_absent ip6tables
           report config_mode_600 config_mode_600
