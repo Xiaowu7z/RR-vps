@@ -474,6 +474,8 @@ printf '%s\n' '[8/13] a committed crash retries finalization before clearing mai
     main recover
     [ "$(cat "$tx/phase")" = committed ] || fail 'committed phase was rewritten'
     [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'committed maintenance marker was not cleared'
+    [ "$(cat "$tx/$RR_COMMITTED_SETTLED_NAME")" = "$RR_COMMITTED_SETTLED_VALUE" ] ||
+        fail 'committed crash recovery did not publish durable settled evidence'
     grep -Fxq '1 --post-update-finalize' "$RR_TEST_FINALIZE_LOG" || \
         fail 'committed crash recovery skipped candidate finalization'
 
@@ -489,8 +491,8 @@ printf '%s\n' '[8/13] a committed crash retries finalization before clearing mai
     [ "$(cat "$tx/phase")" = committed ] || fail 'marker cleanup failure made a committed update rollback-eligible'
     [ -e "$RR_ACTIVE_TX" ] && [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || \
         fail 'committed cleanup failure discarded recovery evidence'
-    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 2 ] || \
-        fail 'committed cleanup retry did not re-run finalization'
+    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 1 ] || \
+        fail 'unsafe maintenance evidence triggered settled finalization'
 
     printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
     chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
@@ -507,6 +509,8 @@ printf '%s\n' '[8/13] a committed crash retries finalization before clearing mai
         [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
         fail 'global terminal sync failure discarded active or maintenance evidence'
     [ ! -e "$restore_log" ] || fail 'terminal sync failure made a committed candidate rollback-eligible'
+    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 1 ] ||
+        fail 'settled durability retry re-ran candidate finalization'
     unset -f sync
 
     main recover || fail 'committed cleanup did not succeed after the durability fault cleared'
@@ -514,18 +518,294 @@ printf '%s\n' '[8/13] a committed crash retries finalization before clearing mai
         [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
         fail 'committed cleanup retry changed its terminal phase or rollback pointer'
     [ ! -e "$restore_log" ] || fail 'second recovery restored or rolled back a committed candidate'
+    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 1 ] ||
+        fail 'settled cleanup re-ran candidate finalization'
 
     printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
     chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
     export RR_TEST_FINALIZE_FAIL=1
+    main recover || fail 'settled cleanup incorrectly depended on candidate finalization'
+    [ "$(cat "$tx/phase")" = committed ] && [ -e "$RR_ACTIVE_TX" ] && \
+        [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || \
+        fail 'settled cleanup changed its rollback window or retained maintenance'
+    main recover || fail 'dormant settled recovery was not idempotent'
+    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 1 ] ||
+        fail 'dormant settled recovery touched the candidate finalizer'
+
+    chmod 0644 "$tx/$RR_COMMITTED_SETTLED_NAME"
     set +e
     main recover
     rc=$?
     set -e
-    [ "$rc" -eq 1 ] || fail 'candidate finalization failure was reported as success'
-    [ "$(cat "$tx/phase")" = committed ] && [ -e "$RR_ACTIVE_TX" ] && \
-        [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || \
-        fail 'candidate finalization failure discarded committed recovery evidence'
+    [ "$rc" -eq 1 ] || fail 'unsafe settled evidence was accepted'
+    [ "$(wc -l < "$RR_TEST_FINALIZE_LOG")" -eq 1 ] && [ ! -e "$restore_log" ] ||
+        fail 'unsafe settled evidence caused host-state mutation'
+    chmod 0600 "$tx/$RR_COMMITTED_SETTLED_NAME"
+)
+
+# A directory-fsync error after the settled rename is ambiguous: the valid
+# marker is already live.  The first recovery must retain maintenance without
+# freezing writers, and the retry must consume the marker without replaying
+# finalization or the old writer snapshot.
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    export RR_UPDATE_LOCK_HELD=1
+    export RR_TX_ROOT="$TEST_ROOT/settled-publish-fault/update"
+    export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/settled-publish-fault/run/update-maintenance"
+    export RR_QUARANTINE_FILE="$RR_TX_ROOT/quarantine"
+    export RR_QUARANTINE_UNIT="$TEST_ROOT/settled-publish-fault/quarantine.service"
+    export RR_QUARANTINE_READY="$TEST_ROOT/settled-publish-fault/quarantine.ready"
+    export RR_QUARANTINE_GUARD_STATE="$TEST_ROOT/settled-publish-fault/guard-state"
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    tx="$RR_TX_ROOT/transactions/tx"
+    marker_parent=$(dirname "$RR_UPDATE_MAINTENANCE_FILE")
+    mkdir -p "$tx/backup" "$marker_parent"
+    chmod 700 "$tx" "$tx/backup" "$marker_parent"
+    printf '2\n' > "$tx/transaction-format"
+    printf 'committed\n' > "$tx/phase"
+    printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+    printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
+    : > "$tx/backup/writer_state_complete"
+    chmod 600 "$tx/transaction-format" "$tx/phase" "$RR_ACTIVE_TX" \
+        "$RR_UPDATE_MAINTENANCE_FILE" "$tx/backup/writer_state_complete"
+
+    finalize_calls=0
+    writer_restore_calls=0
+    freeze_calls=0
+    sync_fault=true
+    mv_fault=none
+    rr_finalize_committed_candidate() { finalize_calls=$((finalize_calls + 1)); }
+    rr_restore_recorded_writer_state() { writer_restore_calls=$((writer_restore_calls + 1)); }
+    rr_recovery_fail_with_health_frozen() { freeze_calls=$((freeze_calls + 1)); return 1; }
+    rr_quarantine_artifact_evidence_present() { return 1; }
+    systemctl() { fail "settled publication fault touched systemd: $*"; }
+    sync() {
+        if [ "$sync_fault" = true ] && [ "$*" = "-f $tx" ] && \
+           [ -e "$tx/$RR_COMMITTED_SETTLED_NAME" ]; then
+            return 1
+        fi
+        command sync "$@"
+    }
+    mv() {
+        local destination="${@: -1}"
+        if [ "$destination" = "$RR_TX_ROOT/transactions/direct-valid/$RR_COMMITTED_SETTLED_NAME" ] || \
+           [ "$destination" = "$RR_TX_ROOT/transactions/direct-unsafe/$RR_COMMITTED_SETTLED_NAME" ]; then
+            command mv "$@" || return
+            case "$mv_fault" in
+                valid) return 1 ;;
+                unsafe) chmod 0644 "$destination"; return 1 ;;
+            esac
+        fi
+        command mv "$@"
+    }
+
+    set +e
+    main recover
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$freeze_calls" -eq 0 ] && \
+        [ "$finalize_calls" -eq 1 ] && [ "$writer_restore_calls" -eq 1 ] ||
+        fail 'post-rename settled fsync fault froze writers or skipped committed work'
+    rr_committed_settled_state "$tx" ||
+        fail 'post-rename settled fsync fault lost its strict visible marker'
+    [ -e "$RR_ACTIVE_TX" ] && [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+        fail 'post-rename settled fsync fault discarded active or maintenance evidence'
+
+    sync_fault=false
+    main recover || fail 'valid visible settled marker was not retryable'
+    [ "$freeze_calls" -eq 0 ] && [ "$finalize_calls" -eq 1 ] && \
+        [ "$writer_restore_calls" -eq 1 ] && [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+        fail 'settled retry froze or replayed committed writer/finalizer state'
+
+    for direct_case in valid unsafe; do
+        direct_tx="$RR_TX_ROOT/transactions/direct-$direct_case"
+        mkdir -p "$direct_tx"
+        chmod 700 "$direct_tx"
+        mv_fault="$direct_case"
+        set +e
+        rr_publish_committed_settled "$direct_tx"
+        direct_rc=$?
+        set -e
+        if [ "$direct_case" = valid ]; then
+            [ "$direct_rc" -eq 2 ] && rr_committed_settled_state "$direct_tx" ||
+                fail 'mv ambiguity with a strict marker was not classified as visible'
+        else
+            [ "$direct_rc" -eq 1 ] ||
+                fail 'unsafe post-mv settled evidence was classified as safely visible'
+        fi
+    done
+)
+
+# Settled format-2 recovery needs only trusted live control metadata.  Its
+# backup is retained solely for an explicit manual rollback, so missing backup
+# evidence must not take down a healthy committed candidate during boot.
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    export RR_UPDATE_LOCK_HELD=1
+    export RR_TX_ROOT="$TEST_ROOT/settled-format2/update"
+    export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/settled-format2/run/update-maintenance"
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    tx="$RR_TX_ROOT/transactions/tx"
+    mkdir -p "$tx"
+    chmod 700 "$tx"
+    printf '2\n' > "$tx/transaction-format"
+    printf 'committed\n' > "$tx/phase"
+    printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+    printf '%s\n' "$RR_COMMITTED_SETTLED_VALUE" > "$tx/$RR_COMMITTED_SETTLED_NAME"
+    chmod 600 "$tx/transaction-format" "$tx/phase" "$RR_ACTIVE_TX" \
+        "$tx/$RR_COMMITTED_SETTLED_NAME"
+    finalize_calls=0
+    restore_calls=0
+    freeze_calls=0
+    systemctl_calls=0
+    rr_finalize_committed_candidate() { finalize_calls=$((finalize_calls + 1)); return 97; }
+    rr_restore_transaction() { restore_calls=$((restore_calls + 1)); return 97; }
+    rr_freeze_health_writers_strict() { freeze_calls=$((freeze_calls + 1)); return 0; }
+    systemctl() { systemctl_calls=$((systemctl_calls + 1)); return 1; }
+
+    main recover || fail 'settled format-2 recovery depended on rollback backup metadata'
+    [ "$finalize_calls" -eq 0 ] && [ "$restore_calls" -eq 0 ] && \
+        [ "$freeze_calls" -eq 0 ] && [ "$systemctl_calls" -eq 0 ] ||
+        fail 'settled format-2 fast path changed live writer or finalizer state'
+
+    set +e
+    main rollback
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$restore_calls" -eq 0 ] && \
+        [ "$(cat "$tx/phase")" = committed ] ||
+        fail 'manual rollback accepted a settled transaction with no safe backup'
+
+    freeze_calls=0
+    chmod 0644 "$tx/phase"
+    set +e
+    main recover
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$freeze_calls" -eq 1 ] && \
+        [ "$finalize_calls" -eq 0 ] && [ "$restore_calls" -eq 0 ] ||
+        fail 'settled fast path bypassed format-2 control metadata validation'
+)
+
+# A durable settled marker makes ordinary recovery a no-op, so manual
+# rollback must leave committed before its first runtime mutation.  A later
+# boot then resumes rolling_back instead of mistaking it for a dormant window.
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    export RR_UPDATE_LOCK_HELD=1
+    export RR_TX_ROOT="$TEST_ROOT/manual-rolling/update"
+    export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/manual-rolling/run/update-maintenance"
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    tx="$RR_TX_ROOT/transactions/tx"
+    marker_parent=$(dirname "$RR_UPDATE_MAINTENANCE_FILE")
+    operation_log="$TEST_ROOT/manual-rolling/operations"
+    mkdir -p "$tx/backup" "$marker_parent"
+    chmod 700 "$RR_TX_ROOT" "$tx" "$tx/backup" "$marker_parent"
+    printf '2\n' > "$tx/transaction-format"
+    printf 'committed\n' > "$tx/phase"
+    printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+    printf '%s\n' "$RR_COMMITTED_SETTLED_VALUE" > "$tx/$RR_COMMITTED_SETTLED_NAME"
+    : > "$tx/backup/writer_state_complete"
+    chmod 600 "$tx/transaction-format" "$tx/phase" "$RR_ACTIVE_TX" \
+        "$tx/$RR_COMMITTED_SETTLED_NAME" "$tx/backup/writer_state_complete"
+    rr_prepare_legacy_lock_for_rollback() { return 0; }
+    restore_calls=0
+    fail_marker_parent_sync=false
+    fail_phase_tx_sync=false
+    eval "$(declare -f rr_create_update_maintenance_marker | \
+        sed '1s/rr_create_update_maintenance_marker/rr_create_update_maintenance_marker_real/')"
+    rr_create_update_maintenance_marker() {
+        printf '%s\n' create-maintenance >> "$operation_log"
+        rr_create_update_maintenance_marker_real "$@"
+    }
+    eval "$(declare -f rr_recovery_write_phase | \
+        sed '1s/rr_recovery_write_phase/rr_recovery_write_phase_real/')"
+    rr_recovery_write_phase() {
+        printf 'phase:%s\n' "$2" >> "$operation_log"
+        rr_recovery_write_phase_real "$@"
+    }
+    sync() {
+        if [ "$fail_marker_parent_sync" = true ] && \
+           [ "$*" = "-f $marker_parent" ] && \
+           [ -e "$RR_UPDATE_MAINTENANCE_FILE" ]; then
+            return 1
+        fi
+        if [ "$fail_phase_tx_sync" = true ] && [ "$*" = "-f $tx" ] && \
+           [ "$(cat "$tx/phase" 2>/dev/null || true)" = rolling_back ]; then
+            return 1
+        fi
+        command sync "$@"
+    }
+    rr_restore_transaction() {
+        restore_calls=$((restore_calls + 1))
+        printf '%s\n' restore-runtime >> "$operation_log"
+        rr_update_maintenance_marker_state "$tx" ||
+            fail 'manual rollback reached runtime restore without a strict maintenance gate'
+        [ "$(cat "$tx/phase")" = rolling_back ] ||
+            fail 'manual rollback reached runtime restore before rolling_back was durable'
+        return 0
+    }
+
+    # An unsafe parent must be rejected before chmod/marker/phase mutation.
+    chmod 0777 "$marker_parent"
+    : > "$operation_log"
+    set +e
+    main rollback
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$(stat -c %a "$marker_parent")" = 777 ] && \
+        [ "$(cat "$tx/phase")" = committed ] && [ "$restore_calls" -eq 0 ] && \
+        [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+        fail 'unsafe maintenance parent was modified or allowed rollback mutation'
+
+    # If rename succeeds but the parent fsync fails, the visible marker is
+    # retained.  No phase/runtime mutation is allowed until a retry durably
+    # flushes that existing marker and its parent.
+    chmod 0700 "$marker_parent"
+    fail_marker_parent_sync=true
+    : > "$operation_log"
+    set +e
+    main rollback
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$(cat "$tx/phase")" = committed ] && \
+        [ "$restore_calls" -eq 0 ] && [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+        fail 'maintenance parent-fsync fault reached rollback phase or runtime mutation'
+
+    fail_marker_parent_sync=false
+    rr_ensure_update_maintenance_marker "$tx" ||
+        fail 'visible maintenance marker could not be made durable on retry'
+    rr_update_maintenance_marker_state "$tx" ||
+        fail 'durable maintenance retry did not retain strict transaction ownership'
+
+    # The rolling_back rename can be visible even if its transaction-directory
+    # fsync reports failure.  That invocation must stop before restore; boot
+    # recovery then treats the visible phase as in-progress and resumes only
+    # after re-validating and flushing the maintenance gate.
+    fail_phase_tx_sync=true
+    : > "$operation_log"
+    set +e
+    main rollback
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$(cat "$tx/phase")" = rolling_back ] && \
+        [ "$restore_calls" -eq 0 ] ||
+        fail 'rolling_back directory-fsync fault reached runtime restoration'
+    [ "$(sed -n '1p' "$operation_log")" = create-maintenance ] && \
+        [ "$(sed -n '2p' "$operation_log")" = phase:rolling_back ] && \
+        [ "$(wc -l < "$operation_log")" -eq 2 ] ||
+        fail 'phase durability failure did not stop between maintenance and runtime restore'
+
+    fail_phase_tx_sync=false
+    : > "$operation_log"
+    main recover || fail 'boot recovery did not resume rolling_back'
+    [ "$(cat "$tx/phase")" = rolling_back ] && [ "$restore_calls" -eq 1 ] && \
+        [ "$(sed -n '1p' "$operation_log")" = create-maintenance ] && \
+        [ "$(sed -n '2p' "$operation_log")" = restore-runtime ] ||
+        fail 'rolling_back boot recovery skipped its durable gate or restore'
 )
 
 printf '%s\n' '[9/13] aborted recovery is idempotent and requires a durable active unlink'
@@ -1185,7 +1465,7 @@ printf '%s\n' '[12/13] recovery bridges legacy locks and delegates both flock de
 
 printf '%s\n' '[13/13] maintenance state is root-only and bound to one transaction'
 grep -Fq "0:0:600:1" "$REPO_ROOT/scripts/install-core.sh" || fail 'installer lacks strict maintenance marker mode check'
-grep -Fq '[ "$owner" = "$TX_DIR" ]' "$REPO_ROOT/scripts/install-core.sh" || fail 'installer marker is not transaction-bound'
-grep -Fq '[ "$owner" = "$tx" ]' "$REPO_ROOT/scripts/update-recover.sh" || fail 'recovery marker is not transaction-bound'
+grep -Fq '[ "$owner" = "$marker_tx" ]' "$REPO_ROOT/scripts/install-core.sh" || fail 'installer marker is not transaction-bound'
+grep -Fq '[ "$value" = "$tx" ]' "$REPO_ROOT/scripts/update-recover.sh" || fail 'recovery marker is not transaction-bound'
 
 printf '%s\n' 'update writer freeze regression: PASS'

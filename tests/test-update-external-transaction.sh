@@ -179,14 +179,21 @@ quarantine_clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr
     'clear-quarantine')
 finalize_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     '--post-update-finalize')
+settle_sync_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
+    'if ! sync')
+settled_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
+    'rr_publish_committed_settled')
 clear_line=$(line_in_function "$REPO_ROOT/scripts/install-core.sh" rr_install_release \
     'rr_clear_update_maintenance_marker')
-for value in "$commit_line" "$keep_line" "$quarantine_clear_line" "$finalize_line" "$clear_line"; do
+for value in "$commit_line" "$keep_line" "$quarantine_clear_line" "$finalize_line" \
+    "$settle_sync_line" "$settled_line" "$clear_line"; do
     [[ "$value" =~ ^[0-9]+$ ]] || fail 'post-commit finalizer ordering evidence is incomplete'
 done
 [ "$commit_line" -lt "$keep_line" ] && [ "$keep_line" -lt "$quarantine_clear_line" ] && \
     [ "$quarantine_clear_line" -lt "$finalize_line" ] && \
-    [ "$finalize_line" -lt "$clear_line" ] || \
+    [ "$finalize_line" -lt "$settle_sync_line" ] && \
+    [ "$settle_sync_line" -lt "$settled_line" ] && \
+    [ "$settled_line" -lt "$clear_line" ] || \
     fail 'finalizer is not protected by durable committed/KEEP state and maintenance'
 install_release_body=$(sed -n '/^rr_install_release() {/,/^}/p' \
     "$REPO_ROOT/scripts/install-core.sh")
