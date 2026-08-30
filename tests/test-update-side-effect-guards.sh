@@ -155,4 +155,84 @@ if post_update_migrate >/dev/null 2>&1; then fail 'mocked ordinary migration une
 [ "$INSTALL_CALLS" -eq 1 ] || fail 'ordinary migration no longer reaches core repair'
 pass 'post-update migration fails before core installation only in transaction mode'
 
+(
+    SECONDS=0
+    HEALTH_PROBES=0
+    HEALTH_SLEEPS=0
+    systemctl() { [ "$*" = 'is-active --quiet rr-nexus' ]; }
+    curl() {
+        HEALTH_PROBES=$((HEALTH_PROBES + 1))
+        [[ "$*" == *'http://127.0.0.1:7900/healthz'* ]]
+        [ "$HEALTH_PROBES" -eq 3 ]
+    }
+    sleep() {
+        HEALTH_SLEEPS=$((HEALTH_SLEEPS + 1))
+        SECONDS=$((SECONDS + 1))
+    }
+    rr_wait_nexus_local_health 7900 ||
+        fail 'bounded Nexus readiness rejected a delayed healthy listener'
+    [ "$HEALTH_PROBES" -eq 3 ] && [ "$HEALTH_SLEEPS" -eq 2 ] ||
+        fail 'bounded Nexus readiness did not retry only until success'
+)
+pass 'post-update Nexus readiness tolerates bounded Type=simple startup delay'
+
+(
+    SECONDS=0
+    HEALTH_PROBES=0
+    HEALTH_SLEEPS=0
+    systemctl() { [ "$*" = 'is-active --quiet rr-nexus' ]; }
+    curl() { HEALTH_PROBES=$((HEALTH_PROBES + 1)); return 1; }
+    sleep() {
+        HEALTH_SLEEPS=$((HEALTH_SLEEPS + 1))
+        SECONDS=$((SECONDS + 10))
+    }
+    if rr_wait_nexus_local_health 7900; then
+        fail 'bounded Nexus readiness accepted a permanently unavailable listener'
+    fi
+    [ "$HEALTH_PROBES" -ge 2 ] && [ "$HEALTH_PROBES" -le 4 ] &&
+        [ "$HEALTH_SLEEPS" -eq "$HEALTH_PROBES" ] ||
+        fail 'Nexus readiness deadline was not finite and deterministic'
+)
+pass 'post-update Nexus readiness remains fail-closed at its deadline'
+
+(
+    SECONDS=0
+    SERVICE_CHECKS=0
+    HEALTH_PROBES=0
+    systemctl() {
+        SERVICE_CHECKS=$((SERVICE_CHECKS + 1))
+        [ "$SERVICE_CHECKS" -eq 1 ]
+    }
+    curl() { HEALTH_PROBES=$((HEALTH_PROBES + 1)); return 1; }
+    sleep() { SECONDS=$((SECONDS + 1)); }
+    if rr_wait_nexus_local_health 7900; then
+        fail 'Nexus readiness accepted a service that exited during startup'
+    fi
+    [ "$SERVICE_CHECKS" -eq 2 ] && [ "$HEALTH_PROBES" -eq 1 ] ||
+        fail 'Nexus readiness kept probing after the service exited'
+)
+pass 'post-update Nexus readiness rejects an exited service immediately'
+
+(
+    systemctl() { fail 'invalid Nexus port reached systemd'; }
+    curl() { fail 'invalid Nexus port reached curl'; }
+    if rr_wait_nexus_local_health invalid; then
+        fail 'Nexus readiness accepted an invalid health port'
+    fi
+)
+
+post_update_body=$(sed -n '/^post_update_migrate() {/,/^}/p' modules/60-update.sh)
+wait_line=$(grep -nF 'rr_wait_nexus_local_health "$nexus_health_port"' \
+    <<<"$post_update_body" | cut -d: -f1)
+proxy_line=$(grep -nF 'nexus_public_proxy_health_check || return 1' \
+    <<<"$post_update_body" | cut -d: -f1)
+[[ "$wait_line" =~ ^[0-9]+$ && "$proxy_line" =~ ^[0-9]+$ ]] &&
+    [ "$wait_line" -lt "$proxy_line" ] ||
+    fail 'post-update migration no longer gates the public proxy on local Nexus readiness'
+if grep -Fq 'curl -fsS --connect-timeout 3 --max-time 8 "http://127.0.0.1:${nexus_health_port}/healthz"' \
+    <<<"$post_update_body"; then
+    fail 'post-update migration restored the racy one-shot Nexus health probe'
+fi
+pass 'post-update migration wires bounded local readiness before public proxy health'
+
 printf 'update side-effect guard tests passed: %s\n' "$pass_count"

@@ -27,7 +27,7 @@ extract_function() {
     ' "$REPO_ROOT/scripts/install-core.sh"
 }
 
-printf '%s\n' '[1/14] an all-inactive writer snapshot is a successful state capture'
+printf '%s\n' '[1/15] an all-inactive writer snapshot is a successful state capture'
 eval "$(extract_function rr_unit_activity_matches)"
 eval "$(extract_function rr_unit_file_state_matches)"
 eval "$(extract_function rr_capture_unit_activity_state)"
@@ -63,7 +63,7 @@ fi
 [ "$RR_HEALTH_STATE_CAPTURED" = false ] || \
     fail 'failed writer capture published partial health evidence'
 
-printf '%s\n' '[2/14] repeated health freezes preserve the first observed enabled state'
+printf '%s\n' '[2/15] repeated health freezes preserve the first observed enabled state'
 eval "$(extract_function rr_freeze_health_monitor)"
 RR_HEALTH_MONITOR_FROZEN=false
 RR_HEALTH_TIMER_WAS_ENABLED=false
@@ -295,13 +295,13 @@ run_recovery_case() (
     [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'successful recovery left maintenance marker'
 )
 
-printf '%s\n' '[3/14] state-record crash recovery touches no service before freezing begins'
+printf '%s\n' '[3/15] state-record crash recovery touches no service before freezing begins'
 run_recovery_case state-recorded false state_recorded
 
-printf '%s\n' '[4/14] pre-mutation crash recovery restores exact active/enabled state'
+printf '%s\n' '[4/15] pre-mutation crash recovery restores exact active/enabled state'
 run_recovery_case restore-success false
 
-printf '%s\n' '[5/14] a real SIGKILL leaves durable state that standalone recovery consumes'
+printf '%s\n' '[5/15] a real SIGKILL leaves durable state that standalone recovery consumes'
 sig_root="$TEST_ROOT/sigkill"
 sig_tx="$sig_root/update/transactions/tx"
 sig_marker="$sig_root/run/update-maintenance"
@@ -332,7 +332,7 @@ set -e
 [ -f "$sig_root/update/active" ] && [ -f "$sig_marker" ] || fail 'SIGKILL lost durable recovery pointers'
 run_recovery_case sigkill false freezing true
 
-printf '%s\n' '[6/14] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
+printf '%s\n' '[6/15] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
 kill_root="$TEST_ROOT/recovery-sigkill"
 kill_tx="$kill_root/update/transactions/tx"
 kill_timer_active="$kill_root/health-timer-active"
@@ -400,13 +400,13 @@ set -e
 [ -e "$kill_root/update/active" ] && [ -e "$kill_root/run/update-maintenance" ] || \
     fail 'runtime-restore SIGKILL discarded transaction evidence'
 
-printf '%s\n' '[7/14] restart failure is fail-closed and retains transaction evidence'
+printf '%s\n' '[7/15] restart failure is fail-closed and retains transaction evidence'
 run_recovery_case restore-failure true
 run_recovery_case restore-query-error query-error
 run_recovery_case restore-absent absent
 run_recovery_case restore-incoherent incoherent
 
-printf '%s\n' '[8/14] a committed crash retries finalization before clearing maintenance'
+printf '%s\n' '[8/15] a committed crash retries finalization before clearing maintenance'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -423,6 +423,7 @@ printf '%s\n' '[8/14] a committed crash retries finalization before clearing mai
         printf '%s\n' restore-called >> "$restore_log"
         return 97
     }
+    rr_restore_recorded_writer_state() { return 0; }
     tx="$RR_TX_ROOT/transactions/tx"
     mkdir -p "$tx/backup" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")" \
         "$(dirname "$RR_LAUNCHER")" "$RR_LIB_DIR/modules"
@@ -430,8 +431,11 @@ printf '%s\n' '[8/14] a committed crash retries finalization before clearing mai
     chmod 0755 "$RR_LIB_DIR" "$RR_LIB_DIR/modules"
     printf 'SCRIPT_VERSION="7.1.1"\n' > "$RR_LIB_DIR/modules/00-runtime.sh"
     chmod 0600 "$RR_LIB_DIR/modules/00-runtime.sh"
+    printf '2\n' > "$tx/transaction-format"
+    : > "$tx/backup/writer_state_complete"
     : > "$tx/backup/health_timer_was_enabled"
-    chmod 600 "$tx/backup/health_timer_was_enabled"
+    chmod 600 "$tx/transaction-format" "$tx/backup/writer_state_complete" \
+        "$tx/backup/health_timer_was_enabled"
     printf '%s\n' '#!/bin/bash' \
         'printf "%s %s\n" "${RR_UPDATE_LOCK_HELD:-}" "$*" >> "$RR_TEST_FINALIZE_LOG"' \
         'exit "${RR_TEST_FINALIZE_FAIL:-0}"' > "$RR_LAUNCHER"
@@ -808,7 +812,7 @@ printf '%s\n' '[8/14] a committed crash retries finalization before clearing mai
         fail 'rolling_back boot recovery skipped its durable gate or restore'
 )
 
-printf '%s\n' '[9/14] aborted recovery is idempotent and requires a durable active unlink'
+printf '%s\n' '[9/15] aborted recovery is idempotent and requires a durable active unlink'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -913,7 +917,7 @@ printf '%s\n' '[9/14] aborted recovery is idempotent and requires a durable acti
         fail 'republished aborted recovery regressed into rollback'
 )
 
-printf '%s\n' '[10/14] normal terminal cleanup retries restore the recorded writer state'
+printf '%s\n' '[10/15] normal terminal cleanup retries restore the recorded writer state'
 for terminal_phase in committed rolled_back aborted; do
     (
         export RR_UPDATE_RECOVER_SOURCE_ONLY=1
@@ -1028,7 +1032,7 @@ active_line=$(grep -n 'rr_clear_active_transaction_pointer' <<<"$terminal_branch
     [ "$marker_line" -lt "$active_line" ] ||
     fail 'terminal cleanup is not ordered writer-restore, global-sync, maintenance, active'
 
-printf '%s\n' '[11/14] invalid evidence and systemd query errors fail closed with health writers frozen'
+printf '%s\n' '[11/15] invalid evidence and systemd query errors fail closed with health writers frozen'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -1299,7 +1303,7 @@ printf '%s\n' '[11/14] invalid evidence and systemd query errors fail closed wit
     assert_health_frozen 'systemd query-error handling'
 )
 
-printf '%s\n' '[12/14] recorded subscription state resumes through the narrow bounded entry point'
+printf '%s\n' '[12/15] recorded subscription state resumes through the narrow bounded entry point'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_TX_ROOT="$TEST_ROOT/subscription-resume/update"
@@ -1371,7 +1375,7 @@ printf '%s\n' '[12/14] recorded subscription state resumes through the narrow bo
         fail 'a partial subscription refresh left its managed worker alive'
 )
 
-printf '%s\n' '[13/14] recovery bridges legacy locks and delegates both flock descriptors safely'
+printf '%s\n' '[13/15] recovery bridges legacy locks and delegates both flock descriptors safely'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=0
@@ -1535,9 +1539,84 @@ printf '%s\n' '[13/14] recovery bridges legacy locks and delegates both flock de
     trap - EXIT
 )
 
-printf '%s\n' '[14/14] maintenance state is root-only and bound to one transaction'
+printf '%s\n' '[14/15] maintenance state is root-only and bound to one transaction'
 grep -Fq "0:0:600:1" "$REPO_ROOT/scripts/install-core.sh" || fail 'installer lacks strict maintenance marker mode check'
 grep -Fq '[ "$owner" = "$marker_tx" ]' "$REPO_ROOT/scripts/install-core.sh" || fail 'installer marker is not transaction-bound'
 grep -Fq '[ "$value" = "$tx" ]' "$REPO_ROOT/scripts/update-recover.sh" || fail 'recovery marker is not transaction-bound'
+
+printf '%s\n' '[15/15] legacy committed recovery preserves the 7.1.0 terminal contract'
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    unset RR_UPDATE_RECOVER_SOURCE_ONLY
+
+    RR_TX_ROOT="$TEST_ROOT/legacy-committed/update"
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    RR_LIB_DIR="$TEST_ROOT/legacy-committed/runtime"
+    RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/legacy-committed/run/update-maintenance"
+    RR_UPDATE_LOCK_HELD=1
+    RR_UPDATE_LOCK_FDS_CLOSED=1
+    tx="$RR_TX_ROOT/transactions/20260830T000000Z-710"
+    mkdir -p "$tx/backup" "$RR_LIB_DIR/modules" \
+        "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
+    chmod 700 "$RR_TX_ROOT" "$RR_TX_ROOT/transactions" "$tx" "$tx/backup" \
+        "$RR_LIB_DIR" "$RR_LIB_DIR/modules" \
+        "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
+    printf 'SCRIPT_VERSION="7.1.0"\n' > "$RR_LIB_DIR/modules/00-runtime.sh"
+    printf '%s\n' committed > "$tx/phase"
+    printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+    chmod 600 "$RR_LIB_DIR/modules/00-runtime.sh" "$tx/phase" "$RR_ACTIVE_TX"
+
+    finalize_calls=0
+    writer_calls=0
+    systemd_calls=0
+    rr_finalize_committed_candidate() {
+        finalize_calls=$((finalize_calls + 1))
+        return 1
+    }
+    rr_restore_recorded_writer_state() {
+        writer_calls=$((writer_calls + 1))
+        return 1
+    }
+    rr_freeze_health_writers_strict() {
+        writer_calls=$((writer_calls + 1))
+        return 1
+    }
+    systemctl() {
+        systemd_calls=$((systemd_calls + 1))
+        return 1
+    }
+
+    main recover >/dev/null 2>&1 ||
+        fail 'legacy committed recovery rejected an absent maintenance marker'
+    [ -f "$RR_ACTIVE_TX" ] && [ "$(cat "$tx/phase")" = committed ] ||
+        fail 'legacy committed recovery retired the old rollback window itself'
+    [ "$finalize_calls" -eq 0 ] && [ "$writer_calls" -eq 0 ] &&
+        [ "$systemd_calls" -eq 0 ] ||
+        fail 'legacy committed recovery invoked a v2 finalizer or replayed writers'
+
+    printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
+    chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
+    main recover >/dev/null 2>&1 ||
+        fail 'legacy committed recovery could not clear its matching retry marker'
+    [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] && [ -f "$RR_ACTIVE_TX" ] ||
+        fail 'legacy committed retry did not converge marker-only residue safely'
+    [ "$finalize_calls" -eq 0 ] && [ "$writer_calls" -eq 0 ] &&
+        [ "$systemd_calls" -eq 0 ] ||
+        fail 'legacy committed retry touched candidate or writer state'
+
+    printf '%s\n' "$tx-forged" > "$RR_UPDATE_MAINTENANCE_FILE"
+    chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
+    if main recover >/dev/null 2>&1; then
+        fail 'legacy committed recovery accepted a mismatched maintenance marker'
+    fi
+    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ -f "$RR_ACTIVE_TX" ] &&
+        [ "$(cat "$tx/phase")" = committed ] ||
+        fail 'unsafe legacy maintenance evidence was not retained fail-closed'
+    [ "$finalize_calls" -eq 0 ] && [ "$writer_calls" -eq 0 ] &&
+        [ "$systemd_calls" -eq 0 ] ||
+        fail 'unsafe legacy evidence triggered finalization or writer mutation'
+)
 
 printf '%s\n' 'update writer freeze regression: PASS'

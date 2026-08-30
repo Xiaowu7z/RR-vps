@@ -34,7 +34,7 @@ make_phase() {
     chmod 600 "$transaction/phase"
 }
 
-printf '%s\n' '[1/10] cleanup preserves a committed transaction even if the active flag is stale'
+printf '%s\n' '[1/11] cleanup preserves a committed transaction even if the active flag is stale'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -79,7 +79,7 @@ printf '%s\n' '[1/10] cleanup preserves a committed transaction even if the acti
         fail 'cleanup removed committed transaction evidence'
 )
 
-printf '%s\n' '[2/10] direct rollback also refuses a trusted committed phase'
+printf '%s\n' '[2/11] direct rollback also refuses a trusted committed phase'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -325,16 +325,16 @@ EOF
         fail 'rollback terminal phase was published before restored host state was durable'
 )
 
-printf '%s\n' '[3/10] rollback re-freezes a candidate-reenabled health timer before old restore'
+printf '%s\n' '[3/11] rollback re-freezes a candidate-reenabled health timer before old restore'
 run_migrating_rollback health-success false
 
-printf '%s\n' '[4/10] systemctl query/bus failure blocks rollback before old runtime mutation'
+printf '%s\n' '[4/11] systemctl query/bus failure blocks rollback before old runtime mutation'
 run_migrating_rollback health-query-failure true
 
-printf '%s\n' '[5/10] inconsistent absent-but-enabled health service blocks rollback'
+printf '%s\n' '[5/11] inconsistent absent-but-enabled health service blocks rollback'
 run_migrating_rollback health-state-mismatch false false false true
 
-printf '%s\n' '[6/10] generic inactive and disabled checks reject query errors but accept absent units'
+printf '%s\n' '[6/11] generic inactive and disabled checks reject query errors but accept absent units'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_unit_activity_matches)"
@@ -369,13 +369,13 @@ printf '%s\n' '[6/10] generic inactive and disabled checks reject query errors b
         fail 'writer restore rejected a proven absent unit'
 )
 
-printf '%s\n' '[7/10] writer restore query failure retains maintenance and active evidence'
+printf '%s\n' '[7/11] writer restore query failure retains maintenance and active evidence'
 run_migrating_rollback writer-restore-query-failure false true false
 
-printf '%s\n' '[8/10] failed global durability barrier never publishes or clears a terminal rollback'
+printf '%s\n' '[8/11] failed global durability barrier never publishes or clears a terminal rollback'
 run_migrating_rollback rollback-sync-failure false false true
 
-printf '%s\n' '[9/10] prior aborted transactions are cleared durably before their directory is pruned'
+printf '%s\n' '[9/11] prior aborted transactions are cleared durably before their directory is pruned'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -547,7 +547,7 @@ printf '%s\n' '[9/10] prior aborted transactions are cleared durably before thei
     [ -d "$incomplete_tx" ] || fail 'pre-phase SIGKILL orphan was deleted as terminal'
 )
 
-printf '%s\n' '[10/10] settled format-2 retirement does not depend on rollback backup metadata'
+printf '%s\n' '[10/11] settled format-2 retirement does not depend on rollback backup metadata'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -612,6 +612,69 @@ printf '%s\n' '[10/10] settled format-2 retirement does not depend on rollback b
         fail 'settled retirement skipped idempotent recovery cleanup'
     [ "$(grep -c -- '--post-update-finalize' "$operation_log")" -eq 1 ] ||
         fail 'settled retirement repeated candidate finalization'
+)
+
+printf '%s\n' '[11/11] installer retires a legacy committed window without a v2 finalizer'
+(
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_dir_is_strict)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_format_state)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_phase)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_legacy_phase)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_previous_transaction_phase)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_active_transaction)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_private_value)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_committed_settled_state)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_republish_active_pointer_for_retry)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_clear_active_transaction_pointer)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_discard_previous_transaction)"
+
+    RR_TX_ROOT="$TEST_ROOT/discard-legacy-committed/update"
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    RR_LAUNCHER="$TEST_ROOT/discard-legacy-committed/old-rr"
+    RR_RECOVERY_HELPER="$TEST_ROOT/discard-legacy-committed/recover"
+    RR_COMMITTED_SETTLED_NAME=committed-settled
+    RR_COMMITTED_SETTLED_VALUE=rr-update-committed-settled-v1
+    RR_UPDATE_MAINTENANCE_ACTIVE=false
+    tx="$RR_TX_ROOT/transactions/tx"
+    operation_log="$TEST_ROOT/discard-legacy-committed/operations"
+    mkdir -p "$tx"
+    chmod 700 "$RR_TX_ROOT" "$tx"
+    printf 'committed\n' > "$tx/phase"
+    printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+    chmod 600 "$tx/phase" "$RR_ACTIVE_TX"
+    : > "$operation_log"
+    rr_create_update_maintenance_marker() {
+        fail 'legacy committed retirement created a format-2 maintenance window'
+    }
+    rr_run_with_delegated_update_lock() {
+        printf '%s\n' "$*" >> "$operation_log"
+        [ "$1" = "$RR_RECOVERY_HELPER" ] && [ "${2:-}" = recover ]
+    }
+    rr_error() { fail "$*"; }
+
+    rr_discard_previous_transaction ||
+        fail 'installer could not retire a recovered 7.1.0 committed window'
+    [ ! -e "$RR_ACTIVE_TX" ] && [ ! -e "$tx" ] ||
+        fail 'legacy committed retirement retained its pointer or transaction directory'
+    [ "$(cat "$operation_log")" = "$RR_RECOVERY_HELPER recover" ] ||
+        fail 'legacy committed retirement invoked the old launcher or an unexpected helper'
+    ! grep -Fq -- '--post-update-finalize' "$operation_log" ||
+        fail 'legacy committed retirement invoked the unsupported v2 finalizer'
 )
 
 printf '%s\n' 'install-core rollback boundary regressions: PASS'

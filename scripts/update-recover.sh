@@ -10,6 +10,7 @@ RR_LIB_DIR="${RR_LIB_DIR:-/usr/local/lib/rr}"
 RR_LAUNCHER="${RR_LAUNCHER:-/usr/local/bin/rr}"
 RR_CONFIG_FILE="${RR_CONFIG_FILE:-/etc/argo_vmess.conf}"
 RR_SUBSCRIPTION_SAFE_VERSION="7.1.1"
+RR_POST_UPDATE_FINALIZE_VERSION="7.1.1"
 RR_QUARANTINE_FILE="${RR_QUARANTINE_FILE:-${RR_TX_ROOT}/subscription-quarantine}"
 RR_QUARANTINE_UNIT="${RR_QUARANTINE_UNIT:-/etc/systemd/system/rr-subscription-quarantine.service}"
 RR_QUARANTINE_READY="${RR_QUARANTINE_READY:-/run/rr-subscription-quarantine.ready}"
@@ -2513,6 +2514,32 @@ main() {
         fi
         rr_recover_log "format-2 active/phase metadata is incomplete or unsafe; transaction retained at $tx"
         return 1
+    fi
+    # A pre-7.1.1 committed transaction predates format 2, the
+    # committed-settled marker, and the --post-update-finalize launcher entry
+    # point.  Under that contract, committed was already terminal and recover
+    # intentionally left the rollback window untouched for the next installer
+    # to retire.  The missing format marker alone is not enough to identify
+    # that contract because early 7.1.1 transactions also used format 1; bind
+    # the exception to the trusted live runtime version.  Do not invoke a
+    # legacy launcher with a command it cannot understand, and do not replay
+    # its writer snapshot over host state that may have legitimately changed
+    # after the old installation completed.
+    if [ "$mode" = recover ] && [ "$phase" = committed ] && \
+       [ "$format_state" -eq 1 ]; then
+        local legacy_runtime_version=""
+        legacy_runtime_version=$(rr_trusted_runtime_version "$RR_LIB_DIR" 2>/dev/null) || {
+            rr_recover_log "format-1 committed runtime version is unsafe; rollback evidence was retained"
+            return 1
+        }
+        if ! rr_version_ge "$legacy_runtime_version" "$RR_POST_UPDATE_FINALIZE_VERSION"; then
+            if ! rr_clear_update_maintenance_marker "$tx"; then
+                rr_recover_log "legacy committed maintenance evidence is unsafe; rollback evidence was retained"
+                return 1
+            fi
+            rr_recover_log "legacy committed transaction is already terminal; rollback evidence was retained"
+            return 0
+        fi
     fi
     # A valid settled marker retires automatic writer-state replay.  Recovery
     # still validates the live control metadata, but rollback-only backup
