@@ -209,9 +209,11 @@ ensure_singbox_core() {
     return 0
 }
 
-setup_systemd() {
+write_singbox_systemd_unit() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
     local unit_tmp=""
-    unit_tmp=$(mktemp /etc/systemd/system/.sing-box.service.XXXXXX) || return 1
+    install -d -m 755 "$(dirname "$service_file")" || return 1
+    unit_tmp=$(mktemp "$(dirname "$service_file")/.sing-box.service.XXXXXX") || return 1
     if ! cat > "$unit_tmp" <<EOF
 [Unit]
 Description=Sing-box service managed by RR-vps
@@ -240,7 +242,11 @@ EOF
         return 1
     fi
     chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
-    mv -f "$unit_tmp" /etc/systemd/system/sing-box.service || { rm -f "$unit_tmp"; return 1; }
+    mv -f "$unit_tmp" "$service_file" || { rm -f "$unit_tmp"; return 1; }
+}
+
+setup_systemd() {
+    write_singbox_systemd_unit || return 1
     systemctl daemon-reload || return 1
     systemctl enable sing-box >/dev/null 2>&1 || return 1
     restart_singbox
@@ -256,11 +262,15 @@ ensure_node_service_running() {
     fi
 }
 
-setup_health_monitor() {
+write_health_monitor_units() {
+    local health_service_file="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
+    local health_timer_file="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
     local service_tmp=""
     local timer_tmp=""
-    service_tmp=$(mktemp /etc/systemd/system/.argo-rr-health.service.XXXXXX) || return 1
-    timer_tmp=$(mktemp /etc/systemd/system/.argo-rr-health.timer.XXXXXX) || {
+    install -d -m 755 "$(dirname "$health_service_file")" \
+        "$(dirname "$health_timer_file")" || return 1
+    service_tmp=$(mktemp "$(dirname "$health_service_file")/.argo-rr-health.service.XXXXXX") || return 1
+    timer_tmp=$(mktemp "$(dirname "$health_timer_file")/.argo-rr-health.timer.XXXXXX") || {
         rm -f "$service_tmp"
         return 1
     }
@@ -304,14 +314,18 @@ EOF
         rm -f "$service_tmp" "$timer_tmp"
         return 1
     }
-    mv -f "$service_tmp" /etc/systemd/system/argo-rr-health.service || {
+    mv -f "$service_tmp" "$health_service_file" || {
         rm -f "$service_tmp" "$timer_tmp"
         return 1
     }
-    mv -f "$timer_tmp" /etc/systemd/system/argo-rr-health.timer || {
+    mv -f "$timer_tmp" "$health_timer_file" || {
         rm -f "$timer_tmp"
         return 1
     }
+}
+
+setup_health_monitor() {
+    write_health_monitor_units || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
     systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || return 1
     return 0

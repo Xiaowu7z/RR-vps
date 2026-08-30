@@ -93,6 +93,16 @@ jobs:
             exit "$rc"
           }
           trap audit_exit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
           test "$(id -u)" -eq 0
           # shellcheck disable=SC1091
           . /etc/os-release
@@ -260,12 +270,16 @@ jobs:
           test "$(stat -c %a /etc/rr-nexus/nexus.json)" = 600
           test "$(stat -c %a /root/rr-audit-panel-pass)" = 600
           test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
-          test -z "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA foreign_key_check;')"
-          systemctl is-active --quiet sing-box
-          systemctl is-active --quiet rr-nexus
-          systemctl is-active --quiet nginx
-          systemctl is-enabled --quiet sing-box
-          systemctl is-enabled --quiet rr-nexus
+          foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'PRAGMA foreign_key_check;') || exit 1
+          test -z "$foreign_key_errors"
+          test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = public
+          test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
+          test "$(jq -r '.port' /etc/rr-nexus/nexus.json)" = 7900
+          test "$(jq -r '.public_port' /etc/rr-nexus/nexus.json)" = 8443
+          assert_unit_state sing-box.service loaded:active:enabled
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state nginx.service loaded:active:enabled
           /usr/local/bin/sing-box check -c /etc/sing-box/config.json
           for inbound_tag in vmess-in vless-in hy2-in tuic5-in anytls-in naive-in; do
             jq -e --arg wanted "$inbound_tag" \
@@ -430,6 +444,16 @@ jobs:
             exit "$rc"
           }
           trap audit_exit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
           test "$(id -u)" -eq 0
           # shellcheck disable=SC1091
           . /etc/os-release
@@ -593,9 +617,9 @@ jobs:
           fi
           unset panel_pass
 
-          systemctl is-active --quiet sing-box
-          systemctl is-active --quiet rr-nexus
-          systemctl is-active --quiet nginx
+          assert_unit_state sing-box.service loaded:active:enabled
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state nginx.service loaded:active:enabled
           test -s /tmp/sub_server.pid
           kill -0 "$(cat /tmp/sub_server.pid)"
           printf 'old-state-built\n' > /root/rr-audit-stage
@@ -642,7 +666,9 @@ jobs:
           }
           assert_persisted_data() {
             test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
-            test -z "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA foreign_key_check;')"
+            foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              'PRAGMA foreign_key_check;') || return 1
+            test -z "$foreign_key_errors"
             test "$(device_row)" = "$(cat /root/rr-audit-before-device.txt)"
             for key in UUID PORT SUB_PORT SUB_PUBLIC_PORT_IPV4 SUB_PUBLIC_PORT_IPV6 \
               VM_ENABLED VM_TLS_ENABLED VL_ENABLED VL_PORT \
@@ -691,9 +717,9 @@ jobs:
               awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null
             )
             /usr/local/bin/sing-box check -c /etc/sing-box/config.json >/dev/null
-            systemctl is-active --quiet sing-box
-            systemctl is-active --quiet rr-nexus
-            systemctl is-active --quiet nginx
+            assert_unit_state sing-box.service loaded:active:enabled
+            assert_unit_state rr-nexus.service loaded:active:enabled
+            assert_unit_state nginx.service loaded:active:enabled
             candidate_subscription_running
             test -s /run/rr-vps-subscription.pid
             grep -qx 'SUB_ACCESS_MODE=local' /etc/argo_vmess.conf
@@ -734,8 +760,7 @@ jobs:
             test "$(stat -c '%U:%G:%a' /run/rr-subscription-quarantine.ready)" = root:root:600
             test "$(stat -c '%U:%G:%a' /var/lib/rr-quarantine/guard-state)" = root:root:600
             test "$(stat -c '%U:%G:%a' /usr/local/libexec/rr-vps/subscription-quarantine-guard)" = root:root:700
-            systemctl is-active --quiet rr-subscription-quarantine
-            systemctl is-enabled --quiet rr-subscription-quarantine
+            assert_unit_state rr-subscription-quarantine.service loaded:active:enabled
             if managed_subscription_process_exists; then
               echo 'B quarantine left a managed legacy subscription worker running.' >&2
               return 1
@@ -780,14 +805,8 @@ jobs:
           test ! -e /etc/systemd/system/rr-subscription-quarantine.service
           test ! -e /var/lib/rr-quarantine/guard-state
           test ! -e /usr/local/libexec/rr-vps/subscription-quarantine-guard
-          if systemctl is-active --quiet rr-subscription-quarantine; then
-            echo 'B safe re-upgrade left the quarantine service active.' >&2
-            exit 1
-          fi
-          if systemctl is-enabled --quiet rr-subscription-quarantine; then
-            echo 'B safe re-upgrade left the quarantine service enabled.' >&2
-            exit 1
-          fi
+          assert_unit_state rr-subscription-quarantine.service \
+            not-found:inactive:not-found
           for backend in iptables ip6tables; do
             command -v "$backend" >/dev/null 2>&1 || continue
             set +e
@@ -827,6 +846,16 @@ jobs:
             exit "$rc"
           }
           trap audit_exit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
           test "$(id -u)" -eq 0
           # Re-enter the unsafe rollback once more and invoke the actual
           # restored 7.1.0 menu uninstaller. It knows nothing about quarantine
@@ -852,8 +881,7 @@ jobs:
           test "$(stat -c '%U:%G:%a' /run/rr-subscription-quarantine.ready)" = root:root:600
           test "$(stat -c '%U:%G:%a' /var/lib/rr-quarantine/guard-state)" = root:root:600
           test "$(stat -c '%U:%G:%a' /usr/local/libexec/rr-vps/subscription-quarantine-guard)" = root:root:700
-          systemctl is-active --quiet rr-subscription-quarantine
-          systemctl is-enabled --quiet rr-subscription-quarantine
+          assert_unit_state rr-subscription-quarantine.service loaded:active:enabled
           for backend in iptables ip6tables; do
             command -v "$backend" >/dev/null 2>&1 || continue
             "$backend" -w 5 -t raw -C PREROUTING ! -i lo -p tcp --dport 18081 \
@@ -869,10 +897,7 @@ jobs:
             uninstall_all
           ' >/root/rr-audit-710-uninstall.log 2>&1
           for _ in $(seq 1 100); do
-            if ! systemctl is-active --quiet rr-subscription-quarantine &&
-               [ ! -e /etc/systemd/system/rr-subscription-quarantine.service ]; then
-              break
-            fi
+            [ -e /etc/systemd/system/rr-subscription-quarantine.service ] || break
             sleep 0.1
           done
           test ! -e /var/lib/rr-update/subscription-quarantine
@@ -882,14 +907,8 @@ jobs:
           test ! -e /usr/local/libexec/rr-vps/subscription-quarantine-guard
           test ! -e /usr/local/sbin/rr-update-recover
           test ! -e /usr/local/bin/rr
-          if systemctl is-active --quiet rr-subscription-quarantine; then
-            echo 'B legacy uninstall left the quarantine service active.' >&2
-            exit 1
-          fi
-          if systemctl is-enabled --quiet rr-subscription-quarantine; then
-            echo 'B legacy uninstall left the quarantine service enabled.' >&2
-            exit 1
-          fi
+          assert_unit_state rr-subscription-quarantine.service \
+            not-found:inactive:not-found
           for backend in iptables ip6tables; do
             command -v "$backend" >/dev/null 2>&1 || continue
             if ! rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null); then
@@ -901,11 +920,7 @@ jobs:
               exit 1
             fi
           done
-          if systemctl is-active --quiet rr-nexus ||
-             systemctl is-enabled --quiet rr-nexus; then
-            echo 'B legacy uninstall left RR Nexus active or enabled.' >&2
-            exit 1
-          fi
+          assert_unit_state rr-nexus.service not-found:inactive:not-found
           test ! -e /etc/systemd/system/rr-nexus.service
           test ! -e /etc/rr-nexus
           test ! -e /var/lib/rr-nexus
@@ -1011,6 +1026,16 @@ jobs:
             exit "$rc"
           }
           trap audit_exit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
           test "$(id -u)" -eq 0
           # shellcheck disable=SC1091
           . /etc/os-release
@@ -1189,8 +1214,7 @@ jobs:
           test "$(jq -r '.public_port' /etc/rr-nexus/nexus.json)" = 17900
           test "$(stat -c %a /etc/rr-nexus/nexus.json)" = 600
           test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
-          systemctl is-active --quiet rr-nexus
-          systemctl is-enabled --quiet rr-nexus
+          assert_unit_state rr-nexus.service loaded:active:enabled
           curl -fsS --connect-timeout 5 --max-time 15 \
             http://127.0.0.1:7900/healthz >/dev/null
           ss -H -ltn 'sport = :7900' | awk '{print $4}' | grep -Eq '^127\.0\.0\.1:7900$'
@@ -1262,6 +1286,16 @@ jobs:
             exit "$rc"
           }
           trap audit_exit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
           install_candidate() {
             RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" \
             RR_GUARD_FILE="$stage/update-guard.sh" \
@@ -1282,9 +1316,10 @@ jobs:
             assert_candidate
             test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
             test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
-            test -z "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA foreign_key_check;')"
-            systemctl is-active --quiet rr-nexus
-            systemctl is-enabled --quiet rr-nexus
+            foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              'PRAGMA foreign_key_check;') || return 1
+            test -z "$foreign_key_errors"
+            assert_unit_state rr-nexus.service loaded:active:enabled
             curl -fsS --connect-timeout 5 --max-time 15 \
               http://127.0.0.1:7900/healthz >/dev/null
             bash -c '
@@ -1335,7 +1370,7 @@ jobs:
                 root:root:600:1
             done
             test "$(cat "$candidate_tx/transaction-format")" = 2
-            systemctl is-enabled --quiet rr-update-recovery.service
+            assert_unit_state rr-update-recovery.service loaded:inactive:enabled
             maintenance_file=/run/rr-vps/update-maintenance
             test -f "$maintenance_file"
             test ! -L "$maintenance_file"
@@ -1352,10 +1387,7 @@ jobs:
           active_tx=$(active_transaction)
           test "$(cat "$active_tx/phase")" = switching
           test -e /run/rr-vps/update-maintenance
-          if systemctl is-active --quiet rr-nexus; then
-            echo 'C Nexus restarted before old_runtime_moved recovery completed.' >&2
-            exit 1
-          fi
+          assert_unit_state rr-nexus.service loaded:inactive:enabled
           /usr/local/sbin/rr-update-recover recover \
             >>/root/rr-audit-crash-old-runtime.log 2>&1
           test ! -e /var/lib/rr-update/active
@@ -1378,10 +1410,7 @@ jobs:
           active_tx=$(active_transaction)
           test "$(cat "$active_tx/phase")" = runtime_swapped
           test -e /run/rr-vps/update-maintenance
-          if systemctl is-active --quiet rr-nexus; then
-            echo 'C Nexus restarted before runtime_swapped recovery completed.' >&2
-            exit 1
-          fi
+          assert_unit_state rr-nexus.service loaded:inactive:enabled
           systemctl start rr-update-recovery.service \
             >>/root/rr-audit-crash-runtime-swapped.log 2>&1
           test "$(systemctl show rr-update-recovery.service -p Result --value)" = success
@@ -1404,10 +1433,945 @@ jobs:
             exit 1
           fi
 
+  cross-machine-migration-scale:
+    name: A → C · encrypted migration and 500-device scale
+    if: github.ref == 'refs/heads/main'
+    needs: [debian-full, ubuntu-transaction]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify candidate and prepare SSH client
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/rebuild-bundle.py --check
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Exercise real scale sync and encrypted A-to-C restore
+        shell: bash
+        env:
+          RR_A_HOST: ${{ secrets.RR_A_HOST }}
+          RR_A_HOST_KEY: ${{ secrets.RR_A_HOST_KEY }}
+          RR_A_PASS: ${{ secrets.RR_A_PASS }}
+          RR_C_HOST: ${{ secrets.RR_C_HOST }}
+          RR_C_HOST_KEY: ${{ secrets.RR_C_HOST_KEY }}
+          RR_C_PASS: ${{ secrets.RR_C_PASS }}
+        run: |
+          set -euo pipefail
+          set +x
+          a_host="$RR_A_HOST"
+          c_host="$RR_C_HOST"
+          a_known_hosts="$RUNNER_TEMP/known-hosts-migration-A"
+          c_known_hosts="$RUNNER_TEMP/known-hosts-migration-C"
+          passphrase_file="$RUNNER_TEMP/rr-audit-cross-passphrase"
+          backup_file="$RUNNER_TEMP/rr-audit-cross.rrbak"
+          fingerprint_file="$RUNNER_TEMP/rr-audit-cross-fingerprint.json"
+
+          prepare_known_hosts() {
+            local host="$1" pinned_key="$2" destination="$3"
+            local host_key_type="" host_key_data="" host_key_extra=""
+            [[ "$pinned_key" != *$'\n'* ]]
+            read -r host_key_type host_key_data host_key_extra <<<"$pinned_key"
+            [ "$host_key_type" = ssh-ed25519 ]
+            [[ "$host_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+            [ -z "$host_key_extra" ]
+            (umask 077; printf '%s %s %s\n' \
+              "$host" "$host_key_type" "$host_key_data" > "$destination")
+            ssh-keygen -F "$host" -f "$destination" >/dev/null
+          }
+          prepare_known_hosts "$a_host" "$RR_A_HOST_KEY" "$a_known_hosts"
+          prepare_known_hosts "$c_host" "$RR_C_HOST_KEY" "$c_known_hosts"
+          ssh_common=(
+            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o LogLevel=ERROR -o PreferredAuthentications=password
+            -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
+          )
+
+          recover_audit_source_config() {
+            SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" '
+                set -euo pipefail
+                backup=/root/rr-audit-cross-source-config
+                if [ -e "$backup" ] || [ -L "$backup" ]; then
+                  [ -f "$backup" ] && [ ! -L "$backup" ]
+                  [ "$(stat -c "%U:%G:%a:%h" "$backup")" = root:root:600:1 ]
+                  [ "$(grep -c "^NAIVE_ENABLED=true$" "$backup")" -eq 1 ]
+                  install -o root -g root -m 600 "$backup" /etc/argo_vmess.conf
+                  cmp -s "$backup" /etc/argo_vmess.conf
+                  rm -f -- "$backup"
+                fi
+                rm -f -- /root/rr-audit-cross-passphrase \
+                  /root/rr-audit-cross.rrbak \
+                  /root/rr-audit-cross-fingerprint.json
+              '
+          }
+
+          cleanup_audit_target_state() {
+            SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" '
+                set -euo pipefail
+                for backend in iptables ip6tables; do
+                  command -v "$backend" >/dev/null 2>&1 || continue
+                  while "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
+                    -m comment --comment argo-rr-managed-block -j DROP >/dev/null 2>&1; do
+                    "$backend" -w 5 -t filter -D INPUT -p tcp --dport 65431 \
+                      -m comment --comment argo-rr-managed-block -j DROP
+                  done
+                  while "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
+                    -m comment --comment argo-rr-audit-fixture \
+                    -j REDIRECT --to-ports 65431 >/dev/null 2>&1; do
+                    "$backend" -w 5 -t nat -D PREROUTING -p udp --dport 65432 \
+                      -m comment --comment argo-rr-audit-fixture \
+                      -j REDIRECT --to-ports 65431
+                  done
+                done
+                if command -v netfilter-persistent >/dev/null 2>&1; then
+                  netfilter-persistent save >/dev/null
+                elif command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
+                  service iptables save >/dev/null
+                fi
+                rm -f -- /root/rr-audit-cross-passphrase \
+                  /root/rr-audit-cross.rrbak \
+                  /root/rr-audit-cross-fingerprint.json \
+                  /root/rr-audit-cross-restored-fingerprint.json \
+                  /root/rr-audit-cross-target-access.json \
+                  /root/rr-audit-cross-target-network.txt \
+                  /root/rr-audit-cross-target-channel \
+                  /root/rr-audit-cross-target-bind \
+                  /root/rr-audit-cross-target-firewall \
+                  /root/rr-audit-cross-restored-firewall
+              '
+          }
+
+          cleanup_cross_audit() {
+            rc=$?
+            trap - EXIT
+            rm -f -- "$passphrase_file" "$backup_file" "$fingerprint_file"
+            recover_audit_source_config >/dev/null 2>&1 || rc=1
+            cleanup_audit_target_state >/dev/null 2>&1 || rc=1
+            exit "$rc"
+          }
+          trap cleanup_cross_audit EXIT
+
+          recover_audit_source_config
+          cleanup_audit_target_state
+          (umask 077; openssl rand -base64 48 > "$passphrase_file")
+          test "$(stat -c %a "$passphrase_file")" = 600
+          test "$(wc -c < "$passphrase_file")" -ge 48
+          SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$a_known_hosts" -q "$passphrase_file" \
+            "root@$a_host:/root/rr-audit-cross-passphrase"
+          SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" -q "$passphrase_file" \
+            "root@$c_host:/root/rr-audit-cross-passphrase"
+
+          SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" bash -s <<'REMOTE_A'
+          set -euo pipefail
+          umask 077
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+          passphrase_file=/root/rr-audit-cross-passphrase
+          backup_file=/root/rr-audit-cross.rrbak
+          fingerprint_file=/root/rr-audit-cross-fingerprint.json
+          source_config_backup=/root/rr-audit-cross-source-config
+          source_config_sha=""
+          nexus_stopped=false
+          health_timer_stopped=false
+          source_config_saved=false
+          finish_source_audit() {
+            rc=$?
+            trap - EXIT
+            if [ "$source_config_saved" = true ]; then
+              if install -o root -g root -m 600 "$source_config_backup" \
+                   /etc/argo_vmess.conf && \
+                 cmp -s "$source_config_backup" /etc/argo_vmess.conf && \
+                 [ "$(sha256sum /etc/argo_vmess.conf | awk '{print $1}')" = \
+                   "$source_config_sha" ]; then
+                rm -f -- "$source_config_backup" || rc=1
+              else
+                rc=1
+              fi
+            fi
+            if [ "$nexus_stopped" = true ]; then
+              systemctl start rr-nexus.service >/dev/null 2>&1 || rc=1
+            fi
+            if [ "$health_timer_stopped" = true ]; then
+              systemctl start argo-rr-health.timer >/dev/null 2>&1 || rc=1
+            fi
+            find /root -maxdepth 1 -type f -name 'rr-audit-cross-*' \
+              -exec chmod 600 {} + 2>/dev/null || true
+            exit "$rc"
+          }
+          trap finish_source_audit EXIT
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
+          test "$(id -u)" -eq 0
+          test "$(stat -c '%U:%G:%a:%h' "$passphrase_file")" = root:root:600:1
+          test -x /usr/local/bin/rr
+          grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf
+          grep -qx SUB_ACCESS_MODE=https /etc/argo_vmess.conf
+          assert_unit_state sing-box.service loaded:active:enabled
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          curl -fsS --connect-timeout 5 --max-time 15 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
+          foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'PRAGMA foreign_key_check;') || exit 1
+          test -z "$foreign_key_errors"
+
+          python3 - /var/lib/rr-nexus/nexus.db <<'PY'
+          import sqlite3
+          import sys
+          import uuid
+
+          database = sys.argv[1]
+          connection = sqlite3.connect(database, timeout=30)
+          try:
+              connection.execute("PRAGMA foreign_keys=ON")
+              columns = {
+                  row[1] for row in connection.execute("PRAGMA table_info(devices)")
+              }
+              required = {
+                  "id", "name", "credential", "subscription_token", "enabled",
+                  "quota_bytes", "used_bytes", "uploaded_bytes", "downloaded_bytes",
+                  "traffic_updated_at", "group_id", "expires_at", "next_reset_at",
+                  "reset_anchor_day", "reset_max", "reset_count", "created_at", "updated_at",
+              }
+              if not required.issubset(columns):
+                  raise RuntimeError("production device schema is incomplete")
+              connection.execute("BEGIN IMMEDIATE")
+              connection.execute("DELETE FROM devices")
+              rows = []
+              for index in range(1, 501):
+                  device_id = f"dev_a{index:011x}"
+                  credential = str(uuid.uuid5(uuid.NAMESPACE_URL, f"rr-audit-{index}"))
+                  token = f"RRAuditToken{index:012d}"
+                  rows.append((
+                      device_id, f"audit-device-{index:03d}", credential, token, 1,
+                      10_737_418_240 + index, 1_000_000 + index,
+                      400_000 + index, 600_000, "2026-08-30T00:00:00+00:00",
+                      None, "2030-08-30", "2029-09-30", 30, 36, 7,
+                      "2026-08-30T00:00:00+00:00", "2026-08-30T00:00:00+00:00",
+                  ))
+              connection.executemany(
+                  "INSERT INTO devices("
+                  "id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,"
+                  "uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,"
+                  "next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at"
+                  ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  rows,
+              )
+              connection.commit()
+          finally:
+              connection.close()
+          PY
+
+          install -d -m 700 /var/lib/rr-nexus/subscriptions /tmp/sub_server/nexus
+          printf 'stale\n' > /var/lib/rr-nexus/subscriptions/dev_deadbeef0000.txt
+          printf 'stale\n' > /tmp/sub_server/nexus/RRAuditStaleToken0001.txt
+          chmod 600 /var/lib/rr-nexus/subscriptions/dev_deadbeef0000.txt \
+            /tmp/sub_server/nexus/RRAuditStaleToken0001.txt
+
+          for scale in 1 10 100 500; do
+            python3 - /var/lib/rr-nexus/nexus.db "$scale" <<'PY'
+          import sqlite3
+          import sys
+
+          database, scale_raw = sys.argv[1:]
+          scale = int(scale_raw)
+          connection = sqlite3.connect(database, timeout=30)
+          try:
+              ids = [
+                  row[0] for row in connection.execute(
+                      "SELECT id FROM devices ORDER BY id LIMIT ?", (scale,)
+                  )
+              ]
+              if len(ids) != scale:
+                  raise RuntimeError("scale fixture is incomplete")
+              connection.execute("BEGIN IMMEDIATE")
+              connection.execute("UPDATE devices SET enabled=0")
+              connection.executemany(
+                  "UPDATE devices SET enabled=1 WHERE id=?",
+                  ((device_id,) for device_id in ids),
+              )
+              connection.commit()
+          finally:
+              connection.close()
+          PY
+            started_ns=$(date +%s%N)
+            timeout --kill-after=5 150 /usr/local/bin/rr --sync-devices \
+              >/root/rr-audit-cross-sync.log 2>&1
+            elapsed_ms=$((($(date +%s%N) - started_ns) / 1000000))
+            test "$elapsed_ms" -gt 0
+            test "$elapsed_ms" -lt 60000
+            test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              'SELECT COUNT(*) FROM devices WHERE enabled=1;')" -eq "$scale"
+            test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              'SELECT COUNT(*) FROM devices;')" -eq 500
+            test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
+            foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              'PRAGMA foreign_key_check;') || exit 1
+            test -z "$foreign_key_errors"
+            python3 - /var/lib/rr-nexus/nexus.db \
+              /var/lib/rr-nexus/subscriptions /tmp/sub_server/nexus "$scale" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sqlite3
+          import stat
+          import sys
+
+          database, private_raw, public_raw, scale_raw = sys.argv[1:]
+          scale = int(scale_raw)
+          private_root = Path(private_raw)
+          public_root = Path(public_raw)
+          suffixes = (
+              ".txt", ".json", ".yaml", "-vl.json", "-mihomo.yaml",
+              "-clash-verge.yaml", "-flclash.yaml", "-v2rayn.txt",
+              "-v2rayng.txt", "-sr.txt", "-nekobox.txt",
+          )
+          connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30)
+          try:
+              rows = connection.execute(
+                  "SELECT id,credential,subscription_token FROM devices "
+                  "WHERE enabled=1 ORDER BY id"
+              ).fetchall()
+          finally:
+              connection.close()
+          if len(rows) != scale:
+              raise RuntimeError("generated-tree device count differs from database")
+          expected_private = {f"{row[0]}{suffix}" for row in rows for suffix in suffixes}
+          expected_public = {f"{row[2]}{suffix}" for row in rows for suffix in suffixes}
+          expected_public.add("index.html")
+          if {path.name for path in private_root.iterdir()} != expected_private:
+              raise RuntimeError("private generated tree is not exact")
+          if {path.name for path in public_root.iterdir()} != expected_public:
+              raise RuntimeError("public generated tree is not exact")
+          for root in (private_root, public_root):
+              info = root.lstat()
+              if root.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                  raise RuntimeError("generated root is not a real directory")
+              if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o700):
+                  raise RuntimeError("generated root metadata is unsafe")
+          for device_id, credential, token in rows:
+              for suffix in suffixes:
+                  private_path = private_root / f"{device_id}{suffix}"
+                  public_path = public_root / f"{token}{suffix}"
+                  for path in (private_path, public_path):
+                      info = path.lstat()
+                      if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                          raise RuntimeError("generated artifact is not a single-link regular file")
+                      if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o600):
+                          raise RuntimeError("generated artifact metadata is unsafe")
+                  private_bytes = private_path.read_bytes()
+                  if private_bytes != public_path.read_bytes():
+                      raise RuntimeError("private/public generated artifacts differ")
+                  if suffix in {".json", "-vl.json"}:
+                      json.loads(private_bytes)
+              if credential.encode() not in (private_root / f"{device_id}.txt").read_bytes():
+                  raise RuntimeError("generated raw subscription omitted the device credential")
+          index = public_root / "index.html"
+          if index.read_bytes() != b"":
+              raise RuntimeError("public index is not empty")
+          index_info = index.lstat()
+          if not stat.S_ISREG(index_info.st_mode) or index_info.st_nlink != 1:
+              raise RuntimeError("public index is not a single-link regular file")
+          if (index_info.st_uid, index_info.st_gid, stat.S_IMODE(index_info.st_mode)) != (0, 0, 0o600):
+              raise RuntimeError("public index metadata is unsafe")
+          PY
+
+            sample_id=dev_a00000000001
+            sample_token=RRAuditToken000000000001
+            sample_credential=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+              "SELECT credential FROM devices WHERE id='$sample_id';")
+            private_per_device=$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+              -type f -name "${sample_id}*" -printf . | wc -c)
+            public_per_device=$(find /tmp/sub_server/nexus -maxdepth 1 \
+              -type f -name "${sample_token}*" -printf . | wc -c)
+            test "$private_per_device" -gt 0
+            test "$public_per_device" -gt 0
+            test "$private_per_device" -eq 11
+            test "$public_per_device" -eq 11
+            test "$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+              -type f -name 'dev_*' -printf . | wc -c)" \
+              -eq "$((scale * private_per_device))"
+            test "$(find /tmp/sub_server/nexus -maxdepth 1 \
+              -type f ! -name index.html -printf . | wc -c)" \
+              -eq "$((scale * public_per_device))"
+            test -f /tmp/sub_server/nexus/index.html
+            test ! -s /tmp/sub_server/nexus/index.html
+            test "$(stat -c '%U:%G:%a' /var/lib/rr-nexus/subscriptions)" = root:root:700
+            test "$(stat -c '%U:%G:%a' /tmp/sub_server/nexus)" = root:root:700
+            unexpected_path=$(find /var/lib/rr-nexus/subscriptions \
+              -mindepth 1 -maxdepth 1 -not -type f -print -quit) || exit 1
+            test -z "$unexpected_path"
+            unexpected_path=$(find /tmp/sub_server/nexus \
+              -mindepth 1 -maxdepth 1 -not -type f -print -quit) || exit 1
+            test -z "$unexpected_path"
+            unexpected_path=$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+              -type f -name 'dev_*' ! -perm 0600 -print -quit) || exit 1
+            test -z "$unexpected_path"
+            unexpected_path=$(find /tmp/sub_server/nexus -maxdepth 1 \
+              -type f ! -perm 0600 -print -quit) || exit 1
+            test -z "$unexpected_path"
+            test ! -e /var/lib/rr-nexus/subscriptions/dev_deadbeef0000.txt
+            test ! -e /tmp/sub_server/nexus/RRAuditStaleToken0001.txt
+            for suffix in .txt .json .yaml -vl.json -mihomo.yaml \
+              -clash-verge.yaml -flclash.yaml -v2rayn.txt -v2rayng.txt \
+              -sr.txt -nekobox.txt; do
+              test -f "/var/lib/rr-nexus/subscriptions/${sample_id}${suffix}"
+              test -f "/tmp/sub_server/nexus/${sample_token}${suffix}"
+              cmp -s "/var/lib/rr-nexus/subscriptions/${sample_id}${suffix}" \
+                "/tmp/sub_server/nexus/${sample_token}${suffix}"
+            done
+            grep -Fq "$sample_credential" \
+              "/var/lib/rr-nexus/subscriptions/${sample_id}.txt"
+            if [ "$scale" -lt 500 ]; then
+              printf -v disabled_suffix '%011x' "$((scale + 1))"
+              printf -v disabled_token 'RRAuditToken%012d' "$((scale + 1))"
+              unexpected_path=$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+                -type f -name "dev_a${disabled_suffix}*" -print -quit) || exit 1
+              test -z "$unexpected_path"
+              unexpected_path=$(find /tmp/sub_server/nexus -maxdepth 1 \
+                -type f -name "${disabled_token}*" -print -quit) || exit 1
+              test -z "$unexpected_path"
+            fi
+            printf 'RR_AUDIT_SCALE scale=%s elapsed_ms=%s\n' "$scale" "$elapsed_ms"
+          done
+
+          assert_unit_state argo-rr-health.timer loaded:active:enabled
+          systemctl stop argo-rr-health.timer
+          health_timer_stopped=true
+          systemctl stop argo-rr-health.service
+          assert_unit_state argo-rr-health.timer loaded:inactive:enabled
+          assert_unit_state argo-rr-health.service loaded:inactive:static
+          systemctl stop rr-nexus.service
+          nexus_stopped=true
+          assert_unit_state rr-nexus.service loaded:inactive:enabled
+          python3 - /var/lib/rr-nexus/nexus.db <<'PY'
+          import sqlite3
+          import sys
+
+          connection = sqlite3.connect(sys.argv[1], timeout=30)
+          try:
+              connection.execute("BEGIN IMMEDIATE")
+              device_values = []
+              for (device_id,) in connection.execute("SELECT id FROM devices ORDER BY id"):
+                  index = int(device_id.removeprefix("dev_a"), 16)
+                  device_values.append((
+                      10_737_418_240 + index, 1_000_000 + index,
+                      400_000 + index, 600_000, device_id,
+                  ))
+              if len(device_values) != 500:
+                  raise RuntimeError("source scale fixture changed before backup")
+              connection.executemany(
+                  "UPDATE devices SET enabled=1,quota_bytes=?,used_bytes=?,uploaded_bytes=?,"
+                  "downloaded_bytes=?,traffic_updated_at='2026-08-30T00:00:00+00:00',"
+                  "expires_at='2030-08-30',quota_reached_at=NULL,expiry_enforced_at=NULL,"
+                  "next_reset_at='2029-09-30',reset_anchor_day=30,reset_max=36,reset_count=7,"
+                  "updated_at='2026-08-30T00:00:00+00:00' WHERE id=?",
+                  device_values,
+              )
+              connection.execute(
+                  "UPDATE server_traffic_policy SET quota_bytes=1099511627776,"
+                  "count_mode='both',interface_name='',last_interface='',"
+                  "received_bytes=222222222,transmitted_bytes=333333333,"
+                  "initial_used_bytes=444444444,last_rx_counter=NULL,last_tx_counter=NULL,"
+                  "cycle_started_at='2026-08-01T00:00:00+00:00',"
+                  "updated_at='2026-08-30T00:00:00+00:00' WHERE id=1"
+              )
+              connection.commit()
+              if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                  raise RuntimeError("source database quick_check failed")
+              if connection.execute("PRAGMA foreign_key_check").fetchone():
+                  raise RuntimeError("source database foreign_key_check failed")
+          finally:
+              connection.close()
+          PY
+          sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA wal_checkpoint(FULL);' >/dev/null
+          python3 - /var/lib/rr-nexus/nexus.db "$fingerprint_file" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sqlite3
+          import sys
+
+          database, output = sys.argv[1:]
+          connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30)
+          try:
+              devices = connection.execute(
+                  "SELECT id,name,credential,subscription_token,enabled,quota_bytes,"
+                  "used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,"
+                  "group_id,expires_at,created_at,updated_at,quota_reached_at,expiry_enforced_at,"
+                  "next_reset_at,reset_anchor_day,reset_max,reset_count FROM devices ORDER BY id"
+              ).fetchall()
+              stable_policy = connection.execute(
+                  "SELECT id,quota_bytes,count_mode,interface_name,initial_used_bytes,cycle_started_at "
+                  "FROM server_traffic_policy WHERE id=1"
+              ).fetchone()
+              traffic = connection.execute(
+                  "SELECT received_bytes,transmitted_bytes FROM server_traffic_policy WHERE id=1"
+              ).fetchone()
+              if len(devices) != 500 or stable_policy is None or traffic is None:
+                  raise RuntimeError("source fingerprint is incomplete")
+          finally:
+              connection.close()
+          stable_payload = json.dumps(
+              {"devices": devices, "server_traffic_policy": stable_policy},
+              ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+          ).encode("utf-8")
+          document = {
+              "received_floor": int(traffic[0]),
+              "stable_sha256": hashlib.sha256(stable_payload).hexdigest(),
+              "transmitted_floor": int(traffic[1]),
+          }
+          descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+              json.dump(document, target, sort_keys=True, separators=(",", ":"))
+              target.write("\n")
+          PY
+          test "$(stat -c '%U:%G:%a:%h' "$fingerprint_file")" = root:root:600:1
+          test "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf)" -eq 1
+          cp -p -- /etc/argo_vmess.conf "$source_config_backup"
+          chmod 600 "$source_config_backup"
+          source_config_sha=$(sha256sum "$source_config_backup" | awk '{print $1}')
+          [[ "$source_config_sha" =~ ^[a-f0-9]{64}$ ]]
+          source_config_saved=true
+          sed -i 's/^NAIVE_ENABLED=true$/NAIVE_ENABLED=false/' /etc/argo_vmess.conf
+          test "$(grep -c '^NAIVE_ENABLED=false$' /etc/argo_vmess.conf)" -eq 1
+          passphrase=$(<"$passphrase_file")
+          test "${#passphrase}" -ge 10
+          RR_BACKUP_PASSPHRASE="$passphrase" \
+            timeout --kill-after=10 300 /usr/local/bin/rr backup "$backup_file" \
+            </dev/null >/root/rr-audit-cross-backup.log 2>&1
+          unset passphrase
+          test "$(stat -c '%U:%G:%a:%h' "$backup_file")" = root:root:600:1
+          test -s "$backup_file"
+          install -o root -g root -m 600 "$source_config_backup" /etc/argo_vmess.conf
+          cmp -s "$source_config_backup" /etc/argo_vmess.conf
+          test "$(sha256sum /etc/argo_vmess.conf | awk '{print $1}')" = "$source_config_sha"
+          rm -f -- "$source_config_backup"
+          source_config_saved=false
+          test "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf)" -eq 1
+          systemctl start rr-nexus.service
+          nexus_stopped=false
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          systemctl start argo-rr-health.timer
+          health_timer_stopped=false
+          assert_unit_state argo-rr-health.timer loaded:active:enabled
+          curl -fsS --connect-timeout 5 --max-time 15 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          REMOTE_A
+
+          SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$a_known_hosts" -q \
+            "root@$a_host:/root/rr-audit-cross.rrbak" "$backup_file"
+          SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$a_known_hosts" -q \
+            "root@$a_host:/root/rr-audit-cross-fingerprint.json" "$fingerprint_file"
+          chmod 600 "$backup_file" "$fingerprint_file"
+          test -s "$backup_file"
+          test -s "$fingerprint_file"
+          backup_sha=$(sha256sum "$backup_file" | awk '{print $1}')
+          fingerprint_sha=$(sha256sum "$fingerprint_file" | awk '{print $1}')
+          [[ "$backup_sha" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$fingerprint_sha" =~ ^[a-f0-9]{64}$ ]]
+          SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" -q "$backup_file" \
+            "root@$c_host:/root/rr-audit-cross.rrbak"
+          SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" -q "$fingerprint_file" \
+            "root@$c_host:/root/rr-audit-cross-fingerprint.json"
+
+          SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" bash -s -- \
+            "$backup_sha" "$fingerprint_sha" <<'REMOTE_C'
+          set -euo pipefail
+          umask 077
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+          expected_backup_sha="$1"
+          expected_fingerprint_sha="$2"
+          passphrase_file=/root/rr-audit-cross-passphrase
+          backup_file=/root/rr-audit-cross.rrbak
+          fingerprint_file=/root/rr-audit-cross-fingerprint.json
+          restored_fingerprint=/root/rr-audit-cross-restored-fingerprint.json
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
+          capture_rr_firewall_state() {
+            local output="$1" command_name="" rules="" temporary=""
+            temporary=$(mktemp "${output}.XXXXXX") || return 1
+            : > "$temporary" || { rm -f -- "$temporary"; return 1; }
+            for command_name in iptables-save ip6tables-save; do
+              if command -v "$command_name" >/dev/null 2>&1; then
+                rules=$("$command_name") || { rm -f -- "$temporary"; return 1; }
+                printf '%s\n' "${command_name}:present" >> "$temporary" || {
+                  rm -f -- "$temporary"
+                  return 1
+                }
+                if ! printf '%s\n' "$rules" | awk '
+                  /^\*/ { table=substr($0, 2); next }
+                  table == "filter" && $1 == "-A" && $2 == "INPUT" &&
+                    $0 ~ /--comment[[:space:]]+"?argo-rr-(managed|managed-block)"?([[:space:]]|$)/ {
+                      print table ":" $0
+                    }
+                  table == "nat" && $1 == "-A" && $2 == "PREROUTING" &&
+                    $0 ~ /--comment[[:space:]]+"?argo-rr-[A-Za-z0-9_-]+"?([[:space:]]|$)/ {
+                      print table ":" $0
+                    }
+                ' >> "$temporary"; then
+                  rm -f -- "$temporary"
+                  return 1
+                fi
+              else
+                printf '%s\n' "${command_name}:absent" >> "$temporary" || {
+                  rm -f -- "$temporary"
+                  return 1
+                }
+              fi
+            done
+            chmod 600 "$temporary" && mv -f -- "$temporary" "$output" || {
+              rm -f -- "$temporary"
+              return 1
+            }
+          }
+          persist_rr_firewall_fixture() {
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+              netfilter-persistent save >/dev/null
+            elif command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
+              service iptables save >/dev/null
+            else
+              return 1
+            fi
+          }
+          install_rr_firewall_fixture() {
+            local backend=""
+            for backend in iptables ip6tables; do
+              command -v "$backend" >/dev/null 2>&1 || return 1
+              "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
+                -m comment --comment argo-rr-managed-block -j DROP \
+                >/dev/null 2>&1 && return 1
+              "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
+                -m comment --comment argo-rr-audit-fixture \
+                -j REDIRECT --to-ports 65431 >/dev/null 2>&1 && return 1
+              "$backend" -w 5 -t filter -A INPUT -p tcp --dport 65431 \
+                -m comment --comment argo-rr-managed-block -j DROP
+              "$backend" -w 5 -t nat -A PREROUTING -p udp --dport 65432 \
+                -m comment --comment argo-rr-audit-fixture \
+                -j REDIRECT --to-ports 65431
+            done
+            persist_rr_firewall_fixture
+          }
+          remove_rr_firewall_fixture() {
+            local backend=""
+            for backend in iptables ip6tables; do
+              command -v "$backend" >/dev/null 2>&1 || continue
+              while "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
+                -m comment --comment argo-rr-managed-block -j DROP >/dev/null 2>&1; do
+                "$backend" -w 5 -t filter -D INPUT -p tcp --dport 65431 \
+                  -m comment --comment argo-rr-managed-block -j DROP || return 1
+              done
+              while "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
+                -m comment --comment argo-rr-audit-fixture \
+                -j REDIRECT --to-ports 65431 >/dev/null 2>&1; do
+                "$backend" -w 5 -t nat -D PREROUTING -p udp --dport 65432 \
+                  -m comment --comment argo-rr-audit-fixture \
+                  -j REDIRECT --to-ports 65431 || return 1
+              done
+            done
+            persist_rr_firewall_fixture
+          }
+          firewall_fixture_active=false
+          finish_target_audit() {
+            rc=$?
+            trap - EXIT
+            if [ "$firewall_fixture_active" = true ]; then
+              remove_rr_firewall_fixture || rc=1
+            fi
+            exit "$rc"
+          }
+          trap finish_target_audit EXIT
+          test "$(id -u)" -eq 0
+          test "$(stat -c '%U:%G:%a:%h' "$passphrase_file")" = root:root:600:1
+          test "$(stat -c '%U:%G:%a:%h' "$backup_file")" = root:root:600:1
+          test "$(stat -c '%U:%G:%a:%h' "$fingerprint_file")" = root:root:600:1
+          test "$(sha256sum "$backup_file" | awk '{print $1}')" = "$expected_backup_sha"
+          test "$(sha256sum "$fingerprint_file" | awk '{print $1}')" = "$expected_fingerprint_sha"
+          test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
+          test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
+          test "$(jq -r '.port' /etc/rr-nexus/nexus.json)" = 7900
+          test "$(jq -r '.public_port' /etc/rr-nexus/nexus.json)" = 17900
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          curl -fsS --connect-timeout 5 --max-time 15 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          jq -cS '{mode,domain,public_port} +
+            (if has("acme_email") then {acme_email:.acme_email} else {} end)' \
+            /etc/rr-nexus/nexus.json > /root/rr-audit-cross-target-access.json
+          grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
+            /etc/argo_vmess.conf | LC_ALL=C sort \
+            > /root/rr-audit-cross-target-network.txt
+          cp -p /etc/rr-update/channel /root/rr-audit-cross-target-channel
+          test -f /run/rr-vps-subscription.bind
+          test ! -L /run/rr-vps-subscription.bind
+          test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
+          cp -p /run/rr-vps-subscription.bind /root/rr-audit-cross-target-bind
+          firewall_fixture_active=true
+          install_rr_firewall_fixture
+          capture_rr_firewall_state /root/rr-audit-cross-target-firewall
+          test "$(grep -Ec '^filter:.*--dport 65431 .*--comment "?argo-rr-managed-block"?([[:space:]]|$)' \
+            /root/rr-audit-cross-target-firewall)" -eq 2
+          test "$(grep -Ec '^nat:.*--dport 65432 .*--comment "?argo-rr-audit-fixture"?([[:space:]]|$)' \
+            /root/rr-audit-cross-target-firewall)" -eq 2
+          chmod 600 /root/rr-audit-cross-target-access.json \
+            /root/rr-audit-cross-target-network.txt /root/rr-audit-cross-target-channel \
+            /root/rr-audit-cross-target-bind /root/rr-audit-cross-target-firewall
+          passphrase=$(<"$passphrase_file")
+          test "${#passphrase}" -ge 10
+          RR_BACKUP_PASSPHRASE="$passphrase" \
+            timeout --kill-after=10 300 /usr/local/bin/rr restore "$backup_file" \
+            </dev/null >/root/rr-audit-cross-restore.log 2>&1
+          unset passphrase
+
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
+          foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'PRAGMA foreign_key_check;') || exit 1
+          test -z "$foreign_key_errors"
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'SELECT COUNT(*) FROM devices;')" -eq 500
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'SELECT COUNT(*) FROM devices WHERE enabled=1;')" -eq 500
+          python3 - /var/lib/rr-nexus/nexus.db \
+            /var/lib/rr-nexus/subscriptions /tmp/sub_server/nexus 500 <<'PY'
+          import json
+          from pathlib import Path
+          import sqlite3
+          import stat
+          import sys
+
+          database, private_raw, public_raw, scale_raw = sys.argv[1:]
+          scale = int(scale_raw)
+          private_root = Path(private_raw)
+          public_root = Path(public_raw)
+          suffixes = (
+              ".txt", ".json", ".yaml", "-vl.json", "-mihomo.yaml",
+              "-clash-verge.yaml", "-flclash.yaml", "-v2rayn.txt",
+              "-v2rayng.txt", "-sr.txt", "-nekobox.txt",
+          )
+          connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30)
+          try:
+              rows = connection.execute(
+                  "SELECT id,credential,subscription_token FROM devices "
+                  "WHERE enabled=1 ORDER BY id"
+              ).fetchall()
+          finally:
+              connection.close()
+          if len(rows) != scale:
+              raise RuntimeError("restored generated-tree count differs from database")
+          expected_private = {f"{row[0]}{suffix}" for row in rows for suffix in suffixes}
+          expected_public = {f"{row[2]}{suffix}" for row in rows for suffix in suffixes}
+          expected_public.add("index.html")
+          if {path.name for path in private_root.iterdir()} != expected_private:
+              raise RuntimeError("restored private generated tree is not exact")
+          if {path.name for path in public_root.iterdir()} != expected_public:
+              raise RuntimeError("restored public generated tree is not exact")
+          for root in (private_root, public_root):
+              info = root.lstat()
+              if root.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                  raise RuntimeError("restored generated root is not a real directory")
+              if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o700):
+                  raise RuntimeError("restored generated root metadata is unsafe")
+          for device_id, credential, token in rows:
+              for suffix in suffixes:
+                  private_path = private_root / f"{device_id}{suffix}"
+                  public_path = public_root / f"{token}{suffix}"
+                  for path in (private_path, public_path):
+                      info = path.lstat()
+                      if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                          raise RuntimeError("restored artifact is not a single-link regular file")
+                      if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o600):
+                          raise RuntimeError("restored generated artifact metadata is unsafe")
+                  private_bytes = private_path.read_bytes()
+                  if private_bytes != public_path.read_bytes():
+                      raise RuntimeError("restored private/public artifacts differ")
+                  if suffix in {".json", "-vl.json"}:
+                      json.loads(private_bytes)
+              if credential.encode() not in (private_root / f"{device_id}.txt").read_bytes():
+                  raise RuntimeError("restored raw subscription omitted the credential")
+          index = public_root / "index.html"
+          if index.read_bytes() != b"":
+              raise RuntimeError("restored public index is not empty")
+          index_info = index.lstat()
+          if not stat.S_ISREG(index_info.st_mode) or index_info.st_nlink != 1:
+              raise RuntimeError("restored public index is not a single-link regular file")
+          if (index_info.st_uid, index_info.st_gid, stat.S_IMODE(index_info.st_mode)) != (0, 0, 0o600):
+              raise RuntimeError("restored public index metadata is unsafe")
+          PY
+          python3 - /var/lib/rr-nexus/nexus.db "$fingerprint_file" \
+            "$restored_fingerprint" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sqlite3
+          import sys
+
+          database, expected_file, output = sys.argv[1:]
+          with open(expected_file, encoding="utf-8") as source:
+              expected = json.load(source)
+          if set(expected) != {"received_floor", "stable_sha256", "transmitted_floor"}:
+              raise RuntimeError("source fingerprint metadata is malformed")
+          connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30)
+          try:
+              devices = connection.execute(
+                  "SELECT id,name,credential,subscription_token,enabled,quota_bytes,"
+                  "used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,"
+                  "group_id,expires_at,created_at,updated_at,quota_reached_at,expiry_enforced_at,"
+                  "next_reset_at,reset_anchor_day,reset_max,reset_count FROM devices ORDER BY id"
+              ).fetchall()
+              stable_policy = connection.execute(
+                  "SELECT id,quota_bytes,count_mode,interface_name,initial_used_bytes,cycle_started_at "
+                  "FROM server_traffic_policy WHERE id=1"
+              ).fetchone()
+              traffic = connection.execute(
+                  "SELECT received_bytes,transmitted_bytes FROM server_traffic_policy WHERE id=1"
+              ).fetchone()
+          finally:
+              connection.close()
+          stable_payload = json.dumps(
+              {"devices": devices, "server_traffic_policy": stable_policy},
+              ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+          ).encode("utf-8")
+          if hashlib.sha256(stable_payload).hexdigest() != expected["stable_sha256"]:
+              raise RuntimeError("restored stable database fingerprint differs from source")
+          if int(traffic[0]) < int(expected["received_floor"]):
+              raise RuntimeError("restored received-byte counter regressed")
+          if int(traffic[1]) < int(expected["transmitted_floor"]):
+              raise RuntimeError("restored transmitted-byte counter regressed")
+          descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as target:
+              json.dump(expected, target, sort_keys=True, separators=(",", ":"))
+              target.write("\n")
+          PY
+          test "$(stat -c '%U:%G:%a:%h' "$restored_fingerprint")" = root:root:600:1
+          cmp -s "$fingerprint_file" "$restored_fingerprint"
+          test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
+          test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
+          test "$(jq -r '.port' /etc/rr-nexus/nexus.json)" = 7900
+          test "$(jq -r '.public_port' /etc/rr-nexus/nexus.json)" = 17900
+          jq -cS '{mode,domain,public_port} +
+            (if has("acme_email") then {acme_email:.acme_email} else {} end)' \
+            /etc/rr-nexus/nexus.json \
+            | cmp -s /root/rr-audit-cross-target-access.json -
+          grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
+            /etc/argo_vmess.conf | LC_ALL=C sort \
+            | cmp -s /root/rr-audit-cross-target-network.txt -
+          cmp -s /etc/rr-update/channel /root/rr-audit-cross-target-channel
+          test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
+          cmp -s /run/rr-vps-subscription.bind /root/rr-audit-cross-target-bind
+          capture_rr_firewall_state /root/rr-audit-cross-restored-firewall
+          cmp -s /root/rr-audit-cross-target-firewall \
+            /root/rr-audit-cross-restored-firewall
+          rm -f -- /root/rr-audit-cross-restored-firewall
+          remove_rr_firewall_fixture
+          firewall_fixture_active=false
+          test ! -e /etc/nginx/sites-available/rr-nexus.conf
+          for proxy in rr-nexus.conf rr-nexus-port.conf rr-nexus-ip.conf; do
+            test ! -e "/etc/nginx/sites-enabled/$proxy"
+          done
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state sing-box.service loaded:active:enabled
+          curl -fsS --connect-timeout 5 --max-time 15 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          local_listen=$(ss -H -ltn 'sport = :7900') || exit 1
+          test "$(awk '{print $4}' <<<"$local_listen" | LC_ALL=C sort -u)" = \
+            127.0.0.1:7900
+          public_listen=$(ss -H -ltn 'sport = :17900') || exit 1
+          test -z "$public_listen"
+          IFS='|' read -r target_sub_port target_sub_bind target_sub_mode \
+            target_sub_domain _ < /root/rr-audit-cross-target-bind
+          [[ "$target_sub_port" =~ ^[0-9]+$ ]]
+          test "$target_sub_bind" = 127.0.0.1
+          test "$target_sub_mode" = local
+          test -z "$target_sub_domain"
+          subscription_listen=$(ss -H -ltn "sport = :${target_sub_port}") || exit 1
+          test "$(awk '{print $4}' <<<"$subscription_listen" | LC_ALL=C sort -u)" = \
+            "127.0.0.1:${target_sub_port}"
+
+          sample_id=dev_a00000000001
+          sample_token=RRAuditToken000000000001
+          sample_credential=$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            "SELECT credential FROM devices WHERE id='$sample_id';")
+          private_per_device=$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+            -type f -name "${sample_id}*" -printf . | wc -c)
+          public_per_device=$(find /tmp/sub_server/nexus -maxdepth 1 \
+            -type f -name "${sample_token}*" -printf . | wc -c)
+          test "$private_per_device" -gt 0
+          test "$public_per_device" -gt 0
+          test "$private_per_device" -eq 11
+          test "$public_per_device" -eq 11
+          test "$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+            -type f -name 'dev_*' -printf . | wc -c)" \
+            -eq "$((500 * private_per_device))"
+          test "$(find /tmp/sub_server/nexus -maxdepth 1 \
+            -type f ! -name index.html -printf . | wc -c)" \
+            -eq "$((500 * public_per_device))"
+          test -f /tmp/sub_server/nexus/index.html
+          test ! -s /tmp/sub_server/nexus/index.html
+          test "$(stat -c '%U:%G:%a' /var/lib/rr-nexus/subscriptions)" = root:root:700
+          test "$(stat -c '%U:%G:%a' /tmp/sub_server/nexus)" = root:root:700
+          unexpected_path=$(find /var/lib/rr-nexus/subscriptions \
+            -mindepth 1 -maxdepth 1 -not -type f -print -quit) || exit 1
+          test -z "$unexpected_path"
+          unexpected_path=$(find /tmp/sub_server/nexus \
+            -mindepth 1 -maxdepth 1 -not -type f -print -quit) || exit 1
+          test -z "$unexpected_path"
+          unexpected_path=$(find /var/lib/rr-nexus/subscriptions -maxdepth 1 \
+            -type f -name 'dev_*' ! -perm 0600 -print -quit) || exit 1
+          test -z "$unexpected_path"
+          unexpected_path=$(find /tmp/sub_server/nexus -maxdepth 1 \
+            -type f ! -perm 0600 -print -quit) || exit 1
+          test -z "$unexpected_path"
+          for suffix in .txt .json .yaml -vl.json -mihomo.yaml \
+            -clash-verge.yaml -flclash.yaml -v2rayn.txt -v2rayng.txt \
+            -sr.txt -nekobox.txt; do
+            test -f "/var/lib/rr-nexus/subscriptions/${sample_id}${suffix}"
+            test -f "/tmp/sub_server/nexus/${sample_token}${suffix}"
+            cmp -s "/var/lib/rr-nexus/subscriptions/${sample_id}${suffix}" \
+              "/tmp/sub_server/nexus/${sample_token}${suffix}"
+          done
+          grep -Fq "$sample_credential" \
+            "/var/lib/rr-nexus/subscriptions/${sample_id}.txt"
+          printf 'RR_AUDIT_CROSS_MIGRATION_COMPLETE devices=500 access=local hashes=verified\n'
+          REMOTE_C
+
   vps-gate:
     name: Three-VPS release gate
     if: always()
-    needs: [debian-full, ubuntu-upgrade, ubuntu-transaction]
+    needs: [debian-full, ubuntu-upgrade, ubuntu-transaction, cross-machine-migration-scale]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1417,10 +2381,12 @@ jobs:
           A_RESULT: ${{ needs.debian-full.result }}
           B_RESULT: ${{ needs.ubuntu-upgrade.result }}
           C_RESULT: ${{ needs.ubuntu-transaction.result }}
+          M_RESULT: ${{ needs.cross-machine-migration-scale.result }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
           test "$A_RESULT" = success
           test "$B_RESULT" = success
           test "$C_RESULT" = success
-          echo 'Three-VPS release gate passed with independently pinned SSH host keys; this is not a real client traffic claim.'
+          test "$M_RESULT" = success
+          echo 'Three-VPS release gate passed with pinned SSH host keys, encrypted A-to-C migration, and real 1/10/100/500-device synchronization; this is not a real client traffic claim.'

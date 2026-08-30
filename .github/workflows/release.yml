@@ -271,9 +271,8 @@ jobs:
             assert_workflow_gate vps-audit.yml "VPS audit"
           }
 
-          assert_release_gate() {
+          assert_main_tip() {
             local main_sha
-            assert_verified_sha_gate
             # This is deliberately the final remote read in the gate. Never
             # publish an older candidate after main has advanced.
             main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
@@ -281,6 +280,11 @@ jobs:
               echo "Main no longer points to the verified release SHA." >&2
               return 1
             }
+          }
+
+          assert_release_gate() {
+            assert_verified_sha_gate
+            assert_main_tip
           }
 
           assert_immutable_releases_enabled() {
@@ -325,6 +329,364 @@ jobs:
             return 1
           }
 
+          list_target_releases() {
+            local inventory
+            inventory=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -ce --arg tag "$TAG" '(add // []) | map(select(.tag_name == $tag))' \
+              <<<"$inventory"
+          }
+
+          list_target_tag_refs() {
+            local inventory
+            inventory=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${TAG}") || return 1
+            jq -ce --arg ref "refs/tags/${TAG}" \
+              '(add // []) | map(select(.ref == $ref))' <<<"$inventory"
+          }
+
+          load_owned_target_tag() {
+            local refs="" count=0 ref_sha="" ref_type="" tag_json="" marker=""
+            local owner_commit="" nonce="" payload_sha="" payload_b64="" payload="" canonical=""
+            LOADED_TAG_STATE=unknown
+            LOADED_TAG_OBJECT_SHA=""
+            LOADED_TAG_OWNER_MARKER=""
+            LOADED_TAG_OWNER_COMMIT=""
+            LOADED_TAG_EXPECTED_ASSETS=""
+            refs=$(list_target_tag_refs) || return 1
+            count=$(jq -r 'length' <<<"$refs")
+            [ "$count" -le 1 ] || {
+              echo "Multiple exact refs exist for $TAG; refusing mutation." >&2
+              return 1
+            }
+            if [ "$count" -eq 0 ]; then
+              LOADED_TAG_STATE=absent
+              return 0
+            fi
+            ref_sha=$(jq -r '.[0].object.sha' <<<"$refs")
+            ref_type=$(jq -r '.[0].object.type' <<<"$refs")
+            [[ "$ref_sha" =~ ^[0-9a-f]{40}$ ]] && [ "$ref_type" = tag ] || {
+              LOADED_TAG_STATE=foreign
+              echo "$TAG is not an owned annotated release tag." >&2
+              return 1
+            }
+            tag_json=$(api "/repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}") || return 1
+            marker=$(jq -r '.message' <<<"$tag_json")
+            if [[ "$marker" =~ ^rr-vps-release-owner:v2:([^:]+):([0-9a-f]{40}):([0-9a-f]{64}):([0-9a-f]{64}):([A-Za-z0-9+/]*={0,2})$ ]]; then
+              [ "${BASH_REMATCH[1]}" = "$TAG" ] || {
+                LOADED_TAG_STATE=foreign
+                return 1
+              }
+              owner_commit="${BASH_REMATCH[2]}"
+              nonce="${BASH_REMATCH[3]}"
+              payload_sha="${BASH_REMATCH[4]}"
+              payload_b64="${BASH_REMATCH[5]}"
+            else
+              LOADED_TAG_STATE=foreign
+              return 1
+            fi
+            payload=$(printf '%s' "$payload_b64" | base64 --decode) || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            [ "$(printf '%s' "$payload" | base64 -w 0)" = "$payload_b64" ] &&
+              [ "$(printf '%s' "$payload" | sha256sum | awk '{print $1}')" = "$payload_sha" ] || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            canonical=$(jq -ceS '
+              if type == "array" then
+                [.[] | {name, size, digest}] | sort_by(.name)
+              else error("asset payload is not an array") end
+            ' <<<"$payload") || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            [ "$canonical" = "$payload" ] && jq -e '
+              length == 5 and
+              ([.[].name] | sort) ==
+                (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort) and
+              ([.[].name] | length == (unique | length)) and
+              all(.[];
+                (keys | sort) == (["digest", "name", "size"] | sort) and
+                (.name | type) == "string" and
+                (.size | type) == "number" and .size == (.size | floor) and .size > 0 and
+                (.digest | type) == "string" and
+                (.digest | test("^sha256:[0-9a-f]{64}$")))
+            ' <<<"$payload" >/dev/null || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            jq -e --arg sha "$ref_sha" --arg tag "$TAG" --arg commit "$owner_commit" \
+              --arg marker "$marker" \
+              '.sha == $sha and .tag == $tag and .message == $marker and
+               .object.type == "commit" and .object.sha == $commit and
+               .tagger.name == "github-actions[bot]" and
+               .tagger.email == "41898282+github-actions[bot]@users.noreply.github.com"' \
+              <<<"$tag_json" >/dev/null || {
+              LOADED_TAG_STATE=foreign
+              echo "$TAG ownership metadata is inconsistent; refusing mutation." >&2
+              return 1
+            }
+            LOADED_TAG_STATE=owned
+            LOADED_TAG_OBJECT_SHA="$ref_sha"
+            LOADED_TAG_OWNER_MARKER="$marker"
+            LOADED_TAG_OWNER_COMMIT="$owner_commit"
+            LOADED_TAG_EXPECTED_ASSETS="$payload"
+          }
+
+          assert_run_owned_target_tag() {
+            load_owned_target_tag || return 1
+            [ "$LOADED_TAG_STATE" = owned ] &&
+              [ -n "${RUN_TAG_OBJECT_SHA:-}" ] &&
+              [ -n "${RUN_OWNER_MARKER:-}" ] &&
+              [ "$LOADED_TAG_OBJECT_SHA" = "$RUN_TAG_OBJECT_SHA" ] &&
+              [ "$LOADED_TAG_OWNER_MARKER" = "$RUN_OWNER_MARKER" ] &&
+              [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ]
+          }
+
+          is_owned_mutable_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            jq -e --arg tag "$TAG" --arg sha "$owner_commit" \
+              --arg title "$RELEASE_TITLE" --arg marker "$body_marker" \
+              --argjson expected "$owner_assets" '
+              (.id | type == "number") and .tag_name == $tag and
+              .target_commitish == $sha and .name == $title and
+              .draft == true and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              (.body | type == "string") and
+              (.body as $body | ($body | index($marker)) as $first |
+                $first != null and
+                (($body[($first + ($marker | length)):] | contains($marker)) | not)) and
+              (.assets | type == "array") and
+              ([.assets[].name] | length == (unique | length)) and
+              all(.assets[];
+                . as $actual | any($expected[];
+                  .name == $actual.name and
+                  (($actual.state == "uploaded" and
+                    .size == $actual.size and .digest == $actual.digest) or
+                   ($actual.state == "starter" and $actual.size == 0 and
+                    ($actual.digest == null or $actual.digest == "") and
+                    $actual.uploader.login == "github-actions[bot]"))))
+            ' <<<"$release_json" >/dev/null
+          }
+
+          is_exact_mutable_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            is_owned_mutable_draft "$release_json" "$owner_marker" \
+              "$owner_commit" "$owner_assets" &&
+              jq -e --rawfile notes "$RELEASE_NOTES_FILE" \
+                --arg marker "$body_marker" --argjson expected "$owner_assets" '
+                .body == ($notes + "\n" + $marker + "\n") and
+                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected
+              ' \
+                <<<"$release_json" >/dev/null
+          }
+
+          is_exact_public_release() {
+            local release_json="$1" expected_id="$2" owner_marker="$3"
+            local owner_commit="$4" owner_assets="$5" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            jq -e --rawfile notes "$RELEASE_NOTES_FILE" \
+              --argjson id "$expected_id" --arg tag "$TAG" --arg sha "$owner_commit" \
+              --arg title "$RELEASE_TITLE" --arg marker "$body_marker" \
+              --argjson expected "$owner_assets" '
+              .id == $id and .tag_name == $tag and .target_commitish == $sha and
+              .name == $title and .draft == false and .prerelease == false and
+              (.immutable == true or .immutable == false) and
+              .author.login == "github-actions[bot]" and
+              .body == ($notes + "\n" + $marker + "\n") and
+              ([.assets[].name] | length == (unique | length)) and
+              ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected and
+              all(.assets[]; .state == "uploaded")
+            ' <<<"$release_json" >/dev/null
+          }
+
+          resource_is_authoritatively_absent() {
+            local endpoint="$1" response="" status=""
+            if response=$(api --include "$endpoint" 2>&1); then
+              return 1
+            fi
+            status=$(awk 'toupper($1) ~ /^HTTP\// { code=$2 } END { print code }' <<<"$response")
+            [ "$status" = 404 ]
+          }
+
+          delete_owned_target_tag() {
+            local expected_object_sha="$1" expected_marker="$2" remaining=""
+            load_owned_target_tag || return 1
+            [ "$LOADED_TAG_STATE" = absent ] && return 0
+            [ "$LOADED_TAG_STATE" = owned ] &&
+              [ "$LOADED_TAG_OBJECT_SHA" = "$expected_object_sha" ] &&
+              [ "$LOADED_TAG_OWNER_MARKER" = "$expected_marker" ] || return 1
+            api --method DELETE "/repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
+              >/dev/null 2>&1 || true
+            resource_is_authoritatively_absent \
+              "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" || {
+              echo "Owned tag $TAG could not be proven absent by its exact ref endpoint." >&2
+              return 1
+            }
+            remaining=$(list_target_tag_refs) || return 1
+            [ "$(jq -r 'length' <<<"$remaining")" -eq 0 ] || {
+              echo "Owned tag $TAG could not be proven absent after deletion." >&2
+              return 1
+            }
+          }
+
+          reconcile_owned_mutable_target() {
+            local releases="" count=0 release_json="" fresh_json="" after=""
+            local release_id="" expected_marker="" expected_object_sha=""
+            local expected_owner_commit="" expected_owner_assets=""
+            local required_object_sha="${1:-}" required_marker="${2:-}"
+            releases=$(list_target_releases) || return 1
+            count=$(jq -r 'length' <<<"$releases")
+            [ "$count" -le 1 ] || {
+              echo "Multiple releases use $TAG; refusing every destructive action." >&2
+              return 1
+            }
+            if [ "$count" -eq 0 ]; then
+              load_owned_target_tag || return 1
+              case "$LOADED_TAG_STATE" in
+                absent) return 0 ;;
+                owned)
+                  if [ -n "$required_object_sha" ] &&
+                     { [ "$LOADED_TAG_OBJECT_SHA" != "$required_object_sha" ] ||
+                       [ "$LOADED_TAG_OWNER_MARKER" != "$required_marker" ]; }; then
+                    echo "The current tag is not owned by this cleanup transaction." >&2
+                    return 1
+                  fi
+                  delete_owned_target_tag "$LOADED_TAG_OBJECT_SHA" "$LOADED_TAG_OWNER_MARKER"
+                  ;;
+                *) return 1 ;;
+              esac
+              return
+            fi
+
+            load_owned_target_tag || return 1
+            [ "$LOADED_TAG_STATE" = owned ] || return 1
+            if [ -n "$required_object_sha" ] &&
+               { [ "$LOADED_TAG_OBJECT_SHA" != "$required_object_sha" ] ||
+                 [ "$LOADED_TAG_OWNER_MARKER" != "$required_marker" ]; }; then
+              echo "The current release/tag pair is not owned by this cleanup transaction." >&2
+              return 1
+            fi
+            expected_object_sha="$LOADED_TAG_OBJECT_SHA"
+            expected_marker="$LOADED_TAG_OWNER_MARKER"
+            expected_owner_commit="$LOADED_TAG_OWNER_COMMIT"
+            expected_owner_assets="$LOADED_TAG_EXPECTED_ASSETS"
+            release_json=$(jq -c '.[0]' <<<"$releases")
+            is_owned_mutable_draft "$release_json" "$expected_marker" \
+              "$expected_owner_commit" "$expected_owner_assets" || {
+              echo "Existing $TAG release is foreign, public, immutable, or inconsistent; refusing deletion." >&2
+              return 1
+            }
+            release_id=$(jq -r '.id' <<<"$release_json")
+            [[ "$release_id" =~ ^[0-9]+$ ]] || return 1
+            fresh_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") || return 1
+            [ "$(jq -r '.id' <<<"$fresh_json")" = "$release_id" ] &&
+              is_owned_mutable_draft "$fresh_json" "$expected_marker" \
+                "$expected_owner_commit" "$expected_owner_assets" || return 1
+
+            # A lost DELETE response is acceptable only after the exact-ID GET
+            # returns an authoritative 404 and a fresh inventory also agrees.
+            api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              >/dev/null 2>&1 || true
+            resource_is_authoritatively_absent \
+              "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" || {
+              echo "Owned draft $release_id could not be proven absent by its exact endpoint." >&2
+              return 1
+            }
+            after=$(list_target_releases) || return 1
+            [ "$(jq -r 'length' <<<"$after")" -eq 0 ] || {
+              echo "Owned draft $release_id could not be proven absent after deletion." >&2
+              return 1
+            }
+            delete_owned_target_tag "$expected_object_sha" "$expected_marker"
+          }
+
+          classify_target_release_state() {
+            local releases="" count=0 release_json="" release_id=""
+            TARGET_RELEASE_STATE=unknown
+            TARGET_RELEASE_ID=""
+            TARGET_RELEASE_JSON=""
+            releases=$(list_target_releases) || return 1
+            count=$(jq -r 'length' <<<"$releases")
+            [ "$count" -le 1 ] || {
+              echo "Multiple releases use $TAG; refusing publication." >&2
+              return 1
+            }
+            load_owned_target_tag || return 1
+            if [ "$count" -eq 0 ]; then
+              case "$LOADED_TAG_STATE" in
+                absent) TARGET_RELEASE_STATE=absent ;;
+                owned) TARGET_RELEASE_STATE=owned_mutable ;;
+                *) return 1 ;;
+              esac
+              return 0
+            fi
+            [ "$LOADED_TAG_STATE" = owned ] || return 1
+            release_json=$(jq -c '.[0]' <<<"$releases")
+            release_id=$(jq -r '.id' <<<"$release_json")
+            [[ "$release_id" =~ ^[0-9]+$ ]] || return 1
+            if is_owned_mutable_draft "$release_json" "$LOADED_TAG_OWNER_MARKER" \
+              "$LOADED_TAG_OWNER_COMMIT" "$LOADED_TAG_EXPECTED_ASSETS"; then
+              TARGET_RELEASE_STATE=owned_mutable
+              TARGET_RELEASE_ID="$release_id"
+              TARGET_RELEASE_JSON="$release_json"
+              return 0
+            fi
+            if is_exact_public_release "$release_json" "$release_id" \
+              "$LOADED_TAG_OWNER_MARKER" "$LOADED_TAG_OWNER_COMMIT" \
+              "$LOADED_TAG_EXPECTED_ASSETS" &&
+              [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ]; then
+              TARGET_RELEASE_STATE=exact_public_current
+              TARGET_RELEASE_ID="$release_id"
+              TARGET_RELEASE_JSON="$release_json"
+              return 0
+            fi
+            echo "Existing $TAG state is public, foreign, or inconsistent; refusing mutation." >&2
+            return 1
+          }
+
+          release_cleanup_on_exit() {
+            local status=$?
+            trap - EXIT
+            if [ "${cleanup_armed:-false}" = true ]; then
+              reconcile_owned_mutable_target "${RUN_TAG_OBJECT_SHA:-}" "${RUN_OWNER_MARKER:-}" ||
+                echo "Automatic release reconciliation refused or failed; no unverified object was deleted." >&2
+            fi
+            exit "$status"
+          }
+
+          publish_draft_and_confirm() {
+            local draft_id="$1" owner_marker="$2" attempt=0 release_json=""
+            # The PATCH transport result is never authoritative. It may have
+            # reached GitHub even when the response was lost.
+            api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
+              -F draft=false -f make_latest=true >/dev/null 2>&1 || true
+            for attempt in 1 2 3 4 5 6; do
+              if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}"); then
+                if is_exact_public_release "$release_json" "$draft_id" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets"; then
+                  return 0
+                fi
+                if ! is_exact_mutable_draft "$release_json" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets"; then
+                  echo "Release $draft_id changed to an unrecognized state after PATCH; refusing mutation." >&2
+                  return 1
+                fi
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "Release publication outcome is not yet authoritative; the draft was left untouched." >&2
+            return 1
+          }
+
           version_gt() {
             local candidate="$1" baseline="$2"
             [ "$candidate" != "$baseline" ] &&
@@ -361,10 +723,21 @@ jobs:
           }
 
           assert_no_newer_product_version() {
-            local releases remote_tags existing existing_version
+            local releases release_tags remote_tags remote_tag_names all_tags
+            local existing existing_version
             releases=$(api --paginate --slurp \
-              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100")
-            remote_tags=$(git ls-remote --tags --refs origin 'refs/tags/v*')
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -e '
+              type == "array" and
+              all(.[]; type == "array") and
+              all(.[][]; type == "object" and (.tag_name | type == "string"))
+            ' <<<"$releases" >/dev/null || return 1
+            release_tags=$(jq -r '.[][] | .tag_name' <<<"$releases") || return 1
+            remote_tags=$(git ls-remote --tags --refs origin 'refs/tags/v*') || return 1
+            remote_tag_names=$(awk '{ sub("refs/tags/", "", $2); print $2 }' \
+              <<<"$remote_tags") || return 1
+            all_tags=$(printf '%s\n%s\n' "$release_tags" "$remote_tag_names" | \
+              LC_ALL=C sort -u) || return 1
             while IFS= read -r existing; do
               [[ "$existing" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
               existing_version=${existing#v}
@@ -372,24 +745,17 @@ jobs:
                 echo "A newer product version $existing_version appeared during publication." >&2
                 return 1
               fi
-            done < <(
-              {
-                jq -r 'add | .[].tag_name' <<<"$releases"
-                awk '{ sub("refs/tags/", "", $2); print $2 }' <<<"$remote_tags"
-              } | LC_ALL=C sort -u
-            )
+            done <<<"$all_tags"
+            return 0
           }
 
           assert_latest_product() {
-            local attempt latest_json
+            local release_id="$1" owner_marker="$2" attempt latest_json
             for attempt in 1 2 3 4 5 6; do
               if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
-            jq -e --arg tag "$TAG" --arg sha "$EXPECTED_SHA" '
-              .tag_name == $tag and .target_commitish == $sha and
-                  .draft == false and .prerelease == false and .immutable == true and
-                  ([.assets[].name] | sort) ==
-                  (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
-                ' <<<"$latest_json" >/dev/null; then
+                is_exact_public_release "$latest_json" "$release_id" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets" &&
+                jq -e '.immutable == true' <<<"$latest_json" >/dev/null; then
                 return 0
               fi
               [ "$attempt" -eq 6 ] || sleep 2
@@ -398,38 +764,57 @@ jobs:
             return 1
           }
 
-          assert_immutable_releases_enabled
-          assert_release_gate
-          existing_tag_sha=$(resolve_remote_tag_sha "$TAG")
-          [ -z "$existing_tag_sha" ] || {
-            echo "Remote tag $TAG already exists; refusing to reuse it." >&2
-            exit 1
-          }
-          assert_new_monotonic_version
+          verify_published_release() {
+            local release_id="$1" owner_marker="$2" attempt=0 release_json=""
+            local exact_public=false published_dir="" asset="" verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") &&
+                is_exact_public_release "$release_json" "$release_id" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets"; then
+                exact_public=true
+                break
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            [ "$exact_public" = true ] || {
+              echo "Public release $release_id is not the exact verified payload." >&2
+              return 1
+            }
+            assert_no_newer_product_version || return 1
+            wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA" || return 1
+            assert_latest_product "$release_id" "$owner_marker" || return 1
+            assert_run_owned_target_tag || {
+              echo "The immutable release is not bound to the owned annotated tag object." >&2
+              return 1
+            }
 
-          # Re-read all mutable remote state before the first release mutation.
-          existing_tag_sha=$(resolve_remote_tag_sha "$TAG")
-          [ -z "$existing_tag_sha" ] || {
-            echo "Remote tag $TAG appeared before publication." >&2
-            exit 1
+            published_dir=$(mktemp -d) || return 1
+            for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+              verified=false
+              for attempt in 1 2 3 4 5 6; do
+                if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+                  --retry 2 --retry-all-errors --retry-delay 1 \
+                  "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${asset}" \
+                  -o "$published_dir/${asset}.part" &&
+                  cmp -s "$asset" "$published_dir/${asset}.part"; then
+                  mv "$published_dir/${asset}.part" "$published_dir/$asset"
+                  verified=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 2
+              done
+              [ "$verified" = true ] || {
+                echo "Latest download for $asset differs from the CI-verified source." >&2
+                rm -rf -- "$published_dir"
+                return 1
+              }
+            done
+            (cd "$published_dir" && sha256sum -c SHA256SUMS) || {
+              rm -rf -- "$published_dir"
+              return 1
+            }
+            rm -rf -- "$published_dir"
           }
-          assert_new_monotonic_version
-          assert_immutable_releases_enabled
-          # Keep the exact-SHA gate adjacent to the atomic ref creation.
-          assert_release_gate
-          created_ref=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${TAG}" -f "sha=${EXPECTED_SHA}")
-          jq -e --arg ref "refs/tags/${TAG}" --arg sha "$EXPECTED_SHA" '
-            .ref == $ref and .object.type == "commit" and .object.sha == $sha
-          ' <<<"$created_ref" >/dev/null
-          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
-          gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --target "$EXPECTED_SHA" \
-            --title "RR-vps ${VERSION} 正式版" \
-            --notes-file release-notes.md \
-            --draft
 
           expected_assets=$(
             for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
@@ -437,17 +822,120 @@ jobs:
               size=$(stat -c %s "$asset")
               jq -cn --arg name "$asset" --arg digest "$digest" --argjson size "$size" \
                 '{name: $name, size: $size, digest: $digest}'
-            done | jq -sc 'sort_by(.name)'
+            done | jq -scS 'sort_by(.name)'
           )
+          RELEASE_NOTES_FILE=release-notes.md
+          RELEASE_TITLE="RR-vps ${VERSION} 正式版"
+          cleanup_armed=false
+
+          # Classify before any version gate that assumes target absence. An
+          # exact public release from this SHA is a verification-only resume;
+          # an owned mutable orphan (including an older SHA) is reconciled
+          # from the asset contract embedded in its annotated tag.
+          classify_target_release_state
+          case "$TARGET_RELEASE_STATE" in
+            exact_public_current)
+              RUN_TAG_OBJECT_SHA="$LOADED_TAG_OBJECT_SHA"
+              RUN_OWNER_MARKER="$LOADED_TAG_OWNER_MARKER"
+              assert_immutable_releases_enabled
+              assert_release_gate
+              verify_published_release "$TARGET_RELEASE_ID" "$RUN_OWNER_MARKER"
+              exit 0
+              ;;
+            owned_mutable)
+              reconcile_owned_mutable_target "$LOADED_TAG_OBJECT_SHA" \
+                "$LOADED_TAG_OWNER_MARKER"
+              ;;
+            absent) ;;
+            *) exit 1 ;;
+          esac
+          classify_target_release_state
+          [ "$TARGET_RELEASE_STATE" = absent ] || {
+            echo "$TAG did not reconcile to authoritative absence." >&2
+            exit 1
+          }
+          assert_new_monotonic_version
+
+          # Re-read immediately before constructing this run's owned annotated
+          # tag object. Any newly appeared state is a race and is never deleted.
+          classify_target_release_state
+          [ "$TARGET_RELEASE_STATE" = absent ] || {
+            echo "$TAG changed during release preparation; refusing mutation." >&2
+            exit 1
+          }
+          assert_new_monotonic_version
+          assert_immutable_releases_enabled
+          assert_release_gate
+          release_nonce=$(openssl rand -hex 32)
+          [[ "$release_nonce" =~ ^[0-9a-f]{64}$ ]]
+          release_payload_sha=$(printf '%s' "$expected_assets" | sha256sum | awk '{print $1}')
+          release_payload_b64=$(printf '%s' "$expected_assets" | base64 -w 0)
+          [[ "$release_payload_sha" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$release_payload_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+          TAG_OWNER_MARKER="rr-vps-release-owner:v2:${TAG}:${EXPECTED_SHA}:${release_nonce}:${release_payload_sha}:${release_payload_b64}"
+          [ "${#TAG_OWNER_MARKER}" -le 4096 ]
+          RELEASE_MARKER="<!-- ${TAG_OWNER_MARKER} -->"
+          {
+            cat release-notes.md
+            printf '\n%s\n' "$RELEASE_MARKER"
+          } > release-draft-notes.md
+          [ -s release-draft-notes.md ] && [ ! -L release-draft-notes.md ]
+
+          tag_object=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/tags" \
+            -f "tag=${TAG}" -f "message=${TAG_OWNER_MARKER}" \
+            -f "object=${EXPECTED_SHA}" -f type=commit \
+            -f 'tagger[name]=github-actions[bot]' \
+            -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com')
+          tag_object_sha=$(jq -r '.sha' <<<"$tag_object")
+          [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+          jq -e --arg sha "$tag_object_sha" --arg tag "$TAG" --arg commit "$EXPECTED_SHA" \
+            --arg marker "$TAG_OWNER_MARKER" '
+            .sha == $sha and .tag == $tag and .message == $marker and
+            .object.type == "commit" and .object.sha == $commit and
+            .tagger.name == "github-actions[bot]" and
+            .tagger.email == "41898282+github-actions[bot]@users.noreply.github.com"
+          ' <<<"$tag_object" >/dev/null
+          RUN_TAG_OBJECT_SHA="$tag_object_sha"
+          RUN_OWNER_MARKER="$TAG_OWNER_MARKER"
+
+          assert_no_newer_product_version
+          # This gate's main-tip read is immediately adjacent to the atomic ref
+          # creation; creating the unreachable annotated object above is safe.
+          assert_release_gate
+          cleanup_armed=true
+          trap release_cleanup_on_exit EXIT
+          created_ref=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${TAG}" -f "sha=${tag_object_sha}")
+          jq -e --arg ref "refs/tags/${TAG}" --arg sha "$tag_object_sha" '
+            .ref == $ref and .object.type == "tag" and .object.sha == $sha
+          ' <<<"$created_ref" >/dev/null
+          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
+          assert_run_owned_target_tag || {
+            echo "The annotated release tag changed before draft creation." >&2
+            exit 1
+          }
+          # This main-tip read must follow the exact annotated-tag recheck and
+          # remain the last remote read before draft creation.
+          assert_main_tip
+          gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$EXPECTED_SHA" \
+            --title "$RELEASE_TITLE" \
+            --notes-file release-draft-notes.md \
+            --draft
+
           draft_verified=false
           for attempt in 1 2 3 4 5 6; do
-            if draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
-              jq -e --arg tag "$TAG" --arg sha "$EXPECTED_SHA" --argjson assets "$expected_assets" '
-                .tag_name == $tag and .target_commitish == $sha and
-                .draft == true and .prerelease == false and .immutable == false and
-                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
-                all(.assets[]; .state == "uploaded")
-              ' <<<"$draft_json" >/dev/null; then
+            if draft_inventory=$(list_target_releases) &&
+               [ "$(jq -r 'length' <<<"$draft_inventory")" -eq 1 ]; then
+              draft_json=$(jq -c '.[0]' <<<"$draft_inventory")
+            else
+              draft_json=""
+            fi
+            if [ -n "$draft_json" ] &&
+               is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \
+                 "$EXPECTED_SHA" "$expected_assets"; then
               draft_verified=true
               break
             fi
@@ -460,57 +948,21 @@ jobs:
           draft_id=$(jq -r '.id' <<<"$draft_json")
           [[ "$draft_id" =~ ^[0-9]+$ ]]
 
-          # Only the draft ID created above may be changed. Main is allowed to
-          # advance after the immutable tag is created: aborting then would
-          # strand an unrepeatable tag/draft. Continue to require the exact-SHA
-          # CI/VPS evidence and reject any genuinely newer product release.
-          assert_immutable_releases_enabled
-          assert_verified_sha_gate
-          assert_no_newer_product_version
           draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
-          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg sha "$EXPECTED_SHA" \
-            --argjson assets "$expected_assets" '
-            .id == $id and .tag_name == $tag and .target_commitish == $sha and
-            .draft == true and .prerelease == false and .immutable == false and
-            ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
-            all(.assets[]; .state == "uploaded")
-          ' <<<"$draft_json" >/dev/null
+          [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ]
+          is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \
+            "$EXPECTED_SHA" "$expected_assets"
           wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
-          # Keep the complete exact-SHA gate immediately adjacent to the draft
-          # publication mutation.
+          assert_run_owned_target_tag || {
+            echo "The annotated release tag changed before publication." >&2
+            exit 1
+          }
           assert_immutable_releases_enabled
-          assert_verified_sha_gate
           assert_no_newer_product_version
-          published_json=$(api --method PATCH \
-            "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
-            -F draft=false -f make_latest=true)
-          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg sha "$EXPECTED_SHA" '
-            .id == $id and .tag_name == $tag and .target_commitish == $sha and
-            .draft == false and .prerelease == false
-          ' <<<"$published_json" >/dev/null
-
-          wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"
-          assert_latest_product
-
-          published_dir=$(mktemp -d)
-          trap 'rm -rf "$published_dir"' EXIT
-          for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
-            verified=false
-            for attempt in 1 2 3 4 5 6; do
-              if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-                --retry 2 --retry-all-errors --retry-delay 1 \
-                "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${asset}" \
-                -o "$published_dir/${asset}.part" &&
-                cmp -s "$asset" "$published_dir/${asset}.part"; then
-                mv "$published_dir/${asset}.part" "$published_dir/$asset"
-                verified=true
-                break
-              fi
-              [ "$attempt" -eq 6 ] || sleep 2
-            done
-            [ "$verified" = true ] || {
-              echo "Latest download for $asset differs from the CI-verified source." >&2
-              exit 1
-            }
-          done
-          (cd "$published_dir" && sha256sum -c SHA256SUMS)
+          # assert_release_gate ends with the main-tip GET. After local trap
+          # disarm, PATCH is the very next remote operation.
+          assert_release_gate
+          cleanup_armed=false
+          trap - EXIT
+          publish_draft_and_confirm "$draft_id" "$RUN_OWNER_MARKER"
+          verify_published_release "$draft_id" "$RUN_OWNER_MARKER"

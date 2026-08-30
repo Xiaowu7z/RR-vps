@@ -30,6 +30,11 @@ export RR_TEST_DAEMON_FAIL="$TEST_ROOT/daemon-fail"
 export RR_TEST_SYSTEMD_QUERY_FAIL="$TEST_ROOT/systemd-query-fail"
 export RR_TEST_HEALTH_STOP_FAIL="$TEST_ROOT/health-stop-fail"
 export RR_TEST_HEALTH_DISABLE_FAIL="$TEST_ROOT/health-disable-fail"
+export RR_TEST_SYNC_FAIL="$TEST_ROOT/sync-fail"
+export RR_TEST_SUBSCRIPTION_REMAINS="$TEST_ROOT/subscription-remains"
+export RR_TEST_SUBSCRIPTION_STOP_FAIL="$TEST_ROOT/subscription-stop-fail"
+export RR_TEST_OPERATION_LOG="$TEST_ROOT/release-operations"
+RR_TEST_RECREATE_PATH=""
 RR_TEST_HEALTH_LOAD_STATE=loaded
 RR_TEST_HEALTH_ACTIVE_STATE=inactive
 RR_TEST_HEALTH_UNIT_FILE_STATE=disabled
@@ -43,6 +48,27 @@ RED=""
 RESET=""
 
 systemctl() {
+    if [ -s "$RR_TEST_OPERATION_LOG" ] || [ -e "$RR_TEST_OPERATION_LOG" ]; then
+        printf 'systemctl:%s\n' "$*" >> "$RR_TEST_OPERATION_LOG"
+    fi
+    case "$*" in
+        "show -p LoadState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
+            [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n'
+            return ;;
+        "show -p ActiveState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
+            [ -e "$RR_TEST_ACTIVE_UNIT" ] && printf 'active\n' || printf 'inactive\n'
+            return ;;
+        "show -p UnitFileState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
+            if [ -e "$RR_TEST_ENABLED_UNIT" ]; then
+                printf 'enabled\n'
+            elif [ -e "$RR_QUARANTINE_UNIT" ]; then
+                printf 'disabled\n'
+            fi
+            return ;;
+    esac
     case "${1:-}:${2:-}" in
         is-active:--quiet) [ -e "$RR_TEST_ACTIVE_UNIT" ] ;;
         is-enabled:--quiet) [ -e "$RR_TEST_ENABLED_UNIT" ] ;;
@@ -62,18 +88,50 @@ systemctl() {
         daemon-reload:*) [ ! -e "$RR_TEST_DAEMON_FAIL" ] ;;
         show:--property=LoadState)
             [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
-            printf '%s\n' "$RR_TEST_HEALTH_LOAD_STATE"
+            if [ "${4:-}" = rr-subscription-quarantine.service ]; then
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n'
+            else
+                printf '%s\n' "$RR_TEST_HEALTH_LOAD_STATE"
+            fi
             ;;
         show:--property=ActiveState)
             [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
-            printf '%s\n' "$RR_TEST_HEALTH_ACTIVE_STATE"
+            if [ "${4:-}" = rr-subscription-quarantine.service ]; then
+                [ -e "$RR_TEST_ACTIVE_UNIT" ] && printf 'active\n' || printf 'inactive\n'
+            else
+                printf '%s\n' "$RR_TEST_HEALTH_ACTIVE_STATE"
+            fi
             ;;
         show:--property=UnitFileState)
             [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
-            printf '%s\n' "$RR_TEST_HEALTH_UNIT_FILE_STATE"
+            if [ "${4:-}" = rr-subscription-quarantine.service ]; then
+                if [ -e "$RR_TEST_ENABLED_UNIT" ]; then
+                    printf 'enabled\n'
+                elif [ -e "$RR_QUARANTINE_UNIT" ]; then
+                    printf 'disabled\n'
+                fi
+            else
+                printf '%s\n' "$RR_TEST_HEALTH_UNIT_FILE_STATE"
+            fi
             ;;
         *) return 0 ;;
     esac
+}
+
+sync() {
+    printf 'sync:%s\n' "$*" >> "$RR_TEST_OPERATION_LOG"
+    [ ! -e "$RR_TEST_SYNC_FAIL" ]
+}
+
+stop_subscription_servers() {
+    printf '%s\n' stop-subscription >> "$RR_TEST_OPERATION_LOG"
+    [ -z "$RR_TEST_RECREATE_PATH" ] || : > "$RR_TEST_RECREATE_PATH"
+    [ ! -e "$RR_TEST_SUBSCRIPTION_STOP_FAIL" ]
+}
+
+subscription_server_running() {
+    printf '%s\n' probe-subscription >> "$RR_TEST_OPERATION_LOG"
+    [ -e "$RR_TEST_SUBSCRIPTION_REMAINS" ]
 }
 
 iptables() {
@@ -119,6 +177,10 @@ reset_case() {
         "$RR_TEST_ENABLED_UNIT" "$RR_TEST_HELPER_LOG" "$RR_TEST_DELETE_FAIL" \
         "$RR_TEST_QUERY_FAIL" "$RR_TEST_STOP_FAIL"
     rm -f -- "$RR_TEST_DAEMON_FAIL"
+    rm -f -- "$RR_TEST_SYSTEMD_QUERY_FAIL"
+    rm -f -- "$RR_TEST_SYNC_FAIL" "$RR_TEST_SUBSCRIPTION_REMAINS" \
+        "$RR_TEST_SUBSCRIPTION_STOP_FAIL" "$RR_TEST_OPERATION_LOG"
+    RR_TEST_RECREATE_PATH=""
     mkdir -p -- "$RR_TX_ROOT" "$(dirname "$RR_QUARANTINE_UNIT")" \
         "$(dirname "$RR_QUARANTINE_READY")" "$(dirname "$RR_RECOVERY_SELF")"
     chmod 700 -- "$(dirname "$RR_RECOVERY_SELF")"
@@ -131,6 +193,7 @@ write_helper() {
 set -u
 [ "${1:-}" = clear-quarantine ] || exit 2
 printf '%s\n' "$1" >> "$RR_TEST_HELPER_LOG"
+[ -z "${RR_TEST_OPERATION_LOG:-}" ] || printf '%s\n' clear-quarantine >> "$RR_TEST_OPERATION_LOG"
 case "$RR_TEST_HELPER_MODE" in
     success)
         rm -f -- "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
@@ -150,13 +213,13 @@ HELPER
     export RR_TEST_HELPER_MODE="$mode"
 }
 
-printf '%s\n' '[1/16] an absent quarantine needs no recovery helper'
+printf '%s\n' '[1/21] an absent quarantine needs no recovery helper'
 reset_case
 _uninstall_clear_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" "$RR_QUARANTINE_READY"
 [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[2/16] a marker or symlink fails closed without a trusted helper'
+printf '%s\n' '[2/21] a marker or symlink fails closed without a trusted helper'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 if _uninstall_clear_subscription_quarantine \
@@ -175,7 +238,7 @@ if _uninstall_clear_subscription_quarantine \
     exit 1
 fi
 
-printf '%s\n' '[3/16] unsafe helpers and writable ancestors are rejected'
+printf '%s\n' '[3/21] unsafe helpers and writable ancestors are rejected'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 write_helper success
@@ -209,7 +272,7 @@ if _uninstall_recovery_helper_is_trusted "$unsafe_parent/helper-dir/recover"; th
     exit 1
 fi
 
-printf '%s\n' '[4/16] helper failure preserves quarantine evidence'
+printf '%s\n' '[4/21] helper failure preserves quarantine evidence'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 write_helper fail
@@ -222,7 +285,7 @@ fi
 [ -e "$RR_QUARANTINE_FILE" ]
 [ "$(cat "$RR_TEST_HELPER_LOG")" = clear-quarantine ]
 
-printf '%s\n' '[5/16] post-clear residue prevents destructive uninstall continuation'
+printf '%s\n' '[5/21] post-clear residue prevents destructive uninstall continuation'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 : > "$RR_TEST_RAW_RULE"
@@ -235,7 +298,7 @@ if _uninstall_clear_subscription_quarantine \
 fi
 [ -e "$RR_TEST_RAW_RULE" ]
 
-printf '%s\n' '[6/16] a trusted helper must remove every quarantine artifact'
+printf '%s\n' '[6/21] a trusted helper must remove every quarantine artifact'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
@@ -252,7 +315,7 @@ if _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[7/16] markerless exact RR firewall residue is discovered and removed'
+printf '%s\n' '[7/21] markerless exact RR firewall residue is discovered and removed'
 reset_case
 : > "$RR_TEST_RAW_RULE"
 _uninstall_quarantine_present \
@@ -265,7 +328,7 @@ if _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[8/16] firewall deletion failure remains visible and fails closed'
+printf '%s\n' '[8/21] firewall deletion failure remains visible and fails closed'
 reset_case
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
 : > "$RR_TEST_RAW_RULE"
@@ -281,7 +344,7 @@ if ! _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[9/16] a foreign same-comment rule is never broadened into deletion'
+printf '%s\n' '[9/21] a foreign same-comment rule is never broadened into deletion'
 reset_case
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
 printf 'foreign\n' > "$RR_TEST_RAW_RULE"
@@ -292,7 +355,7 @@ fi
 [ "$(cat "$RR_TEST_RAW_RULE")" = foreign ]
 [ -e "$RR_QUARANTINE_UNIT" ]
 
-printf '%s\n' '[10/16] an unreadable firewall backend is treated as quarantine evidence'
+printf '%s\n' '[10/21] unreadable firewall or systemd state is quarantine evidence'
 reset_case
 : > "$RR_TEST_QUERY_FAIL"
 if ! _uninstall_quarantine_present \
@@ -300,8 +363,15 @@ if ! _uninstall_quarantine_present \
     echo 'An unreadable raw firewall table was treated as clean.' >&2
     exit 1
 fi
+reset_case
+: > "$RR_TEST_SYSTEMD_QUERY_FAIL"
+if ! _uninstall_quarantine_present \
+    "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" "$RR_QUARANTINE_READY"; then
+    echo 'A systemd query failure with no visible files was treated as clean.' >&2
+    exit 1
+fi
 
-printf '%s\n' '[11/16] direct suspend and clear commands respect the shared update lock'
+printf '%s\n' '[11/21] direct suspend and clear commands respect the shared update lock'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 rr_prepare_update_lock_file "$RR_UPDATE_LOCK_FILE"
@@ -318,7 +388,7 @@ fi
 [ -e "$RR_QUARANTINE_FILE" ]
 exec {held_update_fd}>&-
 
-printf '%s\n' '[12/16] suspend failure retains marker and readiness evidence'
+printf '%s\n' '[12/21] suspend failure retains marker and readiness evidence'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 printf 'ready\n' > "$RR_QUARANTINE_READY"
@@ -332,7 +402,7 @@ fi
 [ -e "$RR_QUARANTINE_READY" ]
 [ -e "$RR_TEST_ACTIVE_UNIT" ]
 
-printf '%s\n' '[13/16] pre-firewall finalization failure retains the exact barrier'
+printf '%s\n' '[13/21] pre-firewall finalization failure retains the exact barrier'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
@@ -350,7 +420,7 @@ if ! _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[14/16] existing legacy locks are validated, contended and never recreated'
+printf '%s\n' '[14/21] existing legacy locks are validated, contended and never recreated'
 legacy_root="$TEST_ROOT/legacy-locks"
 mkdir -p -- "$legacy_root"
 chmod 700 -- "$legacy_root"
@@ -385,7 +455,7 @@ _uninstall_acquire_existing_legacy_lock "$absent_legacy" legacy_fd
 [ -z "$legacy_fd" ]
 [ ! -e "$absent_legacy" ]
 
-printf '%s\n' '[15/16] health-unit proof rejects query, stop, disable and ambiguous states'
+printf '%s\n' '[15/21] health-unit proof rejects query, stop, disable and ambiguous states'
 health_systemd_root="$TEST_ROOT/health-systemd"
 RR_RESTORE_SYSTEMD_DIR="$health_systemd_root"
 mkdir -p "$health_systemd_root"
@@ -424,8 +494,106 @@ rm -f "$RR_TEST_HEALTH_DISABLE_FAIL"
 RR_TEST_HEALTH_ACTIVE_STATE=failed
 RR_TEST_HEALTH_UNIT_FILE_STATE=static
 _uninstall_health_unit_is_safely_stopped argo-rr-health.timer
+RR_TEST_HEALTH_LOAD_STATE=error
+if _uninstall_health_unit_is_safely_stopped argo-rr-health.timer; then
+    echo 'An unknown health LoadState was accepted before quarantine release.' >&2
+    exit 1
+fi
+RR_TEST_HEALTH_LOAD_STATE=loaded
 
-printf '%s\n' '[16/16] destructive uninstall keeps quarantine until old restart paths are gone'
+printf '%s\n' '[16/21] a failed global durability barrier retains quarantine'
+reset_case
+release_systemd_root="$TEST_ROOT/release-systemd"
+release_restart_helper="$TEST_ROOT/release-auto-update-sub.py"
+mkdir -p "$release_systemd_root"
+printf 'marker\n' > "$RR_QUARANTINE_FILE"
+write_helper success
+: > "$RR_TEST_SYNC_FAIL"
+if _uninstall_release_subscription_quarantine \
+    "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
+    "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
+    "$release_systemd_root" "$release_restart_helper" >/dev/null 2>&1; then
+    echo 'A failed global sync released quarantine.' >&2
+    exit 1
+fi
+[ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
+
+printf '%s\n' '[17/21] every runtime and health restart path must be absent'
+reset_case
+mkdir -p "$release_systemd_root"
+printf 'marker\n' > "$RR_QUARANTINE_FILE"
+write_helper success
+ln -s "$TEST_ROOT/missing-health-target" "$release_systemd_root/argo-rr-health.timer"
+if _uninstall_release_subscription_quarantine \
+    "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
+    "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
+    "$release_systemd_root" "$release_restart_helper" >/dev/null 2>&1; then
+    echo 'A symlink health restart path was treated as absent.' >&2
+    exit 1
+fi
+[ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
+
+printf '%s\n' '[18/21] a surviving subscription process retains quarantine'
+reset_case
+rm -rf -- "$release_systemd_root"
+mkdir -p "$release_systemd_root"
+printf 'marker\n' > "$RR_QUARANTINE_FILE"
+write_helper success
+: > "$RR_TEST_SUBSCRIPTION_REMAINS"
+if _uninstall_release_subscription_quarantine \
+    "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
+    "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
+    "$release_systemd_root" "$release_restart_helper" >/dev/null 2>&1; then
+    echo 'A surviving subscription process released quarantine.' >&2
+    exit 1
+fi
+[ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
+
+printf '%s\n' '[19/21] restart paths are rechecked after process shutdown'
+reset_case
+rm -rf -- "$release_systemd_root"
+mkdir -p "$release_systemd_root"
+printf 'marker\n' > "$RR_QUARANTINE_FILE"
+write_helper success
+RR_TEST_RECREATE_PATH="$release_restart_helper"
+if _uninstall_release_subscription_quarantine \
+    "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
+    "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
+    "$release_systemd_root" "$release_restart_helper" >/dev/null 2>&1; then
+    echo 'A restart helper recreated during shutdown released quarantine.' >&2
+    exit 1
+fi
+[ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
+
+printf '%s\n' '[20/21] the durable release gate clears only after every proof succeeds'
+reset_case
+rm -rf -- "$release_systemd_root"
+rm -f -- "$release_restart_helper"
+mkdir -p "$release_systemd_root"
+printf 'marker\n' > "$RR_QUARANTINE_FILE"
+write_helper success
+_uninstall_release_subscription_quarantine \
+    "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
+    "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
+    "$release_systemd_root" "$release_restart_helper"
+[ ! -e "$RR_QUARANTINE_FILE" ]
+sync_line=$(grep -n '^sync:$' "$RR_TEST_OPERATION_LOG" | head -n 1 | cut -d: -f1)
+health_line=$(grep -n '^systemctl:show --property=LoadState --value argo-rr-health.timer$' \
+    "$RR_TEST_OPERATION_LOG" | head -n 1 | cut -d: -f1)
+stop_line=$(grep -n '^stop-subscription$' "$RR_TEST_OPERATION_LOG" | head -n 1 | cut -d: -f1)
+probe_line=$(grep -n '^probe-subscription$' "$RR_TEST_OPERATION_LOG" | head -n 1 | cut -d: -f1)
+clear_line=$(grep -n '^clear-quarantine$' "$RR_TEST_OPERATION_LOG" | head -n 1 | cut -d: -f1)
+[[ "$sync_line" =~ ^[0-9]+$ && "$health_line" =~ ^[0-9]+$ && \
+   "$stop_line" =~ ^[0-9]+$ && "$probe_line" =~ ^[0-9]+$ && \
+   "$clear_line" =~ ^[0-9]+$ ]] || {
+    echo 'Quarantine release ordering evidence is incomplete.' >&2
+    exit 1
+}
+[ "$sync_line" -lt "$health_line" ] && [ "$health_line" -lt "$stop_line" ] && \
+    [ "$stop_line" -lt "$probe_line" ] && [ "$probe_line" -lt "$clear_line" ]
+[ "$(grep -c '^clear-quarantine$' "$RR_TEST_OPERATION_LOG")" -eq 1 ]
+
+printf '%s\n' '[21/21] destructive uninstall keeps quarantine until old restart paths are gone'
 
 # Structural contract: the shared transaction lock and writer freeze must
 # precede destructive cleanup, and quarantine release must follow runtime and
@@ -434,12 +602,15 @@ uninstall_wrapper=$(sed -n '/^uninstall_all() {/,/^}/p' "$REPO_ROOT/modules/95-i
 uninstall_body=$(sed -n '/^uninstall_all_locked() {/,/^}/p' "$REPO_ROOT/modules/95-install.sh")
 timer_line=$(grep -n '_uninstall_health_unit_is_safely_stopped argo-rr-health.timer' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 stop_line=$(grep -n 'stop_subscription_servers' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
-clear_line=$(grep -n '_uninstall_clear_subscription_quarantine' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+clear_line=$(grep -n '_uninstall_release_subscription_quarantine' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 runtime_delete_line=$(grep -n '"\$RR_LIB_DIR" /usr/local/bin/rr' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+sub_root_delete_line=$(grep -n 'rm -rf -- "\$SUB_ROOT"' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 helper_delete_line=$(grep -n '/usr/local/sbin/rr-update-recover' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 [ "$timer_line" -le "$stop_line" ]
 [ "$stop_line" -lt "$clear_line" ]
 [ "$runtime_delete_line" -lt "$clear_line" ]
+[ "$clear_line" -lt "$sub_root_delete_line" ]
+[ "$sub_root_delete_line" -lt "$helper_delete_line" ]
 [ "$clear_line" -lt "$helper_delete_line" ]
 if grep -Eq 'rm[^\n]*/run/rr-vps/locks/update\.lock' <<<"$uninstall_body"; then
     echo 'Uninstall unlinks its still-held update lock.' >&2

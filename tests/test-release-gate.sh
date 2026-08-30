@@ -28,23 +28,89 @@ assert "permissions:\n      contents: write\n      actions: read" in publish
 assert "needs: verify" in publish
 assert "head_sha=${REQUESTED_SHA}" in verify
 assert "head_sha=${EXPECTED_SHA}" in publish
-# Pagination is used only for the pre-tag monotonic inventory and the final
-# no-newer-version recheck; workflow gates use the exact head_sha filter.
-assert release.count("--paginate --slurp") == 2
+# Workflow gates use the exact head_sha filter. Release/tag reconciliation
+# additionally requires successful paginated inventories and never maps a
+# failed API read to absence.
+assert release.count("--paginate --slurp") >= 4
 assert "assert_workflow_gate ci.yml CI" in publish
 assert 'assert_workflow_gate vps-audit.yml "VPS audit"' in publish
-assert publish.count("assert_release_gate") == 3
-assert publish.count("assert_verified_sha_gate") >= 4
+assert publish.count("assert_release_gate") >= 4
+assert publish.count("assert_verified_sha_gate") >= 2
+assert "assert_main_tip()" in publish
 assert 'git/ref/heads/main" --jq \'.object.sha\'' in publish
 assert re.search(
-    r"assert_release_gate\n\s+created_ref=\$\(api --method POST",
+    r"assert_release_gate\n\s+cleanup_armed=true\n\s+trap release_cleanup_on_exit EXIT\n"
+    r"\s+created_ref=\$\(api --method POST",
     publish,
 )
+ref_create = publish.index("created_ref=$(api --method POST")
+tag_wait = publish.index('wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA"', ref_create)
+tag_identity = publish.index("assert_run_owned_target_tag", tag_wait)
+post_tag_main = publish.index("assert_main_tip", tag_identity)
+draft_create = publish.index('gh release create "$TAG"', post_tag_main)
+assert ref_create < tag_wait < tag_identity < post_tag_main < draft_create
 assert re.search(
-    r"assert_verified_sha_gate\n\s+assert_no_newer_product_version\n"
-    r"\s+published_json=\$\(api --method PATCH",
+    r"assert_release_gate\n\s+cleanup_armed=false\n\s+trap - EXIT\n"
+    r"\s+publish_draft_and_confirm \"\$draft_id\" \"\$RUN_OWNER_MARKER\"",
     publish,
 )
+assert "rr-vps-release-owner:v2:" in publish
+assert "rr-vps-release-owner:v1:" not in publish
+assert "reconcile_owned_mutable_target()" in publish
+assert "classify_target_release_state()" in publish
+assert "is_owned_mutable_draft()" in publish
+assert "is_exact_public_release()" in publish
+assert "verify_published_release()" in publish
+assert '$actual.state == "starter"' in publish
+patch_call = publish.index(
+    'publish_draft_and_confirm "$draft_id" "$RUN_OWNER_MARKER"'
+)
+verify_call = publish.index(
+    'verify_published_release "$draft_id" "$RUN_OWNER_MARKER"', patch_call
+)
+assert patch_call < verify_call
+verifier_start = publish.index("          verify_published_release() {")
+assets_start = publish.index("          expected_assets=", verifier_start)
+verifier = publish[verifier_start:assets_start]
+exact_id = verifier.index('api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"')
+newer_gate = verifier.index("assert_no_newer_product_version", exact_id)
+latest_call = verifier.index('assert_latest_product "$release_id" "$owner_marker"', newer_gate)
+final_tag_identity = verifier.index("assert_run_owned_target_tag", latest_call)
+download = verifier.index("releases/latest/download", final_tag_identity)
+assert exact_id < newer_gate < latest_call < final_tag_identity < download
+latest_start = publish.index("          assert_latest_product() {")
+latest_end = verifier_start
+latest = publish[latest_start:latest_end]
+assert "is_exact_public_release" in latest
+assert "'.immutable == true'" in latest
+assert '--rawfile notes "$RELEASE_NOTES_FILE"' in publish
+assert '.body == ($notes + "\\n" + $marker + "\\n")' in publish
+assert 'releases=$(api --paginate --slurp' in publish
+assert '") || return 1\n            jq -e' in publish
+assert "remote_tags=$(git ls-remote --tags --refs origin 'refs/tags/v*') || return 1" in publish
+
+driver = publish[assets_start:]
+first_classify = driver.index("classify_target_release_state")
+first_version_gate = driver.index("assert_new_monotonic_version")
+tag_object_post = driver.index('tag_object=$(api --method POST')
+assert first_classify < first_version_gate < tag_object_post
+resume_start = driver.index("exact_public_current)")
+resume_end = driver.index("owned_mutable)", resume_start)
+resume = driver[resume_start:resume_end]
+assert "assert_release_gate" in resume
+assert "verify_published_release" in resume
+assert "exit 0" in resume
+assert not re.search(r"--method\s+(?:POST|PATCH|DELETE)", resume)
+owned_end = driver.index("absent)", resume_end)
+owned = driver[resume_end:owned_end]
+assert 'reconcile_owned_mutable_target "$LOADED_TAG_OBJECT_SHA"' in owned
+last_creation_gate = driver.rfind("assert_release_gate", 0, tag_object_post)
+assert last_creation_gate != -1 and last_creation_gate < tag_object_post
+assert publish.index(
+    'api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"'
+) < publish.index('delete_owned_target_tag "$expected_object_sha" "$expected_marker"')
+assert "Main is allowed to" not in publish
+assert publish.count("--method PATCH") == 1
 assert "bash scripts/" not in publish
 assert "python3 scripts/" not in publish
 for asset in (
@@ -54,13 +120,13 @@ for asset in (
     assert f"            {asset}\n" in publish
 
 assert "StrictHostKeyChecking=accept-new" not in vps
-assert vps.count("StrictHostKeyChecking=yes") == 3
-assert vps.count("HostKeyAlgorithms=ssh-ed25519") == 3
-assert vps.count("GlobalKnownHostsFile=/dev/null") == 3
+assert vps.count("StrictHostKeyChecking=yes") == 4
+assert vps.count("HostKeyAlgorithms=ssh-ed25519") == 4
+assert vps.count("GlobalKnownHostsFile=/dev/null") == 4
 job_ranges = {
     "A": ("  debian-full:\n", "  ubuntu-upgrade:\n"),
     "B": ("  ubuntu-upgrade:\n", "  ubuntu-transaction:\n"),
-    "C": ("  ubuntu-transaction:\n", "  vps-gate:\n"),
+    "C": ("  ubuntu-transaction:\n", "  cross-machine-migration-scale:\n"),
 }
 for slot, (start_marker, end_marker) in job_ranges.items():
     start = vps.index(start_marker)
@@ -68,14 +134,63 @@ for slot, (start_marker, end_marker) in job_ranges.items():
     job = vps[start:end]
     assert f"RR_{slot}_HOST_KEY: ${{{{ secrets.RR_{slot}_HOST_KEY }}}}" in job
     assert 'printf \'%s %s %s\\n\' "$host" "$host_key_type" "$host_key_data" > "$known_hosts"' in job
+migration_start = vps.index("  cross-machine-migration-scale:\n")
+gate_start = vps.index("  vps-gate:\n", migration_start)
+migration = vps[migration_start:gate_start]
+gate = vps[gate_start:]
+assert "needs: [debian-full, ubuntu-transaction]" in migration
+for slot in ("A", "C"):
+    for secret in ("HOST", "HOST_KEY", "PASS"):
+        assert f"RR_{slot}_{secret}: ${{{{ secrets.RR_{slot}_{secret} }}}}" in migration
+assert "known-hosts-migration-A" in migration
+assert "known-hosts-migration-C" in migration
+assert 'prepare_known_hosts "$a_host" "$RR_A_HOST_KEY" "$a_known_hosts"' in migration
+assert 'prepare_known_hosts "$c_host" "$RR_C_HOST_KEY" "$c_known_hosts"' in migration
+assert migration.count("assert_unit_state() {") == 2
+for fragment in (
+    'systemctl show -p LoadState --value "$unit"',
+    'systemctl show -p ActiveState --value "$unit"',
+    'systemctl show -p UnitFileState --value "$unit"',
+    'test "$load_state:$active_state:$unit_file_state" = "$expected"',
+):
+    assert migration.count(fragment) == 2
+assert "for scale in 1 10 100 500; do" in migration
+assert "timeout --kill-after=5 150 /usr/local/bin/rr --sync-devices" in migration
+assert 'timeout --kill-after=10 300 /usr/local/bin/rr backup "$backup_file"' in migration
+assert 'timeout --kill-after=10 300 /usr/local/bin/rr restore "$backup_file"' in migration
+assert migration.count("RR_BACKUP_PASSPHRASE=") == 2
+assert "PRAGMA quick_check" in migration
+assert "PRAGMA foreign_key_check" in migration
+assert "stable_sha256" in migration
+assert "cmp -s \"$fingerprint_file\" \"$restored_fingerprint\"" in migration
+assert "127.0.0.1:7900" in migration
+assert "public_listen=$(ss -H -ltn 'sport = :17900') || exit 1" in migration
+for field in (
+    "SUB_PORT", "SUB_ACCESS_MODE", "SUB_DOMAIN",
+    "SUB_PUBLIC_PORT_IPV4", "SUB_PUBLIC_PORT_IPV6",
+):
+    assert field in migration
+assert "rr-audit-cross-target-bind" in migration
+assert "rr-audit-cross-target-firewall" in migration
+assert "capture_rr_firewall_state()" in migration
+assert "NAIVE_ENABLED=false" in migration
+assert "expected_private" in migration and "expected_public" in migration
+assert (
+    "needs: [debian-full, ubuntu-upgrade, ubuntu-transaction, "
+    "cross-machine-migration-scale]"
+) in gate
+assert "M_RESULT: ${{ needs.cross-machine-migration-scale.result }}" in gate
+assert 'test "$M_RESULT" = success' in gate
 assert "pinned SSH host keys" in vps
 assert "TOFU" not in vps
+assert not re.search(r"\bsystemctl\s+is-(?:active|enabled)\b", vps)
 for line in vps.splitlines():
     if line.lstrip().startswith("! "):
         assert "||" in line, f"bare negated assertion can pass under errexit: {line}"
 assert not re.search(r"!\s+ss\b", vps)
 assert not re.search(r"if\s+ss\b[^\n]*\|", vps)
 assert not re.search(r"if\s+journalctl\b[^\n]*\|", vps)
+assert not re.search(r'test\s+-z\s+"\$\(', vps)
 assert 'rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null || true)' not in vps
 assert "test-uninstall-quarantine.sh|\\" in ci
 

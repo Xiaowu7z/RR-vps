@@ -27,7 +27,7 @@ extract_function() {
     ' "$REPO_ROOT/scripts/install-core.sh"
 }
 
-printf '%s\n' '[1/11] an all-inactive writer snapshot is a successful state capture'
+printf '%s\n' '[1/13] an all-inactive writer snapshot is a successful state capture'
 eval "$(extract_function rr_unit_activity_matches)"
 eval "$(extract_function rr_unit_file_state_matches)"
 eval "$(extract_function rr_capture_unit_activity_state)"
@@ -63,7 +63,7 @@ fi
 [ "$RR_HEALTH_STATE_CAPTURED" = false ] || \
     fail 'failed writer capture published partial health evidence'
 
-printf '%s\n' '[2/11] repeated health freezes preserve the first observed enabled state'
+printf '%s\n' '[2/13] repeated health freezes preserve the first observed enabled state'
 eval "$(extract_function rr_freeze_health_monitor)"
 RR_HEALTH_MONITOR_FROZEN=false
 RR_HEALTH_TIMER_WAS_ENABLED=false
@@ -183,7 +183,12 @@ run_recovery_case() (
             'show -p LoadState --value '*)
                 unit="${5:-}"
                 if [ "$wanted_failure" = query-error ] && [ "$unit" = rr-nexus ]; then return 1; fi
-                [ "$wanted_failure" = absent ] && [ "$unit" = sing-box ] && printf 'not-found\n' || printf 'loaded\n'
+                if { [ "$wanted_failure" = absent ] && [ "$unit" = sing-box ]; } || \
+                   { [ "$wanted_failure" = incoherent ] && [ "$unit" = rr-nexus ]; }; then
+                    printf 'not-found\n'
+                else
+                    printf 'loaded\n'
+                fi
                 return 0 ;;
             'show -p ActiveState --value '*)
                 unit="${5:-}"
@@ -194,6 +199,10 @@ run_recovery_case() (
                 unit="${5:-}"
                 if [ "$wanted_failure" = query-error ] && [ "$unit" = rr-nexus ]; then return 1; fi
                 if [ "$wanted_failure" = absent ] && [ "$unit" = sing-box ]; then return 0; fi
+                if [ "$wanted_failure" = incoherent ] && [ "$unit" = rr-nexus ]; then
+                    printf 'enabled\n'
+                    return 0
+                fi
                 [ "${enabled[$unit]:-false}" = true ] && printf 'enabled\n' || printf 'disabled\n'
                 return 0 ;;
         esac
@@ -249,7 +258,8 @@ run_recovery_case() (
         chmod 600 "$tx/phase" "$RR_ACTIVE_TX" "$RR_UPDATE_MAINTENANCE_FILE"
     fi
 
-    if [ "$wanted_failure" = true ] || [ "$wanted_failure" = query-error ]; then
+    if [ "$wanted_failure" = true ] || [ "$wanted_failure" = query-error ] || \
+       [ "$wanted_failure" = incoherent ]; then
         set +e
         main recover
         rc=$?
@@ -285,13 +295,13 @@ run_recovery_case() (
     [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'successful recovery left maintenance marker'
 )
 
-printf '%s\n' '[3/11] state-record crash recovery touches no service before freezing begins'
+printf '%s\n' '[3/13] state-record crash recovery touches no service before freezing begins'
 run_recovery_case state-recorded false state_recorded
 
-printf '%s\n' '[4/11] pre-mutation crash recovery restores exact active/enabled state'
+printf '%s\n' '[4/13] pre-mutation crash recovery restores exact active/enabled state'
 run_recovery_case restore-success false
 
-printf '%s\n' '[5/11] a real SIGKILL leaves durable state that standalone recovery consumes'
+printf '%s\n' '[5/13] a real SIGKILL leaves durable state that standalone recovery consumes'
 sig_root="$TEST_ROOT/sigkill"
 sig_tx="$sig_root/update/transactions/tx"
 sig_marker="$sig_root/run/update-maintenance"
@@ -322,7 +332,7 @@ set -e
 [ -f "$sig_root/update/active" ] && [ -f "$sig_marker" ] || fail 'SIGKILL lost durable recovery pointers'
 run_recovery_case sigkill false freezing true
 
-printf '%s\n' '[6/11] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
+printf '%s\n' '[6/13] recovery freezes health writers before a SIGKILL can interrupt runtime restore'
 kill_root="$TEST_ROOT/recovery-sigkill"
 kill_tx="$kill_root/update/transactions/tx"
 kill_timer_active="$kill_root/health-timer-active"
@@ -390,26 +400,38 @@ set -e
 [ -e "$kill_root/update/active" ] && [ -e "$kill_root/run/update-maintenance" ] || \
     fail 'runtime-restore SIGKILL discarded transaction evidence'
 
-printf '%s\n' '[7/11] restart failure is fail-closed and retains transaction evidence'
+printf '%s\n' '[7/13] restart failure is fail-closed and retains transaction evidence'
 run_recovery_case restore-failure true
 run_recovery_case restore-query-error query-error
 run_recovery_case restore-absent absent
+run_recovery_case restore-incoherent incoherent
 
-printf '%s\n' '[8/11] a committed crash retries finalization before clearing maintenance'
+printf '%s\n' '[8/13] a committed crash retries finalization before clearing maintenance'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
     export RR_TX_ROOT="$TEST_ROOT/committed/update"
     export RR_ACTIVE_TX="$RR_TX_ROOT/active"
     export RR_LAUNCHER="$TEST_ROOT/committed/rr"
+    export RR_LIB_DIR="$TEST_ROOT/committed/runtime"
     export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/committed/run/update-maintenance"
     export RR_TEST_FINALIZE_LOG="$TEST_ROOT/committed/finalize.log"
     export RR_TEST_FINALIZE_FAIL=0
     source "$REPO_ROOT/scripts/update-recover.sh"
+    restore_log="$TEST_ROOT/committed/restore.log"
+    rr_restore_transaction() {
+        printf '%s\n' restore-called >> "$restore_log"
+        return 97
+    }
     tx="$RR_TX_ROOT/transactions/tx"
     mkdir -p "$tx/backup" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")" \
-        "$(dirname "$RR_LAUNCHER")"
+        "$(dirname "$RR_LAUNCHER")" "$RR_LIB_DIR/modules"
     chmod 700 "$tx" "$tx/backup"
+    chmod 0755 "$RR_LIB_DIR" "$RR_LIB_DIR/modules"
+    printf 'SCRIPT_VERSION="7.1.1"\n' > "$RR_LIB_DIR/modules/00-runtime.sh"
+    chmod 0600 "$RR_LIB_DIR/modules/00-runtime.sh"
+    : > "$tx/backup/health_timer_was_enabled"
+    chmod 600 "$tx/backup/health_timer_was_enabled"
     printf '%s\n' '#!/bin/bash' \
         'printf "%s %s\n" "${RR_UPDATE_LOCK_HELD:-}" "$*" >> "$RR_TEST_FINALIZE_LOG"' \
         'exit "${RR_TEST_FINALIZE_FAIL:-0}"' > "$RR_LAUNCHER"
@@ -441,6 +463,11 @@ printf '%s\n' '[8/11] a committed crash retries finalization before clearing mai
             'show -p ActiveState --value argo-rr-health.service') printf 'inactive\n' ;;
             'show -p UnitFileState --value argo-rr-health.timer'|\
             'show -p UnitFileState --value argo-rr-health.service') : ;;
+            'show -p LoadState --value rr-subscription-quarantine.service') printf 'not-found\n' ;;
+            'show -p ActiveState --value rr-subscription-quarantine.service') printf 'inactive\n' ;;
+            'show -p UnitFileState --value rr-subscription-quarantine.service') : ;;
+            'enable argo-rr-health.timer'|'start --no-block argo-rr-health.timer'|\
+            'stop --no-block sing-box'|'stop --no-block rr-nexus') return 0 ;;
             *) fail "committed recovery touched service state: $*" ;;
         esac
     }
@@ -476,13 +503,20 @@ printf '%s\n' '[8/11] a committed crash retries finalization before clearing mai
     rc=$?
     set -e
     [ "$rc" -eq 1 ] || fail 'global terminal sync failure was reported as success'
-    [ "$(cat "$tx/phase")" = recovery_failed ] && [ -e "$RR_ACTIVE_TX" ] &&
+    [ "$(cat "$tx/phase")" = committed ] && [ -e "$RR_ACTIVE_TX" ] &&
         [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
         fail 'global terminal sync failure discarded active or maintenance evidence'
+    [ ! -e "$restore_log" ] || fail 'terminal sync failure made a committed candidate rollback-eligible'
     unset -f sync
 
-    printf 'committed\n' > "$tx/phase"
-    chmod 600 "$tx/phase"
+    main recover || fail 'committed cleanup did not succeed after the durability fault cleared'
+    [ "$(cat "$tx/phase")" = committed ] && [ -e "$RR_ACTIVE_TX" ] &&
+        [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+        fail 'committed cleanup retry changed its terminal phase or rollback pointer'
+    [ ! -e "$restore_log" ] || fail 'second recovery restored or rolled back a committed candidate'
+
+    printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
+    chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
     export RR_TEST_FINALIZE_FAIL=1
     set +e
     main recover
@@ -494,7 +528,227 @@ printf '%s\n' '[8/11] a committed crash retries finalization before clearing mai
         fail 'candidate finalization failure discarded committed recovery evidence'
 )
 
-printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with health writers frozen'
+printf '%s\n' '[9/13] aborted recovery is idempotent and requires a durable active unlink'
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    export RR_UPDATE_LOCK_HELD=1
+    export RR_TX_ROOT="$TEST_ROOT/aborted-terminal/update"
+    export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/aborted-terminal/run/update-maintenance"
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    tx="$RR_TX_ROOT/transactions/tx"
+    parent="$RR_TX_ROOT"
+    restore_log="$TEST_ROOT/aborted-terminal/restore.log"
+    unlink_fail=false
+    parent_sync_fail=false
+    rr_restore_transaction() {
+        printf '%s\n' restore-called >> "$restore_log"
+        return 97
+    }
+    rm() {
+        if [ "$unlink_fail" = true ] && [ "$*" = "-f -- $RR_ACTIVE_TX" ]; then
+            return 1
+        fi
+        command rm "$@"
+    }
+    sync() {
+        if [ "$parent_sync_fail" = true ] && [ "$*" = "-f $parent" ]; then
+            return 1
+        fi
+        command sync "$@"
+    }
+    mkdir -p "$tx/backup" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
+    chmod 700 "$RR_TX_ROOT" "$tx" "$tx/backup"
+    printf '2\n' > "$tx/transaction-format"
+    printf 'aborted\n' > "$tx/phase"
+    : > "$tx/backup/writer_state_complete"
+    chmod 600 "$tx/transaction-format" "$tx/phase" "$tx/backup/writer_state_complete"
+    systemctl() {
+        case "$*" in
+            'is-active --quiet rr-subscription-quarantine.service'|\
+            'is-enabled --quiet rr-subscription-quarantine.service') return 1 ;;
+            'disable --now argo-rr-health.timer'|'stop argo-rr-health.timer'|\
+            'disable argo-rr-health.service'|'stop argo-rr-health.service'|\
+            'disable argo-rr-health.timer'|'stop --no-block argo-rr-health.timer'|\
+            'disable sing-box'|'disable rr-nexus'|'stop sing-box'|'stop rr-nexus'|\
+            'stop --no-block sing-box'|'stop --no-block rr-nexus') return 0 ;;
+            'show -p LoadState --value argo-rr-health.timer'|\
+            'show -p LoadState --value argo-rr-health.service') printf 'not-found\n' ;;
+            'show -p LoadState --value sing-box'|\
+            'show -p LoadState --value rr-nexus') printf 'loaded\n' ;;
+            'show -p ActiveState --value argo-rr-health.timer'|\
+            'show -p ActiveState --value argo-rr-health.service'|\
+            'show -p ActiveState --value sing-box'|\
+            'show -p ActiveState --value rr-nexus') printf 'inactive\n' ;;
+            'show -p UnitFileState --value argo-rr-health.timer'|\
+            'show -p UnitFileState --value argo-rr-health.service') : ;;
+            'show -p UnitFileState --value sing-box'|\
+            'show -p UnitFileState --value rr-nexus') printf 'disabled\n' ;;
+            *) fail "aborted recovery touched unexpected service state: $*" ;;
+        esac
+    }
+    rr_stop_subscription_servers() { return 0; }
+    rr_subscription_running() { return 1; }
+
+    publish_active() {
+        printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+        chmod 600 "$RR_ACTIVE_TX"
+    }
+
+    publish_active
+    unlink_fail=true
+    set +e
+    main recover
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$(cat "$tx/phase")" = aborted ] && \
+        [ -e "$RR_ACTIVE_TX" ] && [ -d "$tx" ] ||
+        fail 'active unlink failure lost an aborted terminal transaction'
+    [ ! -e "$restore_log" ] || fail 'aborted unlink failure entered rollback'
+
+    unlink_fail=false
+    main recover || fail 'aborted active unlink retry did not succeed'
+    [ ! -e "$RR_ACTIVE_TX" ] && [ "$(cat "$tx/phase")" = aborted ] ||
+        fail 'aborted retry did not durably clear its active pointer'
+    main recover || fail 'already-consumed aborted recovery was not idempotent'
+    [ ! -e "$restore_log" ] || fail 'idempotent aborted recovery entered rollback'
+
+    publish_active
+    parent_sync_fail=true
+    set +e
+    main recover
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ "$(cat "$tx/phase")" = aborted ] && \
+        [ -f "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ] && [ -d "$tx" ] && \
+        [ "$(cat "$RR_ACTIVE_TX")" = "$tx" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' "$RR_ACTIVE_TX")" = 0:0:600:1 ] ||
+        fail 'active parent-fsync failure did not republish strict terminal evidence'
+    [ ! -e "$restore_log" ] || fail 'active parent-fsync failure entered rollback'
+
+    parent_sync_fail=false
+    main recover || fail 'republished aborted pointer was not consumed safely'
+    [ ! -e "$RR_ACTIVE_TX" ] && [ "$(cat "$tx/phase")" = aborted ] && \
+        [ ! -e "$restore_log" ] ||
+        fail 'republished aborted recovery regressed into rollback'
+)
+
+printf '%s\n' '[10/13] normal terminal cleanup retries restore the recorded writer state'
+for terminal_phase in committed rolled_back aborted; do
+    (
+        export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+        export RR_UPDATE_LOCK_HELD=1
+        export RR_TX_ROOT="$TEST_ROOT/terminal-retry-$terminal_phase/update"
+        export RR_ACTIVE_TX="$RR_TX_ROOT/active"
+        export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/terminal-retry-$terminal_phase/run/update-maintenance"
+        source "$REPO_ROOT/scripts/update-recover.sh"
+        tx="$RR_TX_ROOT/transactions/tx"
+        timer_active="$TEST_ROOT/terminal-retry-$terminal_phase/timer-active"
+        timer_enabled="$TEST_ROOT/terminal-retry-$terminal_phase/timer-enabled"
+        operation_log="$TEST_ROOT/terminal-retry-$terminal_phase/operations"
+        fail_global_sync=true
+        mkdir -p "$tx/backup" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
+        chmod 700 "$RR_TX_ROOT" "$tx" "$tx/backup"
+        printf '%s\n' "$terminal_phase" > "$tx/phase"
+        printf '%s\n' "$tx" > "$RR_ACTIVE_TX"
+        printf '%s\n' "$tx" > "$RR_UPDATE_MAINTENANCE_FILE"
+        printf '2\n' > "$tx/transaction-format"
+        : > "$tx/backup/writer_state_complete"
+        : > "$tx/backup/health_timer_was_enabled"
+        : > "$tx/backup/health_timer_was_running"
+        chmod 600 "$tx/phase" "$RR_ACTIVE_TX" "$RR_UPDATE_MAINTENANCE_FILE" \
+            "$tx/transaction-format" "$tx/backup/writer_state_complete" \
+            "$tx/backup/health_timer_was_enabled" "$tx/backup/health_timer_was_running"
+        : > "$timer_active"
+        : > "$timer_enabled"
+        : > "$operation_log"
+
+        rr_finalize_committed_candidate() { return 0; }
+        rr_stop_subscription_servers() { return 0; }
+        rr_subscription_running() { return 1; }
+        systemctl() {
+            printf 'systemctl:%s\n' "$*" >> "$operation_log"
+            case "$*" in
+                'is-active --quiet rr-subscription-quarantine.service'|\
+                'is-enabled --quiet rr-subscription-quarantine.service') return 1 ;;
+                'disable --now argo-rr-health.timer')
+                    rm -f -- "$timer_active" "$timer_enabled" ;;
+                'stop argo-rr-health.timer') rm -f -- "$timer_active" ;;
+                'disable argo-rr-health.service'|'stop argo-rr-health.service') : ;;
+                'show -p LoadState --value argo-rr-health.timer'|\
+                'show -p LoadState --value argo-rr-health.service') printf 'loaded\n' ;;
+                'show -p LoadState --value sing-box'|\
+                'show -p LoadState --value rr-nexus') printf 'loaded\n' ;;
+                'show -p ActiveState --value argo-rr-health.timer')
+                    [ -e "$timer_active" ] && printf 'active\n' || printf 'inactive\n' ;;
+                'show -p ActiveState --value argo-rr-health.service'|\
+                'show -p ActiveState --value sing-box'|\
+                'show -p ActiveState --value rr-nexus') printf 'inactive\n' ;;
+                'show -p UnitFileState --value argo-rr-health.timer')
+                    [ -e "$timer_enabled" ] && printf 'enabled\n' || printf 'disabled\n' ;;
+                'show -p UnitFileState --value argo-rr-health.service') printf 'static\n' ;;
+                'show -p UnitFileState --value sing-box'|\
+                'show -p UnitFileState --value rr-nexus') printf 'disabled\n' ;;
+                'show -p LoadState --value rr-subscription-quarantine.service') printf 'not-found\n' ;;
+                'show -p ActiveState --value rr-subscription-quarantine.service') printf 'inactive\n' ;;
+                'show -p UnitFileState --value rr-subscription-quarantine.service') : ;;
+                'enable argo-rr-health.timer') : > "$timer_enabled" ;;
+                'restart argo-rr-health.timer') : > "$timer_active" ;;
+                'disable sing-box'|'disable rr-nexus'|\
+                'stop sing-box'|'stop rr-nexus') : ;;
+                *) fail "unexpected terminal-retry systemctl operation: $*" ;;
+            esac
+        }
+        sync() {
+            if [ "$#" -eq 0 ] && [ "$fail_global_sync" = true ]; then
+                printf 'sync:global\n' >> "$operation_log"
+                return 1
+            fi
+            [ "$#" -ne 0 ] || printf 'sync:global\n' >> "$operation_log"
+            command sync "$@"
+        }
+
+        set +e
+        main recover
+        rc=$?
+        set -e
+        [ "$rc" -eq 1 ] && [ "$(cat "$tx/phase")" = "$terminal_phase" ] ||
+            fail "$terminal_phase durability failure changed the terminal phase"
+        [ ! -e "$timer_active" ] && [ ! -e "$timer_enabled" ] ||
+            fail "$terminal_phase durability failure did not freeze health writers"
+        restore_line=$(grep -n '^systemctl:restart argo-rr-health.timer$' "$operation_log" | \
+            head -n 1 | cut -d: -f1)
+        sync_line=$(grep -n '^sync:global$' "$operation_log" | head -n 1 | cut -d: -f1)
+        [[ "$restore_line" =~ ^[0-9]+$ && "$sync_line" =~ ^[0-9]+$ ]] && \
+            [ "$restore_line" -lt "$sync_line" ] ||
+            fail "$terminal_phase synchronized before restoring its recorded writer state"
+        fail_global_sync=false
+        main recover || fail "$terminal_phase terminal cleanup retry failed"
+        [ -e "$timer_active" ] && [ -e "$timer_enabled" ] ||
+            fail "$terminal_phase terminal cleanup retry left the health timer frozen"
+        [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] ||
+            fail "$terminal_phase terminal cleanup retry retained maintenance"
+        if [ "$terminal_phase" = committed ]; then
+            [ -e "$RR_ACTIVE_TX" ] || fail 'committed retry discarded the rollback pointer'
+        else
+            [ ! -e "$RR_ACTIVE_TX" ] || fail "$terminal_phase retry retained the active pointer"
+        fi
+    )
+done
+
+terminal_branch=$(sed -n '/if \[ "$mode" = recover \] && \\/,/^        return 0$/p' \
+    "$REPO_ROOT/scripts/update-recover.sh" | tail -n 95)
+restore_line=$(grep -n 'rr_restore_recorded_writer_state' <<<"$terminal_branch" | tail -n 1 | cut -d: -f1)
+sync_line=$(grep -n 'rr_prepare_terminal_transaction_cleanup' <<<"$terminal_branch" | tail -n 1 | cut -d: -f1)
+marker_line=$(grep -n 'rr_clear_update_maintenance_marker' <<<"$terminal_branch" | tail -n 1 | cut -d: -f1)
+active_line=$(grep -n 'rr_clear_active_transaction_pointer' <<<"$terminal_branch" | tail -n 1 | cut -d: -f1)
+[[ "$restore_line" =~ ^[0-9]+$ && "$sync_line" =~ ^[0-9]+$ && \
+   "$marker_line" =~ ^[0-9]+$ && "$active_line" =~ ^[0-9]+$ ]] && \
+    [ "$restore_line" -lt "$sync_line" ] && [ "$sync_line" -lt "$marker_line" ] && \
+    [ "$marker_line" -lt "$active_line" ] ||
+    fail 'terminal cleanup is not ordered writer-restore, global-sync, maintenance, active'
+
+printf '%s\n' '[11/13] invalid evidence and systemd query errors fail closed with health writers frozen'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=1
@@ -508,6 +762,7 @@ printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with
     service_active="$TEST_ROOT/fail-closed/service-active"
     query_fail=false
     absent_units=false
+    invalid_load_state=false
     mkdir -p "$RR_TX_ROOT/transactions" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
 
     systemctl() {
@@ -519,7 +774,13 @@ printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with
             'show -p LoadState --value argo-rr-health.timer'|\
             'show -p LoadState --value argo-rr-health.service')
                 [ "$query_fail" = false ] || return 1
-                [ "$absent_units" = true ] && printf 'not-found\n' || printf 'loaded\n' ;;
+                if [ "$invalid_load_state" = true ]; then
+                    printf 'error\n'
+                elif [ "$absent_units" = true ]; then
+                    printf 'not-found\n'
+                else
+                    printf 'loaded\n'
+                fi ;;
             'show -p ActiveState --value argo-rr-health.timer')
                 [ "$query_fail" = false ] || return 1
                 [ -e "$timer_active" ] && printf 'active\n' || printf 'inactive\n' ;;
@@ -569,6 +830,24 @@ printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with
     [ "$rc" -eq 1 ] && [ -e "$RR_ACTIVE_TX" ] ||
         fail 'format-2 transaction accepted legacy 0644 active/phase metadata'
     assert_health_frozen 'format-2 0644 transaction metadata'
+
+    arm_health
+    missing_writer_state="$RR_TX_ROOT/transactions/missing-writer-state"
+    mkdir -p "$missing_writer_state/backup"
+    chmod 700 "$missing_writer_state" "$missing_writer_state/backup"
+    printf '2\n' > "$missing_writer_state/transaction-format"
+    printf 'committed\n' > "$missing_writer_state/phase"
+    printf '%s\n' "$missing_writer_state" > "$RR_ACTIVE_TX"
+    chmod 600 "$missing_writer_state/transaction-format" \
+        "$missing_writer_state/phase" "$RR_ACTIVE_TX"
+    set +e
+    main recover
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ] && [ -e "$RR_ACTIVE_TX" ] && \
+        [ "$(cat "$missing_writer_state/phase")" = committed ] ||
+        fail 'format-2 terminal transaction accepted missing writer-state evidence'
+    assert_health_frozen 'format-2 missing writer-state evidence'
 
     arm_health
     printf '%s\n' "$RR_TX_ROOT/transactions/missing-target" > "$RR_ACTIVE_TX"
@@ -726,6 +1005,12 @@ printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with
         fail 'absent systemd units with empty UnitFileState were not normalized safely'
     absent_units=false
 
+    invalid_load_state=true
+    if rr_freeze_health_writers_strict; then
+        fail 'an unknown LoadState was accepted as proof that health writers are frozen'
+    fi
+    invalid_load_state=false
+
     arm_health
     query_fail=true
     if rr_freeze_health_writers_strict; then
@@ -734,7 +1019,7 @@ printf '%s\n' '[9/11] invalid evidence and systemd query errors fail closed with
     assert_health_frozen 'systemd query-error handling'
 )
 
-printf '%s\n' '[10/11] recovery bridges legacy locks and delegates both flock descriptors safely'
+printf '%s\n' '[12/13] recovery bridges legacy locks and delegates both flock descriptors safely'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_UPDATE_LOCK_HELD=0
@@ -898,7 +1183,7 @@ printf '%s\n' '[10/11] recovery bridges legacy locks and delegates both flock de
     trap - EXIT
 )
 
-printf '%s\n' '[11/11] maintenance state is root-only and bound to one transaction'
+printf '%s\n' '[13/13] maintenance state is root-only and bound to one transaction'
 grep -Fq "0:0:600:1" "$REPO_ROOT/scripts/install-core.sh" || fail 'installer lacks strict maintenance marker mode check'
 grep -Fq '[ "$owner" = "$TX_DIR" ]' "$REPO_ROOT/scripts/install-core.sh" || fail 'installer marker is not transaction-bound'
 grep -Fq '[ "$owner" = "$tx" ]' "$REPO_ROOT/scripts/update-recover.sh" || fail 'recovery marker is not transaction-bound'

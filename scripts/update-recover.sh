@@ -280,6 +280,16 @@ rr_acquire_marked_legacy_update_lock() {
     fi
 }
 
+rr_quarantine_acquire_cleanup_legacy_bridge() {
+    # A persistent guard can outlive every volatile /run marker across reboot,
+    # while a restored 7.1.0 installer still serializes only on this public
+    # compatibility lock.  Hold both lock domains in the fixed new->legacy
+    # order before proving absence or committing quarantine cleanup.
+    rr_acquire_legacy_update_lock "$RR_LEGACY_UPDATE_LOCK_FILE" create || return 1
+    [ -n "${RR_UPDATE_RECOVERY_LEGACY_LOCK_FD:-}" ] || return 1
+    rr_publish_legacy_update_bridge
+}
+
 rr_update_lock_fd_is_safe() {
     local lock_file="$1" lock_fd="$2" path_identity="" fd_identity=""
     local shell_pid="${BASHPID:-$$}"
@@ -350,7 +360,7 @@ rr_wait_unit_state() {
         if [ "$wanted" = inactive ]; then
             case "$load_state:$active_state" in
                 loaded:inactive|loaded:failed|masked:inactive|masked:failed|\
-                not-found:inactive|not-found:failed) return 0 ;;
+                not-found:inactive) return 0 ;;
             esac
         fi
         sleep 0.1
@@ -366,8 +376,9 @@ rr_query_unit_file_state() {
     if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
         unit_file_state=not-found
     fi
-    case "$unit_file_state" in
-        enabled|disabled|static|masked|not-found) printf '%s\n' "$unit_file_state" ;;
+    case "$load_state:$unit_file_state" in
+        loaded:enabled|loaded:enabled-runtime|loaded:disabled|loaded:static|\
+        masked:masked|not-found:not-found) printf '%s\n' "$unit_file_state" ;;
         *) return 1 ;;
     esac
 }
@@ -509,17 +520,36 @@ rr_freeze_health_writers_strict() {
     if [ "$service_load_state" = not-found ] && [ -z "$service_unit_file_state" ]; then
         service_unit_file_state=not-found
     fi
-    case "$timer_active_state" in inactive|failed) ;; *) failed=true ;; esac
-    case "$service_active_state" in inactive|failed) ;; *) failed=true ;; esac
-    case "$timer_unit_file_state" in disabled|static|masked|not-found) ;; *) failed=true ;; esac
-    case "$service_unit_file_state" in disabled|static|masked|not-found) ;; *) failed=true ;; esac
+    case "$timer_load_state:$timer_active_state:$timer_unit_file_state" in
+        loaded:inactive:disabled|loaded:inactive:static|\
+        loaded:failed:disabled|loaded:failed:static|\
+        masked:inactive:masked|masked:failed:masked|\
+        not-found:inactive:not-found) ;;
+        *) failed=true ;;
+    esac
+    case "$service_load_state:$service_active_state:$service_unit_file_state" in
+        loaded:inactive:disabled|loaded:inactive:static|\
+        loaded:failed:disabled|loaded:failed:static|\
+        masked:inactive:masked|masked:failed:masked|\
+        not-found:inactive:not-found) ;;
+        *) failed=true ;;
+    esac
     [ "$failed" = false ]
 }
 
 rr_recovery_fail_with_health_frozen() {
-    local tx="$1" message="$2" freeze_failed=false
+    local tx="$1" message="$2" freeze_failed=false current_phase=""
     rr_freeze_health_writers_strict || freeze_failed=true
-    rr_recovery_write_phase "$tx" recovery_failed || true
+    if declare -F rr_read_trusted_phase >/dev/null 2>&1; then
+        current_phase=$(rr_read_trusted_phase "$tx" 2>/dev/null || true)
+    fi
+    case "$current_phase" in
+        committed|rolled_back|rolled_back_degraded|aborted)
+            # A cleanup failure cannot make a terminal transaction eligible
+            # for rollback again.  Keep the terminal phase and retry evidence.
+            ;;
+        *) rr_recovery_write_phase "$tx" recovery_failed || true ;;
+    esac
     if [ "$freeze_failed" = true ]; then
         rr_recover_log "health writers could not be verified inactive and disabled after recovery failure"
     fi
@@ -693,7 +723,13 @@ rr_transaction_v2_metadata_is_safe() {
     [ -f "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ] &&
         [ "$(stat -c '%u:%g:%a:%h' -- "$RR_ACTIVE_TX" 2>/dev/null)" = 0:0:600:1 ] &&
         [ -f "$1/phase" ] && [ ! -L "$1/phase" ] &&
-        [ "$(stat -c '%u:%g:%a:%h' -- "$1/phase" 2>/dev/null)" = 0:0:600:1 ]
+        [ "$(stat -c '%u:%g:%a:%h' -- "$1/phase" 2>/dev/null)" = 0:0:600:1 ] &&
+        [ -d "$1/backup" ] && [ ! -L "$1/backup" ] &&
+        [ "$(readlink -f -- "$1/backup" 2>/dev/null)" = "$1/backup" ] &&
+        [ "$(stat -c '%u:%g:%a' -- "$1/backup" 2>/dev/null)" = 0:0:700 ] &&
+        [ -f "$1/backup/writer_state_complete" ] &&
+        [ ! -L "$1/backup/writer_state_complete" ] &&
+        [ "$(stat -c '%u:%g:%a:%h:%s' -- "$1/backup/writer_state_complete" 2>/dev/null)" = 0:0:600:1:0 ]
 }
 
 rr_read_trusted_phase() {
@@ -785,18 +821,50 @@ rr_root_owned_safe_empty_marker() {
 }
 
 rr_trusted_runtime_version() {
-    local runtime_root="$1" runtime_file="" canonical="" metadata=""
-    local owner_uid="" owner_gid="" mode="" links=""
-    [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || return 1
-    canonical=$(readlink -f -- "$runtime_root" 2>/dev/null) || return 1
-    [ "$canonical" = "$runtime_root" ] || return 1
-    runtime_file="$runtime_root/modules/00-runtime.sh"
+  (
+    local runtime_root="$1" runtime_file="$1/modules/00-runtime.sh"
+    local directory="" canonical="" owner_uid="" owner_gid="" mode="" mode_value=0
+    local runtime_fd="" shell_pid="${BASHPID:-$$}" fd_path=""
+    local path_identity="" fd_identity="" line="" count=0 version=""
+    local -a runtime_lines=()
+    for directory in "$runtime_root" "$runtime_root/modules"; do
+        [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+        canonical=$(readlink -f -- "$directory" 2>/dev/null) || return 1
+        [ "$canonical" = "$directory" ] || return 1
+        IFS=: read -r owner_uid owner_gid mode < <(
+            stat -c '%u:%g:%a' -- "$directory" 2>/dev/null
+        ) || return 1
+        [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] || return 1
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        mode_value=$((8#$mode))
+        (( (mode_value & 07022) == 0 )) || return 1
+    done
     [ -f "$runtime_file" ] && [ ! -L "$runtime_file" ] || return 1
-    metadata=$(stat -c '%u:%g:%a:%h' -- "$runtime_file" 2>/dev/null) || return 1
-    IFS=: read -r owner_uid owner_gid mode links <<<"$metadata"
-    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] && [ "$links" = 1 ] || return 1
+    exec {runtime_fd}<"$runtime_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$runtime_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$runtime_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$runtime_file" 2>/dev/null) || return 1
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$runtime_file" ] || return 1
+    IFS=: read -r _ _ owner_uid owner_gid mode _ <<<"$fd_identity"
+    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] || return 1
     rr_legacy_update_lock_mode_is_safe "$mode" || return 1
-    rr_runtime_version "$runtime_file"
+    [[ "$fd_identity" == *:1 ]] || return 1
+    mapfile -t runtime_lines <&"$runtime_fd"
+    for line in "${runtime_lines[@]}"; do
+        case "$line" in
+            SCRIPT_VERSION=*) count=$((count + 1)); version="$line" ;;
+        esac
+    done
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$runtime_file" 2>/dev/null) || return 1
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$runtime_file" ] || return 1
+    [ "$count" -eq 1 ] || return 1
+    case "$version" in 'SCRIPT_VERSION="'*'"') ;; *) return 1 ;; esac
+    version="${version#SCRIPT_VERSION=\"}"
+    version="${version%\"}"
+    rr_semver_is_valid "$version" || return 1
+    printf '%s\n' "$version"
+  )
 }
 
 rr_trusted_rollback_target_version() {
@@ -1008,11 +1076,50 @@ rr_quarantine_firewall_evidence_present() {
     return 1
 }
 
+rr_quarantine_guard_unit_state_read() {
+    RR_QUARANTINE_UNIT_LOAD_STATE=$(systemctl show -p LoadState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 1
+    RR_QUARANTINE_UNIT_ACTIVE_STATE=$(systemctl show -p ActiveState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 1
+    RR_QUARANTINE_UNIT_FILE_STATE=$(systemctl show -p UnitFileState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 1
+    if [ "$RR_QUARANTINE_UNIT_LOAD_STATE" = not-found ] &&
+       [ -z "$RR_QUARANTINE_UNIT_FILE_STATE" ]; then
+        RR_QUARANTINE_UNIT_FILE_STATE=not-found
+    fi
+    case "$RR_QUARANTINE_UNIT_LOAD_STATE" in loaded|masked|not-found) ;; *) return 1 ;; esac
+    case "$RR_QUARANTINE_UNIT_ACTIVE_STATE" in
+        active|activating|deactivating|inactive|failed) ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_quarantine_guard_unit_state_is_absent() {
+    [ "$RR_QUARANTINE_UNIT_LOAD_STATE:$RR_QUARANTINE_UNIT_ACTIVE_STATE:$RR_QUARANTINE_UNIT_FILE_STATE" = \
+        not-found:inactive:not-found ]
+}
+
+rr_quarantine_guard_unit_state_is_inactive() {
+    case "$RR_QUARANTINE_UNIT_LOAD_STATE:$RR_QUARANTINE_UNIT_ACTIVE_STATE" in
+        loaded:inactive|loaded:failed|masked:inactive|masked:failed|\
+        not-found:inactive|not-found:failed) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_quarantine_guard_unit_state_is_disabled() {
+    rr_quarantine_guard_unit_state_is_inactive || return 1
+    case "$RR_QUARANTINE_UNIT_FILE_STATE" in
+        disabled|static|masked|not-found) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 rr_quarantine_artifact_evidence_present() {
     rr_quarantine_file_evidence_present && return 0
     rr_quarantine_firewall_evidence_present && return 0
-    systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
-        systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1
+    rr_quarantine_guard_unit_state_read || return 0
+    ! rr_quarantine_guard_unit_state_is_absent
 }
 
 rr_quarantine_write_marker() {
@@ -1050,22 +1157,54 @@ rr_quarantine_prepare_private_dir() {
     [ "$(stat -c '%u:%g' -- "$directory" 2>/dev/null)" = 0:0 ] || return 1
     chmod 0700 -- "$directory" || return 1
     [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ] || return 1
+    rr_quarantine_source_ancestors_are_trusted "$directory/.rr-ancestor-check" || return 1
     parent=$(dirname -- "$directory") || return 1
     sync -f "$directory" && sync -f "$parent"
 }
 
 RR_QUARANTINE_STAGED_GUARD=""
 
-rr_quarantine_stage_guard_self() {
-    local source="$RR_RECOVERY_SELF" guard_dir="" temporary="" metadata=""
+rr_quarantine_source_ancestors_are_trusted() {
+    local source="$1" canonical="" directory="" parent="" metadata=""
+    local owner="" group="" mode="" mode_value=0
+    [[ "$source" == /* ]] || return 1
+    canonical=$(readlink -f -- "$source" 2>/dev/null) || return 1
+    [ "$canonical" = "$source" ] || return 1
+    directory=$(dirname -- "$source") || return 1
+    while :; do
+        [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+        metadata=$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null) || return 1
+        IFS=: read -r owner group mode <<<"$metadata"
+        [ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        mode_value=$((8#$mode))
+        (( (mode_value & 06000) == 0 )) || return 1
+        if (( (mode_value & 00022) != 0 && (mode_value & 01000) == 0 )); then
+            return 1
+        fi
+        [ "$directory" != / ] || break
+        parent=$(dirname -- "$directory") || return 1
+        [ "$parent" != "$directory" ] || return 1
+        directory="$parent"
+    done
+}
+
+rr_quarantine_recovery_helper_is_trusted() {
+    local source="${1:-$RR_RECOVERY_SELF}" metadata=""
     local owner="" group="" mode="" links=""
+    rr_quarantine_source_ancestors_are_trusted "$source" || return 1
     [ -f "$source" ] && [ ! -L "$source" ] || return 1
     metadata=$(stat -c '%u %g %a %h' -- "$source" 2>/dev/null) || return 1
     read -r owner group mode links <<< "$metadata"
     [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$links" = 1 ] || return 1
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     [ $((8#$mode & 0022)) -eq 0 ] && [ $((8#$mode & 0100)) -ne 0 ] &&
-        [ $((8#$mode & 07000)) -eq 0 ] || return 1
+        [ $((8#$mode & 07000)) -eq 0 ]
+}
+
+rr_quarantine_stage_guard_self() {
+    local source="$RR_RECOVERY_SELF" guard_dir="" temporary=""
+    rr_quarantine_recovery_helper_is_trusted "$source" || return 1
     bash -n "$source" || return 1
     guard_dir=$(dirname -- "$RR_QUARANTINE_GUARD_SELF") || return 1
     rr_quarantine_prepare_private_dir "$guard_dir" || return 1
@@ -1192,6 +1331,34 @@ rr_quarantine_rule_line_port() {
     printf '%s\n' "$((10#$port))"
 }
 
+rr_quarantine_firewall_backend_inventory_is_exact() {
+    local backend="$1" port="$2" expected="$3"
+    local rules="" line="" parsed_port="" count=0
+    case "$expected" in 0|1) ;; *) return 1 ;; esac
+    if ! command -v "$backend" >/dev/null 2>&1; then
+        [ "$expected" -eq 0 ]
+        return
+    fi
+    rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        [[ "$line" == *"$RR_QUARANTINE_COMMENT"* ]] || continue
+        parsed_port=$(rr_quarantine_rule_line_port "$line") || return 1
+        [ "$parsed_port" = "$port" ] || return 1
+        count=$((count + 1))
+    done <<< "$rules"
+    [ "$count" -eq "$expected" ]
+}
+
+rr_quarantine_firewall_inventory_is_exact() {
+    local port="$1" ipv6_expected=0
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] || return 1
+    rr_quarantine_firewall_backend_inventory_is_exact iptables "$((10#$port))" 1 || return 1
+    [ ! -s "$RR_IPV6_STATE_FILE" ] || ipv6_expected=1
+    rr_quarantine_firewall_backend_inventory_is_exact \
+        ip6tables "$((10#$port))" "$ipv6_expected"
+}
+
 rr_quarantine_audit_orphan_firewall_rules() {
     local backend="" rules="" line=""
     for backend in iptables ip6tables; do
@@ -1233,14 +1400,11 @@ rr_quarantine_remove_orphan_firewall_rules() {
     [ "$failed" = false ]
 }
 
-rr_quarantine_write_unit() {
-    local temporary="" unit_dir=""
+rr_quarantine_render_unit() {
     [[ "$RR_QUARANTINE_GUARD_SELF" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
     [[ "$RR_QUARANTINE_GUARD_STATE" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
-    unit_dir=$(dirname -- "$RR_QUARANTINE_UNIT") || return 1
-    mkdir -p "$unit_dir" || return 1
-    temporary="${RR_QUARANTINE_UNIT}.tmp.$$"
-    cat > "$temporary" <<EOF
+    [[ "$RR_QUARANTINE_FILE" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+    cat <<EOF
 [Unit]
 Description=RR-vps unsafe rollback subscription quarantine
 After=local-fs.target
@@ -1260,16 +1424,39 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+rr_quarantine_write_unit() {
+    local temporary="" unit_dir=""
+    [[ "$RR_QUARANTINE_UNIT" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
+    unit_dir=$(dirname -- "$RR_QUARANTINE_UNIT") || return 1
+    mkdir -p "$unit_dir" || return 1
+    rr_quarantine_source_ancestors_are_trusted "$RR_QUARANTINE_UNIT" || return 1
+    temporary="${RR_QUARANTINE_UNIT}.tmp.$$"
+    rr_quarantine_render_unit > "$temporary" || return 1
     chmod 644 "$temporary" && sync -f "$temporary" &&
-        mv -f "$temporary" "$RR_QUARANTINE_UNIT" && sync -f "$unit_dir"
+        mv -fT "$temporary" "$RR_QUARANTINE_UNIT" && sync -f "$unit_dir"
+}
+
+rr_quarantine_unit_file_is_strict() {
+    local canonical=""
+    [ -f "$RR_QUARANTINE_UNIT" ] && [ ! -L "$RR_QUARANTINE_UNIT" ] || return 1
+    canonical=$(readlink -f -- "$RR_QUARANTINE_UNIT" 2>/dev/null) || return 1
+    [ "$canonical" = "$RR_QUARANTINE_UNIT" ] || return 1
+    rr_quarantine_source_ancestors_are_trusted "$RR_QUARANTINE_UNIT" || return 1
+    [ "$(stat -c '%u:%g:%a:%h' -- "$RR_QUARANTINE_UNIT" 2>/dev/null)" = 0:0:644:1 ] || return 1
+    cmp -s -- "$RR_QUARANTINE_UNIT" <(rr_quarantine_render_unit)
 }
 
 rr_quarantine_guard_cleanup_uninstalled_runtime() {
-    local ready="$1" state_dir="" guard_dir="" failed=false
+    local ready="$1" state_dir="" guard_dir="" failed=false cleanup_residue=false
+    state_dir=$(dirname -- "$RR_QUARANTINE_GUARD_STATE") || return 1
+    guard_dir=$(dirname -- "$RR_QUARANTINE_GUARD_SELF") || return 1
     [ ! -e "$RR_QUARANTINE_FILE" ] && [ ! -L "$RR_QUARANTINE_FILE" ] || return 1
     [ ! -e "$RR_LIB_DIR" ] && [ ! -L "$RR_LIB_DIR" ] || return 1
     [ ! -e "$RR_LAUNCHER" ] && [ ! -L "$RR_LAUNCHER" ] || return 1
     rr_quarantine_guard_state_read || return 1
+    rr_quarantine_acquire_cleanup_legacy_bridge || return 1
     rr_quarantine_audit_orphan_firewall_rules || return 1
     # A legacy uninstaller does not fsync its cross-filesystem unlinks. Flush
     # them globally, then prove the runtime and every health restart path are
@@ -1288,16 +1475,38 @@ rr_quarantine_guard_cleanup_uninstalled_runtime() {
     [ ! -e "$RR_HEALTH_TIMER_FILE" ] && [ ! -L "$RR_HEALTH_TIMER_FILE" ] || return 1
     [ ! -e "$RR_HEALTH_SERVICE_FILE" ] && [ ! -L "$RR_HEALTH_SERVICE_FILE" ] || return 1
     [ ! -e "$RR_HEALTH_RESTART_HELPER" ] && [ ! -L "$RR_HEALTH_RESTART_HELPER" ] || return 1
-    systemctl disable rr-subscription-quarantine.service >/dev/null 2>&1 || return 1
+    # Keep the reboot-persistent unit and independent state intact until both
+    # raw-table inventories have been removed. Before this cleanup commit,
+    # every failure leaves the running socket plus the enabled unit untouched.
     rr_quarantine_remove_firewall_rules "$RR_QUARANTINE_PORT" || failed=true
     rr_quarantine_remove_orphan_firewall_rules || failed=true
     [ "$failed" = false ] || return 1
-    rm -f -- "$ready" "$RR_QUARANTINE_UNIT" || return 1
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
-    rm -f -- "$RR_QUARANTINE_GUARD_STATE" "$RR_QUARANTINE_GUARD_SELF" || return 1
-    state_dir=$(dirname -- "$RR_QUARANTINE_GUARD_STATE") || return 1
-    guard_dir=$(dirname -- "$RR_QUARANTINE_GUARD_SELF") || return 1
+    # The old runtime, launcher and every health restart path were globally
+    # synchronized absent above. Disabling this still-running unit is the
+    # cleanup commit: after it, residual files are availability evidence only,
+    # not authorization to expose an unsafe runtime. Never return the guard to
+    # its retry loop with a disabled unit while claiming quarantine persists.
+    systemctl disable rr-subscription-quarantine.service >/dev/null 2>&1 ||
+        rr_recover_log "quarantine unit disable reported an error; completing committed cleanup against the durably absent runtime"
+    while :; do
+        cleanup_residue=false
+        rm -f -- "$ready" || cleanup_residue=true
+        rm -f -- "$RR_QUARANTINE_UNIT" || cleanup_residue=true
+        systemctl daemon-reload >/dev/null 2>&1 || cleanup_residue=true
+        if [ "$cleanup_residue" = false ]; then
+            rm -f -- "$RR_QUARANTINE_GUARD_SELF" || cleanup_residue=true
+        fi
+        # The state is the final cleanup log and must outlive every executable
+        # artifact deletion attempt so a partial retry retains exact port data.
+        if [ "$cleanup_residue" = false ]; then
+            rm -f -- "$RR_QUARANTINE_GUARD_STATE" || cleanup_residue=true
+        fi
+        [ "$cleanup_residue" = true ] || break
+        rr_recover_log "uninstalled runtime is durably absent; retrying root-owned quarantine cleanup residue"
+        sleep 1
+    done
     rmdir -- "$state_dir" "$guard_dir" >/dev/null 2>&1 || true
+    return 0
 }
 
 rr_quarantine_guard() {
@@ -1307,7 +1516,11 @@ rr_quarantine_guard() {
     # neither may keep a recovery transaction flock alive after its parent
     # finishes activation or recovery.
     rr_close_inherited_recovery_lock_fds
-    rr_quarantine_read_active_state || {
+    if [ -e "$RR_QUARANTINE_GUARD_STATE" ] || [ -L "$RR_QUARANTINE_GUARD_STATE" ]; then
+        rr_quarantine_guard_state_read
+    else
+        rr_quarantine_marker_read
+    fi || {
         rr_recover_log "subscription quarantine state is absent, inconsistent, or invalid"
         return 1
     }
@@ -1329,6 +1542,9 @@ rr_quarantine_guard() {
         return "$exit_status"
     }
     trap rr_quarantine_guard_on_exit EXIT
+    # Install this before launching the reservation child so every unexpected
+    # signal is visible to Restart=on-failure, including the startup window.
+    trap 'exit 1' INT TERM HUP
     (
         rr_close_inherited_recovery_lock_fds
         exec python3 - "$port" "$ready" "${RR_PROC_ROOT:-/proc}" "${RR_SUB_ROOT:-/tmp/sub_server}" <<'PY'
@@ -1423,7 +1639,7 @@ PY
             [ "$child_status" -ne 0 ] || child_status=1
             guard_pid=""
             rm -f -- "$ready" || true
-            trap - EXIT
+            trap - EXIT INT TERM HUP
             return "$child_status"
         fi
         sleep 0.05
@@ -1434,7 +1650,7 @@ PY
         wait "$guard_pid" 2>/dev/null || true
         guard_pid=""
         rm -f -- "$ready" || true
-        trap - EXIT
+        trap - EXIT INT TERM HUP
         rr_recover_log "subscription quarantine socket reservation did not become ready"
         return 1
     fi
@@ -1442,7 +1658,6 @@ PY
     # barrier. A legacy uninstaller may finish without knowing the independent
     # state/unit, so self-clean only after both runtime and launcher are gone,
     # while holding the same lock as every new installer/uninstaller.
-    trap 'exit 0' INT TERM HUP
     while kill -0 "$guard_pid" >/dev/null 2>&1; do
         if [ ! -e "$RR_QUARANTINE_FILE" ] && [ ! -L "$RR_QUARANTINE_FILE" ] &&
            [ ! -e "$RR_LIB_DIR" ] && [ ! -L "$RR_LIB_DIR" ] &&
@@ -1476,15 +1691,16 @@ rr_suspend_subscription_quarantine() {
         return 0
     fi
     rr_quarantine_read_active_state || return 1
+    rr_quarantine_guard_unit_state_read || return 1
     if [ -e "$RR_QUARANTINE_UNIT" ] || [ -L "$RR_QUARANTINE_UNIT" ] ||
-       systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+       ! rr_quarantine_guard_unit_state_is_absent; then
         if ! systemctl stop rr-subscription-quarantine.service >/dev/null 2>&1; then
             rr_recover_log "could not stop the subscription quarantine guard"
             return 1
         fi
     fi
-    if systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+    rr_quarantine_guard_unit_state_read || return 1
+    if ! rr_quarantine_guard_unit_state_is_inactive; then
         rr_recover_log "subscription quarantine guard is still active after stop"
         return 1
     fi
@@ -1497,19 +1713,34 @@ rr_quarantine_ready_is_strict() {
 }
 
 rr_quarantine_guard_helper_is_current() {
-    local source_metadata="" guard_metadata=""
-    [ -f "$RR_RECOVERY_SELF" ] && [ ! -L "$RR_RECOVERY_SELF" ] &&
-        [ -f "$RR_QUARANTINE_GUARD_SELF" ] && [ ! -L "$RR_QUARANTINE_GUARD_SELF" ] || return 1
-    source_metadata=$(stat -c '%u:%g:%a:%h' -- "$RR_RECOVERY_SELF" 2>/dev/null) || return 1
+    local guard_metadata=""
+    rr_quarantine_recovery_helper_is_trusted "$RR_RECOVERY_SELF" || return 1
+    rr_quarantine_recovery_helper_is_trusted "$RR_QUARANTINE_GUARD_SELF" || return 1
     guard_metadata=$(stat -c '%u:%g:%a:%h' -- "$RR_QUARANTINE_GUARD_SELF" 2>/dev/null) || return 1
-    [ "$source_metadata" = 0:0:700:1 ] && [ "$guard_metadata" = 0:0:700:1 ] || return 1
+    [ "$guard_metadata" = 0:0:700:1 ] || return 1
     cmp -s -- "$RR_RECOVERY_SELF" "$RR_QUARANTINE_GUARD_SELF"
 }
 
+rr_quarantine_guard_unit_is_strict() {
+    local fragment_path="" drop_in_paths=""
+    rr_quarantine_guard_unit_state_read || return 1
+    fragment_path=$(systemctl show -p FragmentPath --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 1
+    drop_in_paths=$(systemctl show -p DropInPaths --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 1
+    rr_quarantine_unit_file_is_strict &&
+        [ "$RR_QUARANTINE_UNIT_LOAD_STATE" = loaded ] &&
+        [ "$RR_QUARANTINE_UNIT_ACTIVE_STATE" = active ] &&
+        [ "$RR_QUARANTINE_UNIT_FILE_STATE" = enabled ] &&
+        [ "$fragment_path" = "$RR_QUARANTINE_UNIT" ] &&
+        [ -z "$drop_in_paths" ]
+}
+
 rr_quarantine_existing_guard_is_reusable() {
+    local port="${1:-${RR_QUARANTINE_PORT:-0}}"
     rr_quarantine_guard_helper_is_current && rr_quarantine_ready_is_strict &&
-        systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 &&
-        systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1
+        rr_quarantine_guard_unit_is_strict &&
+        rr_quarantine_firewall_inventory_is_exact "$port"
 }
 
 rr_runtime_is_subscription_safe_or_absent() {
@@ -1518,7 +1749,7 @@ rr_runtime_is_subscription_safe_or_absent() {
        [ ! -e "$RR_LAUNCHER" ] && [ ! -L "$RR_LAUNCHER" ]; then
         return 0
     fi
-    version=$(rr_runtime_version "$RR_LIB_DIR/modules/00-runtime.sh" 2>/dev/null) || return 1
+    version=$(rr_trusted_runtime_version "$RR_LIB_DIR" 2>/dev/null) || return 1
     rr_version_ge "$version" "$RR_SUBSCRIPTION_SAFE_VERSION"
 }
 
@@ -1541,15 +1772,13 @@ rr_clear_subscription_quarantine() {
     # leave all existing isolation in place.
     rr_quarantine_audit_orphan_firewall_rules || return 1
     rr_stop_subscription_servers || return 1
+    rr_quarantine_guard_unit_state_read || return 1
     if [ -e "$RR_QUARANTINE_UNIT" ] || [ -L "$RR_QUARANTINE_UNIT" ] ||
-       systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+       ! rr_quarantine_guard_unit_state_is_absent; then
         systemctl disable --now rr-subscription-quarantine.service >/dev/null 2>&1 || return 1
     fi
-    if systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
-        return 1
-    fi
+    rr_quarantine_guard_unit_state_read || return 1
+    rr_quarantine_guard_unit_state_is_disabled || return 1
     rm -f -- "$RR_QUARANTINE_READY" || return 1
     # Remove the unit and make that removal visible before releasing the
     # firewall. Any failure here leaves the durable rule/state untouched.
@@ -1590,7 +1819,7 @@ rr_activate_subscription_quarantine() {
         existing_state=true
         old_port="$RR_QUARANTINE_PORT"
         if [ "$old_port" = "$port" ] && [ "$port" != 0 ] &&
-           rr_quarantine_existing_guard_is_reusable; then
+           rr_quarantine_existing_guard_is_reusable "$old_port"; then
             # Preserve the already-bound socket and persistent unit. Only the
             # version/resume metadata changes; there is no stop/start gap.
             rr_quarantine_write_marker quarantined "$version" "$port" "$resume" || return 1
@@ -1630,8 +1859,7 @@ rr_activate_subscription_quarantine() {
     rm -f -- "$RR_QUARANTINE_READY" || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
     if systemctl enable --now rr-subscription-quarantine.service >/dev/null 2>&1 &&
-       systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 &&
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+       rr_quarantine_guard_unit_is_strict; then
         guard_enabled=true
     else
         state=degraded
@@ -1641,11 +1869,7 @@ rr_activate_subscription_quarantine() {
         attempt=$((attempt + 1))
     done
     if [ "$guard_enabled" = true ] &&
-       systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 &&
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1 &&
-       [ -f "$RR_QUARANTINE_READY" ] &&
-       [ ! -L "$RR_QUARANTINE_READY" ] &&
-       [ "$(stat -c '%u:%g:%a:%h' -- "$RR_QUARANTINE_READY" 2>/dev/null)" = 0:0:600:1 ]; then
+       rr_quarantine_guard_unit_is_strict && rr_quarantine_ready_is_strict; then
         guard_ready=true
     else
         state=degraded
@@ -1765,6 +1989,54 @@ rr_transaction_path() {
 
 rr_active_transaction_evidence_present() {
     [ -e "$RR_ACTIVE_TX" ] || [ -L "$RR_ACTIVE_TX" ]
+}
+
+rr_republish_active_pointer_for_retry() {
+    local expected="$1" parent="" temporary="" actual=""
+    parent=$(dirname -- "$RR_ACTIVE_TX") || return 1
+    [ "$parent" = "$RR_TX_ROOT" ] && [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+    rr_transaction_dir_is_valid "$expected" || return 1
+    if rr_active_transaction_evidence_present; then
+        actual=$(rr_transaction_path) || return 1
+        [ "$actual" = "$expected" ] || return 1
+        sync -f "$parent"
+        return
+    fi
+    temporary=$(umask 077; mktemp "${RR_ACTIVE_TX}.retry.XXXXXX") || return 1
+    if [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+       ! printf '%s\n' "$expected" > "$temporary" || ! sync -f "$temporary" ||
+       ! mv -f -- "$temporary" "$RR_ACTIVE_TX"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! sync -f "$parent"; then
+        # The live strict pointer keeps this boot recoverable, but a broad sync
+        # cannot substitute for a successfully reported directory fsync.
+        sync || true
+        return 1
+    fi
+    actual=$(rr_transaction_path) || return 1
+    [ "$actual" = "$expected" ]
+}
+
+rr_clear_active_transaction_pointer() {
+    local expected="$1" actual="" parent=""
+    parent=$(dirname -- "$RR_ACTIVE_TX") || return 1
+    if ! rr_active_transaction_evidence_present; then
+        # Retrying an already-unlinked terminal pointer is safe only after the
+        # parent directory itself can be flushed successfully.
+        sync -f "$parent"
+        return
+    fi
+    actual=$(rr_transaction_path) || return 1
+    [ "$actual" = "$expected" ] || return 1
+    rm -f -- "$RR_ACTIVE_TX" || return 1
+    if sync -f "$parent"; then
+        return 0
+    fi
+    rr_republish_active_pointer_for_retry "$expected" || true
+    return 1
 }
 
 rr_restore_file() {
@@ -1922,8 +2194,11 @@ rr_restore_transaction() {
                 "maintenance marker cleanup failed; writers remain frozen and evidence is retained at $tx"
             return 1
         fi
-        rm -f -- "$RR_ACTIVE_TX"
-        sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+        if ! rr_clear_active_transaction_pointer "$tx"; then
+            rr_recovery_fail_with_health_frozen "$tx" \
+                "active transaction cleanup was not durable; terminal evidence was retained at $tx"
+            return 1
+        fi
         rr_recover_log "rollback completed in DEGRADED mode: legacy public subscription is quarantined; upgrade to ${RR_SUBSCRIPTION_SAFE_VERSION}+ before re-enabling it"
         return 3
     fi
@@ -1936,8 +2211,11 @@ rr_restore_transaction() {
             "maintenance marker cleanup failed; writers remain frozen and evidence is retained at $tx"
         return 1
     fi
-    rm -f -- "$RR_ACTIVE_TX"
-    sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+    if ! rr_clear_active_transaction_pointer "$tx"; then
+        rr_recovery_fail_with_health_frozen "$tx" \
+            "active transaction cleanup was not durable; terminal evidence was retained at $tx"
+        return 1
+    fi
     rr_recover_log "rollback completed"
     if [ -f "$RR_BACKUP/runtime_did_not_exist" ]; then
         systemctl disable rr-update-recovery.service >/dev/null 2>&1 || true
@@ -2019,7 +2297,7 @@ main() {
     fi
     if [ "$format_state" -eq 2 ]; then
         case "$phase" in
-            committed|rolled_back|rolled_back_degraded) ;;
+            committed|rolled_back|rolled_back_degraded|aborted) ;;
             *)
                 if ! rr_freeze_health_writers_strict; then
                     rr_recover_log "unsafe transaction format found and health writers could not be verified inactive and disabled"
@@ -2034,22 +2312,19 @@ main() {
         if ! rr_freeze_health_writers_strict; then
             rr_recover_log "format-2 transaction metadata is unsafe and health writers could not be verified inactive and disabled"
         fi
-        rr_recover_log "format-2 active/phase metadata is not root-owned 0600 single-link evidence; transaction retained at $tx"
+        rr_recover_log "format-2 active/phase/writer-state metadata is incomplete or unsafe; transaction retained at $tx"
         return 1
     fi
     if [ "$mode" = recover ] && [ "$phase" = state_recorded ]; then
         if rr_prepare_terminal_transaction_cleanup "$tx" aborted \
                 "global abort durability barrier failed; transaction evidence and maintenance were retained" && \
-           rr_clear_update_maintenance_marker "$tx"; then
-            rm -f -- "$RR_ACTIVE_TX"
-            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+           rr_clear_update_maintenance_marker "$tx" && \
+           rr_clear_active_transaction_pointer "$tx"; then
             rr_recover_log "stale state-record transaction discarded; no service had been stopped"
             return 0
         fi
-        if ! rr_freeze_health_writers_strict; then
-            rr_recover_log "state-record recovery failed and health writers could not be verified inactive and disabled"
-        fi
-        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recovery_fail_with_health_frozen "$tx" \
+            "state-record recovery cleanup failed; terminal evidence was retained at $tx" || true
         rr_recover_log "state-record recovery failed; active transaction and evidence retained at $tx"
         return 1
     fi
@@ -2059,29 +2334,24 @@ main() {
         if rr_restore_recorded_writer_state "$RR_BACKUP" normal && \
            rr_prepare_terminal_transaction_cleanup "$tx" aborted \
                "global pre-mutation abort durability barrier failed; transaction evidence and maintenance were retained" && \
-           rr_clear_update_maintenance_marker "$tx"; then
-            rm -f -- "$RR_ACTIVE_TX"
-            sync -f "$RR_TX_ROOT" >/dev/null 2>&1 || true
+           rr_clear_update_maintenance_marker "$tx" && \
+           rr_clear_active_transaction_pointer "$tx"; then
             rr_recover_log "stale pre-mutation transaction discarded; original service state restored"
             return 0
         fi
-        if ! rr_freeze_health_writers_strict; then
-            rr_recover_log "pre-mutation recovery failed and health writers could not be verified inactive and disabled"
-        fi
-        rr_recovery_write_phase "$tx" recovery_failed || true
+        rr_recovery_fail_with_health_frozen "$tx" \
+            "pre-mutation service recovery cleanup failed; terminal evidence was retained at $tx" || true
         rr_recover_log "pre-mutation service recovery failed; active transaction and evidence retained at $tx"
         return 1
     fi
     if [ "$mode" = recover ] && \
-       { [ "$phase" = committed ] || [ "$phase" = rolled_back ] || [ "$phase" = rolled_back_degraded ]; }; then
+       { [ "$phase" = committed ] || [ "$phase" = rolled_back ] || \
+         [ "$phase" = rolled_back_degraded ] || [ "$phase" = aborted ]; }; then
+        RR_BACKUP="$tx/backup"
         if [ "$phase" = committed ] && ! rr_finalize_committed_candidate; then
             rr_freeze_health_writers_strict ||
                 rr_recover_log "committed finalization failed and health writers could not be verified inactive and disabled"
             rr_recover_log "committed update finalization failed; active transaction and maintenance evidence retained at $tx"
-            return 1
-        fi
-        if ! rr_prepare_terminal_transaction_cleanup "$tx" "$phase" \
-                "global terminal durability barrier failed; active transaction and maintenance evidence were retained"; then
             return 1
         fi
         if [ "$phase" = committed ] && rr_quarantine_artifact_evidence_present &&
@@ -2096,12 +2366,31 @@ main() {
                 rr_recover_log "degraded terminal recovery could not verify health writers inactive and disabled"
                 return 1
             }
+        elif [ ! -d "$RR_BACKUP" ] || [ -L "$RR_BACKUP" ] ||
+             ! rr_restore_recorded_writer_state "$RR_BACKUP" normal; then
+            rr_recovery_fail_with_health_frozen "$tx" \
+                "terminal cleanup could not restore the recorded writer state; evidence was retained at $tx"
+            return 1
         fi
-        if rr_clear_update_maintenance_marker "$tx"; then
-            return 0
+        # Finalization, quarantine cleanup and writer restoration all mutate
+        # host state. Flush those changes before either recovery pointer can be
+        # retired, even though the phase was already terminal on entry.
+        if ! rr_prepare_terminal_transaction_cleanup "$tx" "$phase" \
+                "global terminal durability barrier failed after terminal writer restoration; active transaction and maintenance evidence were retained"; then
+            return 1
         fi
-        rr_recover_log "terminal transaction marker cleanup failed; terminal phase and evidence retained at $tx"
-        return 1
+        if ! rr_clear_update_maintenance_marker "$tx"; then
+            rr_recovery_fail_with_health_frozen "$tx" \
+                "terminal transaction marker cleanup failed; terminal phase and evidence retained at $tx"
+            return 1
+        fi
+        if [ "$phase" != committed ] && \
+           ! rr_clear_active_transaction_pointer "$tx"; then
+            rr_recovery_fail_with_health_frozen "$tx" \
+                "terminal active pointer cleanup was not durable; terminal phase and evidence retained at $tx"
+            return 1
+        fi
+        return 0
     fi
     if ! rr_prepare_legacy_lock_for_rollback "$tx"; then
         if ! rr_freeze_health_writers_strict; then

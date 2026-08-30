@@ -212,14 +212,26 @@ _uninstall_quarantine_present() {
     local guard_state="${RR_QUARANTINE_GUARD_STATE:-/var/lib/rr-quarantine/guard-state}"
     local guard_self="${RR_QUARANTINE_GUARD_SELF:-/usr/local/libexec/rr-vps/subscription-quarantine-guard}"
     local artifact="" firewall_backend="" firewall_rules=""
+    local load_state="" active_state="" unit_file_state=""
 
     for artifact in "$marker" "$unit" "$ready" "$guard_state" "$guard_self"; do
         if [ -e "$artifact" ] || [ -L "$artifact" ]; then
             return 0
         fi
     done
-    if systemctl is-active --quiet rr-subscription-quarantine.service >/dev/null 2>&1 ||
-       systemctl is-enabled --quiet rr-subscription-quarantine.service >/dev/null 2>&1; then
+    load_state=$(systemctl show --property=LoadState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 0
+    active_state=$(systemctl show --property=ActiveState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 0
+    unit_file_state=$(systemctl show --property=UnitFileState --value \
+        rr-subscription-quarantine.service 2>/dev/null) || return 0
+    if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+        unit_file_state=not-found
+    fi
+    if [ "$load_state:$active_state:$unit_file_state" = \
+        not-found:inactive:not-found ]; then
+        :
+    else
         return 0
     fi
     # A previous affected uninstall may have removed the marker while leaving
@@ -347,8 +359,51 @@ _uninstall_health_unit_is_safely_stopped() {
     if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
         unit_file_state=not-found
     fi
-    case "$active_state" in inactive|failed) ;; *) return 1 ;; esac
-    case "$unit_file_state" in disabled|static|masked|not-found) ;; *) return 1 ;; esac
+    case "$load_state:$active_state:$unit_file_state" in
+        loaded:inactive:disabled|loaded:inactive:static|\
+        loaded:failed:disabled|loaded:failed:static|\
+        masked:inactive:masked|masked:failed:masked|\
+        not-found:inactive:not-found) ;;
+        *) return 1 ;;
+    esac
+}
+
+_uninstall_subscription_restart_paths_are_absent() {
+    local runtime="${1:-$RR_LIB_DIR}"
+    local launcher="${2:-/usr/local/bin/rr}"
+    local systemd_dir="${3:-${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}}"
+    local restart_helper="${4:-/usr/local/bin/auto_update_sub.py}"
+    local path=""
+    for path in "$runtime" "$launcher" \
+        "$systemd_dir/argo-rr-health.timer" \
+        "$systemd_dir/argo-rr-health.service" "$restart_helper"; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+    done
+}
+
+_uninstall_release_subscription_quarantine() {
+    local helper="${1:-/usr/local/sbin/rr-update-recover}"
+    local marker="${2:-/var/lib/rr-update/subscription-quarantine}"
+    local unit="${3:-/etc/systemd/system/rr-subscription-quarantine.service}"
+    local ready="${4:-/run/rr-subscription-quarantine.ready}"
+    local runtime="${5:-$RR_LIB_DIR}"
+    local launcher="${6:-/usr/local/bin/rr}"
+    local systemd_dir="${7:-${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}}"
+    local restart_helper="${8:-/usr/local/bin/auto_update_sub.py}"
+
+    # These unlinks span /usr, /etc and /var.  Flush them before releasing the
+    # last subscription barrier, then re-read every restart path after stopping
+    # processes so a concurrent recreation cannot pass on stale evidence.
+    sync || return 1
+    _uninstall_subscription_restart_paths_are_absent \
+        "$runtime" "$launcher" "$systemd_dir" "$restart_helper" || return 1
+    _uninstall_health_unit_is_safely_stopped argo-rr-health.timer || return 1
+    _uninstall_health_unit_is_safely_stopped argo-rr-health.service || return 1
+    stop_subscription_servers >/dev/null 2>&1 || return 1
+    subscription_server_running && return 1
+    _uninstall_subscription_restart_paths_are_absent \
+        "$runtime" "$launcher" "$systemd_dir" "$restart_helper" || return 1
+    _uninstall_clear_subscription_quarantine "$helper" "$marker" "$unit" "$ready"
 }
 
 uninstall_all() {
@@ -458,12 +513,6 @@ uninstall_all_locked() {
 
     stop_subscription_servers >/dev/null 2>&1 || true
 
-    # 可疑的 /tmp 订阅根绝不以 root 身份递归删除；保留现场并提示人工检查。
-    if ensure_subscription_root; then
-        rm -rf -- "$SUB_ROOT"
-    else
-        echo -e "${YELLOW}[警告] ${SUB_ROOT} 未通过安全检查，卸载未删除该路径。${RESET}" >&2
-    fi
     rm -rf /etc/sing-box /etc/argo_vmess.conf /etc/rr-nexus /etc/rr-naive /etc/rr-cloudflared \
         /etc/rr-update /var/lib/rr-nexus /var/lib/rr-backup /var/www/rr-nexus-certbot \
         "$RR_LIB_DIR" /usr/local/bin/rr /usr/local/bin/sing-box /var/log/auto_update_sub.log
@@ -472,19 +521,18 @@ uninstall_all_locked() {
     # Keep the quarantine until the old launcher/runtime and every health
     # restart path are durably absent. A SIGKILL before this point therefore
     # still reboots into the guard instead of exposing the legacy subscription.
-    if [ -e "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ] ||
-       [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] ||
-       ! _uninstall_health_unit_is_safely_stopped argo-rr-health.timer ||
-       ! _uninstall_health_unit_is_safely_stopped argo-rr-health.service ||
-       ! stop_subscription_servers >/dev/null 2>&1 ||
-       ! _uninstall_clear_subscription_quarantine \
-           /usr/local/sbin/rr-update-recover \
-           /var/lib/rr-update/subscription-quarantine \
-           /etc/systemd/system/rr-subscription-quarantine.service \
-           /run/rr-subscription-quarantine.ready; then
+    if ! _uninstall_release_subscription_quarantine; then
         [ -z "$legacy_restore_lock_fd" ] || exec {legacy_restore_lock_fd}>&-
         echo -e "${RED}[失败] 旧运行时已停止，但订阅隔离尚未安全解除；恢复程序和证据已保留。${RESET}" >&2
         return 1
+    fi
+    # Keep the subscription root present until the final process proof above:
+    # managed_subscription_pids binds workers to that canonical cwd and cannot
+    # safely classify a process whose cwd has already become "(deleted)".
+    if ensure_subscription_root; then
+        rm -rf -- "$SUB_ROOT"
+    else
+        echo -e "${YELLOW}[警告] ${SUB_ROOT} 未通过安全检查，卸载未删除该路径。${RESET}" >&2
     fi
     rm -f /etc/systemd/system/rr-update-recovery.service \
         /etc/systemd/system/rr-restore-recovery.service \

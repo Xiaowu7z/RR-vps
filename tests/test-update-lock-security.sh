@@ -66,14 +66,6 @@ stat() {
             fi
         done
     fi
-    if [[ "$path" == */old-required-hostile/* ]]; then
-        for argument in "${arguments[@]}"; do
-            if [ "$argument" = %u:%g:%a:%h ]; then
-                printf '%s\n' 65534:65534:644:1
-                return 0
-            fi
-        done
-    fi
     if [[ "$path" == */legacy-inode-swap/legacy.lock ]] && \
        [ -e "$path.replacement" ]; then
         for argument in "${arguments[@]}"; do
@@ -269,9 +261,13 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
     # shellcheck disable=SC2294
     eval "$(extract_function scripts/install-core.sh rr_legacy_public_lock_is_nonroot_noise)"
     # shellcheck disable=SC2294
+    eval "$(extract_function scripts/install-core.sh rr_promote_trusted_legacy_preoccupation)"
+    # shellcheck disable=SC2294
     eval "$(extract_function scripts/install-core.sh rr_version_ge)"
     # shellcheck disable=SC2294
     eval "$(extract_function scripts/install-core.sh rr_acquire_legacy_update_lock)"
+    # shellcheck disable=SC2294
+    eval "$(extract_function scripts/install-core.sh rr_close_inherited_installer_lock_fds)"
     # shellcheck disable=SC2294
     eval "$(extract_function scripts/install-core.sh rr_run_with_delegated_update_lock)"
     rr_error() { :; }
@@ -380,15 +376,56 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
     exec {current_safe_holder_fd}>&-
 
     prepare_trusted_runtime "$legacy_root/old-runtime" 7.1.0
-    use_bridge_case old-required-hostile
-    mkdir -m 1777 "$legacy_root/old-required-hostile"
-    RR_LEGACY_UPDATE_LOCK_FILE="$legacy_root/old-required-hostile/legacy.lock"
-    printf '%s\n' hostile-preplacement > "$RR_LEGACY_UPDATE_LOCK_FILE"
-    if rr_acquire_legacy_update_lock; then
-        fail 'old installed runtime ignored a non-root hostile legacy preplacement'
+    use_bridge_case old-required-preoccupation
+    mkdir -m 1777 "$legacy_root/old-required-preoccupation"
+    RR_LEGACY_UPDATE_LOCK_FILE="$legacy_root/old-required-preoccupation/legacy.lock"
+    printf '%s\n' preserve-preoccupation > "$RR_LEGACY_UPDATE_LOCK_FILE"
+    chmod 0644 "$RR_LEGACY_UPDATE_LOCK_FILE"
+    physical_nonroot_fixture=false
+    if chown 65534:65534 "$RR_LEGACY_UPDATE_LOCK_FILE" 2>/dev/null; then
+        physical_nonroot_fixture=true
+    elif [ "${GITHUB_ACTIONS:-false}" = true ]; then
+        fail 'GitHub root runner could not create the required physical non-root lock fixture'
+    else
+        printf '%s\n' 'SKIP: local uid namespace maps only root; physical legacy preoccupation runs in CI'
     fi
-    [ ! -e "$RR_LEGACY_UPDATE_BRIDGE_FILE" ] || \
-        fail 'rejected old-runtime hostile path still published a marker'
+    if [ "$physical_nonroot_fixture" = true ]; then
+        preoccupation_inode=$(stat -c '%d:%i' "$RR_LEGACY_UPDATE_LOCK_FILE")
+        preoccupation_digest=$(sha256sum "$RR_LEGACY_UPDATE_LOCK_FILE")
+        rr_acquire_legacy_update_lock || \
+            fail 'trusted 7.1.0 upgrade was permanently denied by an idle non-root preoccupation'
+        [ "$(stat -c '%d:%i' "$RR_LEGACY_UPDATE_LOCK_FILE")" = "$preoccupation_inode" ] && \
+            [ "$(sha256sum "$RR_LEGACY_UPDATE_LOCK_FILE")" = "$preoccupation_digest" ] && \
+            [ "$(stat -c '%u:%g:%a:%h' "$RR_LEGACY_UPDATE_LOCK_FILE")" = 0:0:600:1 ] || \
+            fail 'legacy preoccupation promotion replaced content/inode or left unsafe metadata'
+        rr_legacy_update_bridge_marker_is_safe "$RR_LEGACY_UPDATE_BRIDGE_FILE" || \
+            fail 'promoted legacy preoccupation did not publish a trusted bridge marker'
+        [ -n "$LEGACY_UPDATE_LOCK_FD" ] || fail 'promoted legacy preoccupation retained no flock fd'
+        if flock -n "$RR_LEGACY_UPDATE_LOCK_FILE" -c true; then
+            fail 'a 7.1.0 contender entered through the promoted legacy lock'
+        fi
+        exec {LEGACY_UPDATE_LOCK_FD}>&-
+        LEGACY_UPDATE_LOCK_FD=""
+
+        use_bridge_case old-required-busy-preoccupation
+        RR_LEGACY_UPDATE_LOCK_FILE="$legacy_root/old-required-preoccupation/busy.lock"
+        printf '%s\n' busy-preserve > "$RR_LEGACY_UPDATE_LOCK_FILE"
+        chmod 0644 "$RR_LEGACY_UPDATE_LOCK_FILE"
+        chown 65534:65534 "$RR_LEGACY_UPDATE_LOCK_FILE"
+        busy_before=$(stat -c '%u:%g:%a:%h' "$RR_LEGACY_UPDATE_LOCK_FILE")
+        busy_digest=$(sha256sum "$RR_LEGACY_UPDATE_LOCK_FILE")
+        exec {busy_fd}<>"$RR_LEGACY_UPDATE_LOCK_FILE"
+        flock -n "$busy_fd"
+        if rr_acquire_legacy_update_lock; then
+            fail 'installer mutated or ignored a busy non-root legacy preoccupation'
+        fi
+        [ "$(stat -c '%u:%g:%a:%h' "$RR_LEGACY_UPDATE_LOCK_FILE")" = "$busy_before" ] && \
+            [ "$(sha256sum "$RR_LEGACY_UPDATE_LOCK_FILE")" = "$busy_digest" ] || \
+            fail 'failed busy promotion changed the attacker-owned inode'
+        [ ! -e "$RR_LEGACY_UPDATE_BRIDGE_FILE" ] || \
+            fail 'failed busy promotion published a trusted bridge marker'
+        exec {busy_fd}>&-
+    fi
 
     use_bridge_case nonsticky-parent
     mkdir -m 0777 "$legacy_root/nonsticky-world-parent"
@@ -546,6 +583,16 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
     [ -z "$LEGACY_UPDATE_LOCK_FD" ] || fail 'installer leaked fd after legacy inode replacement'
     grep -Fxq replacement "$RR_LEGACY_UPDATE_LOCK_FILE" || \
         fail 'legacy inode replacement fixture did not execute'
+    promotion_source=$(extract_function scripts/install-core.sh \
+        rr_promote_trusted_legacy_preoccupation)
+    promotion_mismatch_block=$(sed -n \
+        '/if not same_inode(current_state, exact_state):/,/os.fchmod(exact_fd, 0o600)/p' \
+        <<<"$promotion_source")
+    grep -Fq 'fail()' <<<"$promotion_mismatch_block" || \
+        fail 'promotion-time legacy inode replacement is not rejected'
+    if grep -Fq 'SystemExit(0)' <<<"$promotion_mismatch_block"; then
+        fail 'promotion-time root-safe replacement can split the legacy flock domain'
+    fi
 
     delegation_root="$legacy_root/delegation"
     mkdir -m 700 "$delegation_root"
@@ -1288,8 +1335,12 @@ grep -Fq 'rr_run_with_delegated_update_lock "$RR_LAUNCHER" --post-update' \
     scripts/install-core.sh || \
     fail 'installer post-update delegation marker is missing'
 delegate_body=$(extract_function scripts/install-core.sh rr_run_with_delegated_update_lock)
-grep -Fq 'exec {LEGACY_UPDATE_LOCK_FD}>&-' <<<"$delegate_body" && \
-    grep -Fq 'exec {UPDATE_LOCK_FD}>&-' <<<"$delegate_body" && \
+delegate_close_body=$(extract_function scripts/install-core.sh \
+    rr_close_inherited_installer_lock_fds)
+grep -Fq 'rr_close_inherited_installer_lock_fds' <<<"$delegate_body" && \
+    grep -Fq 'exec {lock_fd}>&-' <<<"$delegate_close_body" && \
+    grep -Fq 'LEGACY_UPDATE_LOCK_FD=""' <<<"$delegate_close_body" && \
+    grep -Fq 'UPDATE_LOCK_FD=""' <<<"$delegate_close_body" && \
     grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$@"' <<<"$delegate_body" || \
     fail 'installer delegate does not close both inherited fds before invoking children'
 resilience_source_flat=$(tr '\n' ' ' < modules/55-resilience.sh)

@@ -33,7 +33,11 @@ export RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/run/legacy-rr-update.lock"
 export RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/run/legacy-update-bridge"
 export RR_UPDATE_RECOVER_SOURCE_ONLY=1
 export RR_TEST_QUARANTINE_STOP_FAIL="$TEST_ROOT/quarantine-stop-fail"
+export RR_TEST_QUARANTINE_QUERY_FAIL="$TEST_ROOT/quarantine-query-fail"
 export RR_TEST_QUARANTINE_ENABLED="$TEST_ROOT/quarantine-enabled"
+RR_TEST_QUARANTINE_UNIT_FILE_STATE=""
+RR_TEST_QUARANTINE_FRAGMENT_PATH=""
+RR_TEST_QUARANTINE_DROP_IN_PATHS=""
 # shellcheck source=../scripts/update-recover.sh
 source "$REPO_ROOT/scripts/update-recover.sh"
 eval "$(declare -f rr_quarantine_guard_cleanup_uninstalled_runtime | \
@@ -56,6 +60,38 @@ systemctl() {
             ;;
         "is-enabled --quiet rr-subscription-quarantine.service")
             [ -e "$RR_TEST_QUARANTINE_ENABLED" ]; return
+            ;;
+        "show -p LoadState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
+            [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n'
+            ;;
+        "show -p ActiveState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
+            [ -e "$RR_QUARANTINE_READY" ] && printf 'active\n' || printf 'inactive\n'
+            ;;
+        "show -p UnitFileState --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
+            if [ ! -e "$RR_QUARANTINE_UNIT" ]; then
+                :
+            elif [ -n "$RR_TEST_QUARANTINE_UNIT_FILE_STATE" ]; then
+                printf '%s\n' "$RR_TEST_QUARANTINE_UNIT_FILE_STATE"
+            elif [ -e "$RR_TEST_QUARANTINE_ENABLED" ]; then
+                printf 'enabled\n'
+            else
+                printf 'disabled\n'
+            fi
+            ;;
+        "show -p FragmentPath --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
+            if [ -n "$RR_TEST_QUARANTINE_FRAGMENT_PATH" ]; then
+                printf '%s\n' "$RR_TEST_QUARANTINE_FRAGMENT_PATH"
+            elif [ -e "$RR_QUARANTINE_UNIT" ]; then
+                printf '%s\n' "$RR_QUARANTINE_UNIT"
+            fi
+            ;;
+        "show -p DropInPaths --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
+            printf '%s' "$RR_TEST_QUARANTINE_DROP_IN_PATHS"
             ;;
         "stop rr-subscription-quarantine.service")
             [ ! -e "$RR_TEST_QUARANTINE_STOP_FAIL" ] || return 1
@@ -88,10 +124,15 @@ reset_case() {
         "$(dirname "$RR_QUARANTINE_GUARD_STATE")" \
         "$(dirname "$RR_QUARANTINE_GUARD_SELF")" \
         "$(dirname "$RR_RECOVERY_SELF")"
-    rm -f -- "$RR_TEST_QUARANTINE_STOP_FAIL" "$RR_TEST_QUARANTINE_ENABLED"
+    rm -f -- "$RR_TEST_QUARANTINE_STOP_FAIL" "$RR_TEST_QUARANTINE_QUERY_FAIL" \
+        "$RR_TEST_QUARANTINE_ENABLED" "$RR_LEGACY_UPDATE_LOCK_FILE" \
+        "$RR_LEGACY_UPDATE_BRIDGE_FILE"
+    RR_TEST_QUARANTINE_UNIT_FILE_STATE=""
+    RR_TEST_QUARANTINE_FRAGMENT_PATH=""
+    RR_TEST_QUARANTINE_DROP_IN_PATHS=""
     mkdir -p "$RR_TX_ROOT/transactions" "$RR_LIB_DIR/modules" \
         "$(dirname "$RR_QUARANTINE_READY")" "$(dirname "$RR_RECOVERY_SELF")"
-    install -o 0 -g 0 -m 700 "$REPO_ROOT/scripts/update-recover.sh" "$RR_RECOVERY_SELF"
+    install -o 0 -g 0 -m 755 "$REPO_ROOT/scripts/update-recover.sh" "$RR_RECOVERY_SELF"
     : > "$SYSTEMCTL_LOG"
     : > "$FIREWALL_LOG"
 }
@@ -109,7 +150,7 @@ prepare_transaction() {
     rr_snapshot_rollback_metadata "$CURRENT_TX"
 }
 
-printf '%s\n' '[1/19] snapshot records the old runtime SemVer and subscription port'
+printf '%s\n' '[1/20] snapshot records the old runtime SemVer and subscription port'
 reset_case
 prepare_transaction old 7.1.0 18080
 [ "$(cat "$CURRENT_TX/backup/rollback-runtime-version")" = 7.1.0 ]
@@ -127,7 +168,7 @@ fi
 [ ! -e "$broken_tx/backup/rollback-metadata-complete" ]
 rm -f -- "$RR_QUARANTINE_FILE"
 
-printf '%s\n' '[2/19] pre-7.1.1 rollback is quarantined without touching other services or backup data'
+printf '%s\n' '[2/20] pre-7.1.1 rollback is quarantined without touching other services or backup data'
 : > "$CURRENT_TX/backup/subscription_was_running"
 rr_apply_rollback_subscription_policy "$CURRENT_TX"
 [ "$(cat "$CURRENT_TX/rollback-subscription-status")" = quarantined ]
@@ -154,7 +195,7 @@ cp "$RR_CONFIG_FILE" "$resume_tx/backup/argo_vmess.conf"
 rr_snapshot_rollback_metadata "$resume_tx"
 [ -f "$resume_tx/backup/subscription_was_running" ]
 
-printf '%s\n' '[3/19] 7.1.1+ rollback retains normal behavior and clears an old quarantine'
+printf '%s\n' '[3/20] 7.1.1+ rollback retains normal behavior and clears an old quarantine'
 reset_case
 prepare_transaction safe 7.1.1 18443
 rr_quarantine_write_marker quarantined 7.1.0 18080
@@ -165,7 +206,7 @@ rr_apply_rollback_subscription_policy "$CURRENT_TX"
 [ ! -e "$RR_QUARANTINE_UNIT" ]
 [ -d "$CURRENT_TX/backup" ]
 
-printf '%s\n' '[4/19] missing, forged, or inconsistent metadata fails safe'
+printf '%s\n' '[4/20] missing, forged, or inconsistent metadata fails safe'
 reset_case
 prepare_transaction forged 7.1.0 19090
 printf '7.1.1\n' > "$CURRENT_TX/backup/rollback-runtime-version"
@@ -189,7 +230,56 @@ rr_quarantine_marker_read
 [ "$RR_QUARANTINE_STATE" = degraded ]
 [ "$RR_QUARANTINE_PORT" = 0 ]
 
-printf '%s\n' '[5/19] quarantine firewall operations are exact and never flush user rules'
+(
+    export RR_UPDATE_RECOVER_SOURCE_ONLY=1
+    # shellcheck source=../scripts/update-recover.sh
+    source "$REPO_ROOT/scripts/update-recover.sh"
+    runtime_root="$TEST_ROOT/trusted-runtime"
+    runtime_file="$runtime_root/modules/00-runtime.sh"
+    mkdir -p "$runtime_root/modules"
+    chmod 0755 "$runtime_root" "$runtime_root/modules"
+    printf 'SCRIPT_VERSION="7.1.1"\n' > "$runtime_file"
+    chmod 0600 "$runtime_file"
+    [ "$(rr_trusted_runtime_version "$runtime_root")" = 7.1.1 ] || {
+        echo 'A strict runtime version fixture was rejected.' >&2
+        exit 1
+    }
+    chmod 0777 "$runtime_root/modules"
+    if rr_trusted_runtime_version "$runtime_root" >/dev/null 2>&1; then
+        echo 'A runtime below a writable modules directory was trusted.' >&2
+        exit 1
+    fi
+    chmod 0755 "$runtime_root/modules"
+    printf 'SCRIPT_VERSION="7.0.0"\n' > "$runtime_file.replacement"
+    chmod 0600 "$runtime_file.replacement"
+    runtime_stat_counter_file="$TEST_ROOT/runtime-stat-count"
+    printf '0\n' > "$runtime_stat_counter_file"
+    stat() {
+        local path="" argument="" runtime_stat_count=0
+        path="${!#}"
+        if [ "$path" = "$runtime_file" ]; then
+            for argument in "$@"; do
+                if [ "$argument" = '%d:%i:%u:%g:%a:%h' ]; then
+                    runtime_stat_count=$(cat "$runtime_stat_counter_file")
+                    runtime_stat_count=$((runtime_stat_count + 1))
+                    printf '%s\n' "$runtime_stat_count" > "$runtime_stat_counter_file"
+                    if [ "$runtime_stat_count" -eq 2 ]; then
+                        mv -- "$runtime_file" "$runtime_file.opened"
+                        mv -- "$runtime_file.replacement" "$runtime_file"
+                    fi
+                    break
+                fi
+            done
+        fi
+        command stat "$@"
+    }
+    if rr_trusted_runtime_version "$runtime_root" >/dev/null 2>&1; then
+        echo 'A runtime version path swapped after fd binding was trusted.' >&2
+        exit 1
+    fi
+)
+
+printf '%s\n' '[5/20] quarantine firewall operations are exact and never flush user rules'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     # shellcheck source=../scripts/update-recover.sh
@@ -207,9 +297,50 @@ printf '%s\n' '[5/19] quarantine firewall operations are exact and never flush u
         echo 'Quarantine attempted to flush unrelated firewall state.' >&2
         exit 1
     fi
+    exact_rule='-A PREROUTING ! -i lo -p tcp -m tcp --dport 23456 -m addrtype --dst-type LOCAL -m comment --comment "rr-vps unsafe rollback subscription quarantine" -j DROP'
+    raw_v4="$exact_rule"
+    raw_v6=""
+    firewall_query_fails=false
+    iptables() {
+        [ "$firewall_query_fails" = false ] || return 1
+        printf '%s\n' "$raw_v4"
+    }
+    ip6tables() { printf '%s\n' "$raw_v6"; }
+    rm -f -- "$RR_IPV6_STATE_FILE"
+    rr_quarantine_firewall_inventory_is_exact 23456 || {
+        echo 'An exact IPv4 quarantine inventory was rejected.' >&2
+        exit 1
+    }
+    raw_v4=$(printf '%s\n%s\n' "$exact_rule" "$exact_rule")
+    if rr_quarantine_firewall_inventory_is_exact 23456; then
+        echo 'Duplicate quarantine rules were accepted as exact.' >&2
+        exit 1
+    fi
+    raw_v4="${exact_rule/23456/23457}"
+    if rr_quarantine_firewall_inventory_is_exact 23456; then
+        echo 'A quarantine rule for the wrong port was accepted.' >&2
+        exit 1
+    fi
+    raw_v4="$exact_rule"
+    firewall_query_fails=true
+    if rr_quarantine_firewall_inventory_is_exact 23456; then
+        echo 'An unreadable firewall inventory was accepted as exact.' >&2
+        exit 1
+    fi
+    firewall_query_fails=false
+    printf 'enabled\n' > "$RR_IPV6_STATE_FILE"
+    if rr_quarantine_firewall_inventory_is_exact 23456; then
+        echo 'IPv6 quarantine was accepted without its required exact rule.' >&2
+        exit 1
+    fi
+    raw_v6="$exact_rule"
+    rr_quarantine_firewall_inventory_is_exact 23456 || {
+        echo 'Exact dual-stack quarantine inventory was rejected.' >&2
+        exit 1
+    }
 )
 
-printf '%s\n' '[6/19] automatic/manual restore orchestration skips only the unsafe subscription restart'
+printf '%s\n' '[6/20] automatic/manual restore orchestration skips only the unsafe subscription restart'
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_HEALTH_SERVICE_FILE="$TEST_ROOT/fake-health.service"
@@ -236,6 +367,21 @@ printf '%s\n' '[6/19] automatic/manual restore orchestration skips only the unsa
                 [ -e "$quarantine_active" ]; return ;;
             "is-enabled --quiet rr-subscription-quarantine.service")
                 [ -e "$quarantine_enabled" ]; return ;;
+            "show -p LoadState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n' ;;
+            "show -p ActiveState --value rr-subscription-quarantine.service")
+                [ -e "$quarantine_active" ] && printf 'active\n' || printf 'inactive\n' ;;
+            "show -p UnitFileState --value rr-subscription-quarantine.service")
+                if [ ! -e "$RR_QUARANTINE_UNIT" ]; then
+                    :
+                elif [ -e "$quarantine_enabled" ]; then
+                    printf 'enabled\n'
+                else
+                    printf 'disabled\n'
+                fi ;;
+            "show -p FragmentPath --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf '%s\n' "$RR_QUARANTINE_UNIT" ;;
+            "show -p DropInPaths --value rr-subscription-quarantine.service") : ;;
             "stop rr-subscription-quarantine.service")
                 rm -f -- "$quarantine_active" "$RR_QUARANTINE_READY" ;;
             "disable --now rr-subscription-quarantine.service")
@@ -320,8 +466,13 @@ printf '%s\n' '[6/19] automatic/manual restore orchestration skips only the unsa
     [ ! -e "$RR_QUARANTINE_FILE" ]
 )
 
-printf '%s\n' '[7/19] in-process installer rollback consumes the same policy before health recovery'
+printf '%s\n' '[7/20] in-process installer rollback consumes the same policy before health recovery'
 (
+    delegate_close_function=$(awk '
+        /^rr_close_inherited_installer_lock_fds\(\) \{/ { capture = 1 }
+        capture { print }
+        capture && /^}$/ { exit }
+    ' "$REPO_ROOT/scripts/install-core.sh")
     delegate_function=$(awk '
         /^rr_run_with_delegated_update_lock\(\) \{/ { capture = 1 }
         capture { print }
@@ -332,6 +483,7 @@ printf '%s\n' '[7/19] in-process installer rollback consumes the same policy bef
         capture { print }
         capture && /^}$/ { exit }
     ' "$REPO_ROOT/scripts/install-core.sh")
+    eval "$delegate_close_function"
     eval "$delegate_function"
     eval "$rollback_function"
     immediate_root="$TEST_ROOT/immediate"
@@ -397,7 +549,7 @@ printf '%s\n' '[7/19] in-process installer rollback consumes the same policy bef
     [ "$KEEP_TRANSACTION" = false ]
 )
 
-printf '%s\n' '[8/19] status exposes quarantine/degraded state instead of claiming a normal rollback'
+printf '%s\n' '[8/20] status exposes quarantine/degraded state instead of claiming a normal rollback'
 reset_case
 rr_quarantine_write_marker degraded unknown 0
 status_json=$(main status)
@@ -444,7 +596,7 @@ set -e
 exec {held_lock_fd}>&-
 rm -f "$RR_ACTIVE_TX"
 
-printf '%s\n' '[9/19] guard blocks legacy servers and survives a pre-7.1.1 uninstall cleanup'
+printf '%s\n' '[9/20] guard blocks legacy servers and survives a pre-7.1.1 uninstall cleanup'
 unset -f sleep
 rr_quarantine_add_firewall_rules() { printf 'add:%s\n' "$1" >> "$FIREWALL_LOG"; }
 rr_quarantine_remove_firewall_rules() { printf 'guard-delete:%s\n' "$1" >> "$FIREWALL_LOG"; }
@@ -512,7 +664,7 @@ GUARD_PID=""
 [ ! -e "$RR_QUARANTINE_GUARD_SELF" ]
 grep -Fxq "guard-delete:$port" "$FIREWALL_LOG"
 
-printf '%s\n' '[10/19] firewall cleanup failures retain the reserved port'
+printf '%s\n' '[10/20] firewall cleanup failures retain the reserved port'
 reset_case
 unset -f sleep
 cleanup_allow="$TEST_ROOT/guard-cleanup-allow"
@@ -585,7 +737,7 @@ GUARD_PID=""
 [ ! -e "$RR_QUARANTINE_GUARD_STATE" ]
 [ ! -e "$RR_QUARANTINE_GUARD_SELF" ]
 
-printf '%s\n' '[11/19] locked self-clean failures retain the reserved port'
+printf '%s\n' '[11/20] locked self-clean failures retain the reserved port'
 reset_case
 unset -f sleep
 finalize_allow="$TEST_ROOT/guard-finalize-allow"
@@ -654,7 +806,7 @@ GUARD_PID=""
 [ ! -e "$RR_QUARANTINE_GUARD_STATE" ]
 [ ! -e "$RR_QUARANTINE_GUARD_SELF" ]
 
-printf '%s\n' '[12/19] state-only guard restart replaces stale readiness before cleanup'
+printf '%s\n' '[12/20] state-only guard restart replaces stale readiness before cleanup'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18112
 rr_test_production_install_guard_self
@@ -686,9 +838,98 @@ fi
 
 reset_case
 unset -f sleep
+read -r state_port marker_port < <(python3 - <<'PY'
+import socket
+sockets = []
+ports = []
+for _ in range(2):
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    ports.append(sock.getsockname()[1])
+    sockets.append(sock)
+print(*ports)
+for sock in sockets:
+    sock.close()
+PY
+)
+rr_quarantine_write_marker quarantined 7.1.0 "$state_port"
+rr_test_production_install_guard_self
+rr_quarantine_sync_guard_state
+# Simulate power loss between the marker rename and the independent state
+# rename. The reboot guard must bind the last durable guard-state port.
+rr_quarantine_write_marker quarantined 7.0.9 "$marker_port"
+rr_quarantine_add_firewall_rules() { :; }
+rr_stop_subscription_servers() { :; }
+rr_recover_log() { :; }
+(rr_quarantine_guard) &
+GUARD_PID=$!
+for _ in $(seq 1 120); do
+    [ "$(cat "$RR_QUARANTINE_READY" 2>/dev/null || true)" = ready ] && break
+    /bin/sleep 0.05
+done
+[ "$(cat "$RR_QUARANTINE_READY")" = ready ]
+if python3 - "$state_port" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+then
+    echo 'A marker/state crash mismatch left the durable guard-state port unreserved.' >&2
+    exit 1
+fi
+/bin/sleep 0.1
+kill -TERM "$GUARD_PID"
+set +e
+wait "$GUARD_PID" 2>/dev/null
+guard_signal_status=$?
+set -e
+GUARD_PID=""
+[ "$guard_signal_status" -eq 1 ] || {
+    echo 'A direct guard TERM was reported as a clean service exit.' >&2
+    exit 1
+}
+[ ! -e "$RR_QUARANTINE_READY" ]
+# Simulate Restart=on-failure after the explicit nonzero signal result.  The
+# new guard must immediately reserve the same durable state-only port again.
+(rr_quarantine_guard) &
+GUARD_PID=$!
+for _ in $(seq 1 120); do
+    [ "$(cat "$RR_QUARANTINE_READY" 2>/dev/null || true)" = ready ] && break
+    /bin/sleep 0.05
+done
+[ "$(cat "$RR_QUARANTINE_READY")" = ready ]
+if python3 - "$state_port" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+then
+    echo 'A restarted state-only guard did not reclaim its durable port.' >&2
+    exit 1
+fi
+/bin/sleep 0.1
+kill -TERM "$GUARD_PID"
+set +e
+wait "$GUARD_PID" 2>/dev/null
+guard_signal_status=$?
+set -e
+GUARD_PID=""
+[ "$guard_signal_status" -eq 1 ]
+
+reset_case
+unset -f sleep
 restart_allow="$TEST_ROOT/guard-restart-allow"
 restart_attempts="$TEST_ROOT/guard-restart-attempts"
 rm -f -- "$restart_allow" "$restart_attempts"
+rm -f -- "$RR_LEGACY_UPDATE_LOCK_FILE" "$RR_LEGACY_UPDATE_BRIDGE_FILE"
 export restart_allow restart_attempts
 port=$(python3 - <<'PY'
 import socket
@@ -727,7 +968,9 @@ rm -f -- "$RR_QUARANTINE_FILE" "$RR_RECOVERY_SELF"
     rr_quarantine_remove_firewall_rules() { :; }
     rr_quarantine_remove_orphan_firewall_rules() {
         printf 'attempt\n' >> "$restart_attempts"
-        [ -e "$restart_allow" ]
+        while [ ! -e "$restart_allow" ]; do
+            /bin/sleep 0.05
+        done
     }
     rr_stop_subscription_servers() { :; }
     rr_subscription_running() { return 1; }
@@ -764,6 +1007,16 @@ for _ in $(seq 1 120); do
     /bin/sleep 0.05
 done
 [ -s "$restart_attempts" ]
+[ "$(cat "$RR_LEGACY_UPDATE_BRIDGE_FILE")" = rr-legacy-update-bridge-v1 ]
+[ "$(stat -c '%U:%G:%a:%h' "$RR_LEGACY_UPDATE_BRIDGE_FILE")" = root:root:600:1 ]
+[ "$(stat -c '%U:%G:%a:%h' "$RR_LEGACY_UPDATE_LOCK_FILE")" = root:root:600:1 ]
+if (
+    exec {legacy_contender_fd}<"$RR_LEGACY_UPDATE_LOCK_FILE"
+    flock -n "$legacy_contender_fd"
+); then
+    echo 'State-only cleanup released the 7.1.0 compatibility flock before commit.' >&2
+    exit 1
+fi
 : > "$restart_allow"
 for _ in $(seq 1 120); do
     ! kill -0 "$GUARD_PID" 2>/dev/null && break
@@ -776,7 +1029,99 @@ GUARD_PID=""
 [ ! -e "$RR_QUARANTINE_GUARD_STATE" ]
 [ ! -e "$RR_QUARANTINE_GUARD_SELF" ]
 
-printf '%s\n' '[13/19] quarantine replacement preserves the old barrier on stop or staging failure'
+# A reboot can also leave an attacker-controlled inode at the predictable old
+# lock path.  Cleanup must fail closed without repairing that inode, publishing
+# a bridge, reaching firewall mutation, or releasing the socket reservation.
+reset_case
+unset -f sleep
+unsafe_cleanup_callback="$TEST_ROOT/unsafe-cleanup-callback"
+rm -f -- "$unsafe_cleanup_callback"
+port=$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)
+rr_quarantine_write_marker quarantined 7.1.0 "$port"
+rr_test_production_install_guard_self
+rr_quarantine_sync_guard_state
+printf 'legacy quarantine unit\n' > "$RR_QUARANTINE_UNIT"
+rm -f -- "$RR_QUARANTINE_FILE" "$RR_RECOVERY_SELF" "$RR_LAUNCHER"
+rm -rf -- "$RR_LIB_DIR"
+: > "$RR_LEGACY_UPDATE_LOCK_FILE"
+chmod 0666 "$RR_LEGACY_UPDATE_LOCK_FILE"
+unsafe_lock_inode=$(stat -c %i "$RR_LEGACY_UPDATE_LOCK_FILE")
+rr_quarantine_add_firewall_rules() { :; }
+rr_quarantine_remove_firewall_rules() { : > "$unsafe_cleanup_callback"; }
+rr_quarantine_remove_orphan_firewall_rules() { : > "$unsafe_cleanup_callback"; }
+rr_stop_subscription_servers() { :; }
+rr_subscription_running() { return 1; }
+rr_recover_log() { :; }
+(rr_quarantine_guard) &
+GUARD_PID=$!
+for _ in $(seq 1 120); do
+    [ "$(cat "$RR_QUARANTINE_READY" 2>/dev/null || true)" = ready ] && break
+    /bin/sleep 0.05
+done
+[ "$(cat "$RR_QUARANTINE_READY")" = ready ]
+for _ in $(seq 1 40); do
+    kill -0 "$GUARD_PID"
+    /bin/sleep 0.05
+done
+[ ! -e "$unsafe_cleanup_callback" ]
+[ ! -e "$RR_LEGACY_UPDATE_BRIDGE_FILE" ]
+[ "$(stat -c %i "$RR_LEGACY_UPDATE_LOCK_FILE")" = "$unsafe_lock_inode" ]
+[ "$(stat -c %a "$RR_LEGACY_UPDATE_LOCK_FILE")" = 666 ]
+[ -e "$RR_QUARANTINE_READY" ] && [ -e "$RR_QUARANTINE_UNIT" ] && \
+    [ -e "$RR_QUARANTINE_GUARD_STATE" ] && [ -e "$RR_QUARANTINE_GUARD_SELF" ]
+if python3 - "$port" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+then
+    echo 'Unsafe legacy-lock preoccupation released the state-only guard port.' >&2
+    exit 1
+fi
+kill -TERM "$GUARD_PID"
+set +e
+wait "$GUARD_PID" 2>/dev/null
+guard_signal_status=$?
+set -e
+GUARD_PID=""
+[ "$guard_signal_status" -eq 1 ]
+rr_quarantine_remove_firewall_rules() { :; }
+rr_quarantine_remove_orphan_firewall_rules() { :; }
+
+printf '%s\n' '[13/20] quarantine replacement preserves the old barrier on stop or staging failure'
+(
+    reset_case
+    unsafe_ancestor="$TEST_ROOT/unsafe-quarantine-ancestor"
+    mkdir -p "$unsafe_ancestor"
+    chmod 0777 "$unsafe_ancestor"
+    RR_QUARANTINE_GUARD_SELF="$unsafe_ancestor/guard/subscription-quarantine-guard"
+    if rr_test_production_install_guard_self; then
+        echo 'A guard helper below a non-sticky writable ancestor was installed.' >&2
+        exit 1
+    fi
+    RR_QUARANTINE_GUARD_STATE="$unsafe_ancestor/state/guard-state"
+    rr_quarantine_write_marker quarantined 7.1.0 18081
+    if rr_quarantine_sync_guard_state; then
+        echo 'Guard state below a non-sticky writable ancestor was published.' >&2
+        exit 1
+    fi
+    RR_QUARANTINE_UNIT="$unsafe_ancestor/systemd/rr-subscription-quarantine.service"
+    if rr_quarantine_write_unit; then
+        echo 'A quarantine unit below a non-sticky writable ancestor was published.' >&2
+        exit 1
+    fi
+)
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 rr_test_production_install_guard_self
@@ -795,6 +1140,28 @@ rr_quarantine_marker_read
 [ -e "$RR_QUARANTINE_READY" ]
 if grep -Fq 'delete:18081' "$FIREWALL_LOG"; then
     echo 'Failed guard stop removed the old firewall barrier.' >&2
+    exit 1
+fi
+
+reset_case
+rr_quarantine_write_marker quarantined 7.1.0 18081
+rr_test_production_install_guard_self
+rr_quarantine_sync_guard_state
+printf 'legacy quarantine unit\n' > "$RR_QUARANTINE_UNIT"
+printf 'ready\n' > "$RR_QUARANTINE_READY"
+: > "$RR_TEST_QUARANTINE_ENABLED"
+: > "$RR_TEST_QUARANTINE_QUERY_FAIL"
+old_guard_sha=$(sha256sum "$RR_QUARANTINE_GUARD_SELF" | awk '{print $1}')
+: > "$FIREWALL_LOG"
+if rr_activate_subscription_quarantine 7.0.9 19091 1 >/dev/null 2>&1; then
+    echo 'Quarantine replacement accepted an unprovable stopped state.' >&2
+    exit 1
+fi
+[ "$(sha256sum "$RR_QUARANTINE_GUARD_SELF" | awk '{print $1}')" = "$old_guard_sha" ]
+[ -e "$RR_QUARANTINE_READY" ] && [ -e "$RR_QUARANTINE_GUARD_STATE" ] && \
+    [ -e "$RR_QUARANTINE_UNIT" ]
+if grep -Fq 'delete:18081' "$FIREWALL_LOG"; then
+    echo 'Guard state query failure removed the old firewall barrier.' >&2
     exit 1
 fi
 
@@ -844,7 +1211,7 @@ if grep -Fq 'stop rr-subscription-quarantine.service' "$SYSTEMCTL_LOG"; then
 fi
 rr_quarantine_add_firewall_rules() { printf 'add:%s\n' "$1" >> "$FIREWALL_LOG"; }
 
-printf '%s\n' '[14/19] a ready file without persistent unit or firewall is not a barrier'
+printf '%s\n' '[14/20] a ready file without persistent unit or firewall is not a barrier'
 (
     reset_case
     systemctl() {
@@ -858,6 +1225,12 @@ printf '%s\n' '[14/19] a ready file without persistent unit or firewall is not a
             "is-active --quiet rr-subscription-quarantine.service")
                 [ -e "$RR_QUARANTINE_READY" ]; return ;;
             "is-enabled --quiet rr-subscription-quarantine.service") return 1 ;;
+            "show -p LoadState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n' ;;
+            "show -p ActiveState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_READY" ] && printf 'active\n' || printf 'inactive\n' ;;
+            "show -p UnitFileState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'disabled\n' || : ;;
         esac
         return 0
     }
@@ -871,19 +1244,57 @@ printf '%s\n' '[14/19] a ready file without persistent unit or firewall is not a
     [ "$RR_QUARANTINE_STATE" = degraded ]
 )
 
-printf '%s\n' '[15/19] reusable guards have no gap and port changes use a DROP handoff'
+printf '%s\n' '[15/20] reusable guards have no gap and port changes use a DROP handoff'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081 0
 rr_test_production_install_guard_self
 rr_quarantine_sync_guard_state
-printf 'legacy quarantine unit\n' > "$RR_QUARANTINE_UNIT"
+rr_quarantine_write_unit
 (umask 077; printf 'ready\n' > "$RR_QUARANTINE_READY")
 : > "$RR_TEST_QUARANTINE_ENABLED"
 : > "$SYSTEMCTL_LOG"
 : > "$FIREWALL_LOG"
+rr_quarantine_firewall_inventory_is_exact() { [ "$1" = 18081 ]; }
 ready_inode=$(stat -c %i "$RR_QUARANTINE_READY")
 unit_digest=$(sha256sum "$RR_QUARANTINE_UNIT")
 guard_digest=$(sha256sum "$RR_QUARANTINE_GUARD_SELF")
+[ "$(stat -c '%u:%g:%a:%h' "$RR_RECOVERY_SELF")" = 0:0:755:1 ]
+[ "$(stat -c '%u:%g:%a:%h' "$RR_QUARANTINE_GUARD_SELF")" = 0:0:700:1 ]
+rr_quarantine_guard_helper_is_current || {
+    echo 'The valid production 0755 recovery helper was rejected by its 0700 guard copy.' >&2
+    exit 1
+}
+chmod 0777 "$(dirname "$RR_QUARANTINE_GUARD_SELF")"
+if rr_quarantine_guard_helper_is_current; then
+    echo 'A reusable guard below a non-sticky writable ancestor was trusted.' >&2
+    exit 1
+fi
+chmod 0700 "$(dirname "$RR_QUARANTINE_GUARD_SELF")"
+cp -- "$RR_QUARANTINE_UNIT" "$TEST_ROOT/strict-unit.saved"
+printf 'tampered\n' >> "$RR_QUARANTINE_UNIT"
+if rr_quarantine_existing_guard_is_reusable 18081; then
+    echo 'A guard with tampered unit content was reused.' >&2
+    exit 1
+fi
+mv -f -- "$TEST_ROOT/strict-unit.saved" "$RR_QUARANTINE_UNIT"
+chmod 0600 "$RR_QUARANTINE_UNIT"
+if rr_quarantine_existing_guard_is_reusable 18081; then
+    echo 'A guard with unsafe unit metadata was reused.' >&2
+    exit 1
+fi
+chmod 0644 "$RR_QUARANTINE_UNIT"
+RR_TEST_QUARANTINE_FRAGMENT_PATH="$TEST_ROOT/foreign.service"
+if rr_quarantine_existing_guard_is_reusable 18081; then
+    echo 'A guard loaded from a foreign systemd fragment was reused.' >&2
+    exit 1
+fi
+RR_TEST_QUARANTINE_FRAGMENT_PATH=""
+RR_TEST_QUARANTINE_DROP_IN_PATHS="$TEST_ROOT/override.conf"
+if rr_quarantine_existing_guard_is_reusable 18081; then
+    echo 'A guard with a systemd drop-in override was reused.' >&2
+    exit 1
+fi
+RR_TEST_QUARANTINE_DROP_IN_PATHS=""
 rr_activate_subscription_quarantine 7.0.9 18081 1
 [ "$(stat -c %i "$RR_QUARANTINE_READY")" = "$ready_inode" ]
 [ "$(sha256sum "$RR_QUARANTINE_UNIT")" = "$unit_digest" ]
@@ -905,7 +1316,7 @@ reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 rr_test_production_install_guard_self
 rr_quarantine_sync_guard_state
-printf 'legacy quarantine unit\n' > "$RR_QUARANTINE_UNIT"
+rr_quarantine_write_unit
 (umask 077; printf 'ready\n' > "$RR_QUARANTINE_READY")
 : > "$RR_TEST_QUARANTINE_ENABLED"
 rm -f -- "$RR_QUARANTINE_FILE"
@@ -919,7 +1330,30 @@ grep -Fxq 'add:18081' "$FIREWALL_LOG"
 grep -Fxq 'add:19093' "$FIREWALL_LOG"
 grep -Fxq 'delete:18081' "$FIREWALL_LOG"
 
-printf '%s\n' '[16/19] a transient firewall-only barrier never replaces the persistent guard'
+printf '%s\n' '[16/20] runtime-only unit enablement is never accepted as a persistent guard'
+(
+    reset_case
+    rr_quarantine_write_marker quarantined 7.1.0 18081
+    rr_test_production_install_guard_self
+    rr_quarantine_sync_guard_state
+    rr_quarantine_write_unit
+    (umask 077; printf 'ready\n' > "$RR_QUARANTINE_READY")
+    : > "$RR_TEST_QUARANTINE_ENABLED"
+    RR_TEST_QUARANTINE_UNIT_FILE_STATE=enabled-runtime
+    if rr_quarantine_existing_guard_is_reusable; then
+        echo 'Runtime-only unit enablement was accepted as a reboot-persistent guard.' >&2
+        exit 1
+    fi
+    if rr_activate_subscription_quarantine 7.0.9 18081 1 >/dev/null 2>&1; then
+        echo 'Activation accepted a guard that disappears on reboot.' >&2
+        exit 1
+    fi
+    rr_quarantine_marker_read
+    [ "$RR_QUARANTINE_STATE" = degraded ]
+    [ -e "$RR_QUARANTINE_GUARD_STATE" ] && [ -e "$RR_QUARANTINE_GUARD_SELF" ]
+)
+
+printf '%s\n' '[17/20] a transient firewall-only barrier never replaces the persistent guard'
 (
     reset_case
     systemctl() {
@@ -928,6 +1362,11 @@ printf '%s\n' '[16/19] a transient firewall-only barrier never replaces the pers
             "enable --now rr-subscription-quarantine.service") return 1 ;;
             "is-active --quiet rr-subscription-quarantine.service"|\
             "is-enabled --quiet rr-subscription-quarantine.service") return 1 ;;
+            "show -p LoadState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'loaded\n' || printf 'not-found\n' ;;
+            "show -p ActiveState --value rr-subscription-quarantine.service") printf 'inactive\n' ;;
+            "show -p UnitFileState --value rr-subscription-quarantine.service")
+                [ -e "$RR_QUARANTINE_UNIT" ] && printf 'disabled\n' || : ;;
         esac
         return 0
     }
@@ -942,7 +1381,7 @@ printf '%s\n' '[16/19] a transient firewall-only barrier never replaces the pers
     [ "$RR_QUARANTINE_STATE" = degraded ]
 )
 
-printf '%s\n' '[17/19] markerless raw-table evidence is visible and blocks replacement'
+printf '%s\n' '[18/20] markerless raw-table evidence is visible and blocks replacement'
 (
     reset_case
     rm -f -- "$RR_ACTIVE_TX"
@@ -975,7 +1414,7 @@ PY
     }
 )
 
-printf '%s\n' '[18/19] committed boot recovery sweeps markerless raw rules before finalizing'
+printf '%s\n' '[19/20] committed boot recovery sweeps markerless raw rules before finalizing'
 (
     reset_case
     export RR_UPDATE_LOCK_HELD=1
@@ -1003,6 +1442,9 @@ printf '%s\n' '[18/19] committed boot recovery sweeps markerless raw rules befor
         case "$*" in
             "is-active --quiet rr-subscription-quarantine.service"|\
             "is-enabled --quiet rr-subscription-quarantine.service") return 1 ;;
+            "show -p LoadState --value rr-subscription-quarantine.service") printf 'not-found\n' ;;
+            "show -p ActiveState --value rr-subscription-quarantine.service") printf 'inactive\n' ;;
+            "show -p UnitFileState --value rr-subscription-quarantine.service") : ;;
             *) return 0 ;;
         esac
     }
@@ -1028,7 +1470,7 @@ printf '%s\n' '[18/19] committed boot recovery sweeps markerless raw rules befor
     }
 )
 
-printf '%s\n' '[19/19] long-lived quarantine guard releases inherited recovery flock descriptors'
+printf '%s\n' '[20/20] long-lived quarantine guard releases inherited recovery flock descriptors'
 reset_case
 rm -f -- "$RR_ACTIVE_TX"
 rr_quarantine_write_marker degraded unknown 0
