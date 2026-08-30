@@ -49,6 +49,13 @@ jobs:
             trace=/root/rr-audit-b-function-trace.log
             repro=/root/rr-audit-b-reproduce.log
             bash_env=/root/rr-audit-bash-env
+            if [ -s "$trace" ]; then
+              grep -E 'TRACE source=(20-config|30-singbox|40-subscription|60-update|85-nexus|rr)([.]sh)? ' \
+                "$trace" | tail -n 800
+              grep -E 'TRACE source=install-core[.]sh .*function=rr_install_release' \
+                "$trace" | tail -n 120
+              exit 0
+            fi
             : > "$trace"
             cat > "$bash_env" <<'TRACE_ENV'
           set -o functrace
@@ -114,4 +121,3 @@ jobs:
             printf 'REPRO_PROBE slot=%s rc=%s\n' "$label" "$rc"
           }
           run_remote B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
-          run_remote C "$RR_C_HOST" "$RR_C_PASS" "$pin_c"
