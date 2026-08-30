@@ -590,7 +590,7 @@ jobs:
           # The previous audit run proved that the old cleanup path could leave
           # a worker with no PID file.  Use the new candidate's strict
           # command-line + cwd identity check once to reset this disposable
-          # host, then exercise a completely new 7.1.0 -> 7.1.1 cycle below.
+          # host, then exercise a completely new 7.1.0 -> current candidate cycle below.
           cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
           chmod 700 "$cleanup_runtime"
           tar --no-same-owner --no-same-permissions -xzf \
@@ -2424,6 +2424,16 @@ jobs:
             done
             persist_rr_firewall_fixture
           }
+          audit_update_channel_value() {
+            local value=stable
+            if [ -e /etc/rr-update/channel ] || [ -L /etc/rr-update/channel ]; then
+              [ -f /etc/rr-update/channel ] && [ ! -L /etc/rr-update/channel ] || return 1
+              test "$(stat -c '%U:%G:%a:%h' /etc/rr-update/channel)" = root:root:600:1 || return 1
+              value=$(tr -d '[:space:]' < /etc/rr-update/channel) || return 1
+              case "$value" in stable|beta) ;; *) return 1 ;; esac
+            fi
+            printf '%s\n' "$value"
+          }
           firewall_fixture_active=false
           finish_target_audit() {
             rc=$?
@@ -2453,7 +2463,7 @@ jobs:
           grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
             /etc/argo_vmess.conf | LC_ALL=C sort \
             > /root/rr-audit-cross-target-network.txt
-          cp -p /etc/rr-update/channel /root/rr-audit-cross-target-channel
+          audit_update_channel_value > /root/rr-audit-cross-target-channel
           test -f /run/rr-vps-subscription.bind
           test ! -L /run/rr-vps-subscription.bind
           test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
@@ -2607,7 +2617,8 @@ jobs:
           grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
             /etc/argo_vmess.conf | LC_ALL=C sort \
             | cmp -s /root/rr-audit-cross-target-network.txt -
-          cmp -s /etc/rr-update/channel /root/rr-audit-cross-target-channel
+          audit_update_channel_value \
+            | cmp -s /root/rr-audit-cross-target-channel -
           test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
           cmp -s /run/rr-vps-subscription.bind /root/rr-audit-cross-target-bind
           capture_rr_firewall_state /root/rr-audit-cross-restored-firewall

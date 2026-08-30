@@ -8,15 +8,15 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.1.1** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.2.0** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### 7.1.1：安全与发布门禁维护版
+### 7.2.0：安全边界重构、事务恢复加固与可信发布
 
-7.1.1 集中修复订阅鉴权、SSRF、代理来源伪造、备份恢复注入、临时目录符号链接、慢客户端资源耗尽和更新回滚问题。Stable 更新只消费 CI 全绿后生成的 GitHub Release，并固定到同版本 Tag；Beta 与 Stable 分离。
+7.2.0 是一次覆盖订阅与管理面安全、持久热更新、跨版本回滚、加密迁移、供应链和正式发布链路的系统性工程升级。Stable 更新只消费普通 CI 与三机实测全部通过后生成的不可变 GitHub Release，并固定到同版本 Tag；Beta 与 Stable 分离。
 
 本版同时移除公网明文 HTTP 订阅：独立订阅端点要么使用可信域名 TLS，要么只监听 `127.0.0.1` 并经 SSH 隧道访问。旧公网 HTTP 地址升级后不再可用。
 
-原有 `rr doctor`、加密 `.rrbak`、告警、TOTP/Passkey、历史图表、批量管理和 NaiveProxy HTTP/3 功能保持兼容；完整变更见 Changelog。
+原有 `rr doctor`、加密 `.rrbak`、告警、TOTP/Passkey、历史图表、批量管理和 NaiveProxy HTTP/3 功能保持兼容；本版的安全边界、事务恢复、三发行版 CI 与三机实测证据见 Changelog。
 
 ## 一键安装
 

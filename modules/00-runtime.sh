@@ -36,7 +36,7 @@ rr_refresh_update_channel_constants() {
 }
 
 rr_refresh_update_channel_constants
-SCRIPT_VERSION="7.1.1"
+SCRIPT_VERSION="7.2.0"
 RR_LIB_DIR="/usr/local/lib/rr"
 RR_LOCAL_MANIFEST="${RR_LIB_DIR}/manifest.sha256"
 RR_LAUNCHER="/usr/local/bin/rr"
