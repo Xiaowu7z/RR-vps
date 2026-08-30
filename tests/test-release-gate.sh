@@ -8,6 +8,26 @@ CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
+CURRENT_VERSION=$(sed -n 's/^RR-vps \([0-9][0-9.]*\)$/\1/p' "$REPO_ROOT/version")
+[[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+[ "$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' \
+    "$REPO_ROOT/modules/00-runtime.sh")" = "$CURRENT_VERSION" ]
+grep -Fxq "RR_RELEASE_TAG=\"v${CURRENT_VERSION}\"" "$REPO_ROOT/install.sh"
+grep -Fxq "RR_RELEASE_TAG=\"v${CURRENT_VERSION}\"" \
+    "$REPO_ROOT/scripts/install-core.sh"
+grep -Fxq "NEXUS_CORE_PINNED_PRODUCT_VERSION=\"${CURRENT_VERSION}\"" \
+    "$REPO_ROOT/modules/85-nexus.sh"
+grep -Fq "当前版本：**${CURRENT_VERSION}**" "$REPO_ROOT/README.md"
+grep -Fq "Current version: **${CURRENT_VERSION}**" "$REPO_ROOT/README_EN.md"
+grep -Fq "## ${CURRENT_VERSION} -" "$REPO_ROOT/CHANGELOG.md"
+# These are security/transaction compatibility cutoffs, not display versions.
+grep -Fxq 'RR_SUBSCRIPTION_SAFE_VERSION="7.1.1"' \
+    "$REPO_ROOT/scripts/install-core.sh"
+grep -Fxq 'RR_SUBSCRIPTION_SAFE_VERSION="7.1.1"' \
+    "$REPO_ROOT/scripts/update-recover.sh"
+grep -Fxq 'RR_POST_UPDATE_FINALIZE_VERSION="7.1.1"' \
+    "$REPO_ROOT/scripts/update-recover.sh"
+
 python3 - "$WORKFLOW" "$VPS_WORKFLOW" "$CI_WORKFLOW" \
     "$TEST_ROOT/assert-workflow-gate.sh" <<'PY'
 from pathlib import Path
@@ -494,6 +514,43 @@ for field in (
 assert "rr-audit-cross-target-bind" in migration
 assert "rr-audit-cross-target-firewall" in migration
 assert "capture_rr_firewall_state()" in migration
+remote_c_start = migration.index(
+    "            \"$backup_sha\" \"$fingerprint_sha\" <<'REMOTE_C'\n"
+    "          set -euo pipefail\n"
+    "          umask 077\n"
+)
+remote_c_end = migration.index("          REMOTE_C\n", remote_c_start)
+channel_helper_text = """          audit_update_channel_value() {
+            local value=stable
+            if [ -e /etc/rr-update/channel ] || [ -L /etc/rr-update/channel ]; then
+              [ -f /etc/rr-update/channel ] && [ ! -L /etc/rr-update/channel ] || return 1
+              test "$(stat -c '%U:%G:%a:%h' /etc/rr-update/channel)" = root:root:600:1 || return 1
+              value=$(tr -d '[:space:]' < /etc/rr-update/channel) || return 1
+              case "$value" in stable|beta) ;; *) return 1 ;; esac
+            fi
+            printf '%s\\n' "$value"
+          }
+"""
+assert migration.count(channel_helper_text) == 1
+channel_helper = migration.index(channel_helper_text, remote_c_start, remote_c_end)
+channel_snapshot_text = (
+    "          audit_update_channel_value > /root/rr-audit-cross-target-channel\n"
+)
+channel_compare_text = (
+    "          audit_update_channel_value \\\n"
+    "            | cmp -s /root/rr-audit-cross-target-channel -\n"
+)
+assert migration.count(channel_snapshot_text) == 1
+assert migration.count(channel_compare_text) == 1
+channel_snapshot = migration.index(channel_snapshot_text)
+cross_restore = migration.index(
+    'timeout --kill-after=10 300 /usr/local/bin/rr restore "$backup_file"',
+    channel_snapshot,
+)
+channel_compare = migration.index(channel_compare_text, cross_restore)
+assert channel_helper < channel_snapshot < cross_restore < channel_compare < remote_c_end
+assert "cp -p /etc/rr-update/channel" not in migration
+assert "cmp -s /etc/rr-update/channel" not in migration
 assert "NAIVE_ENABLED=false" in migration
 assert "expected_private" in migration and "expected_public" in migration
 assert (

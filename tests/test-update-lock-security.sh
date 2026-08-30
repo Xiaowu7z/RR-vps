@@ -277,6 +277,17 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
     RR_SUBSCRIPTION_SAFE_VERSION=7.1.1
     RR_LAUNCHER="$legacy_root/rr"
     RR_LEGACY_UPDATE_BRIDGE_FILE="$legacy_root/private/legacy-update-bridge"
+    CURRENT_PRODUCT_VERSION=$(sed -n \
+        's/^RR-vps \([0-9][0-9.]*\)$/\1/p' "$REPO_ROOT/version")
+    [[ "$CURRENT_PRODUCT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+        fail 'current product version fixture is invalid'
+    rr_version_ge "$CURRENT_PRODUCT_VERSION" "$RR_SUBSCRIPTION_SAFE_VERSION" || \
+        fail 'current product version fell below the subscription safety boundary'
+    rr_version_ge 7.1.1 "$RR_SUBSCRIPTION_SAFE_VERSION" || \
+        fail 'the exact 7.1.1 subscription safety boundary was rejected'
+    if rr_version_ge 7.1.1 "$CURRENT_PRODUCT_VERSION"; then
+        fail 'the 7.1.1 compatibility boundary was mistaken for the current release'
+    fi
 
     prepare_trusted_runtime() {
         local runtime_root="$1" runtime_version="$2"
@@ -324,6 +335,17 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
     [ ! -e "$RR_LEGACY_UPDATE_LOCK_FILE" ] && [ ! -L "$RR_LEGACY_UPDATE_LOCK_FILE" ] || \
         fail '7.1.1 install recreated an unnecessary legacy lock'
     [ -z "$LEGACY_UPDATE_LOCK_FD" ] || fail '7.1.1 absent legacy path retained an fd'
+
+    use_bridge_case current
+    prepare_trusted_runtime "$legacy_root/current-runtime" "$CURRENT_PRODUCT_VERSION"
+    RR_LEGACY_UPDATE_LOCK_FILE="$legacy_root/current-absent/legacy.lock"
+    LEGACY_UPDATE_LOCK_FD=""
+    mkdir -m 700 "$legacy_root/current-absent"
+    rr_acquire_legacy_update_lock || fail 'current release rejected an absent legacy lock'
+    [ ! -e "$RR_LEGACY_UPDATE_LOCK_FILE" ] && [ ! -L "$RR_LEGACY_UPDATE_LOCK_FILE" ] || \
+        fail 'current release recreated an unnecessary legacy lock'
+    [ -z "$LEGACY_UPDATE_LOCK_FD" ] || \
+        fail 'current release retained an absent legacy lock fd'
 
     installer_noise_root="$legacy_root/installer-unmarked-hostile"
     mkdir -m 1777 "$installer_noise_root"

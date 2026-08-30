@@ -8,15 +8,15 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.1.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.0** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
-### 7.1.1: security and release-gate maintenance
+### 7.2.0: rebuilt trust boundaries, hardened recovery, and verifiable releases
 
-7.1.1 fixes subscription authorization, SSRF, proxy-source spoofing, backup/restore injection, predictable temporary paths, slow-client resource exhaustion, and rollback failures. Stable now consumes only a CI-verified GitHub Release pinned to the matching version tag; Beta remains isolated on its own branch.
+7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. Stable consumes only an immutable GitHub Release that passed both ordinary CI and the three-host audit, pinned to the matching version tag; Beta remains isolated on its own branch.
 
 This release also removes public cleartext HTTP subscriptions. A standalone subscription endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Legacy public HTTP URLs stop working after the upgrade.
 
-Existing diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 features remain compatible. See the changelog for the complete list.
+Existing diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 features remain compatible. See the changelog for the trust-boundary, recovery, multi-distribution CI, and real-host audit evidence.
 
 ## One-command installation
 

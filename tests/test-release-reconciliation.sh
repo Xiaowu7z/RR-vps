@@ -28,10 +28,12 @@ source "$TEST_ROOT/functions.sh"
 
 EXPECTED_SHA=0123456789abcdef0123456789abcdef01234567
 OLD_SHA=1123456789abcdef0123456789abcdef01234567
-TAG=v7.1.1
-VERSION=7.1.1
+VERSION=$(sed -n 's/^RR-vps \([0-9][0-9.]*\)$/\1/p' "$REPO_ROOT/version")
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    fail 'current release version fixture is invalid'
+TAG="v${VERSION}"
 GITHUB_REPOSITORY=example/rr-vps
-RELEASE_TITLE='RR-vps 7.1.1 正式版'
+RELEASE_TITLE="RR-vps ${VERSION} 正式版"
 ASSET_ROOT="$TEST_ROOT/assets"
 mkdir -p "$ASSET_ROOT"
 RELEASE_NOTES_FILE="$ASSET_ROOT/release-notes.md"
@@ -256,8 +258,10 @@ reset_owned_state
 reconcile_owned_mutable_target
 [ ! -e "$STATE_ROOT/release.json" ] && [ ! -e "$STATE_ROOT/ref.json" ] ||
     fail 'owned orphan state was not fully reconciled'
-release_delete=$(grep -n '^DELETE .*/releases/17$' "$API_LOG" | cut -d: -f1)
-tag_delete=$(grep -n '^DELETE .*/git/refs/tags/v7.1.1$' "$API_LOG" | cut -d: -f1)
+release_delete=$(grep -nFx \
+    "DELETE /repos/${GITHUB_REPOSITORY}/releases/17" "$API_LOG" | cut -d: -f1)
+tag_delete=$(grep -nFx \
+    "DELETE /repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" "$API_LOG" | cut -d: -f1)
 [[ "$release_delete" =~ ^[0-9]+$ && "$tag_delete" =~ ^[0-9]+$ ]] && \
     [ "$release_delete" -lt "$tag_delete" ] ||
     fail 'owned orphan deletion did not remove release before tag'

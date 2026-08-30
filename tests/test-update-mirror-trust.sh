@@ -74,7 +74,10 @@ RR_RAW_BASE="https://trusted.invalid/release"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
 RR_LOCAL_MANIFEST="$test_root/local-manifest.sha256"
-SCRIPT_VERSION="7.1.1"
+SCRIPT_VERSION=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' \
+    modules/00-runtime.sh)
+[[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+    fail "current runtime version fixture is invalid"
 RR_TEST_DOWNLOAD_TRACE="$test_root/download-trace"
 RR_TEST_EXEC_MARKER="$test_root/bootstrap-executed"
 export RR_TEST_EXEC_MARKER
