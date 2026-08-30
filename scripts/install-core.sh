@@ -1003,6 +1003,23 @@ rr_resume_subscription_bounded() {
     fi
 }
 
+rr_restore_committed_subscription_state() {
+    local backup="${1:-$BACKUP_DIR}"
+    if [ -f "$backup/subscription_was_running" ]; then
+        rr_resume_subscription_bounded
+        return $?
+    fi
+    rr_stop_subscription_servers || return 1
+    ! rr_subscription_running
+}
+
+rr_reconcile_committed_writer_state() {
+    local backup="${1:-$BACKUP_DIR}"
+    rr_restore_committed_subscription_state "$backup" || return 1
+    [ -f "$backup/runtime_did_not_exist" ] || \
+        rr_verify_update_writer_state "$backup"
+}
+
 rr_restart_health_service_bounded() {
     local pid="" attempt=0 status=0
     (
@@ -2319,7 +2336,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "6f74dc15f7c417171a59c03aabfaed2c844dc6dd33f4ccc2406773f04687203b" ] && \
+        if [ "$actual" = "60f938008bade3084ed50846fcde8f282e09d4efea01d744f59e4456863aa889" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -2543,6 +2560,14 @@ rr_install_release() {
     if ! rr_run_with_delegated_update_lock \
         "$RR_LAUNCHER" --post-update-finalize; then
         rr_error "版本已提交，但订阅防火墙收尾失败；事务与维护标记已保留，绝不回滚已提交版本。"
+        return 1
+    fi
+    # clear-quarantine deliberately stops every managed subscription worker.
+    # Restore only that affected writer here: the remaining unit state already
+    # passed the migration gate, and restarting healthy Nexus/Sing-box units
+    # would create a needless post-commit readiness race.
+    if ! rr_reconcile_committed_writer_state "$BACKUP_DIR"; then
+        rr_error "版本已提交，但升级前的订阅状态无法恢复或最终服务状态校验失败；事务与维护标记已保留，等待安全恢复。"
         return 1
     fi
     if ! sync; then

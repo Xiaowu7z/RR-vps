@@ -43,18 +43,25 @@ printf '%s\n' '[1/11] cleanup preserves a committed transaction even if the acti
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_phase)"
     # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_reconcile_committed_writer_state)"
+    # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_cleanup)"
 
     RR_TX_ROOT="$TEST_ROOT/committed-cleanup/update"
     RR_ACTIVE_TX="$RR_TX_ROOT/active"
     TX_DIR="$RR_TX_ROOT/transactions/tx"
     BACKUP_DIR="$TX_DIR/backup"
+    RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/committed-cleanup/update-maintenance"
     make_phase "$TX_DIR" committed
     mkdir -p "$BACKUP_DIR"
+    printf '%s\n' "$TX_DIR" > "$RR_UPDATE_MAINTENANCE_FILE"
+    chmod 600 "$RR_UPDATE_MAINTENANCE_FILE"
     printf '%s\n' "$TX_DIR" > "$RR_ACTIVE_TX"
     chmod 600 "$RR_ACTIVE_TX"
     rollback_log="$TEST_ROOT/committed-cleanup/rollback.log"
     rr_rollback() { printf '%s\n' rollback >> "$rollback_log"; }
+    rr_restore_committed_subscription_state() { printf '%s\n' restore-subscription >> "$rollback_log"; }
+    rr_verify_update_writer_state() { printf '%s\n' verify-writers >> "$rollback_log"; return 1; }
     rr_error() { :; }
     TRANSACTION_ACTIVE=true
     ROLLBACK_FAILED=false
@@ -68,15 +75,23 @@ printf '%s\n' '[1/11] cleanup preserves a committed transaction even if the acti
     OLD_RUNTIME=""
 
     set +e
-    rr_cleanup 23
+    rr_reconcile_committed_writer_state "$BACKUP_DIR"
+    reconcile_status=$?
+    rr_cleanup "$reconcile_status"
     cleanup_status=$?
     set -e
-    [ "$cleanup_status" -eq 23 ] || fail 'cleanup lost the original committed finalizer failure'
-    [ ! -e "$rollback_log" ] || fail 'cleanup rolled a committed candidate back'
+    [ "$reconcile_status" -ne 0 ] && [ "$cleanup_status" -ne 0 ] ||
+        fail 'cleanup lost the committed writer-verification failure'
+    [ "$(cat "$rollback_log")" = $'restore-subscription\nverify-writers' ] ||
+        fail 'committed writer failure crossed its boundary or entered rollback'
     [ "$TRANSACTION_ACTIVE" = false ] && [ "$KEEP_TRANSACTION" = true ] || \
         fail 'cleanup did not retain committed transaction state for finalizer retry'
     [ "$(cat "$TX_DIR/phase")" = committed ] && [ -f "$RR_ACTIVE_TX" ] || \
         fail 'cleanup removed committed transaction evidence'
+    [ "$(cat "$RR_UPDATE_MAINTENANCE_FILE")" = "$TX_DIR" ] ||
+        fail 'cleanup removed committed maintenance evidence'
+    [ ! -e "$TX_DIR/committed-settled" ] ||
+        fail 'writer verification failure published settled evidence'
 )
 
 printf '%s\n' '[2/11] direct rollback also refuses a trusted committed phase'

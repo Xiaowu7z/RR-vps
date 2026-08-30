@@ -50,14 +50,14 @@ ensure_runtime_health() {
     printf '%s\n' "${RR_UPDATE_LOCK_HELD:-0}" >> "$health_runs"
 }
 
-printf '%s\n' '[1/9] a normal health pass owns the root-only shared transaction lock'
+printf '%s\n' '[1/10] a normal health pass owns the root-only shared transaction lock'
 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'normal health pass did not receive delegated lock ownership'
 [ -d "$TEST_ROOT/locks" ] || fail 'root-only lock directory was not created'
 [ "$(stat -c '%u:%g:%a' "$TEST_ROOT/locks")" = 0:0:700 ] || fail 'lock directory mode/owner is unsafe'
 [ "$(stat -c '%u:%g:%a:%h' "$RR_RESTORE_LOCK_FILE")" = 0:0:600:1 ] || fail 'lock file mode/owner/link count is unsafe'
 
-printf '%s\n' '[2/9] a timer firing during update/backup skips without mutating or retry-failing'
+printf '%s\n' '[2/10] a timer firing during update/backup skips without mutating or retry-failing'
 : > "$health_runs"
 (
     exec 8>>"$RR_RESTORE_LOCK_FILE"
@@ -76,14 +76,14 @@ done
 rr_run_health_check || fail 'busy transaction lock should be an expected health skip'
 [ ! -s "$health_runs" ] || fail 'health body ran while another transaction owned the lock'
 
-printf '%s\n' '[3/9] an installer re-entry must explicitly delegate its already-held lock'
+printf '%s\n' '[3/10] an installer re-entry must explicitly delegate its already-held lock'
 RR_UPDATE_LOCK_HELD=1 rr_run_health_check
 [ "$(cat "$health_runs")" = 1 ] || fail 'delegated installer re-entry did not run the health body'
 : > "$TEST_ROOT/release-holder"
 wait "$LOCK_HOLDER_PID"
 LOCK_HOLDER_PID=""
 
-printf '%s\n' '[4/9] a nohup child cannot inherit either transaction lock fd'
+printf '%s\n' '[4/10] a nohup child cannot inherit either transaction lock fd'
 nohup_pid_file="$TEST_ROOT/nohup.pid"
 ensure_runtime_health() {
     nohup bash -c 'printf "%s\n" "$$" > "$1"; sleep 30' _ "$nohup_pid_file" \
@@ -101,7 +101,7 @@ flock -n "$RR_RESTORE_LOCK_FILE" -c true || fail 'nohup child inherited the new 
 flock -n "$RR_LEGACY_UPDATE_LOCK_FILE" -c true || fail 'nohup child inherited the legacy update lock fd'
 kill "$nohup_pid" >/dev/null 2>&1 || true
 
-printf '%s\n' '[5/9] an unsafe lock path fails closed before health mutations'
+printf '%s\n' '[5/10] an unsafe lock path fails closed before health mutations'
 : > "$health_runs"
 mkdir -p "$TEST_ROOT/unsafe"
 ln -s "$TEST_ROOT/attacker-target" "$TEST_ROOT/unsafe/update.lock"
@@ -140,7 +140,7 @@ eval "$(extract_function rr_snapshot_runtime)"
 declare -F rr_freeze_health_monitor >/dev/null || fail 'installer freeze helper is missing'
 declare -F rr_snapshot_runtime >/dev/null || fail 'installer snapshot function is missing'
 
-printf '%s\n' '[6/9] installer stops timer and in-flight service before its first snapshot read'
+printf '%s\n' '[6/10] installer stops timer and in-flight service before its first snapshot read'
 RR_TX_ROOT="$TEST_ROOT/transactions-root"
 RR_ACTIVE_TX="$RR_TX_ROOT/active"
 RR_LIB_DIR="$TEST_ROOT/live-runtime"
@@ -213,7 +213,7 @@ first_backup=$(grep -n '^backup-' "$operation_log" | head -n 1 | cut -d: -f1)
 [ -f "$BACKUP_DIR/health_timer_was_enabled" ] || fail 'snapshot lost the pre-update timer enabled state'
 [ "$RR_HEALTH_MONITOR_FROZEN" = true ] || fail 'snapshot did not retain frozen state through switching'
 
-printf '%s\n' '[7/9] a pre-switch abort restores the timer and production call sites delegate re-entry'
+printf '%s\n' '[7/10] a pre-switch abort restores the timer and production call sites delegate re-entry'
 : > "$RR_HEALTH_TIMER_FILE"
 rr_resume_health_monitor_after_abort || fail 'abort did not restore the enabled health timer'
 [ "$RR_HEALTH_MONITOR_FROZEN" = false ] || fail 'abort left health monitor marked frozen'
@@ -225,7 +225,7 @@ grep -Fq '"$RR_LAUNCHER" --post-update' "$REPO_ROOT/scripts/install-core.sh" || 
     fail 'installer migration re-entry no longer declares shared-lock ownership'
 grep -Fq 'rr_run_health_check' "$REPO_ROOT/rr" || fail 'launcher health entry bypasses the lock wrapper'
 
-printf '%s\n' '[8/9] a failed subscription resume re-freezes a restored health timer'
+printf '%s\n' '[8/10] a failed subscription resume re-freezes a restored health timer'
 eval "$(extract_function rr_close_inherited_installer_lock_fds)"
 eval "$(extract_function rr_resume_subscription_bounded)"
 eval "$(extract_function rr_restore_update_writer_state)"
@@ -268,7 +268,85 @@ fi
 [ -e "$resume_failure_stopped" ] ||
     fail 'subscription resume failure did not stop a partial managed worker'
 
-printf '%s\n' '[9/9] bounded background workers cannot orphan installer lock descriptors'
+printf '%s\n' '[9/10] committed cleanup restores only the recorded subscription state'
+eval "$(extract_function rr_restore_committed_subscription_state)"
+eval "$(extract_function rr_reconcile_committed_writer_state)"
+committed_backup="$TEST_ROOT/committed-subscription/backup"
+mkdir -p "$committed_backup"
+committed_subscription_active=false
+committed_resume_calls=0
+committed_stop_calls=0
+rr_resume_subscription_bounded() {
+    committed_resume_calls=$((committed_resume_calls + 1))
+    committed_subscription_active=true
+}
+rr_stop_subscription_servers() {
+    committed_stop_calls=$((committed_stop_calls + 1))
+    committed_subscription_active=false
+}
+rr_subscription_running() { [ "$committed_subscription_active" = true ]; }
+
+: > "$committed_backup/subscription_was_running"
+rr_restore_committed_subscription_state "$committed_backup" ||
+    fail 'committed cleanup did not resume a previously running subscription'
+[ "$committed_resume_calls" -eq 1 ] && [ "$committed_stop_calls" -eq 0 ] &&
+    [ "$committed_subscription_active" = true ] ||
+    fail 'committed cleanup changed unrelated subscription state while resuming'
+
+rm -f -- "$committed_backup/subscription_was_running"
+rr_restore_committed_subscription_state "$committed_backup" ||
+    fail 'committed cleanup could not preserve a previously stopped subscription'
+[ "$committed_resume_calls" -eq 1 ] && [ "$committed_stop_calls" -eq 1 ] &&
+    [ "$committed_subscription_active" = false ] ||
+    fail 'committed cleanup started a subscription absent from the snapshot'
+
+: > "$committed_backup/subscription_was_running"
+rr_resume_subscription_bounded() { return 1; }
+if rr_restore_committed_subscription_state "$committed_backup"; then
+    fail 'committed cleanup accepted a failed subscription restoration'
+fi
+
+run_committed_reconcile_case() {
+    local failure_stage="$1" expected="$2" result=0
+    committed_events="$TEST_ROOT/committed-subscription/$failure_stage.events"
+    : > "$committed_events"
+    rm -f -- "$committed_backup/runtime_did_not_exist"
+    rr_restore_committed_subscription_state() {
+        printf '%s\n' restore >> "$committed_events"
+        [ "$failure_stage" != restore ]
+    }
+    rr_verify_update_writer_state() {
+        printf '%s\n' verify >> "$committed_events"
+        [ "$failure_stage" != verify ]
+    }
+    set +e
+    rr_reconcile_committed_writer_state "$committed_backup"
+    result=$?
+    set -e
+    if [ "$failure_stage" = success ]; then
+        [ "$result" -eq 0 ] || fail 'valid committed writer reconciliation failed'
+    else
+        [ "$result" -ne 0 ] || fail "$failure_stage reconciliation failure was accepted"
+    fi
+    [ "$(paste -sd, "$committed_events")" = "$expected" ] ||
+        fail "$failure_stage reconciliation crossed its failure boundary"
+}
+run_committed_reconcile_case restore restore
+run_committed_reconcile_case verify restore,verify
+run_committed_reconcile_case success restore,verify
+
+: > "$committed_backup/runtime_did_not_exist"
+committed_events="$TEST_ROOT/committed-subscription/fresh.events"
+: > "$committed_events"
+rr_restore_committed_subscription_state() { printf '%s\n' restore >> "$committed_events"; }
+rr_verify_update_writer_state() { printf '%s\n' verify >> "$committed_events"; }
+rr_reconcile_committed_writer_state "$committed_backup" ||
+    fail 'fresh-install committed reconciliation failed'
+[ "$(cat "$committed_events")" = restore ] ||
+    fail 'fresh-install committed reconciliation replayed an inapplicable unit snapshot'
+
+printf '%s\n' '[10/10] bounded background workers cannot orphan installer lock descriptors'
+eval "$(extract_function rr_resume_subscription_bounded)"
 eval "$(extract_function rr_restart_health_service_bounded)"
 async_root="$TEST_ROOT/installer-async"
 async_new_lock="$async_root/update.lock"

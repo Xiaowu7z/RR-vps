@@ -2023,6 +2023,23 @@ nexus_remove_public_proxy() {
     fi
 }
 
+nexus_update_ip_certificate_files_are_safe() {
+    local cert_file="${1:-}"
+    local key_file="${2:-}"
+    local cert_metadata=""
+    local key_metadata=""
+    [ -n "$cert_file" ] && [ -n "$key_file" ] || return 1
+    [ -f "$cert_file" ] && [ ! -L "$cert_file" ] || return 1
+    [ -f "$key_file" ] && [ ! -L "$key_file" ] || return 1
+    cert_metadata=$(stat -c '%u:%g:%a:%h' -- "$cert_file" 2>/dev/null) || return 1
+    key_metadata=$(stat -c '%u:%g:%a:%h' -- "$key_file" 2>/dev/null) || return 1
+    case "$cert_metadata" in
+        0:0:600:1|0:0:644:1) ;;
+        *) return 1 ;;
+    esac
+    [ "$key_metadata" = 0:0:600:1 ]
+}
+
 nexus_enable_public_ip_https() {
     local address="$1"
     local port="$2"
@@ -2070,6 +2087,9 @@ nexus_enable_public_ip_https() {
     fi
     if [ "${RR_UPDATE_TRANSACTION:-0}" != 1 ]; then
         install -d -m 700 "$cert_dir" || return 1
+    elif ! nexus_update_ip_certificate_files_are_safe "$cert_file" "$key_file"; then
+        echo -e "${RED}[失败] 热更新候选拒绝不安全的公网 IP 面板证书文件。${RESET}" >&2
+        return 1
     fi
     if [ ! -s "$cert_file" ] || [ ! -s "$key_file" ] || \
        ! certificate_identity_matches "$cert_file" "$address" || \
@@ -2215,8 +2235,12 @@ NGXEOF
     fi
     if [ "$transaction_ok" = true ]; then
         if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
-            [ "$(stat -c %a "$key_file" 2>/dev/null)" = 600 ] && \
-                [ "$(stat -c %a "$cert_file" 2>/dev/null)" = 644 ] || transaction_ok=false
+            # 7.1.0 created both the public certificate and its private key as
+            # 0600.  Preserve that stricter certificate mode during an update;
+            # newly generated certificates remain 0644.  Never chmod or follow
+            # links in the candidate transaction.
+            nexus_update_ip_certificate_files_are_safe \
+                "$cert_file" "$key_file" || transaction_ok=false
         elif ! chmod 600 "$key_file" || ! chmod 644 "$cert_file"; then
             transaction_ok=false
         fi
