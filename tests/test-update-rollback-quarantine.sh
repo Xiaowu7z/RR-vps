@@ -35,6 +35,8 @@ export RR_UPDATE_RECOVER_SOURCE_ONLY=1
 export RR_TEST_QUARANTINE_STOP_FAIL="$TEST_ROOT/quarantine-stop-fail"
 export RR_TEST_QUARANTINE_QUERY_FAIL="$TEST_ROOT/quarantine-query-fail"
 export RR_TEST_QUARANTINE_ENABLED="$TEST_ROOT/quarantine-enabled"
+export RR_TEST_QUARANTINE_FAILED="$TEST_ROOT/quarantine-failed"
+export RR_TEST_QUARANTINE_RESET_FAIL="$TEST_ROOT/quarantine-reset-fail"
 RR_TEST_QUARANTINE_UNIT_FILE_STATE=""
 RR_TEST_QUARANTINE_FRAGMENT_PATH=""
 RR_TEST_QUARANTINE_DROP_IN_PATHS=""
@@ -67,7 +69,13 @@ systemctl() {
             ;;
         "show -p ActiveState --value rr-subscription-quarantine.service")
             [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
-            [ -e "$RR_QUARANTINE_READY" ] && printf 'active\n' || printf 'inactive\n'
+            if [ -e "$RR_QUARANTINE_READY" ]; then
+                printf 'active\n'
+            elif [ -e "$RR_TEST_QUARANTINE_FAILED" ]; then
+                printf 'failed\n'
+            else
+                printf 'inactive\n'
+            fi
             ;;
         "show -p UnitFileState --value rr-subscription-quarantine.service")
             [ ! -e "$RR_TEST_QUARANTINE_QUERY_FAIL" ] || return 1
@@ -99,7 +107,13 @@ systemctl() {
             ;;
         "disable --now rr-subscription-quarantine.service")
             [ ! -e "$RR_TEST_QUARANTINE_STOP_FAIL" ] || return 1
+            [ -e "$RR_QUARANTINE_UNIT" ] || return 1
             rm -f -- "$RR_QUARANTINE_READY" "$RR_TEST_QUARANTINE_ENABLED"
+            : > "$RR_TEST_QUARANTINE_FAILED"
+            ;;
+        "reset-failed rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_QUARANTINE_RESET_FAIL" ] || return 1
+            rm -f -- "$RR_TEST_QUARANTINE_FAILED"
             ;;
         "disable rr-subscription-quarantine.service")
             rm -f -- "$RR_TEST_QUARANTINE_ENABLED"
@@ -125,7 +139,9 @@ reset_case() {
         "$(dirname "$RR_QUARANTINE_GUARD_SELF")" \
         "$(dirname "$RR_RECOVERY_SELF")"
     rm -f -- "$RR_TEST_QUARANTINE_STOP_FAIL" "$RR_TEST_QUARANTINE_QUERY_FAIL" \
-        "$RR_TEST_QUARANTINE_ENABLED" "$RR_LEGACY_UPDATE_LOCK_FILE" \
+        "$RR_TEST_QUARANTINE_ENABLED" "$RR_TEST_QUARANTINE_FAILED" \
+        "$RR_TEST_QUARANTINE_RESET_FAIL" \
+        "$RR_LEGACY_UPDATE_LOCK_FILE" \
         "$RR_LEGACY_UPDATE_BRIDGE_FILE"
     RR_TEST_QUARANTINE_UNIT_FILE_STATE=""
     RR_TEST_QUARANTINE_FRAGMENT_PATH=""
@@ -205,6 +221,31 @@ rr_apply_rollback_subscription_policy "$CURRENT_TX"
 [ ! -e "$RR_QUARANTINE_FILE" ]
 [ ! -e "$RR_QUARANTINE_UNIT" ]
 [ -d "$CURRENT_TX/backup" ]
+grep -Fxq 'reset-failed rr-subscription-quarantine.service' "$SYSTEMCTL_LOG"
+rr_quarantine_guard_unit_state_read
+rr_quarantine_guard_unit_state_is_absent
+
+reset_case
+prepare_transaction failed-cache 7.1.1 18443
+rr_quarantine_write_marker quarantined 7.1.0 18080
+printf 'stale-unit\n' > "$RR_QUARANTINE_UNIT"
+: > "$RR_TEST_QUARANTINE_RESET_FAIL"
+if rr_apply_rollback_subscription_policy "$CURRENT_TX" >/dev/null 2>&1; then
+    echo 'A persistent failed unit cache was accepted before firewall release.' >&2
+    exit 1
+fi
+[ -e "$RR_QUARANTINE_FILE" ]
+if grep -q '^delete:' "$FIREWALL_LOG"; then
+    echo 'A failed unit-cache reset released the quarantine firewall.' >&2
+    exit 1
+fi
+rm -f -- "$RR_TEST_QUARANTINE_RESET_FAIL"
+rr_apply_rollback_subscription_policy "$CURRENT_TX"
+[ "$(cat "$CURRENT_TX/rollback-subscription-status")" = normal ]
+[ ! -e "$RR_QUARANTINE_FILE" ]
+grep -Fxq 'delete:18080' "$FIREWALL_LOG"
+rr_quarantine_guard_unit_state_read
+rr_quarantine_guard_unit_state_is_absent
 
 printf '%s\n' '[4/20] missing, forged, or inconsistent metadata fails safe'
 reset_case
