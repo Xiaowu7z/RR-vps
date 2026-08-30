@@ -128,11 +128,17 @@ job_ranges = {
     "B": ("  ubuntu-upgrade:\n", "  ubuntu-transaction:\n"),
     "C": ("  ubuntu-transaction:\n", "  cross-machine-migration-scale:\n"),
 }
+pinned_keys = {
+    "A": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm",
+    "B": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A",
+    "C": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3",
+}
+assert len(set(pinned_keys.values())) == 3
 for slot, (start_marker, end_marker) in job_ranges.items():
     start = vps.index(start_marker)
     end = vps.index(end_marker, start)
     job = vps[start:end]
-    assert f"RR_{slot}_HOST_KEY: ${{{{ secrets.RR_{slot}_HOST_KEY }}}}" in job
+    assert f"RR_{slot}_HOST_KEY: {pinned_keys[slot]}" in job
     assert 'printf \'%s %s %s\\n\' "$host" "$host_key_type" "$host_key_data" > "$known_hosts"' in job
 migration_start = vps.index("  cross-machine-migration-scale:\n")
 gate_start = vps.index("  vps-gate:\n", migration_start)
@@ -140,8 +146,11 @@ migration = vps[migration_start:gate_start]
 gate = vps[gate_start:]
 assert "needs: [debian-full, ubuntu-transaction]" in migration
 for slot in ("A", "C"):
-    for secret in ("HOST", "HOST_KEY", "PASS"):
+    for secret in ("HOST", "PASS"):
         assert f"RR_{slot}_{secret}: ${{{{ secrets.RR_{slot}_{secret} }}}}" in migration
+    assert f"RR_{slot}_HOST_KEY: {pinned_keys[slot]}" in migration
+for slot in ("A", "B", "C"):
+    assert f"secrets.RR_{slot}_HOST_KEY" not in vps
 assert "known-hosts-migration-A" in migration
 assert "known-hosts-migration-C" in migration
 assert 'prepare_known_hosts "$a_host" "$RR_A_HOST_KEY" "$a_known_hosts"' in migration

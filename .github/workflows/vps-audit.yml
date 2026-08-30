@@ -40,7 +40,7 @@ jobs:
         shell: bash
         env:
           RR_A_HOST: ${{ secrets.RR_A_HOST }}
-          RR_A_HOST_KEY: ${{ secrets.RR_A_HOST_KEY }}
+          RR_A_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
           RR_A_PASS: ${{ secrets.RR_A_PASS }}
           RR_A_NAIVE_DOMAIN: ${{ secrets.RR_A_NAIVE_DOMAIN }}
         run: |
@@ -395,7 +395,7 @@ jobs:
         shell: bash
         env:
           RR_B_HOST: ${{ secrets.RR_B_HOST }}
-          RR_B_HOST_KEY: ${{ secrets.RR_B_HOST_KEY }}
+          RR_B_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
           RR_B_PASS: ${{ secrets.RR_B_PASS }}
         run: |
           set -euo pipefail
@@ -976,7 +976,7 @@ jobs:
         shell: bash
         env:
           RR_C_HOST: ${{ secrets.RR_C_HOST }}
-          RR_C_HOST_KEY: ${{ secrets.RR_C_HOST_KEY }}
+          RR_C_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
           RR_C_PASS: ${{ secrets.RR_C_PASS }}
         run: |
           set -euo pipefail
@@ -1460,10 +1460,10 @@ jobs:
         shell: bash
         env:
           RR_A_HOST: ${{ secrets.RR_A_HOST }}
-          RR_A_HOST_KEY: ${{ secrets.RR_A_HOST_KEY }}
+          RR_A_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
           RR_A_PASS: ${{ secrets.RR_A_PASS }}
           RR_C_HOST: ${{ secrets.RR_C_HOST }}
-          RR_C_HOST_KEY: ${{ secrets.RR_C_HOST_KEY }}
+          RR_C_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
           RR_C_PASS: ${{ secrets.RR_C_PASS }}
         run: |
           set -euo pipefail
