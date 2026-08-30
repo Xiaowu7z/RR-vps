@@ -1,4 +1,4 @@
-name: VPS B diagnostic cleanup
+name: VPS A and B fixed-output diagnostic
 
 on:
   push:
@@ -6,29 +6,143 @@ on:
       - audit/vps-diagnostic-v711
 
 permissions:
-  actions: write
   contents: read
 
 jobs:
-  cleanup-b:
+  diagnose:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      RR_B_HOST: ${{ secrets.RR_B_HOST }}
-      RR_B_PASS: ${{ secrets.RR_B_PASS }}
     steps:
       - name: Install SSH client helper
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
-      - name: Remove the disposable B fixture
+      - name: Classify A pre-clean state
         shell: bash
+        env:
+          RR_A_HOST: ${{ secrets.RR_A_HOST }}
+          RR_A_PASS: ${{ secrets.RR_A_PASS }}
+        run: |
+          set -euo pipefail
+          set +x
+          pin_a='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm'
+          known_hosts="$RUNNER_TEMP/diagnostic-known-hosts-A"
+          (umask 077; printf '%s %s\n' "$RR_A_HOST" "$pin_a" > "$known_hosts")
+          ssh-keygen -F "$RR_A_HOST" -f "$known_hosts" >/dev/null
+          export SSHPASS="$RR_A_PASS"
+          ssh_opts=(
+            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o LogLevel=ERROR -o PreferredAuthentications=password
+            -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
+            -o UserKnownHostsFile="$known_hosts"
+          )
+          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_A_HOST" bash -s \
+            2>/dev/null <<'REMOTE'
+          set -u
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+
+          classify_path() {
+            local label="$1" path="$2"
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              printf 'A_PATH name=%s state=present\n' "$label"
+            else
+              printf 'A_PATH name=%s state=absent\n' "$label"
+            fi
+          }
+          classify_unit() {
+            local label="$1" unit="$2" load="" active="" enabled=""
+            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
+            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
+            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
+            if [ "$load:$active:$enabled" = loaded:active:enabled ]; then
+              printf 'A_UNIT name=%s state=loaded_active_enabled\n' "$label"
+            elif [ "$load" = not-found ] && [ "$active" = inactive ] && [ -z "$enabled" ]; then
+              printf 'A_UNIT name=%s state=strictly_absent\n' "$label"
+            elif [ "$active" = failed ]; then
+              printf 'A_UNIT name=%s state=failed_cache\n' "$label"
+            elif [ "$active" = active ]; then
+              printf 'A_UNIT name=%s state=active_other\n' "$label"
+            elif [ "$active" = activating ] || [ "$active" = deactivating ]; then
+              printf 'A_UNIT name=%s state=transitioning\n' "$label"
+            else
+              printf 'A_UNIT name=%s state=other\n' "$label"
+            fi
+          }
+
+          log_class=unclassified
+          if [ ! -r /root/rr-audit-preclean.log ]; then
+            log_class=missing
+          elif grep -Fq '更新、恢复、备份或健康修复正在运行' /root/rr-audit-preclean.log; then
+            log_class=outer_lock_busy
+          elif grep -Fq '共享事务锁或旧版兼容锁不安全' /root/rr-audit-preclean.log; then
+            log_class=outer_lock_unsafe
+          elif grep -Fq '检测到旧版更新或恢复事务仍在运行' /root/rr-audit-preclean.log; then
+            log_class=legacy_restore_lock
+          elif grep -Fq '无法冻结健康检查或订阅进程' /root/rr-audit-preclean.log; then
+            log_class=writer_freeze_failed
+          elif grep -Fq '订阅隔离尚未安全解除' /root/rr-audit-preclean.log; then
+            log_class=quarantine_release_failed
+          fi
+          printf 'A_PRECLEAN class=%s\n' "$log_class"
+
+          stage=absent
+          if [ -r /root/rr-audit-stage ]; then
+            case "$(cat /root/rr-audit-stage 2>/dev/null)" in
+              '') stage=empty ;;
+              *) stage=unknown ;;
+            esac
+          fi
+          printf 'A_STAGE class=%s\n' "$stage"
+
+          classify_path launcher /usr/local/bin/rr
+          classify_path runtime /usr/local/lib/rr
+          classify_path config /etc/argo_vmess.conf
+          classify_path nexus_config /etc/rr-nexus
+          classify_path nexus_data /var/lib/rr-nexus
+          classify_path update_state /var/lib/rr-update
+          classify_path quarantine_marker /var/lib/rr-update/subscription-quarantine
+          classify_path quarantine_ready /run/rr-subscription-quarantine.ready
+          classify_path quarantine_guard /usr/local/libexec/rr-vps/subscription-quarantine-guard
+          classify_unit health_timer argo-rr-health.timer
+          classify_unit health_service argo-rr-health.service
+          classify_unit nexus rr-nexus.service
+          classify_unit quarantine rr-subscription-quarantine.service
+
+          lock_class=runtime_unavailable
+          if [ -d /usr/local/lib/rr/modules ]; then
+            set +e
+            bash -c '
+              set -o pipefail
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                source "$module_file"
+              done
+              rr_run_with_update_locks direct 0 true
+            ' >/dev/null 2>&1
+            lock_rc=$?
+            set -e
+            case "$lock_rc" in
+              0) lock_class=available ;;
+              75) lock_class=busy ;;
+              76) lock_class=unsafe ;;
+              *) lock_class=other ;;
+            esac
+          fi
+          printf 'A_UPDATE_LOCK class=%s\n' "$lock_class"
+          REMOTE
+          unset SSHPASS
+
+      - name: Classify B public Nexus state
+        shell: bash
+        env:
+          RR_B_HOST: ${{ secrets.RR_B_HOST }}
+          RR_B_PASS: ${{ secrets.RR_B_PASS }}
         run: |
           set -euo pipefail
           set +x
           pin_b='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A'
-          known_hosts="$RUNNER_TEMP/cleanup-known-hosts-B"
+          known_hosts="$RUNNER_TEMP/diagnostic-known-hosts-B"
           (umask 077; printf '%s %s\n' "$RR_B_HOST" "$pin_b" > "$known_hosts")
           ssh-keygen -F "$RR_B_HOST" -f "$known_hosts" >/dev/null
           export SSHPASS="$RR_B_PASS"
@@ -39,98 +153,124 @@ jobs:
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
             -o UserKnownHostsFile="$known_hosts"
           )
-          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_B_HOST" bash -s \
-            2>/dev/null <<'REMOTE'
-          set -euo pipefail
-          umask 077
+          sshpass -e ssh "${ssh_opts[@]}" "root@$RR_B_HOST" bash -s -- \
+            "$RR_B_HOST" 2>/dev/null <<'REMOTE'
+          set -u
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+          public_host="$1"
 
-          assert_unit_absent() {
-            local unit="$1" load_state="" active_state="" unit_file_state=""
-            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
-            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
-            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
-            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
-              unit_file_state=not-found
+          classify_unit() {
+            local label="$1" unit="$2" load="" active="" enabled=""
+            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
+            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
+            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
+            if [ "$load:$active:$enabled" = loaded:active:enabled ]; then
+              printf 'B_UNIT name=%s state=loaded_active_enabled\n' "$label"
+            elif [ "$load" = not-found ] && [ "$active" = inactive ] && [ -z "$enabled" ]; then
+              printf 'B_UNIT name=%s state=strictly_absent\n' "$label"
+            elif [ "$active" = failed ]; then
+              printf 'B_UNIT name=%s state=failed_cache\n' "$label"
+            elif [ "$active" = active ]; then
+              printf 'B_UNIT name=%s state=active_other\n' "$label"
+            elif [ "$active" = activating ] || [ "$active" = deactivating ]; then
+              printf 'B_UNIT name=%s state=transitioning\n' "$label"
+            else
+              printf 'B_UNIT name=%s state=other\n' "$label"
             fi
-            test "$load_state:$active_state:$unit_file_state" = \
-              not-found:inactive:not-found
           }
 
-          systemctl reset-failed rr-subscription-quarantine.service \
-            >/dev/null 2>&1 || true
-          if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
-            if ! printf '%s\n' y | bash -c '
-                set -o pipefail
-                for module_file in /usr/local/lib/rr/modules/*.sh; do
-                  # shellcheck disable=SC1090
-                  source "$module_file"
-                done
-                uninstall_all
-              ' >/root/rr-diagnostic-cleanup.log 2>&1; then
-              exit 1
+          stage=absent
+          if [ -r /root/rr-audit-stage ]; then
+            case "$(cat /root/rr-audit-stage 2>/dev/null)" in
+              preclean-complete) stage=preclean_complete ;;
+              old-state-built) stage=old_state_built ;;
+              first-upgrade-complete) stage=first_upgrade_complete ;;
+              manual-rollback-complete) stage=manual_rollback_complete ;;
+              second-upgrade-complete) stage=second_upgrade_complete ;;
+              '') stage=empty ;;
+              *) stage=unknown ;;
+            esac
+          fi
+          printf 'B_STAGE class=%s\n' "$stage"
+
+          runtime=absent
+          if [ -x /usr/local/bin/rr ]; then
+            if /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.1'; then
+              runtime=candidate
+            elif /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.0'; then
+              runtime=legacy
+            else
+              runtime=other
             fi
           fi
-          systemctl daemon-reload >/dev/null 2>&1
-          systemctl reset-failed rr-subscription-quarantine.service \
-            rr-nexus.service sing-box.service >/dev/null 2>&1 || true
+          printf 'B_RUNTIME class=%s\n' "$runtime"
+          classify_unit nexus rr-nexus.service
+          classify_unit nginx nginx.service
+          classify_unit quarantine rr-subscription-quarantine.service
 
-          test ! -e /usr/local/bin/rr
-          test ! -L /usr/local/bin/rr
-          test ! -e /usr/local/lib/rr
-          test ! -L /usr/local/lib/rr
-          test ! -e /etc/argo_vmess.conf
-          test ! -L /etc/argo_vmess.conf
-          test ! -e /etc/rr-nexus
-          test ! -L /etc/rr-nexus
-          test ! -e /var/lib/rr-nexus
-          test ! -L /var/lib/rr-nexus
-          test ! -e /var/lib/rr-update
-          test ! -L /var/lib/rr-update
-          test ! -e /run/rr-vps/update-maintenance
-          test ! -L /run/rr-vps/update-maintenance
-          test ! -e /var/lib/rr-update/subscription-quarantine
-          test ! -L /var/lib/rr-update/subscription-quarantine
-          test ! -e /run/rr-subscription-quarantine.ready
-          test ! -L /run/rr-subscription-quarantine.ready
-          test ! -e /etc/systemd/system/rr-subscription-quarantine.service
-          test ! -L /etc/systemd/system/rr-subscription-quarantine.service
-          test ! -e /var/lib/rr-quarantine/guard-state
-          test ! -L /var/lib/rr-quarantine/guard-state
-          test ! -e /usr/local/libexec/rr-vps/subscription-quarantine-guard
-          test ! -L /usr/local/libexec/rr-vps/subscription-quarantine-guard
-          test ! -e /usr/local/sbin/rr-update-recover
-          test ! -L /usr/local/sbin/rr-update-recover
-          assert_unit_absent rr-subscription-quarantine.service
-          assert_unit_absent rr-nexus.service
-          assert_unit_absent sing-box.service
-          for backend in iptables ip6tables; do
-            command -v "$backend" >/dev/null 2>&1 || continue
-            rules=$("$backend" -w 5 -t raw -S PREROUTING 2>/dev/null)
-            [[ "$rules" != *'rr-vps unsafe rollback subscription quarantine'* ]]
-          done
-          for port in 10443 18081 21444 22444 23444 24444 25444; do
-            test -z "$(ss -H -ltn "sport = :${port}" 2>/dev/null)"
-            test -z "$(ss -H -lun "sport = :${port}" 2>/dev/null)"
-          done
-          find /root -maxdepth 1 -type f \
-            \( -name 'rr-audit-*' -o -name 'rr-diagnostic-cleanup.log' \) \
-            -delete
-          rm -rf -- /root/rr-audit-candidate /root/rr-audit-old
-          printf 'B_CLEANUP result=pass\n'
+          if ss -H -ltn 'sport = :10443' 2>/dev/null | grep -q .; then
+            printf 'B_LISTEN_10443 state=present\n'
+          else
+            printf 'B_LISTEN_10443 state=absent\n'
+          fi
+          if curl -kfsS --connect-timeout 5 --max-time 15 \
+            https://127.0.0.1:10443/healthz >/dev/null 2>&1; then
+            printf 'B_LOCAL_HEALTH state=pass\n'
+          else
+            printf 'B_LOCAL_HEALTH state=fail\n'
+          fi
+          if curl -kfsS --connect-timeout 5 --max-time 15 \
+            "https://${public_host}:10443/healthz" >/dev/null 2>&1; then
+            printf 'B_SELF_PUBLIC_HEALTH state=pass\n'
+          else
+            printf 'B_SELF_PUBLIC_HEALTH state=fail\n'
+          fi
+          if [ -r /etc/rr-nexus/nexus.json ] && \
+             jq -e '.public_port == 10443' /etc/rr-nexus/nexus.json >/dev/null 2>&1; then
+            printf 'B_PUBLIC_PORT_CONFIG state=expected\n'
+          else
+            printf 'B_PUBLIC_PORT_CONFIG state=unexpected\n'
+          fi
+          if [ -e /etc/nginx/sites-enabled/rr-nexus.conf ] || \
+             [ -L /etc/nginx/sites-enabled/rr-nexus.conf ]; then
+            printf 'B_NGINX_SITE state=present\n'
+          else
+            printf 'B_NGINX_SITE state=absent\n'
+          fi
+          if nginx -t >/dev/null 2>&1; then
+            printf 'B_NGINX_CONFIG state=valid\n'
+          else
+            printf 'B_NGINX_CONFIG state=invalid\n'
+          fi
+          if command -v ufw >/dev/null 2>&1; then
+            if LC_ALL=C ufw status 2>/dev/null | grep -qx 'Status: active'; then
+              printf 'B_UFW state=active\n'
+            elif LC_ALL=C ufw status 2>/dev/null | grep -qx 'Status: inactive'; then
+              printf 'B_UFW state=inactive\n'
+            else
+              printf 'B_UFW state=other\n'
+            fi
+            if LC_ALL=C ufw status 2>/dev/null | grep -Eq '(^|[[:space:]])10443/tcp([[:space:]]|$)'; then
+              printf 'B_UFW_10443 state=rule_present\n'
+            else
+              printf 'B_UFW_10443 state=rule_absent\n'
+            fi
+          else
+            printf 'B_UFW state=unavailable\n'
+            printf 'B_UFW_10443 state=unavailable\n'
+          fi
+          if iptables -w 5 -C INPUT -p tcp --dport 10443 -j ACCEPT \
+            >/dev/null 2>&1; then
+            printf 'B_IPTABLES_10443 state=direct_accept\n'
+          else
+            printf 'B_IPTABLES_10443 state=no_direct_accept\n'
+          fi
           REMOTE
-          unset SSHPASS
 
-      - name: Delete superseded diagnostic runs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          set +x
-          for run_id in 33319396858 33319478272; do
-            curl -fsS -X DELETE \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/Xiaowu7z/RR-vps/actions/runs/${run_id}"
-          done
+          if curl -kfsS --connect-timeout 5 --max-time 20 \
+            "https://${RR_B_HOST}:10443/healthz" >/dev/null 2>&1; then
+            printf 'B_RUNNER_PUBLIC_HEALTH state=pass\n'
+          else
+            printf 'B_RUNNER_PUBLIC_HEALTH state=fail\n'
+          fi
+          unset SSHPASS
