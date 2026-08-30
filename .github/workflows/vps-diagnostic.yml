@@ -68,11 +68,11 @@ jobs:
             )
             rc=$?
             unset SSHPASS
+            printf '%s\n' "$output"
             if [ "$rc" -ne 0 ]; then
               printf 'PROBE_FAILED slot=%s rc=%s\n' "$label" "$rc"
               return 0
             fi
-            printf '%s\n' "$output"
           }
           probe A "$RR_A_HOST" "$RR_A_PASS" "$pin_a"
           probe B "$RR_B_HOST" "$RR_B_PASS" "$pin_b"
