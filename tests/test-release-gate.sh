@@ -144,6 +144,88 @@ b_start, b_end = job_ranges["B"]
 b_job = vps[vps.index(b_start):vps.index(b_end, vps.index(b_start))]
 a_start, a_end = job_ranges["A"]
 a_job = vps[vps.index(a_start):vps.index(a_end, vps.index(a_start))]
+expected_waited_helper = [
+    "rr_audit_waited_uninstall() {",
+    "  local deadline=$((SECONDS + 180)) remaining=0 result=0",
+    "  while :; do",
+    "    remaining=$((deadline - SECONDS))",
+    '    [ "$remaining" -ge 1 ] || return 75',
+    '    if rr_run_with_update_locks direct "$remaining" \\',
+    "        uninstall_all_locked; then",
+    "      return 0",
+    "    else",
+    "      result=$?",
+    "    fi",
+    '    [ "$result" = 75 ] || return "$result"',
+    "    sleep 1",
+    "  done",
+    "}",
+]
+
+def waited_helpers(job):
+    lines = job.splitlines()
+    helpers = []
+    for start, line in enumerate(lines):
+        match = re.fullmatch(r"(\s*)rr_audit_waited_uninstall\(\) \{", line)
+        if not match:
+            continue
+        indent = match.group(1)
+        for end in range(start + 1, len(lines)):
+            if lines[end] == f"{indent}}}":
+                helpers.append([entry[len(indent):] for entry in lines[start:end + 1]])
+                break
+        else:
+            raise AssertionError("unterminated rr_audit_waited_uninstall helper")
+    return helpers
+
+def assert_waited_preclean_contract(job, slot):
+    # Bind the entire retry helper, including ordering and control flow. This
+    # rejects deleted retries, busy-spin loops and fail-open command changes.
+    assert waited_helpers(job) == [expected_waited_helper, expected_waited_helper]
+    assert job.count("rr_audit_waited_uninstall\n") == 2
+    # The installed-runtime call must be the final successful command in the
+    # feature-detected branch; the candidate call must be the final command in
+    # its fail-closed bash body. A later `true` would otherwise hide failure.
+    assert len(re.findall(
+        r"^\s+rr_audit_waited_uninstall\n\s+else$", job, re.MULTILINE
+    )) == 1
+    assert len(re.findall(
+        r'^\s+else\n\s+printf "%s\\n" y \| uninstall_all\n\s+fi$',
+        job,
+        re.MULTILINE,
+    )) == 1
+    assert "                rr_audit_waited_uninstall\n              '" in job
+    assert len(re.findall(r"^\s+if ! bash -c '$", job, re.MULTILINE)) == 1
+    assert len(re.findall(
+        r'^\s+if ! CLEANUP_RUNTIME="\$cleanup_runtime" bash -c \'$',
+        job,
+        re.MULTILINE,
+    )) == 1
+    installed_failure = (
+        r"^\s+' >/root/rr-audit-preclean\.log 2>&1; then\n"
+        + rf"\s+echo '{slot} pre-clean failed; root-only log retained on VPS\.' >&2\n"
+        + r"\s+exit 1\n\s+fi$"
+    )
+    candidate_log = (
+        "/root/rr-audit-preclean.log" if slot in ("A", "B")
+        else "/root/rr-audit-candidate-preclean.log"
+    )
+    candidate_redirect = ">>" if slot in ("A", "B") else ">"
+    candidate_failure = (
+        rf"^\s+' {candidate_redirect}{re.escape(candidate_log)} 2>&1; then\n"
+        + rf"\s+echo '{slot} candidate pre-clean failed; root-only log retained on VPS\.' >&2\n"
+        + r"\s+exit 1\n\s+fi$"
+    )
+    assert len(re.findall(installed_failure, job, re.MULTILINE)) == 1
+    assert len(re.findall(candidate_failure, job, re.MULTILINE)) == 1
+    assert job.count("declare -F rr_run_with_update_locks") == 1
+    assert job.count("declare -F uninstall_all_locked") == 1
+    assert job.count('printf "%s\\n" y | uninstall_all') == 1
+    assert f"{slot} pre-clean failed; root-only log retained on VPS." in job
+    assert f"{slot} candidate pre-clean failed; root-only log retained on VPS." in job
+
+for slot, job in (("A", a_job), ("B", b_job)):
+    assert_waited_preclean_contract(job, slot)
 assert "openssl x509 -checkhost" not in a_job
 assert "declare -F certificate_identity_matches >/dev/null" in a_job
 for certificate, identity in (
@@ -172,7 +254,10 @@ for fragment in (
 ):
     assert fragment in b_job
 candidate_cleanup_if = b_job.index("          if [ -e /usr/local/bin/rr ]")
-candidate_cleanup_call = b_job.index("                uninstall_all", candidate_cleanup_if)
+candidate_cleanup_call = b_job.index(
+    "                rr_audit_waited_uninstall\n              '",
+    candidate_cleanup_if,
+)
 candidate_cleanup_stage = b_job.index("          printf 'preclean-complete", candidate_cleanup_call)
 quarantine_contract_start = b_job.index("          quarantine_fully_absent() {")
 quarantine_contract_end = b_job.index(
@@ -191,6 +276,19 @@ assert '[ ! -e "$artifact" ] && [ ! -L "$artifact" ]' in quarantine_contract
 assert "not-found:inactive:not-found || return 1" in quarantine_contract
 assert '"$backend" -w 5 -t raw -S PREROUTING' in quarantine_contract
 assert "rr-vps unsafe rollback subscription quarantine" in quarantine_contract
+assert "assert_product_quarantine_firewall() (" in quarantine_contract
+assert "assert_product_quarantine_firewall_absent() (" in quarantine_contract
+assert "export RR_UPDATE_RECOVER_SOURCE_ONLY=1" in quarantine_contract
+assert "source /usr/local/sbin/rr-update-recover" in quarantine_contract
+assert "rr_quarantine_firewall_inventory_is_exact 18081" in quarantine_contract
+assert (
+    "rr_quarantine_firewall_backend_inventory_is_exact iptables 18081 0"
+    in quarantine_contract
+)
+assert (
+    "rr_quarantine_firewall_backend_inventory_is_exact ip6tables 18081 0"
+    in quarantine_contract
+)
 for fragment in (
     "[ -e /var/lib/rr-update ]",
     "[ -L /var/lib/rr-update ]",
@@ -228,6 +326,92 @@ lock_timeout = b_job.index(
 assert quarantine_final < lock_wait < lock_probe < lock_busy_retry
 assert lock_busy_retry < lock_timeout < candidate_cleanup_stage
 assert "B pre-clean update lock probe failed safely" in b_job[lock_probe:lock_timeout]
+assert b_job.count("source /usr/local/sbin/rr-update-recover") == 3
+assert b_job.count("rr_quarantine_firewall_inventory_is_exact 18081") == 2
+legacy_assert_start = b_job.index("          assert_legacy_quarantine() {")
+legacy_assert_end = b_job.index(
+    "          install_candidate >/root/rr-audit-upgrade.log", legacy_assert_start
+)
+legacy_assert = b_job[legacy_assert_start:legacy_assert_end]
+assert legacy_assert.count("            assert_product_quarantine_firewall\n") == 1
+first_rollback = b_job.index(
+    "          /usr/local/sbin/rr-update-recover rollback", legacy_assert_end
+)
+first_legacy_assert_call = b_job.index(
+    "          assert_legacy_quarantine\n", first_rollback
+)
+second_upgrade = b_job.index(
+    "          install_candidate >>/root/rr-audit-upgrade.log", first_legacy_assert_call
+)
+second_upgrade_runtime = b_job.index(
+    "          assert_candidate_runtime\n", second_upgrade
+)
+post_upgrade_firewall_absent = b_job.index(
+    "          assert_product_quarantine_firewall_absent\n", second_upgrade_runtime
+)
+second_upgrade_stage = b_job.index(
+    "          printf 'second-upgrade-complete", post_upgrade_firewall_absent
+)
+assert second_upgrade < second_upgrade_runtime < post_upgrade_firewall_absent
+assert post_upgrade_firewall_absent < second_upgrade_stage
+assert b_job.count("          assert_product_quarantine_firewall_absent\n") == 1
+pre710_start = b_job.index("          # Re-enter the unsafe rollback once more")
+legacy_contract_start = b_job.rfind(
+    "          legacy_quarantine_fully_absent() {", 0, pre710_start
+)
+legacy_contract_end = b_job.index(
+    '          test "$(id -u)" -eq 0', legacy_contract_start
+)
+legacy_contract = b_job[legacy_contract_start:legacy_contract_end]
+for artifact in (
+    "/var/lib/rr-update/subscription-quarantine",
+    "/run/rr-subscription-quarantine.ready",
+    "/etc/systemd/system/rr-subscription-quarantine.service",
+    "/var/lib/rr-quarantine/guard-state",
+    "/usr/local/libexec/rr-vps/subscription-quarantine-guard",
+):
+    assert artifact in legacy_contract
+assert '[ ! -e "$artifact" ] && [ ! -L "$artifact" ]' in legacy_contract
+assert "not-found:inactive:not-found || return 1" in legacy_contract
+assert '"$backend" -w 5 -t raw -S PREROUTING' in legacy_contract
+assert "rr-vps unsafe rollback subscription quarantine" in legacy_contract
+pre710_firewall = b_job.index(
+    "          assert_product_quarantine_firewall\n", pre710_start
+)
+legacy_uninstall = b_job.index("          printf 'y\\n' | bash -c '", pre710_firewall)
+assert pre710_firewall < legacy_uninstall
+assert '"$backend" -w 5 -t raw -C PREROUTING' not in b_job[
+    pre710_start:legacy_uninstall
+]
+legacy_wait = b_job.index(
+    "          legacy_quarantine_absent=false", legacy_uninstall
+)
+legacy_probe = b_job.index(
+    "            if legacy_quarantine_fully_absent; then", legacy_wait
+)
+legacy_final = b_job.index(
+    "          legacy_quarantine_final=false", legacy_probe
+)
+legacy_final_probe = b_job.index(
+    "          if legacy_quarantine_fully_absent; then", legacy_final
+)
+legacy_final_gate = b_job.index(
+    '          if [ "$legacy_quarantine_absent" != true ] ||', legacy_final_probe
+)
+legacy_helper_removed = b_job.index(
+    "          test ! -e /usr/local/sbin/rr-update-recover", legacy_final_gate
+)
+assert legacy_uninstall < legacy_wait < legacy_probe < legacy_final
+assert legacy_final < legacy_final_probe < legacy_final_gate < legacy_helper_removed
+assert "for _ in $(seq 1 30); do" in b_job[legacy_wait:legacy_final]
+assert "sleep 1" in b_job[legacy_wait:legacy_final]
+assert "B legacy uninstall did not converge quarantine cleanup." in b_job[
+    legacy_final_gate:legacy_helper_removed
+]
+assert (
+    "[ -e /etc/systemd/system/rr-subscription-quarantine.service ] || break"
+    not in b_job[legacy_uninstall:legacy_helper_removed]
+)
 for fragment in (
     "run_old_install_deps() {",
     "attempt <= 30",
@@ -247,6 +431,7 @@ assert "set -eo pipefail" in nexus_assert
 assert "nexus_traffic_user_names" in nexus_assert and "| jq -e" in nexus_assert
 c_start, c_end = job_ranges["C"]
 c_job = vps[vps.index(c_start):vps.index(c_end, vps.index(c_start))]
+assert_waited_preclean_contract(c_job, "C")
 assert "printf '%s\\n' 0 '' '' '' | bash -c" in c_job
 assert "committed-settled" in c_job
 assert "rr-update-committed-settled-v1" in c_job
