@@ -71,6 +71,35 @@ jobs:
               'https://api.github.com/repos/Xiaowu7z/RR-vps/releases/tags/rr-nexus-core-v1.13.20-r1'
             probe_http exact-page \
               'https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.20-r1'
+            if [ -d /usr/local/lib/rr/modules ]; then
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                # shellcheck disable=SC1090
+                source "$module_file"
+              done
+              probe_root=$(mktemp -d /root/rr-nexus-probe.XXXXXX)
+              mkdir -m 700 "$probe_root/download"
+              if nexus_validate_pinned_core_constants; then
+                constants_rc=0
+              else
+                constants_rc=$?
+              fi
+              if nexus_fetch_traffic_core_release "$probe_root/release.json" \
+                >/dev/null 2>&1; then
+                fetch_rc=0
+              else
+                fetch_rc=$?
+              fi
+              if nexus_download_traffic_core "$probe_root/download" \
+                >/dev/null 2>&1; then
+                download_rc=0
+              else
+                download_rc=$?
+              fi
+              printf 'NEXUS_PROBE slot=A product=%s arch=%s constants=%s fetch=%s download=%s\n' \
+                "${SCRIPT_VERSION:-unset}" "${SYS_ARCH:-unset}" \
+                "$constants_rc" "$fetch_rc" "$download_rc"
+              rm -rf "$probe_root"
+            fi
           fi
           for unit in sing-box.service rr-nexus.service nginx.service \
             rr-subscription-quarantine.service argo-rr-health.timer; do
@@ -111,6 +140,23 @@ jobs:
                 printf 'LOG_ERROR slot=%s file=%s text=%s\n' "$label" "$base" "$line"
               done
           done < <(find /root -maxdepth 1 -type f -name 'rr-audit-*.log' -print | sort)
+          if [ "$label" = C ]; then
+            for base in rr-audit-crash-old-runtime.log \
+              rr-audit-between-crashes.log; do
+              log_file="/root/$base"
+              [ -f "$log_file" ] || continue
+              sed -E \
+                -e 's#https?://[^[:space:]]+#<url>#g' \
+                -e 's#([[:alnum:]_-]+\.)+[[:alpha:]]{2,}#<domain>#g' \
+                -e 's#([0-9]{1,3}\.){3}[0-9]{1,3}#<ip>#g' \
+                -e 's#[[:alnum:]_+/=-]{24,}#<token>#g' "$log_file" |
+                grep -Eiv 'password|passwd|密码|uuid|secret|credential|authorization|用户名|username|恢复码|订阅地址|subscription[ _-]?url' |
+                tail -n 80 |
+                while IFS= read -r line; do
+                  printf 'RECOVERY_DETAIL slot=C file=%s text=%s\n' "$base" "$line"
+                done
+            done
+          fi
           exit 0
           REMOTE
             rc=$?
