@@ -323,37 +323,156 @@ run_nexus_ip_nginx_case() (
 run_nexus_ip_nginx_case success 0 true
 run_nexus_ip_nginx_case nginx-test-failure 1 false
 
-# 更新/回滚后的订阅 worker 可能没有 PID 文件。进程回收必须依靠命令行
-# 与 RR 订阅根 cwd 双重身份，而不是广泛 pkill 或仅信任状态文件。
+# 更新/回滚后的订阅 worker 可能没有 PID 文件，旧目录也可能已经被删除。
+# 进程回收必须同时证明 root UID、精确 argv，以及 live cwd 或内核可证明的
+# deleted cwd；不能广泛 pkill、仅信任状态文件或仅匹配“(deleted)”字符串。
 (
     load_modules_for_tests
     subscription_test_root=$(mktemp -d)
     trap 'rm -rf "$subscription_test_root"' EXIT
     RR_PROC_ROOT="$subscription_test_root/proc"
     SUB_ROOT="$subscription_test_root/sub-root"
-    mkdir -p "$RR_PROC_ROOT/1234" "$RR_PROC_ROOT/5678" "$SUB_ROOT" "$subscription_test_root/other-root"
+    mkdir -p "$RR_PROC_ROOT/1234" "$RR_PROC_ROOT/2345" "$RR_PROC_ROOT/3456" \
+        "$RR_PROC_ROOT/4567" "$RR_PROC_ROOT/5678" "$RR_PROC_ROOT/6789" \
+        "$RR_PROC_ROOT/7890" "$SUB_ROOT" "${SUB_ROOT} (deleted)" \
+        "$subscription_test_root/other-root"
+    for root_pid in 1234 2345 3456 5678 6789 7890; do
+        printf 'Name:\tpython3\nUid:\t0\t0\t0\t0\n' > "$RR_PROC_ROOT/$root_pid/status"
+    done
+    printf 'Name:\tpython3\nUid:\t1000\t1000\t1000\t1000\n' > \
+        "$RR_PROC_ROOT/4567/status"
+
     printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/1234/cmdline"
     ln -s "$SUB_ROOT" "$RR_PROC_ROOT/1234/cwd"
+    printf '%s\0' /usr/bin/python3.10 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+        > "$RR_PROC_ROOT/2345/cmdline"
+    ln -s "${SUB_ROOT} (deleted)" "$RR_PROC_ROOT/2345/cwd"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+        > "$RR_PROC_ROOT/3456/cmdline"
+    ln -s "${SUB_ROOT} (deleted)" "$RR_PROC_ROOT/3456/cwd"
+    printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+        > "$RR_PROC_ROOT/4567/cmdline"
+    ln -s "${SUB_ROOT} (deleted)" "$RR_PROC_ROOT/4567/cwd"
     printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 > "$RR_PROC_ROOT/5678/cmdline"
     ln -s "$subscription_test_root/other-root" "$RR_PROC_ROOT/5678/cwd"
-    [ "$(managed_subscription_pids)" = 1234 ]
+    printf '%s\0' python3 -c pass /usr/local/lib/rr/nexus/sub_server.py 18081 \
+        > "$RR_PROC_ROOT/6789/cmdline"
+    ln -s "$SUB_ROOT" "$RR_PROC_ROOT/6789/cwd"
+    printf '%s\0' python3.10 -m http.server 18081 --bind 127.0.0.1 \
+        > "$RR_PROC_ROOT/7890/cmdline"
+    ln -s "${SUB_ROOT} (deleted)" "$RR_PROC_ROOT/7890/cwd"
+
+    # Ordinary symlinks cannot model procfs' still-open unlinked inode.  Only
+    # the marked fake proc entries report st_nlink=0; PID 3456 points at a real
+    # literal directory named "sub-root (deleted)" and must remain excluded.
+    stat() {
+        local path="${!#}"
+        if [ "${1:-}" = -Lc ] && [ "${2:-}" = %h ]; then
+            case "$path" in
+                "$RR_PROC_ROOT/2345/cwd"|"$RR_PROC_ROOT/4567/cwd"|"$RR_PROC_ROOT/7890/cwd")
+                    printf '%s\n' 0
+                    return 0
+                    ;;
+            esac
+        fi
+        command stat "$@"
+    }
+    : > "$subscription_test_root/killed"
+    kill() {
+        if [ "${1:-}" = -0 ]; then
+            [ -d "$RR_PROC_ROOT/${2:-}" ]
+            return
+        fi
+        printf '%s\n' "$1" >> "$subscription_test_root/killed"
+        rm -rf "$RR_PROC_ROOT/$1"
+    }
+
+    [ "$(managed_subscription_pids)" = $'1234\n2345\n7890' ]
     subscription_server_running
+    is_subscription_pid 2345
+    ! is_subscription_pid 3456
+    ! is_subscription_pid 4567
+    ! is_subscription_pid 6789
     SUB_PID_FILE="$subscription_test_root/current.pid"
     SUB_BIND_STATE_FILE="$subscription_test_root/current.bind"
     : > "$SUB_PID_FILE"
     : > "$SUB_BIND_STATE_FILE"
-    : > "$subscription_test_root/killed"
-    kill() {
-        printf '%s\n' "$1" >> "$subscription_test_root/killed"
-        rm -rf "$RR_PROC_ROOT/$1"
-    }
     sleep() { :; }
     stop_subscription_servers
-    [ "$(cat "$subscription_test_root/killed")" = 1234 ]
+    [ "$(cat "$subscription_test_root/killed")" = $'1234\n2345\n7890' ]
+    [ -d "$RR_PROC_ROOT/3456" ]
+    [ -d "$RR_PROC_ROOT/4567" ]
     [ -d "$RR_PROC_ROOT/5678" ]
+    [ -d "$RR_PROC_ROOT/6789" ]
     [ ! -e "$SUB_PID_FILE" ]
     [ ! -e "$SUB_BIND_STATE_FILE" ]
 )
+
+# 冻结安装器和独立恢复器不能依赖运行时模块，因此各自携带同一身份判定。
+# 对两份真实函数运行同一 fixture，防止后续只修主模块而遗漏更新/回滚路径。
+subscription_extract_function() {
+    local source_file="$1" function_name="$2"
+    awk -v signature="${function_name}() {" '
+        $0 == signature { capture = 1 }
+        capture { print }
+        capture && /^}$/ { exit }
+    ' "$source_file"
+}
+for subscription_identity_source in scripts/install-core.sh scripts/update-recover.sh; do
+    (
+        eval "$(subscription_extract_function "$subscription_identity_source" \
+            rr_subscription_process_matches)"
+        eval "$(subscription_extract_function "$subscription_identity_source" \
+            rr_subscription_pid_is_managed)"
+        eval "$(subscription_extract_function "$subscription_identity_source" \
+            rr_managed_subscription_pids)"
+
+        identity_root=$(mktemp -d)
+        trap 'rm -rf "$identity_root"' EXIT
+        RR_PROC_ROOT="$identity_root/proc"
+        RR_SUB_ROOT="$identity_root/sub-root"
+        RR_LIB_DIR=/usr/local/lib/rr
+        mkdir -p "$RR_PROC_ROOT/101" "$RR_PROC_ROOT/102" "$RR_PROC_ROOT/103" \
+            "$RR_PROC_ROOT/104" "$RR_PROC_ROOT/105" "$RR_SUB_ROOT" \
+            "${RR_SUB_ROOT} (deleted)"
+        for root_pid in 101 102 104 105; do
+            printf 'Name:\tpython3\nUid:\t0\t0\t0\t0\n' > "$RR_PROC_ROOT/$root_pid/status"
+        done
+        printf 'Name:\tpython3\nUid:\t1000\t1000\t1000\t1000\n' > \
+            "$RR_PROC_ROOT/103/status"
+        printf '%s\0' python3.10 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+            > "$RR_PROC_ROOT/101/cmdline"
+        printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+            > "$RR_PROC_ROOT/102/cmdline"
+        printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 18081 \
+            > "$RR_PROC_ROOT/103/cmdline"
+        printf '%s\0' python3 -c pass /usr/local/lib/rr/nexus/sub_server.py 18081 \
+            > "$RR_PROC_ROOT/104/cmdline"
+        printf '%s\0' python3.10 -m http.server 18081 --bind 127.0.0.1 \
+            > "$RR_PROC_ROOT/105/cmdline"
+        for deleted_pid in 101 102 103; do
+            ln -s "${RR_SUB_ROOT} (deleted)" "$RR_PROC_ROOT/$deleted_pid/cwd"
+        done
+        ln -s "$RR_SUB_ROOT" "$RR_PROC_ROOT/104/cwd"
+        ln -s "$RR_SUB_ROOT" "$RR_PROC_ROOT/105/cwd"
+        stat() {
+            local path="${!#}"
+            if [ "${1:-}" = -Lc ] && [ "${2:-}" = %h ] && \
+               { [ "$path" = "$RR_PROC_ROOT/101/cwd" ] || \
+                 [ "$path" = "$RR_PROC_ROOT/103/cwd" ]; }; then
+                printf '%s\n' 0
+                return 0
+            fi
+            command stat "$@"
+        }
+        [ "$(rr_managed_subscription_pids)" = $'101\n105' ] || {
+            printf 'Subscription identity drift in %s.\n' \
+                "$subscription_identity_source" >&2
+            exit 1
+        }
+    )
+done
+unset -f subscription_extract_function
 
 # Nexus 公网 IP 安装后的健康检查必须使用真实存在的地址构造函数，且
 # IPv6 URL 必须带方括号。

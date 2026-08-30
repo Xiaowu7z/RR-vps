@@ -55,6 +55,8 @@ RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
 RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
 RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
 RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
+RR_COMMITTED_SETTLED_NAME="committed-settled"
+RR_COMMITTED_SETTLED_VALUE="rr-update-committed-settled-v1"
 
 rr_error() {
     echo "[RR-vps] $*" >&2
@@ -688,6 +690,88 @@ rr_set_private_marker() {
         sync -f "$target" && sync -f "$parent"
 }
 
+rr_read_trusted_private_value() {
+    local value_file="$1" value_fd="" shell_pid="${BASHPID:-$$}"
+    local fd_path="" path_identity="" fd_identity="" value=""
+    local -a value_lines=()
+    [ -f "$value_file" ] && [ ! -L "$value_file" ] || return 1
+    exec {value_fd}<"$value_file" || return 1
+    fd_path="/proc/$shell_pid/fd/$value_fd"
+    [ -e "$fd_path" ] || fd_path="/dev/fd/$value_fd"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$value_file" 2>/dev/null) || {
+        exec {value_fd}>&-
+        return 1
+    }
+    fd_identity=$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "$fd_path" 2>/dev/null) || {
+        exec {value_fd}>&-
+        return 1
+    }
+    if [ "$path_identity" != "$fd_identity" ] ||
+       [[ "$fd_identity" != *:0:0:600:1 ]] || [ -L "$value_file" ]; then
+        exec {value_fd}>&-
+        return 1
+    fi
+    mapfile -t value_lines <&"$value_fd"
+    if [ "${#value_lines[@]}" -ne 1 ]; then
+        exec {value_fd}>&-
+        return 1
+    fi
+    value="${value_lines[0]}"
+    path_identity=$(stat -c '%d:%i:%u:%g:%a:%h' -- "$value_file" 2>/dev/null) || {
+        exec {value_fd}>&-
+        return 1
+    }
+    exec {value_fd}>&-
+    [ "$path_identity" = "$fd_identity" ] && [ ! -L "$value_file" ] || return 1
+    printf '%s\n' "$value"
+}
+
+rr_committed_settled_state() {
+    local transaction="$1" marker="" value=""
+    marker="$transaction/$RR_COMMITTED_SETTLED_NAME"
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    value=$(rr_read_trusted_private_value "$marker") || return 2
+    [ "$value" = "$RR_COMMITTED_SETTLED_VALUE" ] || return 2
+    return 0
+}
+
+rr_publish_committed_settled() {
+    local transaction="$1" marker="" temporary="" state=0
+    rr_transaction_dir_is_strict "$transaction" || return 1
+    marker="$transaction/$RR_COMMITTED_SETTLED_NAME"
+    if rr_committed_settled_state "$transaction"; then
+        return 0
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ] || return 1
+    temporary=$(umask 077; mktemp "$transaction/.${RR_COMMITTED_SETTLED_NAME}.XXXXXX") || return 1
+    if ! printf '%s\n' "$RR_COMMITTED_SETTLED_VALUE" > "$temporary" ||
+       ! chmod 0600 "$temporary" ||
+       [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+       ! sync -f "$temporary"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! mv -f -- "$temporary" "$marker"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        rr_committed_settled_state "$transaction" && return 2
+        return 1
+    fi
+    # A post-rename failure is ambiguous: the marker is already visible even
+    # when the directory entry has not yet been reported durable.  Preserve it
+    # for recovery and distinguish this state from a definite pre-publication
+    # failure so callers never assume the marker is absent.
+    if ! sync -f "$transaction"; then
+        rr_committed_settled_state "$transaction" && return 2
+        return 1
+    fi
+    rr_committed_settled_state "$transaction" || return 1
+    return 0
+}
+
 rr_write_transaction_format() {
     local target="$TX_DIR/transaction-format" temporary=""
     temporary="$TX_DIR/.transaction-format.$$"
@@ -811,16 +895,28 @@ rr_persist_update_writer_state() {
 }
 
 rr_create_update_maintenance_marker() {
-    local marker_tx="${1:-$TX_DIR}" marker_dir="" temporary="" owner=""
+    local marker_tx="${1:-$TX_DIR}" marker_dir="" canonical="" temporary="" owner=""
+    local owner_uid="" owner_gid="" mode="" mode_value=0
     [ -n "$marker_tx" ] || return 1
     marker_dir=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
     [ -d "$marker_dir" ] && [ ! -L "$marker_dir" ] || return 1
-    [ "$(stat -c '%u:%g' "$marker_dir" 2>/dev/null)" = 0:0 ] || return 1
-    chmod 0700 "$marker_dir" || return 1
+    canonical=$(readlink -f -- "$marker_dir" 2>/dev/null) || return 1
+    [ "$canonical" = "$marker_dir" ] || return 1
+    IFS=: read -r owner_uid owner_gid mode < <(
+        stat -c '%u:%g:%a' -- "$marker_dir" 2>/dev/null
+    ) || return 1
+    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    (( (mode_value & 07022) == 0 )) || return 1
+    chmod 0700 -- "$marker_dir" || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$marker_dir" 2>/dev/null)" = 0:0:700 ] || return 1
     if [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || [ -L "$RR_UPDATE_MAINTENANCE_FILE" ]; then
-        [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] && \
-            [ "$(stat -c '%u:%g:%a:%h' "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null)" = 0:0:600:1 ] || return 1
-        owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
+        owner=$(rr_read_trusted_private_value "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+        [ "$owner" = "$marker_tx" ] || return 1
+        sync -f "$RR_UPDATE_MAINTENANCE_FILE" || return 1
+        sync -f "$marker_dir" || return 1
+        owner=$(rr_read_trusted_private_value "$RR_UPDATE_MAINTENANCE_FILE") || return 1
         [ "$owner" = "$marker_tx" ] || return 1
         RR_UPDATE_MAINTENANCE_ACTIVE=true
         return 0
@@ -839,11 +935,12 @@ rr_create_update_maintenance_marker() {
 }
 
 rr_clear_update_maintenance_marker() {
-    local owner="" parent=""
-    [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || return 0
-    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] || return 1
-    owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
-    [ "$owner" = "$TX_DIR" ] || return 1
+    local marker_tx="${1:-$TX_DIR}" owner="" parent=""
+    if [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ]; then
+        return 0
+    fi
+    owner=$(rr_read_trusted_private_value "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+    [ "$owner" = "$marker_tx" ] || return 1
     parent=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
     rm -f -- "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$parent" && \
         RR_UPDATE_MAINTENANCE_ACTIVE=false
@@ -986,24 +1083,57 @@ rr_verify_update_writer_state() {
     fi
 }
 
-rr_managed_subscription_pids() {
+rr_subscription_process_matches() {
+    local process_dir="${1:-}"
+    local expected_cwd="${2:-}"
+    local expected_app="${3:-}"
+    local uid_line="" python_name="" port="" process_cwd="" cwd_links=""
+    local -a arguments=()
+    [ -n "$process_dir" ] && [ -n "$expected_cwd" ] && [ -n "$expected_app" ] || return 1
+    [ -r "$process_dir/status" ] && [ -r "$process_dir/cmdline" ] || return 1
+    uid_line=$(awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+        "$process_dir/status" 2>/dev/null) || return 1
+    [ "$uid_line" = 0:0:0:0 ] || return 1
+    mapfile -d '' -t arguments < "$process_dir/cmdline" 2>/dev/null || return 1
+    [ "${#arguments[@]}" -ge 3 ] || return 1
+    python_name="${arguments[0]##*/}"
+    [[ "$python_name" =~ ^python3([.][0-9]+)?$ ]] || return 1
+    if [ "${arguments[1]}" = "$expected_app" ]; then
+        port="${arguments[2]}"
+    elif [ "${#arguments[@]}" -ge 4 ] && [ "${arguments[1]}" = -m ] && \
+         [ "${arguments[2]}" = http.server ]; then
+        port="${arguments[3]}"
+    else
+        return 1
+    fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    process_cwd=$(readlink -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$process_cwd" = "$expected_cwd" ] && return 0
+    [ "$process_cwd" = "${expected_cwd} (deleted)" ] || return 1
+    cwd_links=$(stat -Lc '%h' -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$cwd_links" = 0 ]
+}
+
+rr_subscription_pid_is_managed() {
+    local pid="${1:-}"
     local proc_root="${RR_PROC_ROOT:-/proc}"
     local subscription_root="${RR_SUB_ROOT:-/tmp/sub_server}"
     local expected_cwd=""
-    local process_dir=""
-    local pid=""
-    local cmdline=""
-    local process_cwd=""
-    expected_cwd=$(readlink -f "$subscription_root" 2>/dev/null) || return 0
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    expected_cwd=$(readlink -f -- "$subscription_root" 2>/dev/null) || return 1
+    rr_subscription_process_matches "$proc_root/$pid" "$expected_cwd" \
+        "$RR_LIB_DIR/nexus/sub_server.py"
+}
+
+rr_managed_subscription_pids() {
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local process_dir="" pid=""
     for process_dir in "$proc_root"/[0-9]*; do
-        [ -r "$process_dir/cmdline" ] || continue
         pid="${process_dir##*/}"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
-        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
-        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
-        [ "$process_cwd" = "$expected_cwd" ] || continue
-        printf '%s\n' "$pid"
+        rr_subscription_pid_is_managed "$pid" || continue
+        printf '%s\n' "$pid" 2>/dev/null || return 0
     done
 }
 
@@ -1021,6 +1151,7 @@ rr_stop_subscription_servers() {
     local attempt=0
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
+        rr_subscription_pid_is_managed "$pid" || continue
         kill "$pid" 2>/dev/null || true
     done < <(rr_managed_subscription_pids)
     while [ "$attempt" -lt 20 ] && rr_subscription_running; do
@@ -1539,7 +1670,7 @@ rr_read_trusted_phase() {
     exec {phase_fd}>&-
     [ "$path_identity" = "$fd_identity" ] && [ ! -L "$phase_file" ] || return 1
     case "$phase" in
-        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|\
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|rolling_back|\
         committed|rolled_back|rolled_back_degraded|recovery_failed|aborted) ;;
         *) return 1 ;;
     esac
@@ -1585,7 +1716,7 @@ rr_read_trusted_legacy_phase() {
     exec {phase_fd}>&-
     [ "$path_identity" = "$fd_identity" ] && [ ! -L "$phase_file" ] || return 1
     case "$phase" in
-        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|\
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|rolling_back|\
         committed|rolled_back|rolled_back_degraded|recovery_failed|aborted) ;;
         *) return 1 ;;
     esac
@@ -1745,7 +1876,7 @@ EOF
 }
 
 rr_discard_previous_transaction() {
-    local previous="" phase="" format_state=0
+    local previous="" phase="" format_state=0 settled_state=0
     if [ ! -e "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ]; then
         return 0
     fi
@@ -1767,6 +1898,15 @@ rr_discard_previous_transaction() {
             fi
             if [ "$format_state" -eq 2 ]; then
                 rr_error "旧事务格式标记损坏，拒绝清理或覆盖回滚证据。"
+                return 1
+            fi
+            if rr_committed_settled_state "$previous"; then
+                settled_state=0
+            else
+                settled_state=$?
+            fi
+            if [ "$settled_state" -eq 2 ]; then
+                rr_error "旧事务收尾证据不可信，拒绝修改防火墙或清理回滚窗口。"
                 return 1
             fi
             if [ "$format_state" -eq 0 ]; then
@@ -2171,7 +2311,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "18e4cf6ed7bd3835804f0a635ed79c9c9331567ab45172a95a4e5ea2ed8826b4" ] && \
+        if [ "$actual" = "7696b5093c504d4cc17810b2484679dfc403d2b1158708f102e328c326ef1d2e" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -2395,6 +2535,14 @@ rr_install_release() {
     if ! rr_run_with_delegated_update_lock \
         "$RR_LAUNCHER" --post-update-finalize; then
         rr_error "版本已提交，但订阅防火墙收尾失败；事务与维护标记已保留，绝不回滚已提交版本。"
+        return 1
+    fi
+    if ! sync; then
+        rr_error "版本已提交，但收尾状态无法持久化；事务与维护标记已保留，等待安全恢复。"
+        return 1
+    fi
+    if ! rr_publish_committed_settled "$TX_DIR"; then
+        rr_error "版本已提交，但无法持久发布收尾证据；事务与维护标记已保留，等待安全恢复。"
         return 1
     fi
     rr_clear_update_maintenance_marker "$TX_DIR" || return 1

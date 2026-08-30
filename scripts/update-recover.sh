@@ -25,6 +25,8 @@ RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
 RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
 RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
 RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
+RR_COMMITTED_SETTLED_NAME="committed-settled"
+RR_COMMITTED_SETTLED_VALUE="rr-update-committed-settled-v1"
 RR_QUARANTINE_COMMENT="rr-vps unsafe rollback subscription quarantine"
 RR_UPDATE_RECOVERY_LOCK_FD=""
 RR_UPDATE_RECOVERY_LEGACY_LOCK_FD=""
@@ -300,24 +302,57 @@ rr_update_lock_fd_is_safe() {
     [ "$path_identity" = "$fd_identity" ] && [[ "$fd_identity" == *:0:0:600:1 ]]
 }
 
-rr_managed_subscription_pids() {
+rr_subscription_process_matches() {
+    local process_dir="${1:-}"
+    local expected_cwd="${2:-}"
+    local expected_app="${3:-}"
+    local uid_line="" python_name="" port="" process_cwd="" cwd_links=""
+    local -a arguments=()
+    [ -n "$process_dir" ] && [ -n "$expected_cwd" ] && [ -n "$expected_app" ] || return 1
+    [ -r "$process_dir/status" ] && [ -r "$process_dir/cmdline" ] || return 1
+    uid_line=$(awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+        "$process_dir/status" 2>/dev/null) || return 1
+    [ "$uid_line" = 0:0:0:0 ] || return 1
+    mapfile -d '' -t arguments < "$process_dir/cmdline" 2>/dev/null || return 1
+    [ "${#arguments[@]}" -ge 3 ] || return 1
+    python_name="${arguments[0]##*/}"
+    [[ "$python_name" =~ ^python3([.][0-9]+)?$ ]] || return 1
+    if [ "${arguments[1]}" = "$expected_app" ]; then
+        port="${arguments[2]}"
+    elif [ "${#arguments[@]}" -ge 4 ] && [ "${arguments[1]}" = -m ] && \
+         [ "${arguments[2]}" = http.server ]; then
+        port="${arguments[3]}"
+    else
+        return 1
+    fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    process_cwd=$(readlink -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$process_cwd" = "$expected_cwd" ] && return 0
+    [ "$process_cwd" = "${expected_cwd} (deleted)" ] || return 1
+    cwd_links=$(stat -Lc '%h' -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$cwd_links" = 0 ]
+}
+
+rr_subscription_pid_is_managed() {
+    local pid="${1:-}"
     local proc_root="${RR_PROC_ROOT:-/proc}"
     local subscription_root="${RR_SUB_ROOT:-/tmp/sub_server}"
     local expected_cwd=""
-    local process_dir=""
-    local pid=""
-    local cmdline=""
-    local process_cwd=""
-    expected_cwd=$(readlink -f "$subscription_root" 2>/dev/null) || return 0
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    expected_cwd=$(readlink -f -- "$subscription_root" 2>/dev/null) || return 1
+    rr_subscription_process_matches "$proc_root/$pid" "$expected_cwd" \
+        "$RR_LIB_DIR/nexus/sub_server.py"
+}
+
+rr_managed_subscription_pids() {
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local process_dir="" pid=""
     for process_dir in "$proc_root"/[0-9]*; do
-        [ -r "$process_dir/cmdline" ] || continue
         pid="${process_dir##*/}"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
-        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
-        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
-        [ "$process_cwd" = "$expected_cwd" ] || continue
-        printf '%s\n' "$pid"
+        rr_subscription_pid_is_managed "$pid" || continue
+        printf '%s\n' "$pid" 2>/dev/null || return 0
     done
 }
 
@@ -335,6 +370,7 @@ rr_stop_subscription_servers() {
     local attempt=0
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
+        rr_subscription_pid_is_managed "$pid" || continue
         kill "$pid" 2>/dev/null || true
     done < <(rr_managed_subscription_pids)
     while [ "$attempt" -lt 20 ] && rr_subscription_running; do
@@ -384,12 +420,16 @@ rr_query_unit_file_state() {
 }
 
 rr_clear_update_maintenance_marker() {
-    local tx="$1" owner="" parent=""
-    [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || return 0
-    [ -f "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ] || return 1
-    [ "$(stat -c '%u:%g:%a:%h' "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null)" = 0:0:600:1 ] || return 1
-    owner=$(head -n 1 "$RR_UPDATE_MAINTENANCE_FILE" 2>/dev/null) || return 1
-    [ "$owner" = "$tx" ] || return 1
+    local tx="$1" parent="" marker_state=0
+    if [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ]; then
+        return 0
+    fi
+    if rr_update_maintenance_marker_state "$tx"; then
+        marker_state=0
+    else
+        marker_state=$?
+    fi
+    [ "$marker_state" -eq 0 ] || return 1
     parent=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
     rm -f -- "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$parent"
 }
@@ -719,17 +759,25 @@ rr_transaction_metadata_identity_is_safe() {
     rr_legacy_update_lock_mode_is_safe "$mode"
 }
 
-rr_transaction_v2_metadata_is_safe() {
+rr_transaction_v2_control_metadata_is_safe() {
     [ -f "$RR_ACTIVE_TX" ] && [ ! -L "$RR_ACTIVE_TX" ] &&
         [ "$(stat -c '%u:%g:%a:%h' -- "$RR_ACTIVE_TX" 2>/dev/null)" = 0:0:600:1 ] &&
         [ -f "$1/phase" ] && [ ! -L "$1/phase" ] &&
-        [ "$(stat -c '%u:%g:%a:%h' -- "$1/phase" 2>/dev/null)" = 0:0:600:1 ] &&
-        [ -d "$1/backup" ] && [ ! -L "$1/backup" ] &&
+        [ "$(stat -c '%u:%g:%a:%h' -- "$1/phase" 2>/dev/null)" = 0:0:600:1 ]
+}
+
+rr_transaction_v2_backup_metadata_is_safe() {
+    [ -d "$1/backup" ] && [ ! -L "$1/backup" ] &&
         [ "$(readlink -f -- "$1/backup" 2>/dev/null)" = "$1/backup" ] &&
         [ "$(stat -c '%u:%g:%a' -- "$1/backup" 2>/dev/null)" = 0:0:700 ] &&
         [ -f "$1/backup/writer_state_complete" ] &&
         [ ! -L "$1/backup/writer_state_complete" ] &&
         [ "$(stat -c '%u:%g:%a:%h:%s' -- "$1/backup/writer_state_complete" 2>/dev/null)" = 0:0:600:1:0 ]
+}
+
+rr_transaction_v2_metadata_is_safe() {
+    rr_transaction_v2_control_metadata_is_safe "$1" &&
+        rr_transaction_v2_backup_metadata_is_safe "$1"
 }
 
 rr_read_trusted_phase() {
@@ -768,7 +816,7 @@ rr_read_trusted_phase() {
     exec {phase_fd}>&-
     [ "$path_identity" = "$fd_identity" ] && [ ! -L "$phase_file" ] || return 1
     case "$phase" in
-        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|\
+        state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|rolling_back|\
         committed|rolled_back|rolled_back_degraded|recovery_failed|aborted) ;;
         *) return 1 ;;
     esac
@@ -809,6 +857,104 @@ rr_read_trusted_private_line() {
     exec {value_fd}>&-
     [ "$path_identity" = "$fd_identity" ] && [ ! -L "$value_file" ] || return 1
     printf '%s\n' "$value"
+}
+
+rr_committed_settled_state() {
+    local tx="$1" marker="" value=""
+    marker="$tx/$RR_COMMITTED_SETTLED_NAME"
+    if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+        return 1
+    fi
+    value=$(rr_read_trusted_private_line "$marker") || return 2
+    [ "$value" = "$RR_COMMITTED_SETTLED_VALUE" ] || return 2
+    return 0
+}
+
+rr_publish_committed_settled() {
+    local tx="$1" marker="" temporary="" state=0
+    rr_transaction_dir_is_valid "$tx" || return 1
+    marker="$tx/$RR_COMMITTED_SETTLED_NAME"
+    if rr_committed_settled_state "$tx"; then
+        return 0
+    else
+        state=$?
+    fi
+    [ "$state" -eq 1 ] || return 1
+    temporary=$(umask 077; mktemp "$tx/.${RR_COMMITTED_SETTLED_NAME}.XXXXXX") || return 1
+    if ! printf '%s\n' "$RR_COMMITTED_SETTLED_VALUE" > "$temporary" ||
+       ! chmod 0600 "$temporary" ||
+       [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+       ! sync -f "$temporary"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! mv -f -- "$temporary" "$marker"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        rr_committed_settled_state "$tx" && return 2
+        return 1
+    fi
+    # After rename, a failure is ambiguous: the strict marker is already
+    # visible even if its directory entry has not yet been reported durable.
+    # Callers must retain maintenance/evidence, but must not freeze writers on
+    # the assumption that the marker is absent.
+    if ! sync -f "$tx"; then
+        rr_committed_settled_state "$tx" && return 2
+        return 1
+    fi
+    rr_committed_settled_state "$tx" || return 1
+    return 0
+}
+
+rr_update_maintenance_marker_state() {
+    local tx="$1" value=""
+    if [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] && [ ! -L "$RR_UPDATE_MAINTENANCE_FILE" ]; then
+        return 1
+    fi
+    value=$(rr_read_trusted_private_line "$RR_UPDATE_MAINTENANCE_FILE") || return 2
+    [ "$value" = "$tx" ] || return 2
+    return 0
+}
+
+rr_create_update_maintenance_marker() {
+    local tx="$1" parent="" canonical="" temporary="" marker_state=0
+    local owner_uid="" owner_gid="" mode="" mode_value=0
+    rr_transaction_dir_is_valid "$tx" || return 1
+    parent=$(dirname -- "$RR_UPDATE_MAINTENANCE_FILE") || return 1
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+    [ "$canonical" = "$parent" ] || return 1
+    IFS=: read -r owner_uid owner_gid mode < <(
+        stat -c '%u:%g:%a' -- "$parent" 2>/dev/null
+    ) || return 1
+    [ "$owner_uid" = 0 ] && [ "$owner_gid" = 0 ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    mode_value=$((8#$mode))
+    (( (mode_value & 07022) == 0 )) || return 1
+    chmod 0700 -- "$parent" || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+    if rr_update_maintenance_marker_state "$tx"; then
+        sync -f "$RR_UPDATE_MAINTENANCE_FILE" && sync -f "$parent" &&
+            rr_update_maintenance_marker_state "$tx"
+        return
+    else
+        marker_state=$?
+    fi
+    [ "$marker_state" -eq 1 ] || return 1
+    temporary=$(umask 077; mktemp "$parent/.update-maintenance.XXXXXX") || return 1
+    if ! printf '%s\n' "$tx" > "$temporary" || ! chmod 0600 "$temporary" ||
+       [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+       ! sync -f "$temporary" ||
+       ! mv -f -- "$temporary" "$RR_UPDATE_MAINTENANCE_FILE"; then
+        rm -f -- "$temporary" >/dev/null 2>&1 || true
+        return 1
+    fi
+    sync -f "$RR_UPDATE_MAINTENANCE_FILE" || return 1
+    sync -f "$parent" || return 1
+    rr_update_maintenance_marker_state "$tx"
+}
+
+rr_ensure_update_maintenance_marker() {
+    rr_create_update_maintenance_marker "$1"
 }
 
 rr_root_owned_safe_empty_marker() {
@@ -1547,16 +1693,18 @@ rr_quarantine_guard() {
     trap 'exit 1' INT TERM HUP
     (
         rr_close_inherited_recovery_lock_fds
-        exec python3 - "$port" "$ready" "${RR_PROC_ROOT:-/proc}" "${RR_SUB_ROOT:-/tmp/sub_server}" <<'PY'
+        exec python3 - "$port" "$ready" "${RR_PROC_ROOT:-/proc}" \
+            "${RR_SUB_ROOT:-/tmp/sub_server}" "$RR_LIB_DIR" <<'PY'
 import errno
 import os
+import re
 import signal
 import socket
 import sys
 import time
 
 port = int(sys.argv[1])
-ready, proc_root, subscription_root = sys.argv[2:]
+ready, proc_root, subscription_root, runtime_root = sys.argv[2:]
 sockets = []
 released = False
 
@@ -1579,6 +1727,42 @@ def reserve(family, address):
         raise
     sockets.append(sock)
 
+def valid_port(raw):
+    return 1 <= len(raw) <= 5 and raw.isdigit() and 1 <= int(raw) <= 65535
+
+def managed_argv(process):
+    with open(os.path.join(process, "cmdline"), "rb") as handle:
+        arguments = handle.read(8192).split(b"\0")
+    if arguments and not arguments[-1]:
+        arguments.pop()
+    if len(arguments) < 3 or not re.fullmatch(
+        rb"python3(?:\.[0-9]+)?", os.path.basename(arguments[0])
+    ):
+        return False
+    expected_app = os.fsencode(os.path.join(runtime_root, "nexus", "sub_server.py"))
+    if arguments[1] == expected_app:
+        return valid_port(arguments[2])
+    return (
+        len(arguments) >= 4
+        and arguments[1:3] == [b"-m", b"http.server"]
+        and valid_port(arguments[3])
+    )
+
+def root_owned_process(process):
+    with open(os.path.join(process, "status"), "rb") as handle:
+        for line in handle:
+            fields = line.split()
+            if fields and fields[0] == b"Uid:":
+                return len(fields) >= 5 and fields[1:5] == [b"0"] * 4
+    return False
+
+def managed_cwd(process, expected):
+    cwd_path = os.path.join(process, "cwd")
+    actual = os.readlink(cwd_path)
+    if actual == expected:
+        return True
+    return actual == f"{expected} (deleted)" and os.stat(cwd_path).st_nlink == 0
+
 def stop_managed_servers():
     try:
         expected = os.path.realpath(subscription_root)
@@ -1593,11 +1777,9 @@ def stop_managed_servers():
             continue
         process = os.path.join(proc_root, entry)
         try:
-            with open(os.path.join(process, "cmdline"), "rb") as handle:
-                command = handle.read(8192).replace(b"\0", b" ")
-            if b"python3 -m http.server" not in command and b"nexus/sub_server.py" not in command:
+            if not root_owned_process(process) or not managed_argv(process):
                 continue
-            if os.path.realpath(os.path.join(process, "cwd")) != expected:
+            if not managed_cwd(process, expected):
                 continue
             os.kill(int(entry), signal.SIGTERM)
         except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
@@ -2227,7 +2409,8 @@ rr_restore_transaction() {
 }
 
 main() {
-    local mode="${1:-recover}" argument="${2:-}" tx="" phase="" format_state=0 quarantine_json='{"active":false}'
+    local mode="${1:-recover}" argument="${2:-}" tx="" phase="" format_state=0
+    local settled_state=0 maintenance_state=0 publish_state=0 quarantine_json='{"active":false}'
     case "$mode" in
         recover|rollback|status|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine|quarantine-guard) ;;
         *) echo "usage: rr-update-recover [recover|rollback|status|snapshot-metadata TX|apply-rollback-policy TX|suspend-quarantine|clear-quarantine|quarantine-guard]" >&2; return 2 ;;
@@ -2308,11 +2491,56 @@ main() {
         rr_recover_log "transaction format marker is unsafe; active transaction and evidence retained at $tx"
         return 1
     fi
-    if [ "$format_state" -eq 0 ] && ! rr_transaction_v2_metadata_is_safe "$tx"; then
+    if [ "$format_state" -eq 0 ] && ! rr_transaction_v2_control_metadata_is_safe "$tx"; then
         if ! rr_freeze_health_writers_strict; then
-            rr_recover_log "format-2 transaction metadata is unsafe and health writers could not be verified inactive and disabled"
+            rr_recover_log "format-2 transaction control metadata is unsafe and health writers could not be verified inactive and disabled"
         fi
-        rr_recover_log "format-2 active/phase/writer-state metadata is incomplete or unsafe; transaction retained at $tx"
+        rr_recover_log "format-2 active/phase metadata is incomplete or unsafe; transaction retained at $tx"
+        return 1
+    fi
+    # A valid settled marker retires automatic writer-state replay.  Recovery
+    # still validates the live control metadata, but rollback-only backup
+    # damage must not freeze a successfully committed installation.  Manual
+    # rollback deliberately falls through to the complete backup validation.
+    if [ "$mode" = recover ] && [ "$phase" = committed ]; then
+        if rr_committed_settled_state "$tx"; then
+            settled_state=0
+        else
+            settled_state=$?
+        fi
+        if [ "$settled_state" -eq 2 ]; then
+            rr_recover_log "committed settled evidence is unsafe; no host state was changed and evidence was retained at $tx"
+            return 1
+        fi
+        if [ "$settled_state" -eq 0 ]; then
+            if rr_update_maintenance_marker_state "$tx"; then
+                maintenance_state=0
+            else
+                maintenance_state=$?
+            fi
+            if [ "$maintenance_state" -eq 2 ]; then
+                rr_recover_log "committed maintenance evidence is unsafe; no host state was changed and evidence was retained at $tx"
+                return 1
+            fi
+            # A settled committed transaction is a dormant manual-rollback
+            # window.  Never inspect or replay its old writer snapshot.
+            [ "$maintenance_state" -eq 0 ] || return 0
+            if ! sync; then
+                rr_recover_log "settled committed cleanup could not flush host state; maintenance and rollback evidence were retained at $tx"
+                return 1
+            fi
+            if ! rr_clear_update_maintenance_marker "$tx"; then
+                rr_recover_log "settled committed cleanup could not clear maintenance; live writers were not frozen and evidence was retained at $tx"
+                return 1
+            fi
+            return 0
+        fi
+    fi
+    if [ "$format_state" -eq 0 ] && ! rr_transaction_v2_backup_metadata_is_safe "$tx"; then
+        if ! rr_freeze_health_writers_strict; then
+            rr_recover_log "format-2 transaction backup metadata is unsafe and health writers could not be verified inactive and disabled"
+        fi
+        rr_recover_log "format-2 backup/writer-state metadata is incomplete or unsafe; transaction retained at $tx"
         return 1
     fi
     if [ "$mode" = recover ] && [ "$phase" = state_recorded ]; then
@@ -2331,7 +2559,8 @@ main() {
     if [ "$mode" = recover ] && \
        { [ "$phase" = freezing ] || [ "$phase" = snapshotting ] || [ "$phase" = prepared ]; }; then
         RR_BACKUP="$tx/backup"
-        if rr_restore_recorded_writer_state "$RR_BACKUP" normal && \
+        if rr_ensure_update_maintenance_marker "$tx" && \
+           rr_restore_recorded_writer_state "$RR_BACKUP" normal && \
            rr_prepare_terminal_transaction_cleanup "$tx" aborted \
                "global pre-mutation abort durability barrier failed; transaction evidence and maintenance were retained" && \
            rr_clear_update_maintenance_marker "$tx" && \
@@ -2344,24 +2573,78 @@ main() {
         rr_recover_log "pre-mutation service recovery failed; active transaction and evidence retained at $tx"
         return 1
     fi
-    if [ "$mode" = recover ] && \
-       { [ "$phase" = committed ] || [ "$phase" = rolled_back ] || \
-         [ "$phase" = rolled_back_degraded ] || [ "$phase" = aborted ]; }; then
+    if [ "$mode" = recover ] && [ "$phase" = committed ]; then
+        if rr_update_maintenance_marker_state "$tx"; then
+            maintenance_state=0
+        else
+            maintenance_state=$?
+        fi
+        if [ "$maintenance_state" -eq 2 ]; then
+            rr_recover_log "committed maintenance evidence is unsafe; no host state was changed and evidence was retained at $tx"
+            return 1
+        fi
         RR_BACKUP="$tx/backup"
-        if [ "$phase" = committed ] && ! rr_finalize_committed_candidate; then
+        if ! rr_ensure_update_maintenance_marker "$tx"; then
+            rr_recover_log "committed maintenance gate could not be created or verified; no committed recovery mutation was attempted"
+            return 1
+        fi
+        if ! rr_finalize_committed_candidate; then
             rr_freeze_health_writers_strict ||
                 rr_recover_log "committed finalization failed and health writers could not be verified inactive and disabled"
             rr_recover_log "committed update finalization failed; active transaction and maintenance evidence retained at $tx"
             return 1
         fi
-        if [ "$phase" = committed ] && rr_quarantine_artifact_evidence_present &&
+        if rr_quarantine_artifact_evidence_present &&
            ! rr_clear_subscription_quarantine; then
             rr_freeze_health_writers_strict ||
                 rr_recover_log "committed quarantine cleanup failed and health writers could not be verified inactive and disabled"
             rr_recover_log "committed update is safe, but quarantine cleanup still requires retry; evidence retained at $tx"
             return 1
         fi
-        if [ "$phase" = rolled_back_degraded ]; then
+        if [ ! -d "$RR_BACKUP" ] || [ -L "$RR_BACKUP" ] ||
+           ! rr_restore_recorded_writer_state "$RR_BACKUP" normal; then
+            rr_recovery_fail_with_health_frozen "$tx" \
+                "committed cleanup could not restore the recorded writer state; evidence was retained at $tx"
+            return 1
+        fi
+        if ! rr_prepare_terminal_transaction_cleanup "$tx" committed \
+                "global committed durability barrier failed after writer restoration; active transaction and maintenance evidence were retained"; then
+            return 1
+        fi
+        if rr_publish_committed_settled "$tx"; then
+            publish_state=0
+        else
+            publish_state=$?
+        fi
+        case "$publish_state" in
+            0) ;;
+            2)
+                rr_recover_log "committed settled evidence became visible but durability/readback was uncertain; live writers were not frozen and maintenance evidence was retained"
+                return 1
+                ;;
+            *)
+                rr_recovery_fail_with_health_frozen "$tx" \
+                    "committed settled evidence could not be published; active transaction and maintenance evidence were retained"
+                return 1
+                ;;
+        esac
+        # Once settled is durable, retries deliberately do not replay the old
+        # writer state.  A volatile marker cleanup failure therefore retains
+        # evidence without freezing otherwise healthy live services.
+        if ! rr_clear_update_maintenance_marker "$tx"; then
+            rr_recover_log "committed update settled, but maintenance cleanup failed; evidence was retained at $tx"
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$mode" = recover ] && \
+       { [ "$phase" = rolled_back ] || [ "$phase" = rolled_back_degraded ] || \
+         [ "$phase" = aborted ]; }; then
+        RR_BACKUP="$tx/backup"
+        if ! rr_ensure_update_maintenance_marker "$tx"; then
+            rr_recover_log "terminal maintenance gate could not be created or verified; no terminal writer restoration was attempted"
+            return 1
+        elif [ "$phase" = rolled_back_degraded ]; then
             rr_freeze_health_writers_strict || {
                 rr_recover_log "degraded terminal recovery could not verify health writers inactive and disabled"
                 return 1
@@ -2372,9 +2655,6 @@ main() {
                 "terminal cleanup could not restore the recorded writer state; evidence was retained at $tx"
             return 1
         fi
-        # Finalization, quarantine cleanup and writer restoration all mutate
-        # host state. Flush those changes before either recovery pointer can be
-        # retired, even though the phase was already terminal on entry.
         if ! rr_prepare_terminal_transaction_cleanup "$tx" "$phase" \
                 "global terminal durability barrier failed after terminal writer restoration; active transaction and maintenance evidence were retained"; then
             return 1
@@ -2384,8 +2664,7 @@ main() {
                 "terminal transaction marker cleanup failed; terminal phase and evidence retained at $tx"
             return 1
         fi
-        if [ "$phase" != committed ] && \
-           ! rr_clear_active_transaction_pointer "$tx"; then
+        if ! rr_clear_active_transaction_pointer "$tx"; then
             rr_recovery_fail_with_health_frozen "$tx" \
                 "terminal active pointer cleanup was not durable; terminal phase and evidence retained at $tx"
             return 1
@@ -2399,6 +2678,17 @@ main() {
         rr_recovery_write_phase "$tx" recovery_failed || true
         rr_recover_log "rollback target version or legacy-lock evidence is unsafe; old runtime remains hidden and transaction evidence was retained at $tx"
         return 1
+    fi
+    if ! rr_ensure_update_maintenance_marker "$tx"; then
+        rr_recover_log "rollback maintenance gate could not be created or verified; no rollback phase or runtime state was changed"
+        return 1
+    fi
+    if [ "$mode" = rollback ] && [ "$phase" = committed ]; then
+        if ! rr_recovery_write_phase "$tx" rolling_back; then
+            rr_recover_log "manual rollback could not durably publish its in-progress phase; no runtime state was changed"
+            return 1
+        fi
+        phase=rolling_back
     fi
     rr_restore_transaction "$tx" "$([ "$mode" = rollback ] && printf 'manual rollback requested' || printf 'interrupted update detected')"
 }

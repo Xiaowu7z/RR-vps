@@ -917,20 +917,71 @@ ensure_subscription_root() {
         [ "$(stat -c '%u' -- "$SUB_ROOT" 2>/dev/null)" = 0 ]
 }
 
+rr_subscription_process_matches() {
+    local process_dir="${1:-}"
+    local expected_cwd="${2:-}"
+    local expected_app="${3:-}"
+    local uid_line=""
+    local python_name=""
+    local port=""
+    local process_cwd=""
+    local cwd_links=""
+    local -a arguments=()
+
+    [ -n "$process_dir" ] && [ -n "$expected_cwd" ] && [ -n "$expected_app" ] || return 1
+    [ -r "$process_dir/status" ] && [ -r "$process_dir/cmdline" ] || return 1
+
+    # RR launches this worker as root.  Requiring all four kernel UID fields
+    # prevents a user-owned Python process from becoming a kill candidate even
+    # if it can imitate the remaining argv/cwd evidence.
+    uid_line=$(awk '$1 == "Uid:" { print $2 ":" $3 ":" $4 ":" $5; exit }' \
+        "$process_dir/status" 2>/dev/null) || return 1
+    [ "$uid_line" = 0:0:0:0 ] || return 1
+
+    # Parse the NUL-delimited argv instead of substring-matching a flattened
+    # command line.  The latter could accept an unrelated Python command that
+    # merely carries nexus/sub_server.py as data in a later argument.
+    mapfile -d '' -t arguments < "$process_dir/cmdline" 2>/dev/null || return 1
+    [ "${#arguments[@]}" -ge 3 ] || return 1
+    python_name="${arguments[0]##*/}"
+    [[ "$python_name" =~ ^python3([.][0-9]+)?$ ]] || return 1
+    if [ "${arguments[1]}" = "$expected_app" ]; then
+        port="${arguments[2]}"
+    elif [ "${#arguments[@]}" -ge 4 ] && [ "${arguments[1]}" = -m ] && \
+         [ "${arguments[2]}" = http.server ]; then
+        port="${arguments[3]}"
+    else
+        return 1
+    fi
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+
+    process_cwd=$(readlink -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$process_cwd" = "$expected_cwd" ] && return 0
+    [ "$process_cwd" = "${expected_cwd} (deleted)" ] || return 1
+    # procfs appends " (deleted)" to an unlinked cwd, but those characters
+    # are also legal in a real directory name.  st_nlink==0 proves that the
+    # matched inode is actually unlinked and rejects that literal-name trap.
+    cwd_links=$(stat -Lc '%h' -- "$process_dir/cwd" 2>/dev/null) || return 1
+    [ "$cwd_links" = 0 ]
+}
+
+rr_subscription_pid_is_managed() {
+    local pid="${1:-}"
+    local proc_root="${RR_PROC_ROOT:-/proc}"
+    local expected_cwd=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    expected_cwd=$(readlink -f -- "$SUB_ROOT" 2>/dev/null) || return 1
+    rr_subscription_process_matches "$proc_root/$pid" "$expected_cwd" \
+        "$RR_LIB_DIR/nexus/sub_server.py"
+}
+
 is_subscription_pid() {
     local pid="${1:-}"
-    local cmdline=""
-    local process_cwd=""
-    local expected_cwd=""
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     # 必须核对进程身份，绝不因陈旧 PID 文件误杀其他服务。
-    [ -r "/proc/${pid}/cmdline" ] || return 1
-    cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
-    [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || return 1
-    process_cwd=$(readlink -f "/proc/${pid}/cwd" 2>/dev/null) || return 1
-    expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 1
-    [ "$process_cwd" = "$expected_cwd" ]
+    rr_subscription_pid_is_managed "$pid"
 }
 
 managed_subscription_pids() {
@@ -938,21 +989,13 @@ managed_subscription_pids() {
     # 按“受支持命令行 + RR 订阅根 cwd”双重条件扫描 /proc，避免仅凭名称
     # pkill 误伤用户进程，也确保无 PID 文件的 RR 孤儿 worker 仍可回收。
     local proc_root="${RR_PROC_ROOT:-/proc}"
-    local expected_cwd=""
     local process_dir=""
     local pid=""
-    local cmdline=""
-    local process_cwd=""
-    expected_cwd=$(readlink -f "$SUB_ROOT" 2>/dev/null) || return 0
     for process_dir in "$proc_root"/[0-9]*; do
-        [ -r "$process_dir/cmdline" ] || continue
         pid="${process_dir##*/}"
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        cmdline=$(tr '\0' ' ' < "$process_dir/cmdline" 2>/dev/null) || continue
-        [[ "$cmdline" == *"python3 -m http.server"* || "$cmdline" == *"nexus/sub_server.py"* ]] || continue
-        process_cwd=$(readlink -f "$process_dir/cwd" 2>/dev/null) || continue
-        [ "$process_cwd" = "$expected_cwd" ] || continue
-        printf '%s\n' "$pid"
+        rr_subscription_pid_is_managed "$pid" || continue
+        printf '%s\n' "$pid" 2>/dev/null || return 0
     done
 }
 
@@ -970,7 +1013,8 @@ stop_subscription_servers() {
     local attempt=0
     while IFS= read -r pid; do
         [ -n "$pid" ] || continue
-        # 进程可能在扫描和 kill 之间自行退出；最终是否仍存在才决定失败。
+        # 扫描后立即复核完整身份，收窄退出/PID 复用窗口。
+        rr_subscription_pid_is_managed "$pid" || continue
         kill "$pid" 2>/dev/null || true
     done < <(managed_subscription_pids)
     while [ "$attempt" -lt 20 ] && subscription_server_running; do

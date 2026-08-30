@@ -526,9 +526,10 @@ uninstall_all_locked() {
         echo -e "${RED}[失败] 旧运行时已停止，但订阅隔离尚未安全解除；恢复程序和证据已保留。${RESET}" >&2
         return 1
     fi
-    # Keep the subscription root present until the final process proof above:
-    # managed_subscription_pids binds workers to that canonical cwd and cannot
-    # safely classify a process whose cwd has already become "(deleted)".
+    # Keep the subscription root present until the final process proof above.
+    # The matcher can authenticate an already-deleted cwd by its exact procfs
+    # suffix plus st_nlink=0, but avoiding that state here removes needless
+    # ambiguity and remains a useful defense against cleanup races.
     if ensure_subscription_root; then
         rm -rf -- "$SUB_ROOT"
     else

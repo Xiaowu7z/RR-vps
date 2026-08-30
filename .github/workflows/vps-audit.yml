@@ -85,6 +85,8 @@ jobs:
           expected_bundle_sha="$4"
           expected_core_sha="$5"
           expected_guard_sha="$6"
+          find /root -maxdepth 1 -type f -name 'rr-audit-*.log' -delete
+          rm -f -- /root/rr-audit-stage
           audit_exit() {
             rc=$?
             trap - EXIT
@@ -169,6 +171,11 @@ jobs:
           # before installation so every RR rule is exercised through UFW.
           DEBIAN_FRONTEND=noninteractive apt-get install -y ufw \
             >/root/rr-audit-ufw-prepare.log 2>&1
+          # These are owner-authorized destructive audit hosts.  Normalize a
+          # dirty state where ufw.conf says enabled but the live user chains
+          # are missing before proving the candidate's firewall behavior.
+          ufw --force reset >/root/rr-audit-ufw-enable.log 2>&1
+          LC_ALL=C ufw status | grep -qx 'Status: inactive'
           ufw_marker=/etc/ufw/applications.d/rr-audit-marker
           printf '%s\n' \
             '[RR-Audit-Marker]' \
@@ -178,9 +185,12 @@ jobs:
           chmod 600 "$ufw_marker"
           ufw_marker_sha=$(sha256sum "$ufw_marker" | awk '{print $1}')
           ufw allow "$ssh_control_port/tcp" \
-            comment 'rr-audit-ssh-control' >/root/rr-audit-ufw-enable.log 2>&1
+            comment 'rr-audit-ssh-control' >>/root/rr-audit-ufw-enable.log 2>&1
+          LC_ALL=C ufw show added | \
+            grep -Fqx "ufw allow ${ssh_control_port}/tcp comment 'rr-audit-ssh-control'"
           ufw --force enable >>/root/rr-audit-ufw-enable.log 2>&1
           LC_ALL=C ufw status | grep -qx 'Status: active'
+          rr_ufw_rule_state "$ssh_control_port" tcp ALLOW 'rr-audit-ssh-control'
           bash -c '
               set -eo pipefail
               for module_file in /usr/local/lib/rr/modules/*.sh; do
@@ -1216,6 +1226,15 @@ jobs:
           assert_candidate
           install_candidate >>/root/rr-audit-idempotent.log 2>&1
           assert_candidate
+          settled_tx=$(cat /var/lib/rr-update/active)
+          case "$settled_tx" in /var/lib/rr-update/transactions/*) ;; *) exit 1 ;; esac
+          test -f "$settled_tx/committed-settled"
+          test ! -L "$settled_tx/committed-settled"
+          test "$(stat -c '%U:%G:%a:%h' "$settled_tx/committed-settled")" = \
+            root:root:600:1
+          test "$(cat "$settled_tx/committed-settled")" = \
+            rr-update-committed-settled-v1
+          test ! -e /run/rr-vps/update-maintenance
 
           bash -c '
             set -eo pipefail

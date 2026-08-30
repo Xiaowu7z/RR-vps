@@ -142,6 +142,8 @@ for slot, (start_marker, end_marker) in job_ranges.items():
     assert 'printf \'%s %s %s\\n\' "$host" "$host_key_type" "$host_key_data" > "$known_hosts"' in job
 b_start, b_end = job_ranges["B"]
 b_job = vps[vps.index(b_start):vps.index(b_end, vps.index(b_start))]
+a_start, a_end = job_ranges["A"]
+a_job = vps[vps.index(a_start):vps.index(a_end, vps.index(a_start))]
 for fragment in (
     "[ -e /etc/rr-nexus ]",
     "[ -e /var/lib/rr-nexus ]",
@@ -171,9 +173,20 @@ assert "nexus_traffic_user_names" in nexus_assert and "| jq -e" in nexus_assert
 c_start, c_end = job_ranges["C"]
 c_job = vps[vps.index(c_start):vps.index(c_end, vps.index(c_start))]
 assert "printf '%s\\n' 0 '' '' '' | bash -c" in c_job
-assert 'ufw allow "$ssh_control_port/tcp"' in vps
-assert 'ufw --force allow' not in vps
-assert 'ufw --force enable' in vps
+assert "committed-settled" in c_job
+assert "rr-update-committed-settled-v1" in c_job
+assert 'ufw --force allow' not in a_job
+ufw_reset = a_job.index('ufw --force reset')
+ufw_inactive = a_job.index("grep -qx 'Status: inactive'", ufw_reset)
+ufw_marker = a_job.index('ufw_marker=/etc/ufw/applications.d/rr-audit-marker', ufw_inactive)
+ufw_allow = a_job.index('ufw allow "$ssh_control_port/tcp"', ufw_marker)
+ufw_saved = a_job.index('ufw show added', ufw_allow)
+ufw_enable = a_job.index('ufw --force enable', ufw_saved)
+ufw_active = a_job.index("grep -qx 'Status: active'", ufw_enable)
+ufw_live = a_job.index('rr_ufw_rule_state "$ssh_control_port" tcp ALLOW', ufw_active)
+assert ufw_reset < ufw_inactive < ufw_marker < ufw_allow < ufw_saved
+assert ufw_saved < ufw_enable < ufw_active < ufw_live
+assert "|| true" not in a_job[ufw_reset:ufw_live]
 migration_start = vps.index("  cross-machine-migration-scale:\n")
 gate_start = vps.index("  vps-gate:\n", migration_start)
 migration = vps[migration_start:gate_start]
