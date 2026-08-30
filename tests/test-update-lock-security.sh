@@ -414,7 +414,10 @@ printf '%s\n' '[2/7] installer safely bridges 7.1.0 locking without mutating exi
         chown 65534:65534 "$RR_LEGACY_UPDATE_LOCK_FILE"
         busy_before=$(stat -c '%u:%g:%a:%h' "$RR_LEGACY_UPDATE_LOCK_FILE")
         busy_digest=$(sha256sum "$RR_LEGACY_UPDATE_LOCK_FILE")
-        exec {busy_fd}<>"$RR_LEGACY_UPDATE_LOCK_FILE"
+        # An exclusive flock does not require a writable descriptor. Open the
+        # attacker-owned 0644 inode read-only so this fixture also works on
+        # constrained root runners without CAP_DAC_OVERRIDE.
+        exec {busy_fd}<"$RR_LEGACY_UPDATE_LOCK_FILE"
         flock -n "$busy_fd"
         if rr_acquire_legacy_update_lock; then
             fail 'installer mutated or ignored a busy non-root legacy preoccupation'
