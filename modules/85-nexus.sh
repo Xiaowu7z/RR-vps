@@ -19,7 +19,7 @@ NEXUS_CORE_RELEASE_REVISION=1
 NEXUS_CORE_PINNED_VERSION="1.13.19"
 NEXUS_CORE_PINNED_RELEASE_TAG="rr-nexus-core-v1.13.19"
 NEXUS_CORE_PINNED_PRODUCT_VERSION="7.1.1"
-NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG="v1.13.20"
+NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS="v1.13.20 v1.13.21"
 NEXUS_CORE_PINNED_SOURCE_COMMIT="b5ebaa1fc0f2b94256180b95468e73ef53caa27d"
 NEXUS_CORE_PINNED_AUDIT_RUN="33071792235"
 NEXUS_CORE_PINNED_AMD64_SIZE="20610257"
@@ -191,7 +191,8 @@ nexus_validate_pinned_core_constants() {
         "rr-nexus-core-v${NEXUS_CORE_PINNED_VERSION}" ] || return 1
     version_ge "$NEXUS_CORE_PINNED_VERSION" "$MIN_SINGBOX_VERSION" || return 1
     [ "$NEXUS_CORE_PINNED_PRODUCT_VERSION" = "${SCRIPT_VERSION:-}" ] || return 1
-    [ "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG" = v1.13.20 ] || return 1
+    [ "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS" = \
+        "v1.13.20 v1.13.21" ] || return 1
     [[ "$NEXUS_CORE_PINNED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || return 1
     [[ "$NEXUS_CORE_PINNED_AUDIT_RUN" =~ ^[1-9][0-9]+$ ]] || return 1
     for architecture in amd64 arm64; do
@@ -209,7 +210,10 @@ nexus_pinned_core_fallback_allowed() {
     [ -f "$upstream_file" ] && [ ! -L "$upstream_file" ] || return 1
     nexus_validate_pinned_core_constants || return 1
     upstream_tag=$(jq -r '.tag_name // empty' "$upstream_file" 2>/dev/null) || return 1
-    [ "$upstream_tag" = "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG" ]
+    case "$upstream_tag" in
+        v1.13.20|v1.13.21) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 nexus_stats_port() {
@@ -556,9 +560,10 @@ nexus_download_traffic_core() {
             nexus_pinned_core_fallback_allowed "${release_json}.upstream" || return 1
         rm -f "$release_json" "$checksums" "$build_info"
         pinned_core=true
+        source_tag=$(jq -r '.tag_name // empty' "${release_json}.upstream") || return 1
         version="$NEXUS_CORE_PINNED_VERSION"
         release_tag="$NEXUS_CORE_PINNED_RELEASE_TAG"
-        echo "[供应链] 上游 ${NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG} 的不可变统计核心尚未发布；${SCRIPT_VERSION} 正在使用内置大小与 SHA-256 固定的 ${version} 审计核心。" >&2
+        echo "[供应链] 上游 ${source_tag} 的不可变统计核心尚未发布；${SCRIPT_VERSION} 正在使用内置大小与 SHA-256 固定的 ${version} 审计核心。" >&2
         archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
         archive_url="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}"
         expected=$(nexus_pinned_core_asset_field "$SYS_ARCH" sha256) || return 1

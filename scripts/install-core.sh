@@ -2311,7 +2311,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "7696b5093c504d4cc17810b2484679dfc403d2b1158708f102e328c326ef1d2e" ] && \
+        if [ "$actual" = "1f3bbb3a95ce751957f6ae0a49eeabcbade92b42bae2a44c049baf73d5a3e7bb" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
