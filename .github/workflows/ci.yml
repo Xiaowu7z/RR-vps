@@ -89,6 +89,7 @@ jobs:
               test-cloudflared-supply-chain.sh|\
               test-firewall-transaction.sh|\
               test-health-transaction-lock.sh|\
+              test-install-core-rollback-boundary.sh|\
               test-nexus-sync.sh|\
               test-restore-watchdog.sh|\
               test-update-external-state.sh|\
