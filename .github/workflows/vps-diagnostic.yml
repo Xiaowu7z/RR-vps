@@ -1,4 +1,4 @@
-# diagnostic rerun: main audit 37 B failure
+# diagnostic rerun: main audit 38 B/C failure
 name: VPS diagnostic
 
 on:
