@@ -177,7 +177,7 @@ jobs:
             'ports=61234/tcp' > "$ufw_marker"
           chmod 600 "$ufw_marker"
           ufw_marker_sha=$(sha256sum "$ufw_marker" | awk '{print $1}')
-          ufw --force allow "$ssh_control_port/tcp" \
+          ufw allow "$ssh_control_port/tcp" \
             comment 'rr-audit-ssh-control' >/root/rr-audit-ufw-enable.log 2>&1
           ufw --force enable >>/root/rr-audit-ufw-enable.log 2>&1
           LC_ALL=C ufw status | grep -qx 'Status: active'
@@ -501,7 +501,10 @@ jobs:
             source "$module_file"
           done
           if [ -e /usr/local/bin/rr ] || [ -e /usr/local/lib/rr ] || \
-             [ -e /etc/argo_vmess.conf ]; then
+             [ -e /etc/argo_vmess.conf ] || [ -e /etc/rr-nexus ] || \
+             [ -e /var/lib/rr-nexus ] || \
+             systemctl list-unit-files rr-nexus.service --no-legend 2>/dev/null \
+               | grep -q '^rr-nexus\.service'; then
             CLEANUP_RUNTIME="$cleanup_runtime" printf 'y\n' | \
               CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
                 set -o pipefail
@@ -526,6 +529,9 @@ jobs:
           test ! -e /usr/local/bin/rr
           test ! -e /usr/local/lib/rr
           test ! -e /etc/argo_vmess.conf
+          test ! -e /etc/rr-nexus
+          test ! -e /var/lib/rr-nexus
+          test "$(systemctl show -p LoadState --value rr-nexus.service 2>/dev/null)" = not-found
           unset stale_subscription_pids
           rm -rf "$cleanup_runtime"
           printf 'preclean-complete\n' > /root/rr-audit-stage
@@ -556,7 +562,36 @@ jobs:
                 # shellcheck disable=SC1090
                 source "$module_file"
               done
-              install_deps </dev/null
+              # DPkg::Lock::Timeout does not cover apt lists/archive locks.
+              # Retry only a diagnosed lock collision; network/package errors
+              # remain immediate hard failures.  This preserves the exact old
+              # installer while tolerating a brief unattended-upgrade window.
+              run_old_install_deps() {
+                local attempt=0 result=0 output=""
+                output=$(mktemp) || return 1
+                for ((attempt = 1; attempt <= 30; attempt++)); do
+                  : > "$output"
+                  if install_deps </dev/null >"$output" 2>&1; then
+                    sed -n p "$output"
+                    rm -f "$output"
+                    return 0
+                  else
+                    result=$?
+                  fi
+                  sed -n p "$output"
+                  if ! grep -Eqi \
+                    "Could not get lock|Unable to acquire.*lock|held by process|is another process using" \
+                    "$output"; then
+                    rm -f "$output"
+                    return "$result"
+                  fi
+                  [ "$attempt" -lt 30 ] || break
+                  sleep 10
+                done
+                rm -f "$output"
+                return 75
+              }
+              run_old_install_deps
             ' >/root/rr-audit-old-deps.log 2>&1
 
           for tcp_port in 10443 24444 18081 21444 22444; do
@@ -617,6 +652,12 @@ jobs:
           fi
           unset panel_pass
 
+          # A disposable upgrade fixture must start from an empty device set.
+          # This prevents an interrupted historical audit from contaminating
+          # the next exact 7.1.0 -> candidate migration exercise.
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'SELECT COUNT(*) FROM devices;')" -eq 0
+
           assert_unit_state sing-box.service loaded:active:enabled
           assert_unit_state rr-nexus.service loaded:active:enabled
           assert_unit_state nginx.service loaded:active:enabled
@@ -647,6 +688,18 @@ jobs:
           SQL
           expected_device="dev_a1b2c3d4e5f6|legacy-phone|${legacy_credential}|${legacy_token}|1|10737418240|1234567|456789|777778|2026-08-27T00:00:00+00:00|<NULL>|2027-08-27|2026-09-27|27|12|3|2026-08-01T00:00:00+00:00|2026-08-27T00:00:00+00:00"
           test "$(device_row)" = "$expected_device"
+          test "$(sqlite3 /var/lib/rr-nexus/nexus.db \
+            'SELECT COUNT(*) FROM devices;')" -eq 1
+          bash -c '
+            set -eo pipefail
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            nexus_traffic_user_names \
+              | jq -e '\''type == "array" and length == 1 and
+                all(.[]; test("^dev_[a-f0-9]{12}$"))'\'' >/dev/null
+          '
           printf '%s\n' "$expected_device" > /root/rr-audit-before-device.txt
           unset legacy_credential legacy_token
           systemctl restart rr-nexus
@@ -1172,7 +1225,7 @@ jobs:
             done
             install_deps </dev/null
           ' >/root/rr-audit-deps.log 2>&1
-          printf '0\n\n' | bash -c '
+          printf '%s\n' 0 '' '' '' | bash -c '
             set -o pipefail
             for module_file in /usr/local/lib/rr/modules/*.sh; do
               # shellcheck disable=SC1090

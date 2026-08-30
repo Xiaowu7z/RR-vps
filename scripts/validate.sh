@@ -1171,6 +1171,217 @@ EOF
         echo "mawk is required for the Nexus checksum portability regression." >&2
         exit 1
     }
+
+    # The legacy bootstrap release is mutable, so only product-pinned
+    # executable bytes may be consumed from it.  Validate both architecture
+    # anchors and exercise the complete fallback without trusting release
+    # metadata or a downloaded checksum file.
+    nexus_validate_pinned_core_constants
+    [ "$(nexus_pinned_core_asset_field amd64 size)" = 20610257 ]
+    [ "$(nexus_pinned_core_asset_field amd64 sha256)" = \
+        9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad ]
+    [ "$(nexus_pinned_core_asset_field arm64 size)" = 18978144 ]
+    [ "$(nexus_pinned_core_asset_field arm64 sha256)" = \
+        28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0 ]
+    [ "$NEXUS_CORE_PINNED_SOURCE_COMMIT" = \
+        b5ebaa1fc0f2b94256180b95468e73ef53caa27d ]
+    [ "$NEXUS_CORE_PINNED_AUDIT_RUN" = 33071792235 ]
+    if nexus_pinned_core_asset_field 386 sha256 >/dev/null 2>&1; then
+        echo "Unsupported architecture received a pinned Nexus digest." >&2
+        exit 1
+    fi
+    (
+        bad_sha="$NEXUS_CORE_PINNED_AMD64_SHA256"
+        NEXUS_CORE_PINNED_AMD64_SHA256="${bad_sha%?}g"
+        if nexus_validate_pinned_core_constants; then
+            echo "Malformed pinned Nexus digest was accepted." >&2
+            exit 1
+        fi
+    )
+    (
+        status_root="$checksum_tmp/status"
+        mkdir -p "$status_root"
+        target_mode=missing
+        seen_target_url="$status_root/seen-target-url"
+        curl() {
+            local output="" argument="" url=""
+            while [ "$#" -gt 0 ]; do
+                argument="$1"
+                shift
+                case "$argument" in
+                    -o) output="$1"; shift ;;
+                    https://*) url="$argument" ;;
+                esac
+            done
+            if [ "$url" = "$NEXUS_CORE_UPSTREAM_API" ]; then
+                printf '%s\n' \
+                    '{"tag_name":"v1.13.20"}' > "$output"
+                return 0
+            fi
+            printf '%s\n' "$url" > "$seen_target_url"
+            case "$target_mode" in
+                missing) printf '%s' 404; return 22 ;;
+                forbidden) printf '%s' 403; return 22 ;;
+                timeout) printf '%s' 404; return 28 ;;
+                malformed)
+                    printf '%s\n' '{"immutable":false}' > "$output"
+                    printf '%s' 200
+                    return 0
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
+            echo "Missing exact Nexus core release did not report fallback status." >&2
+            exit 1
+        else
+            [ "$?" -eq 44 ]
+        fi
+        [ "$(cat "$seen_target_url")" = \
+            "${NEXUS_CORE_RELEASE_API}/rr-nexus-core-v1.13.20-r1" ]
+        target_mode=forbidden
+        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
+            echo "Forbidden Nexus metadata response was accepted." >&2
+            exit 1
+        else
+            [ "$?" -eq 1 ]
+        fi
+        target_mode=timeout
+        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
+            echo "Curl timeout carrying a 404 status selected Nexus fallback." >&2
+            exit 1
+        else
+            [ "$?" -eq 1 ]
+        fi
+        target_mode=malformed
+        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
+            echo "Malformed mutable Nexus metadata was accepted." >&2
+            exit 1
+        else
+            [ "$?" -eq 1 ]
+        fi
+    )
+    (
+        fallback_root="$checksum_tmp/fallback"
+        payload_root="$checksum_tmp/payload"
+        mkdir -p "$fallback_root" \
+            "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64"
+        cat > "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'sing-box version 1.13.19 with_v2ray_api'
+EOF
+        chmod 755 "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box"
+        tar -czf "$payload_root/core.tar.gz" -C "$payload_root" \
+            "sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box"
+        payload_archive="$payload_root/core.tar.gz"
+        NEXUS_CORE_PINNED_AMD64_SIZE=$(stat -c %s "$payload_root/core.tar.gz")
+        NEXUS_CORE_PINNED_AMD64_SHA256=$(sha256sum "$payload_root/core.tar.gz" | awk '{print $1}')
+        SYS_ARCH=amd64
+        nexus_fetch_traffic_core_release() {
+            printf '%s\n' '{"tag_name":"v1.13.20"}' > "${1}.upstream"
+            return 44
+        }
+        curl() {
+            local output="" argument="" url=""
+            while [ "$#" -gt 0 ]; do
+                argument="$1"
+                shift
+                case "$argument" in
+                    -o) output="$1"; shift ;;
+                    https://*) url="$argument" ;;
+                esac
+            done
+            [ "$url" = \
+                "https://github.com/${RR_REPOSITORY}/releases/download/${NEXUS_CORE_PINNED_RELEASE_TAG}/rr-sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64.tar.gz" ] || return 1
+            cp "$payload_archive" "$output"
+        }
+        nexus_download_traffic_core "$fallback_root"
+        [ "$(get_singbox_version "$fallback_root/sing-box")" = \
+            "$NEXUS_CORE_PINNED_VERSION" ]
+        [ "$(nexus_traffic_core_version)" = "$NEXUS_CORE_PINNED_VERSION" ]
+
+        cp "$payload_root/core.tar.gz" "$payload_root/core-tampered.tar.gz"
+        printf X | dd of="$payload_root/core-tampered.tar.gz" \
+            bs=1 seek=0 count=1 conv=notrunc status=none
+        [ "$(stat -c %s "$payload_root/core-tampered.tar.gz")" = \
+            "$NEXUS_CORE_PINNED_AMD64_SIZE" ]
+        payload_archive="$payload_root/core-tampered.tar.gz"
+        mkdir -p "$checksum_tmp/fallback-tampered"
+        if nexus_download_traffic_core "$checksum_tmp/fallback-tampered" \
+            >/dev/null 2>&1; then
+            echo "Same-size tampered pinned Nexus archive was accepted." >&2
+            exit 1
+        fi
+
+        cp "$payload_root/core.tar.gz" "$payload_root/core-wrong-size.tar.gz"
+        printf X >> "$payload_root/core-wrong-size.tar.gz"
+        payload_archive="$payload_root/core-wrong-size.tar.gz"
+        NEXUS_CORE_PINNED_AMD64_SHA256=$(sha256sum "$payload_archive" | awk '{print $1}')
+        mkdir -p "$checksum_tmp/fallback-wrong-size"
+        if nexus_download_traffic_core "$checksum_tmp/fallback-wrong-size" \
+            >/dev/null 2>&1; then
+            echo "Wrong-size pinned Nexus archive with a matching digest was accepted." >&2
+            exit 1
+        fi
+    )
+    (
+        # The architecture-specific trust anchor is part of the executable
+        # path, not just a constant table.  Exercise the arm64 URL, size and
+        # digest selection independently from the amd64 negative cases above.
+        fallback_root="$checksum_tmp/fallback-arm64"
+        payload_root="$checksum_tmp/payload-arm64"
+        mkdir -p "$fallback_root" \
+            "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64"
+        cat > "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'sing-box version 1.13.19 with_v2ray_api'
+EOF
+        chmod 755 "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box"
+        tar -czf "$payload_root/core.tar.gz" -C "$payload_root" \
+            "sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box"
+        NEXUS_CORE_PINNED_ARM64_SIZE=$(stat -c %s "$payload_root/core.tar.gz")
+        NEXUS_CORE_PINNED_ARM64_SHA256=$(sha256sum "$payload_root/core.tar.gz" | awk '{print $1}')
+        SYS_ARCH=arm64
+        nexus_fetch_traffic_core_release() {
+            printf '%s\n' '{"tag_name":"v1.13.20"}' > "${1}.upstream"
+            return 44
+        }
+        curl() {
+            local output="" argument="" url=""
+            while [ "$#" -gt 0 ]; do
+                argument="$1"
+                shift
+                case "$argument" in
+                    -o) output="$1"; shift ;;
+                    https://*) url="$argument" ;;
+                esac
+            done
+            [ "$url" = \
+                "https://github.com/${RR_REPOSITORY}/releases/download/${NEXUS_CORE_PINNED_RELEASE_TAG}/rr-sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64.tar.gz" ] || return 1
+            cp "$payload_root/core.tar.gz" "$output"
+        }
+        nexus_download_traffic_core "$fallback_root"
+        [ "$(get_singbox_version "$fallback_root/sing-box")" = \
+            "$NEXUS_CORE_PINNED_VERSION" ]
+    )
+    (
+        nexus_fetch_traffic_core_release() { return 1; }
+        if nexus_traffic_core_version >/dev/null 2>&1; then
+            echo "Transport failure silently selected the pinned Nexus core." >&2
+            exit 1
+        fi
+    )
+    (
+        nexus_fetch_traffic_core_release() {
+            printf '%s\n' '{"tag_name":"v1.13.21"}' > "${1}.upstream"
+            return 44
+        }
+        if nexus_traffic_core_version >/dev/null 2>&1; then
+            echo "Unexpected upstream version selected the pinned Nexus core." >&2
+            exit 1
+        fi
+    )
+
     digest_a=$(printf 'a%.0s' {1..64})
     digest_b=$(printf 'b%.0s' {1..64})
     printf '%s  rr-sing-box-1.2.3-linux-amd64.tar.gz\n%s  rr-sing-box-1.2.3-linux-arm64.tar.gz\n' \
@@ -2557,6 +2768,26 @@ echo 'sing-box version test with_v2ray_api'
 SH
     chmod +x "$SINGBOX_BIN"
     nexus_core_supports_traffic
+    # A newer already-installed core that contains with_v2ray_api is always
+    # retained.  The pinned bootstrap is only a replacement for an official
+    # build that cannot provide Nexus traffic statistics, never a generic
+    # version downgrade policy.
+    cat > "$SINGBOX_BIN" <<'SH'
+#!/bin/sh
+echo 'sing-box version 9.9.9 with_v2ray_api'
+SH
+    chmod +x "$SINGBOX_BIN"
+    download_marker="$nexus_tmp/download-called"
+    nexus_download_traffic_core() { : > "$download_marker"; return 1; }
+    managed_singbox_running() { return 1; }
+    build_singbox_config() { SINGBOX_CONFIG_CHANGED=false; return 0; }
+    any_node_protocol_enabled() { return 1; }
+    ensure_node_service_running() { return 0; }
+    nexus_enable_traffic_engine >/dev/null
+    [ ! -e "$download_marker" ] || {
+        echo "A newer traffic-capable Nexus core was replaced by the pinned fallback." >&2
+        exit 1
+    }
     python3 - "$NEXUS_DB_FILE" <<'PY'
 import sqlite3
 import sys

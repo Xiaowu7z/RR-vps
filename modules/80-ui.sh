@@ -117,8 +117,8 @@ show_info() {
     load_config_with_defaults || return 1
     if ! generate_node_and_sub; then
         echo -e "${RED}节点与订阅生成失败，原有配置未改动。${RESET}"
-        read -p "按回车键返回主菜单..."
-        return
+        read -r -p "按回车键返回主菜单..." || true
+        return 1
     fi
     local SERVER_IP="$ENTRY_IP_URI"
     local raw_sub_url=""
@@ -221,7 +221,11 @@ show_info() {
     fi
     echo ""
     echo -e "${CYAN}=================================================================================${RESET}"
-    read -p "按回车键返回主菜单..."
+    # A completed install is also used from non-interactive automation.  EOF
+    # only means that there is no menu to return to; it must not turn the
+    # already committed install into a false failure.
+    read -r -p "按回车键返回主菜单..." || true
+    return 0
 }
 
 # ==========================================
