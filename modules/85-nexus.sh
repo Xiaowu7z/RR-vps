@@ -11,6 +11,21 @@ NEXUS_APP="${RR_LIB_DIR}/nexus/rr_nexus.py"
 NEXUS_CORE_UPSTREAM_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 NEXUS_CORE_RELEASE_API="https://api.github.com/repos/${RR_REPOSITORY}/releases/tags"
 NEXUS_CORE_RELEASE_REVISION=1
+# Bootstrap trust anchor for the last audited traffic-core bytes published
+# before immutable releases were enabled.  The mutable release metadata and
+# its checksum file are deliberately not trusted: executable size and SHA-256
+# are pinned in this product release.  A matching immutable current core
+# always takes precedence when one exists.
+NEXUS_CORE_PINNED_VERSION="1.13.19"
+NEXUS_CORE_PINNED_RELEASE_TAG="rr-nexus-core-v1.13.19"
+NEXUS_CORE_PINNED_PRODUCT_VERSION="7.1.1"
+NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG="v1.13.20"
+NEXUS_CORE_PINNED_SOURCE_COMMIT="b5ebaa1fc0f2b94256180b95468e73ef53caa27d"
+NEXUS_CORE_PINNED_AUDIT_RUN="33071792235"
+NEXUS_CORE_PINNED_AMD64_SIZE="20610257"
+NEXUS_CORE_PINNED_AMD64_SHA256="9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad"
+NEXUS_CORE_PINNED_ARM64_SIZE="18978144"
+NEXUS_CORE_PINNED_ARM64_SHA256="28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0"
 NEXUS_SYNC_LOCK_FILE="${RR_NEXUS_SYNC_LOCK_FILE:-/run/rr-vps/locks/nexus-sync.lock}"
 NEXUS_SYNC_LOCK_WAIT_SECONDS="${RR_NEXUS_SYNC_LOCK_WAIT_SECONDS:-300}"
 
@@ -125,16 +140,76 @@ nexus_fetch_traffic_core_release() {
     local upstream_file="${target_file}.upstream"
     local upstream_tag=""
     local release_tag=""
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+    local http_code=""
+    local curl_result=0
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 10 --max-time 40 \
         -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
         -o "$upstream_file" "$NEXUS_CORE_UPSTREAM_API" || return 1
     upstream_tag=$(jq -r '.tag_name // empty' "$upstream_file")
     [[ "$upstream_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || return 1
     release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 40 \
+    if http_code=$(curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 10 --max-time 40 --write-out '%{http_code}' \
         -H 'Accept: application/vnd.github+json' -H 'User-Agent: RR-vps' \
-        -o "$target_file" "${NEXUS_CORE_RELEASE_API}/${release_tag}" || return 1
+        -o "$target_file" "${NEXUS_CORE_RELEASE_API}/${release_tag}"); then
+        curl_result=0
+    else
+        curl_result=$?
+    fi
+    if [ "$curl_result" -ne 0 ]; then
+        rm -f "$target_file"
+        # Only an authoritative absence of this exact, validated upstream
+        # release may select the product-pinned bootstrap bytes.  Transport,
+        # authorization, rate-limit and malformed-response failures stay
+        # fail-closed instead of silently downgrading.
+        [ "$curl_result" -eq 22 ] && [ "$http_code" = 404 ] && return 44
+        return 1
+    fi
+    [ "$http_code" = 200 ] || { rm -f "$target_file"; return 1; }
     nexus_validate_traffic_core_release "$target_file" "$upstream_tag"
+}
+
+nexus_pinned_core_asset_field() {
+    local architecture="$1"
+    local field="$2"
+    case "${architecture}:${field}" in
+        amd64:size) printf '%s\n' "$NEXUS_CORE_PINNED_AMD64_SIZE" ;;
+        amd64:sha256) printf '%s\n' "$NEXUS_CORE_PINNED_AMD64_SHA256" ;;
+        arm64:size) printf '%s\n' "$NEXUS_CORE_PINNED_ARM64_SIZE" ;;
+        arm64:sha256) printf '%s\n' "$NEXUS_CORE_PINNED_ARM64_SHA256" ;;
+        *) return 1 ;;
+    esac
+}
+
+nexus_validate_pinned_core_constants() {
+    local architecture=""
+    local expected_size=""
+    local expected_sha256=""
+    [[ "$NEXUS_CORE_PINNED_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [ "$NEXUS_CORE_PINNED_RELEASE_TAG" = \
+        "rr-nexus-core-v${NEXUS_CORE_PINNED_VERSION}" ] || return 1
+    version_ge "$NEXUS_CORE_PINNED_VERSION" "$MIN_SINGBOX_VERSION" || return 1
+    [ "$NEXUS_CORE_PINNED_PRODUCT_VERSION" = "${SCRIPT_VERSION:-}" ] || return 1
+    [ "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG" = v1.13.20 ] || return 1
+    [[ "$NEXUS_CORE_PINNED_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [[ "$NEXUS_CORE_PINNED_AUDIT_RUN" =~ ^[1-9][0-9]+$ ]] || return 1
+    for architecture in amd64 arm64; do
+        expected_size=$(nexus_pinned_core_asset_field "$architecture" size) || return 1
+        expected_sha256=$(nexus_pinned_core_asset_field "$architecture" sha256) || return 1
+        [[ "$expected_size" =~ ^[1-9][0-9]{0,8}$ ]] && \
+            [ "$expected_size" -le 104857600 ] || return 1
+        [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    done
+}
+
+nexus_pinned_core_fallback_allowed() {
+    local upstream_file="$1"
+    local upstream_tag=""
+    [ -f "$upstream_file" ] && [ ! -L "$upstream_file" ] || return 1
+    nexus_validate_pinned_core_constants || return 1
+    upstream_tag=$(jq -r '.tag_name // empty' "$upstream_file" 2>/dev/null) || return 1
+    [ "$upstream_tag" = "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG" ]
 }
 
 nexus_stats_port() {
@@ -356,12 +431,22 @@ nexus_traffic_core_version() {
     local source_tag=""
     local release_tag=""
     local builder_commit=""
+    local fetch_result=0
     work_dir=$(mktemp -d /tmp/rr-nexus-version.XXXXXX) || return 1
     release_json="$work_dir/release.json"
     build_info="$work_dir/BUILD_INFO"
-    if ! nexus_fetch_traffic_core_release "$release_json"; then
+    if nexus_fetch_traffic_core_release "$release_json"; then
+        fetch_result=0
+    else
+        fetch_result=$?
+        if [ "$fetch_result" -ne 44 ] || \
+           ! nexus_pinned_core_fallback_allowed "${release_json}.upstream"; then
+            rm -rf "$work_dir"
+            return 1
+        fi
         rm -rf "$work_dir"
-        return 1
+        printf '%s\n' "$NEXUS_CORE_PINNED_VERSION"
+        return 0
     fi
     release_tag=$(jq -r '.tag_name // empty' "$release_json")
     builder_commit=$(jq -r '.target_commitish // empty' "$release_json")
@@ -370,7 +455,8 @@ nexus_traffic_core_version() {
     info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
         "$release_json" | head -n 1)
     if [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ] || \
-       ! curl -fL --retry 2 --connect-timeout 8 --max-time 30 \
+       ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+           --retry 2 --connect-timeout 8 --max-time 30 \
            -o "$build_info" "$info_url"; then
         rm -rf "$work_dir"
         return 1
@@ -420,39 +506,72 @@ nexus_download_traffic_core() {
     local info_url=""
     local expected=""
     local actual=""
+    local actual_size=""
     local version=""
     local source_tag=""
     local builder_commit=""
     local extracted=""
     local actual_version=""
+    local expected_size=""
+    local pinned_core=false
+    local fetch_result=0
 
-    nexus_fetch_traffic_core_release "$release_json" || return 1
     local release_tag=""
-    release_tag=$(jq -r '.tag_name // empty' "$release_json")
-    builder_commit=$(jq -r '.target_commitish // empty' "$release_json")
-    source_tag=$(jq -r '.tag_name // empty' "${release_json}.upstream")
-    version="${source_tag#v}"
-    checksum_url=$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url' \
-        "$release_json" | head -n 1)
-    info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
-        "$release_json" | head -n 1)
-    if [ "$checksum_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/SHA256SUMS" ] || \
-       [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ]; then
-        return 1
+    if nexus_fetch_traffic_core_release "$release_json"; then
+        fetch_result=0
+        release_tag=$(jq -r '.tag_name // empty' "$release_json")
+        builder_commit=$(jq -r '.target_commitish // empty' "$release_json")
+        source_tag=$(jq -r '.tag_name // empty' "${release_json}.upstream")
+        version="${source_tag#v}"
+        checksum_url=$(jq -r '.assets[] | select(.name == "SHA256SUMS") | .browser_download_url' \
+            "$release_json" | head -n 1)
+        info_url=$(jq -r '.assets[] | select(.name == "BUILD_INFO") | .browser_download_url' \
+            "$release_json" | head -n 1)
+        if [ "$checksum_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/SHA256SUMS" ] || \
+           [ "$info_url" != "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/BUILD_INFO" ]; then
+            return 1
+        fi
+        curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --connect-timeout 10 --max-time 40 \
+            -o "$checksums" "$checksum_url" || return 1
+        curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --connect-timeout 10 --max-time 40 \
+            -o "$build_info" "$info_url" || return 1
+        nexus_validate_core_build_info \
+            "$build_info" "$version" "$release_tag" "$builder_commit" || return 1
+        nexus_validate_core_checksums "$checksums" "$version" || return 1
+        archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
+        archive_url=$(jq -r --arg name "$archive_name" \
+            '.assets[] | select(.name == $name) | .browser_download_url' \
+            "$release_json" | head -n 1)
+        [ "$archive_url" = \
+            "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}" ] || return 1
+        expected=$(awk -v name="$archive_name" '$2 == name {print $1; exit}' "$checksums")
+    else
+        fetch_result=$?
+        # The current immutable core may lag a just-published upstream patch.
+        # Fall back only to the executable bytes pinned above; never accept
+        # checksum or provenance metadata from the mutable legacy release.
+        [ "$fetch_result" -eq 44 ] && \
+            nexus_pinned_core_fallback_allowed "${release_json}.upstream" || return 1
+        rm -f "$release_json" "$checksums" "$build_info"
+        pinned_core=true
+        version="$NEXUS_CORE_PINNED_VERSION"
+        release_tag="$NEXUS_CORE_PINNED_RELEASE_TAG"
+        echo "[供应链] 上游 ${NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAG} 的不可变统计核心尚未发布；${SCRIPT_VERSION} 正在使用内置大小与 SHA-256 固定的 ${version} 审计核心。" >&2
+        archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
+        archive_url="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}"
+        expected=$(nexus_pinned_core_asset_field "$SYS_ARCH" sha256) || return 1
+        expected_size=$(nexus_pinned_core_asset_field "$SYS_ARCH" size) || return 1
     fi
-    curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$checksums" "$checksum_url" || return 1
-    curl -fL --retry 3 --connect-timeout 10 --max-time 40 -o "$build_info" "$info_url" || return 1
-    nexus_validate_core_build_info \
-        "$build_info" "$version" "$release_tag" "$builder_commit" || return 1
-    nexus_validate_core_checksums "$checksums" "$version" || return 1
-    archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"
-    archive_url=$(jq -r --arg name "$archive_name" \
-        '.assets[] | select(.name == $name) | .browser_download_url' "$release_json" | head -n 1)
-    [ "$archive_url" = "https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/${archive_name}" ] || return 1
-    curl -fL --retry 3 --connect-timeout 10 --max-time 240 --max-filesize 104857600 \
+    curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 3 --connect-timeout 10 --max-time 240 --max-filesize 104857600 \
         -o "$work_dir/$archive_name" "$archive_url" || return 1
-    [ "$(stat -c %s "$work_dir/$archive_name" 2>/dev/null || echo 0)" -le 104857600 ] || return 1
-    expected=$(awk -v name="$archive_name" '$2 == name {print $1; exit}' "$checksums")
+    actual_size=$(stat -c %s "$work_dir/$archive_name" 2>/dev/null || echo 0)
+    [ "$actual_size" -le 104857600 ] || return 1
+    if [ "$pinned_core" = true ]; then
+        [ "$actual_size" = "$expected_size" ] || return 1
+    fi
     actual=$(sha256sum "$work_dir/$archive_name" | awk '{print $1}')
     [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] || return 1
     extracted="sing-box-${version}-linux-${SYS_ARCH}/sing-box"

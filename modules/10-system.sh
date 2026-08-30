@@ -312,7 +312,10 @@ rr_reconcile_ufw_protocol_rule() {
         fi
         case "$state" in
             0)
-                ufw --force delete "$opposite_action" "$proto_port/$proto_type" \
+                # UFW only accepts --force for commands that can prompt, such
+                # as enable/reset.  Rule add/delete syntax rejects it on the
+                # Debian 12 and Ubuntu 22.04/24.04 versions we support.
+                ufw delete "$opposite_action" "$proto_port/$proto_type" \
                     comment "$opposite_comment" >/dev/null 2>&1 || return 1
                 attempts=$((attempts + 1))
                 ;;
@@ -330,7 +333,7 @@ rr_reconcile_ufw_protocol_rule() {
     case "$state" in
         0) ;;
         1)
-            ufw --force "$desired_action" "$proto_port/$proto_type" \
+            ufw "$desired_action" "$proto_port/$proto_type" \
                 comment "$desired_comment" >/dev/null 2>&1 || return 1
             ;;
         *) return 1 ;;

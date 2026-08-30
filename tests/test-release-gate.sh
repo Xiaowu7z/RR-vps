@@ -140,6 +140,40 @@ for slot, (start_marker, end_marker) in job_ranges.items():
     job = vps[start:end]
     assert f"RR_{slot}_HOST_KEY: {pinned_keys[slot]}" in job
     assert 'printf \'%s %s %s\\n\' "$host" "$host_key_type" "$host_key_data" > "$known_hosts"' in job
+b_start, b_end = job_ranges["B"]
+b_job = vps[vps.index(b_start):vps.index(b_end, vps.index(b_start))]
+for fragment in (
+    "[ -e /etc/rr-nexus ]",
+    "[ -e /var/lib/rr-nexus ]",
+    "systemctl list-unit-files rr-nexus.service --no-legend",
+    "test ! -e /etc/rr-nexus",
+    "test ! -e /var/lib/rr-nexus",
+    'systemctl show -p LoadState --value rr-nexus.service',
+):
+    assert fragment in b_job
+for fragment in (
+    "run_old_install_deps() {",
+    "attempt <= 30",
+    "Could not get lock|Unable to acquire.*lock|held by process|is another process using",
+    "sleep 10",
+    "return 75",
+):
+    assert fragment in b_job
+assert b_job.count("run_old_install_deps") == 2
+assert "SELECT COUNT(*) FROM devices;" in b_job
+assert 'all(.[]; test("^dev_[a-f0-9]{12}$"))' in b_job
+nexus_names = b_job.index("            nexus_traffic_user_names")
+nexus_assert_start = b_job.rfind("          bash -c '\n", 0, nexus_names)
+nexus_assert_end = b_job.index("\n          '\n", nexus_names)
+nexus_assert = b_job[nexus_assert_start:nexus_assert_end]
+assert "set -eo pipefail" in nexus_assert
+assert "nexus_traffic_user_names" in nexus_assert and "| jq -e" in nexus_assert
+c_start, c_end = job_ranges["C"]
+c_job = vps[vps.index(c_start):vps.index(c_end, vps.index(c_start))]
+assert "printf '%s\\n' 0 '' '' '' | bash -c" in c_job
+assert 'ufw allow "$ssh_control_port/tcp"' in vps
+assert 'ufw --force allow' not in vps
+assert 'ufw --force enable' in vps
 migration_start = vps.index("  cross-machine-migration-scale:\n")
 gate_start = vps.index("  vps-gate:\n", migration_start)
 migration = vps[migration_start:gate_start]

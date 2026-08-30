@@ -1891,8 +1891,8 @@ PY
     )
     [ "${#arguments[@]}" -ge 4 ] && [ "${arguments[0]}" = ufw ] || return 1
     case "$operation" in
-        add) ufw --force "${arguments[@]:1}" >/dev/null 2>&1 ;;
-        delete) ufw --force delete "${arguments[@]:1}" >/dev/null 2>&1 ;;
+        add) ufw "${arguments[@]:1}" >/dev/null 2>&1 ;;
+        delete) ufw delete "${arguments[@]:1}" >/dev/null 2>&1 ;;
         *) return 1 ;;
     esac
 }

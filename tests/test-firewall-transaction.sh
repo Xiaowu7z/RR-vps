@@ -120,7 +120,9 @@ setup_ufw_mock() {
             done < "$MOCK_UFW_RULES"
             return 0
         fi
-        [ "${1:-}" = --force ] && shift
+        # Real UFW rejects --force for allow/deny/delete rule operations.
+        # Keep the mock strict so regressions cannot pass only in CI.
+        [ "${1:-}" != --force ] || return 2
         operation=add
         if [ "${1:-}" = delete ]; then operation=delete; shift; fi
         action="${1:-}"; rule="${2:-}"
