@@ -193,6 +193,18 @@ jobs:
           fi
           printf 'B_STAGE class=%s\n' "$stage"
 
+          for entry in \
+            pre710_rollback:/root/rr-audit-pre710-uninstall-rollback.log \
+            legacy_uninstall:/root/rr-audit-710-uninstall.log; do
+            label=${entry%%:*}
+            path=${entry#*:}
+            if [ -f "$path" ] && [ ! -L "$path" ]; then
+              printf 'B_PHASE_LOG name=%s state=present\n' "$label"
+            else
+              printf 'B_PHASE_LOG name=%s state=absent\n' "$label"
+            fi
+          done
+
           runtime=absent
           if [ -x /usr/local/bin/rr ]; then
             if /usr/local/bin/rr --version 2>/dev/null | grep -Fq 'RR-vps 7.1.1'; then
@@ -207,6 +219,45 @@ jobs:
           classify_unit nexus rr-nexus.service
           classify_unit nginx nginx.service
           classify_unit quarantine rr-subscription-quarantine.service
+          classify_unit health_timer argo-rr-health.timer
+          classify_unit health_service argo-rr-health.service
+          classify_unit recovery rr-update-recovery.service
+
+          recovery=unavailable
+          quarantine=unavailable
+          if [ -x /usr/local/sbin/rr-update-recover ] && command -v jq >/dev/null; then
+            set +e
+            status_json=$(timeout 10 /usr/local/sbin/rr-update-recover status 2>/dev/null)
+            status_rc=$?
+            set -e
+            if [ "$status_rc" -eq 0 ] && jq -e 'type == "object"' \
+              <<<"$status_json" >/dev/null 2>&1; then
+              if jq -e '.active == false' <<<"$status_json" >/dev/null 2>&1; then
+                recovery=inactive
+              elif jq -e '.active == true' <<<"$status_json" >/dev/null 2>&1; then
+                recovery=active
+              else
+                recovery=invalid
+              fi
+              if jq -e '.subscription_quarantine.active == false' \
+                <<<"$status_json" >/dev/null 2>&1; then
+                quarantine=inactive
+              elif jq -e '.subscription_quarantine.active == true and .subscription_quarantine.state == "quarantined"' \
+                <<<"$status_json" >/dev/null 2>&1; then
+                quarantine=quarantined
+              elif jq -e '.subscription_quarantine.active == true' \
+                <<<"$status_json" >/dev/null 2>&1; then
+                quarantine=active_other
+              else
+                quarantine=invalid
+              fi
+            else
+              recovery=probe_error
+              quarantine=probe_error
+            fi
+          fi
+          printf 'B_RECOVERY class=%s\n' "$recovery"
+          printf 'B_QUARANTINE class=%s\n' "$quarantine"
 
           if ss -H -ltn 'sport = :10443' 2>/dev/null | grep -q .; then
             printf 'B_LISTEN_10443 state=present\n'
