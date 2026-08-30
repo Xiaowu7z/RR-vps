@@ -1,4 +1,4 @@
-name: A migration fixed-output diagnostic
+name: A health-freeze normalization diagnostic
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  diagnose-a-migration:
+  diagnose-a-freeze:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
 
-      - name: Classify source-side migration residue
+      - name: Verify failed oneshot can be normalized and frozen
         shell: bash
         env:
           RR_A_HOST: ${{ secrets.RR_A_HOST }}
@@ -39,128 +39,38 @@ jobs:
             -o UserKnownHostsFile="$known_hosts"
           )
           sshpass -e ssh "${ssh_opts[@]}" "root@$RR_A_HOST" bash -s             2>/dev/null <<'REMOTE'
-          set -u
+          set -euo pipefail
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-
-          classify_unit() {
-            local label="$1" unit="$2" load="" active="" enabled=""
-            load=$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)
-            active=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null || true)
-            enabled=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null || true)
-            if [ "$load:$active:$enabled" = loaded:active:enabled ]; then
-              printf 'A_DIAG_UNIT name=%s class=loaded_active_enabled\n' "$label"
-            elif [ "$load:$active:$enabled" = loaded:inactive:enabled ]; then
-              printf 'A_DIAG_UNIT name=%s class=loaded_inactive_enabled\n' "$label"
-            elif [ "$load:$active:$enabled" = loaded:inactive:static ]; then
-              printf 'A_DIAG_UNIT name=%s class=loaded_inactive_static\n' "$label"
-            elif [ "$active" = failed ]; then
-              printf 'A_DIAG_UNIT name=%s class=failed\n' "$label"
-            elif [ "$active" = active ]; then
-              printf 'A_DIAG_UNIT name=%s class=active_other\n' "$label"
-            else
-              printf 'A_DIAG_UNIT name=%s class=other\n' "$label"
+          resume_timer=true
+          finish_probe() {
+            rc=$?
+            trap - EXIT
+            if [ "$resume_timer" = true ]; then
+              systemctl start argo-rr-health.timer >/dev/null 2>&1 || rc=1
             fi
+            exit "$rc"
           }
+          trap finish_probe EXIT
 
-          classify_log() {
-            local path=/root/rr-audit-cross-backup.log class=unclassified_nonempty
-            if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-              class=missing
-            elif [ ! -f "$path" ] || [ -L "$path" ]; then
-              class=unsafe_type
-            elif [ ! -s "$path" ]; then
-              class=empty
-            elif grep -Fq '加密备份已生成' "$path"; then
-              class=success
-            elif grep -Fq '另一个更新、备份恢复或迁移事务正在运行' "$path"; then
-              class=lock_busy
-            elif grep -Fq '无法安装加密备份所需组件' "$path"; then
-              class=dependency_failure
-            elif grep -Fq '备份工作目录的所有者、权限或路径不安全' "$path"; then
-              class=unsafe_workdir
-            elif grep -Fq '当前没有完整的 RR-vps 安装' "$path"; then
-              class=incomplete_install
-            elif grep -Fq '备份目标已存在' "$path"; then
-              class=target_exists
-            elif grep -Fq '备份源中包含不支持的链接或特殊文件' "$path"; then
-              class=unsupported_source
-            elif grep -Fq '无法从当前固定 Argo 服务提取 Token' "$path"; then
-              class=fixed_tunnel_token
-            elif grep -Fq '检测到非标准 RR 自动更新 cron' "$path"; then
-              class=nonstandard_cron
-            elif grep -Fq 'Nexus 已配置但数据库缺失或为空' "$path"; then
-              class=nexus_database_missing
-            elif grep -Fq 'backup source member exceeds its size limit' "$path"; then
-              class=member_size_limit
-            elif grep -Fq 'backup source contains a link or special file' "$path"; then
-              class=preflight_unsafe_source
-            elif grep -Fq 'backup source has too many members' "$path"; then
-              class=member_count_limit
-            elif grep -Fq 'backup source exceeds the expanded-size limit' "$path"; then
-              class=expanded_size_limit
-            elif grep -Fq 'insufficient free space to create and encrypt backup' "$path"; then
-              class=free_space
-            elif grep -Fq 'Traceback (most recent call last)' "$path"; then
-              class=python_exception
-            fi
-            printf 'A_DIAG_BACKUP_LOG class=%s\n' "$class"
-          }
+          test "$(systemctl show -p LoadState --value argo-rr-health.timer)" = loaded
+          test "$(systemctl show -p ActiveState --value argo-rr-health.timer)" = active
+          test "$(systemctl show -p UnitFileState --value argo-rr-health.timer)" = enabled
+          test "$(systemctl show -p LoadState --value argo-rr-health.service)" = loaded
+          test "$(systemctl show -p UnitFileState --value argo-rr-health.service)" = static
 
-          classify_unit health_timer argo-rr-health.timer
-          classify_unit health_service argo-rr-health.service
-          classify_unit nexus rr-nexus.service
-          classify_log
+          systemctl stop argo-rr-health.timer
+          systemctl stop argo-rr-health.service
+          systemctl reset-failed argo-rr-health.service
+          test "$(systemctl show -p ActiveState --value argo-rr-health.timer)" = inactive
+          test "$(systemctl show -p UnitFileState --value argo-rr-health.timer)" = enabled
+          test "$(systemctl show -p ActiveState --value argo-rr-health.service)" = inactive
+          test "$(systemctl show -p UnitFileState --value argo-rr-health.service)" = static
+          printf 'A_FREEZE_NORMALIZATION class=strict_inactive\n'
 
-          config_class=other
-          if [ -f /etc/argo_vmess.conf ] && [ ! -L /etc/argo_vmess.conf ]; then
-            if [ "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf 2>/dev/null)" -eq 1 ]; then
-              config_class=naive_true
-            elif [ "$(grep -c '^NAIVE_ENABLED=false$' /etc/argo_vmess.conf 2>/dev/null)" -eq 1 ]; then
-              config_class=naive_false
-            fi
-          fi
-          printf 'A_DIAG_CONFIG class=%s\n' "$config_class"
-
-          for entry in source_config:/root/rr-audit-cross-source-config                        backup_archive:/root/rr-audit-cross.rrbak                        fingerprint:/root/rr-audit-cross-fingerprint.json; do
-            label=${entry%%:*}
-            path=${entry#*:}
-            if [ -e "$path" ] || [ -L "$path" ]; then
-              printf 'A_DIAG_PATH name=%s class=present\n' "$label"
-            else
-              printf 'A_DIAG_PATH name=%s class=absent\n' "$label"
-            fi
-          done
-
-          db_class=invalid
-          if [ "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;' 2>/dev/null)" = ok ] &&
-             [ -z "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA foreign_key_check;' 2>/dev/null)" ]; then
-            if [ "$(sqlite3 /var/lib/rr-nexus/nexus.db 'SELECT COUNT(*) FROM devices;' 2>/dev/null)" -eq 500 ]; then
-              db_class=valid_500
-            else
-              db_class=valid_other_count
-            fi
-          fi
-          printf 'A_DIAG_DATABASE class=%s\n' "$db_class"
-
-          lock_class=runtime_unavailable
-          if [ -d /usr/local/lib/rr/modules ]; then
-            set +e
-            bash -c '
-              set -o pipefail
-              for module_file in /usr/local/lib/rr/modules/*.sh; do
-                source "$module_file"
-              done
-              rr_run_with_update_locks direct 0 true
-            ' >/dev/null 2>&1
-            lock_rc=$?
-            set -e
-            case "$lock_rc" in
-              0) lock_class=available ;;
-              75) lock_class=busy ;;
-              76) lock_class=unsafe ;;
-              *) lock_class=other ;;
-            esac
-          fi
-          printf 'A_DIAG_UPDATE_LOCK class=%s\n' "$lock_class"
+          systemctl start argo-rr-health.timer
+          resume_timer=false
+          test "$(systemctl show -p ActiveState --value argo-rr-health.timer)" = active
+          test "$(systemctl show -p UnitFileState --value argo-rr-health.timer)" = enabled
+          printf 'A_FREEZE_RESUME class=active_enabled\n'
           REMOTE
           unset SSHPASS
