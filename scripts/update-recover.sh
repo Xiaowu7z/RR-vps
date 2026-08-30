@@ -619,11 +619,51 @@ rr_finalize_committed_candidate() {
     rr_run_delegated_without_lock_fds 60 "$RR_LAUNCHER" --post-update-finalize
 }
 
+rr_resume_subscription_from_recovery_service() {
+    local transient_unit="" attempt=0
+    command -v systemd-run >/dev/null 2>&1 || return 1
+    transient_unit="rr-subscription-recovery-$$-${RANDOM}.scope"
+    # A worker forked directly by rr-update-recovery.service remains in that
+    # oneshot unit's cgroup and is killed when the recovery service exits.  A
+    # transient scope moves the launcher and its worker into a separate cgroup,
+    # while preserving the caller's environment and umask.  The scope remains
+    # active for the worker's lifetime and --collect retires it automatically
+    # after a later refresh or uninstall stops that worker.  Unlike a forking
+    # service, the scope never owns or removes the application's shared PID file.
+    if ! rr_run_delegated_without_lock_fds 30 systemd-run \
+        --quiet --scope --collect --unit="$transient_unit" -- \
+        "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1; then
+        systemctl stop "$transient_unit" >/dev/null 2>&1 || true
+        return 1
+    fi
+    while [ "$attempt" -lt 50 ]; do
+        if systemctl is-active --quiet "$transient_unit" >/dev/null 2>&1 && \
+           rr_subscription_running; then
+            return 0
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    systemctl stop "$transient_unit" >/dev/null 2>&1 || true
+    return 1
+}
+
 rr_resume_subscription_bounded() {
-    if [ ! -f "$RR_LAUNCHER" ] || [ ! -x "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ] ||
-       ! rr_run_delegated_without_lock_fds 30 \
-           "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1 ||
-       ! rr_subscription_running; then
+    local status=0
+    if [ ! -f "$RR_LAUNCHER" ] || [ ! -x "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ]; then
+        rr_stop_subscription_servers >/dev/null 2>&1 || true
+        return 1
+    fi
+    if [ "${RR_UPDATE_RECOVERY_SERVICE:-0}" = 1 ]; then
+        rr_stop_subscription_servers || status=$?
+        if [ "$status" -eq 0 ]; then
+            rr_resume_subscription_from_recovery_service || status=$?
+        fi
+    else
+        rr_run_delegated_without_lock_fds 30 \
+            "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1 || status=$?
+    fi
+    if [ "$status" -ne 0 ] || ! rr_subscription_running; then
         rr_stop_subscription_servers >/dev/null 2>&1 || true
         return 1
     fi

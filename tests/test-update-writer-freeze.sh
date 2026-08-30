@@ -1373,6 +1373,70 @@ printf '%s\n' '[12/15] recorded subscription state resumes through the narrow bo
     [ -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] &&
         [ ! -e "$RR_TEST_SUBSCRIPTION_RUNNING" ] ||
         fail 'a partial subscription refresh left its managed worker alive'
+
+    rm -f -- "$RR_TEST_REFRESH_LOG" "$RR_TEST_SUBSCRIPTION_RUNNING" \
+        "$RR_TEST_SUBSCRIPTION_STOPPED"
+    mock_bin="$TEST_ROOT/subscription-resume/bin"
+    systemd_run_log="$TEST_ROOT/subscription-resume/systemd-run.log"
+    mkdir -p "$mock_bin"
+    printf '%s\n' '#!/bin/bash' \
+        'printf "%s\n" "$*" > "$RR_TEST_SYSTEMD_RUN_LOG"' \
+        'while [ "$#" -gt 0 ]; do' \
+        '  if [ "$1" = -- ]; then shift; break; fi' \
+        '  shift' \
+        'done' \
+        '[ "$#" -gt 0 ] || exit 64' \
+        'exec "$@"' > "$mock_bin/systemd-run"
+    chmod 700 "$mock_bin/systemd-run"
+    export PATH="$mock_bin:$PATH"
+    export RR_TEST_SYSTEMD_RUN_LOG="$systemd_run_log"
+    export RR_TEST_REFRESH_RESULT=success
+    export RR_UPDATE_RECOVERY_SERVICE=1
+    systemctl() {
+        [ "${1:-}:${2:-}" = is-active:--quiet ]
+    }
+    rr_restore_recorded_writer_state "$backup" normal ||
+        fail 'systemd recovery did not resume subscription outside its oneshot cgroup'
+    grep -Fq -- '--collect' "$systemd_run_log" &&
+        grep -Fq -- '--scope' "$systemd_run_log" &&
+        grep -Eq -- '--unit=rr-subscription-recovery-[0-9]+-[0-9]+\.scope([[:space:]]|$)' \
+            "$systemd_run_log" &&
+        grep -Fq -- "$RR_LAUNCHER --refresh-subscription" "$systemd_run_log" ||
+        fail 'systemd recovery did not create the bounded subscription scope'
+    if grep -Fq -- 'PIDFile=' "$systemd_run_log"; then
+        fail 'subscription scope delegated ownership of the shared application PID file to systemd'
+    fi
+    [ "$(cat "$RR_TEST_REFRESH_LOG")" = '1|--refresh-subscription' ] &&
+        [ -e "$RR_TEST_SUBSCRIPTION_RUNNING" ] &&
+        [ -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] ||
+        fail 'transient subscription scope lost delegated refresh state'
+
+    rm -f -- "$RR_TEST_SUBSCRIPTION_RUNNING" "$RR_TEST_SUBSCRIPTION_STOPPED"
+    inactive_stop_log="$TEST_ROOT/subscription-resume/inactive-scope-stop.log"
+    systemctl() {
+        case "${1:-}:${2:-}" in
+            is-active:--quiet) return 1 ;;
+            stop:rr-subscription-recovery-*.scope)
+                printf '%s\n' "$2" > "$inactive_stop_log"
+                return 0
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    sleep() { :; }
+    if rr_restore_recorded_writer_state "$backup" normal; then
+        fail 'an inactive subscription scope was accepted as durable recovery'
+    fi
+    unset -f sleep
+    grep -Eq '^rr-subscription-recovery-[0-9]+-[0-9]+\.scope$' \
+        "$inactive_stop_log" &&
+        [ -e "$RR_TEST_SUBSCRIPTION_STOPPED" ] &&
+        [ ! -e "$RR_TEST_SUBSCRIPTION_RUNNING" ] ||
+        fail 'inactive subscription scope did not converge to the stopped failure state'
+    grep -Fq 'Environment=RR_UPDATE_RECOVERY_SERVICE=1' \
+        "$REPO_ROOT/scripts/install-core.sh" &&
+        grep -Fq 'UMask=0077' "$REPO_ROOT/scripts/install-core.sh" ||
+        fail 'installed recovery unit does not select the cgroup-safe resume path'
 )
 
 printf '%s\n' '[13/15] recovery bridges legacy locks and delegates both flock descriptors safely'
