@@ -156,8 +156,8 @@ done
 
 extract_rr_function() {
     local name="$1"
-    awk -v signature="^${name}\\(\\) \\{" '
-        $0 ~ signature { capture = 1 }
+    awk -v signature="${name}() {" '
+        $0 == signature { capture = 1 }
         capture { print }
         capture && /^}$/ { exit }
     ' "$REPO_ROOT/rr"
@@ -191,6 +191,8 @@ RR_CERT_RELOAD_READONLY_SYSTEMCTL_BIN="$native_systemctl"
 export RR_PENDING_NATIVE_LOG RR_CERT_RELOAD_NGINX_BIN \
     RR_CERT_RELOAD_READONLY_SYSTEMCTL_BIN
 eval "$(extract_rr_function rr_certificate_nginx_service_control)"
+declare -F rr_certificate_nginx_service_control >/dev/null || \
+    fail 'RR Nginx adapter extraction failed'
 RR_CERT_RELOAD_SYSTEMCTL_BIN=rr_certificate_nginx_service_control
 printf '%s\n' \
     '{"mode":"public","domain":"panel.example.test","public_port":20443}' \
