@@ -218,7 +218,11 @@ jobs:
             rr-restore-watchdog.service rr-subscription-quarantine.service \
             rr-nexus.service rr-subscription.service sing-box.service \
             rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
-            argo-rr-health.timer argo-rr-health.service; do
+            argo-rr-health.timer argo-rr-health.service \
+            cloudflared.service rr-firewall-quarantine-guard.service \
+            rr-firewall-quarantine-guard.path \
+            rr-firewall-quarantine-guard.timer \
+            netfilter-persistent.service; do
             load=$(safe_unit_value "$unit" LoadState)
             active=$(safe_unit_value "$unit" ActiveState)
             enabled=$(safe_unit_value "$unit" UnitFileState)
@@ -745,15 +749,23 @@ jobs:
           rr_audit_prepare_ephemeral_firewall_reboot() {
             local load_state="" active_state="" file_state=""
             local unit=""
+            reboot_gate=role-rejected
             case "$role" in A|C) ;; *) return 1 ;; esac
+            reboot_gate=ufw-not-installed
             dpkg-query -W -f='${db:Status-Abbrev}' ufw 2>/dev/null | \
               grep -q '^ii' || return 1
+            reboot_gate=persistence-present
             ! rr_firewall_persistence_backend_available || return 1
+            reboot_gate=quarantine-inactive
             rr_firewall_fail_closed_quarantine_active || return 1
+            reboot_gate=quarantine-unowned
             rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
+            reboot_gate=supervisor-unsettled
             rr_audit_quarantine_supervisor_is_settled || return 1
+            reboot_gate=restore-active
             rr_audit_path_absent /var/lib/rr-backup/active || return 1
             rr_audit_path_absent /run/rr-vps/restore-live || return 1
+            reboot_gate=managed-unit-present
             for unit in rr-restore-recovery.service rr-restore-watchdog.service \
               rr-nexus.service rr-subscription.service sing-box.service \
               argo-rr-health.service argo-rr-health.timer \
@@ -761,7 +773,9 @@ jobs:
               cloudflared.service; do
               rr_audit_unit_absent "$unit" || return 1
             done
+            reboot_gate=recovery-unowned
             rr_update_recovery_unit_is_owned || return 1
+            reboot_gate=recovery-not-ready
             load_state=$(systemctl show rr-update-recovery.service \
               --property=LoadState --value 2>/dev/null) || return 1
             active_state=$(systemctl show rr-update-recovery.service \
@@ -770,14 +784,18 @@ jobs:
               --property=UnitFileState --value 2>/dev/null) || return 1
             [ "$load_state:$active_state:$file_state" = loaded:inactive:enabled ] || \
               return 1
+            reboot_gate=runtime-present
             [ "$(rr_audit_callable_state subscription_server_running)" = absent ] || \
               return 1
             [ "$(rr_audit_callable_state managed_singbox_running)" = absent ] || \
               return 1
             [ "$(rr_audit_cloudflared_state)" = absent ] || return 1
+            reboot_gate=disable-failed
             systemctl disable --now rr-update-recovery.service \
               >>"$recovery_log" 2>&1 || return 1
+            reboot_gate=recovery-unowned-post
             rr_update_recovery_unit_is_owned || return 1
+            reboot_gate=recovery-not-disabled
             load_state=$(systemctl show rr-update-recovery.service \
               --property=LoadState --value 2>/dev/null) || return 1
             active_state=$(systemctl show rr-update-recovery.service \
@@ -786,6 +804,7 @@ jobs:
               --property=UnitFileState --value 2>/dev/null) || return 1
             [ "$load_state:$active_state:$file_state" = loaded:inactive:disabled ] || \
               return 1
+            reboot_gate=postcheck-failed
             rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
             rr_firewall_fail_closed_quarantine_active || return 1
             rr_audit_quarantine_supervisor_is_settled || return 1
@@ -803,11 +822,13 @@ jobs:
             [ "$(rr_audit_callable_state managed_singbox_running)" = absent ] || \
               return 1
             [ "$(rr_audit_cloudflared_state)" = absent ] || return 1
+            reboot_gate=sync-failed
             sync -f /etc/systemd/system/rr-update-recovery.service || return 1
             sync -f /etc/systemd/system || return 1
             sync -f /var/lib/rr-update/active || return 1
             sync -f /var/lib/rr-vps/firewall-quarantine || return 1
             sync -f /var/lib/rr-vps || return 1
+            reboot_gate=prepared
           }
           rr_audit_publish_legacy_update_bridge() {
             local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" parent="" canonical=""
@@ -950,6 +971,11 @@ jobs:
           live_raw=not-probed
           reboot_state=not-needed
           reboot_required=false
+          if [ "$role" = B ]; then
+            reboot_gate=not-applicable
+          else
+            reboot_gate=not-invoked
+          fi
           external_helper_cleanup=not-applicable
           hook_remediation=not-run
           orphan_state=not-run
@@ -967,6 +993,7 @@ jobs:
             legacy_lock_state=$?
             if [ "$legacy_lock_state" -ne 0 ]; then
               remediation_failed=true
+              reboot_gate=legacy-lock-rejected
               case "$legacy_lock_state" in
                 75) uninstall_state=lock-busy ;;
                 *) uninstall_state=lock-unsafe ;;
@@ -1085,6 +1112,7 @@ jobs:
           if [ -f "$callback_marker" ]; then callback_entered=yes; fi
           if [ "$callback_entered" = no ]; then
             remediation_failed=true
+            if [ "$role" != B ]; then reboot_gate=update-lock-rejected; fi
             firewall_repair=not-run
             live_raw=not-probed
             reboot_state=not-needed
@@ -1117,6 +1145,8 @@ jobs:
             "$diag_nonce" "$role" "$live_raw"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
+          printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
+            "$diag_nonce" "$role" "$reboot_gate"
           printf 'SAFE_DIAG nonce=%s role=%s external_helper_cleanup=%s\n' \
             "$diag_nonce" "$role" "$external_helper_cleanup"
           printf 'SAFE_DIAG nonce=%s role=%s hook_remediation=%s\n' \
@@ -1182,12 +1212,13 @@ jobs:
           seen_cleanup=0
           seen_cleanup_deferred=0
           seen_reboot_prepared=0
+          seen_reboot_gate=0
           safe_prefix="SAFE_DIAG nonce=${diag_nonce} role=${TARGET_ROLE} "
           while IFS= read -r line; do
             [[ "$line" == "$safe_prefix"* ]] || continue
             payload="${line#"$safe_prefix"}"
             if [[ "$payload" =~ ^object=(launcher|runtime|config|active_tx|maintenance|restore_active|recovery_helper|external_helper|recovery_unit|launcher_after|runtime_after|config_after|active_tx_after|maintenance_after|external_helper_after)\ state=(absent|file|dir|symlink|other)$ ]] ||
-               [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-restore-recovery\.service|rr-restore-watchdog\.service|rr-subscription-quarantine\.service|rr-nexus\.service|rr-subscription\.service|sing-box\.service|rr-nexus-ip-acme\.service|rr-nexus-ip-acme\.timer|argo-rr-health\.timer|argo-rr-health\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
+               [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-restore-recovery\.service|rr-restore-watchdog\.service|rr-subscription-quarantine\.service|rr-nexus\.service|rr-subscription\.service|sing-box\.service|rr-nexus-ip-acme\.service|rr-nexus-ip-acme\.timer|argo-rr-health\.timer|argo-rr-health\.service|cloudflared\.service|rr-firewall-quarantine-guard\.service|rr-firewall-quarantine-guard\.path|rr-firewall-quarantine-guard\.timer|netfilter-persistent\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
                [[ "$payload" =~ ^ufw=(absent|installed)\ persistence=(absent|present)$ ]] ||
                [[ "$payload" =~ ^lock_probe=(available|busy|unsafe|other)$ ]] ||
                [[ "$payload" =~ ^backend=(iptables|ip6tables)\ state=(missing|ready|error)$ ]] ||
@@ -1198,6 +1229,7 @@ jobs:
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
+               [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^external_helper_cleanup=(not-applicable|not-present|not-run|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
                [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
@@ -1208,6 +1240,9 @@ jobs:
               safe_line_count=$((safe_line_count + 1))
               if [ "$payload" = reboot=prepared ]; then
                 seen_reboot_prepared=1
+              fi
+              if [[ "$payload" =~ ^reboot_gate= ]]; then
+                seen_reboot_gate=$((seen_reboot_gate + 1))
               fi
             elif [[ "$payload" =~ ^uninstall=(success|not-needed|not-run|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
@@ -1223,7 +1258,8 @@ jobs:
               fi
             fi
           done < "$runner_log"
-          if [ "$safe_line_count" -eq 0 ] || [ "$seen_uninstall" -ne 1 ]; then
+          if [ "$safe_line_count" -eq 0 ] || [ "$seen_uninstall" -ne 1 ] || \
+             [ "$seen_reboot_gate" -ne 1 ]; then
             printf 'SAFE_DIAG role=%s runner=remote-error-raw-suppressed\n' \
               "$TARGET_ROLE" >&2
             exit 1
