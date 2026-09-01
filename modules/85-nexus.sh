@@ -4163,7 +4163,7 @@ nexus_nginx_exec_condition_set_is_exact() {
     local gate_script="${NEXUS_IP_CERT_GATE_SCRIPT:-/usr/local/lib/rr-vps/nexus-ip-cert-gate}"
     local gate_dropin="${NEXUS_IP_CERT_GATE_DROPIN:-/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf}"
     local restore_dropin="${NEXUS_RESTORE_GATE_DROPIN:-/etc/systemd/system/nginx.service.d/zzzz-rr-restore-gate.conf}"
-    local load_state="" dropin_paths="" conditions=""
+    local load_state="" fragment_path="" dropin_paths="" conditions=""
     local expect_restore=false
     local restore_argv="/bin/sh -c '[ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate'"
     local nexus_argv="$gate_script $cert_file $key_file $pending_file"
@@ -4178,6 +4178,22 @@ nexus_nginx_exec_condition_set_is_exact() {
     fi
     load_state=$(systemctl show nginx.service --property=LoadState --value \
         2>/dev/null) || return 1
+    if [ "$load_state" = not-found ]; then
+        [ "$expect_nexus" = false ] || return 1
+        [ ! -e "$gate_script" ] && [ ! -L "$gate_script" ] && \
+            [ ! -e "$gate_dropin" ] && [ ! -L "$gate_dropin" ] || return 1
+        fragment_path=$(systemctl show nginx.service --property=FragmentPath \
+            --value 2>/dev/null) || return 1
+        dropin_paths=$(systemctl show nginx.service --property=DropInPaths --value \
+            2>/dev/null) || return 1
+        conditions=$(systemctl show nginx.service --property=ExecCondition --value \
+            2>/dev/null) || return 1
+        [ -z "$fragment_path" ] && [ -z "$dropin_paths" ] && \
+            [ -z "$conditions" ] || return 1
+        [ ! -e "$gate_script" ] && [ ! -L "$gate_script" ] && \
+            [ ! -e "$gate_dropin" ] && [ ! -L "$gate_dropin" ] || return 1
+        return 0
+    fi
     [ "$load_state" = loaded ] || return 1
     dropin_paths=$(systemctl show nginx.service --property=DropInPaths --value \
         2>/dev/null) || return 1

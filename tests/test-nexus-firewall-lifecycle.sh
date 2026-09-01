@@ -710,6 +710,76 @@ pass 'public proxy health failure compensates owned firewall and aborts install'
 pass 'first-publish SIGKILL leaves durable evidence and reboot gate blocks Nginx'
 
 (
+    case_root="$TEST_ROOT/nginx-absent-cert-gate-proof"
+    cert_file="$case_root/certs/ip.crt"
+    key_file="$case_root/certs/ip.key"
+    pending_file="$case_root/certs/.ip-cert-pending"
+    NEXUS_IP_CERT_GATE_SCRIPT="$case_root/lib/nexus-ip-cert-gate"
+    NEXUS_RESTORE_GATE_DROPIN="$case_root/systemd/zzzz-rr-restore-gate.conf"
+    NEXUS_IP_CERT_GATE_DROPIN="$case_root/systemd/zzzzzz-rr-nexus-ip-cert-gate.conf"
+    NGINX_LOAD_STATE=not-found
+    NGINX_FRAGMENT_PATH=""
+    NGINX_DROPIN_PATHS=""
+    NGINX_EXEC_CONDITION=""
+    systemctl() {
+        case "$*" in
+            'show nginx.service --property=LoadState --value')
+                printf '%s\n' "$NGINX_LOAD_STATE" ;;
+            'show nginx.service --property=FragmentPath --value')
+                printf '%s\n' "$NGINX_FRAGMENT_PATH" ;;
+            'show nginx.service --property=DropInPaths --value')
+                printf '%s\n' "$NGINX_DROPIN_PATHS" ;;
+            'show nginx.service --property=ExecCondition --value')
+                printf '%s\n' "$NGINX_EXEC_CONDITION" ;;
+            *) return 1 ;;
+        esac
+    }
+    nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false ||
+        fail 'an absent Nginx unit with empty effective state was rejected'
+
+    NGINX_FRAGMENT_PATH=/usr/lib/systemd/system/nginx.service
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an absent Nginx unit retained a fragment path'
+    fi
+    NGINX_FRAGMENT_PATH=""
+    NGINX_DROPIN_PATHS=/etc/systemd/system/nginx.service.d/foreign.conf
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an absent Nginx unit retained a drop-in path'
+    fi
+    NGINX_DROPIN_PATHS=""
+    NGINX_EXEC_CONDITION='{ path=/usr/bin/false ; argv[]=/usr/bin/false ; ignore_errors=no ; }'
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an absent Nginx unit retained a compiled ExecCondition'
+    fi
+    NGINX_EXEC_CONDITION=""
+    NGINX_LOAD_STATE=masked
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an empty but non-absent/non-loaded Nginx state was accepted'
+    fi
+    NGINX_LOAD_STATE=not-found
+
+    mkdir -p "$(dirname "$NEXUS_IP_CERT_GATE_SCRIPT")" \
+        "$(dirname "$NEXUS_IP_CERT_GATE_DROPIN")"
+    printf '%s\n' residual > "$NEXUS_IP_CERT_GATE_SCRIPT"
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an absent Nginx unit bypassed a residual gate script'
+    fi
+    unlink "$NEXUS_IP_CERT_GATE_SCRIPT"
+    printf '%s\n' residual > "$NEXUS_IP_CERT_GATE_DROPIN"
+    if nexus_nginx_exec_condition_set_is_exact "$cert_file" "$key_file" \
+        "$pending_file" false; then
+        fail 'an absent Nginx unit bypassed a residual gate drop-in'
+    fi
+)
+pass 'absent Nginx gate proof requires empty compiled state and no gate artifacts'
+
+(
     reset_firewall_mock
     case_root="$TEST_ROOT/ip-cert-second-rename"
     NEXUS_NGINX_AVAILABLE_DIR="$case_root/sites-available"

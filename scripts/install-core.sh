@@ -54,8 +54,10 @@ RR_IP_ACME_WAS_PRESENT=false
 RR_IP_ACME_WAS_READY=false
 RR_IP_ACME_TIMER_WAS_ACTIVE=false
 RR_IP_ACME_TIMER_WAS_ENABLED=false
+RR_CONFIG_FILE="/etc/argo_vmess.conf"
 RR_IP_ACME_STATE_ROOT="/var/lib/rr-nexus/ip-acme"
 RR_IP_ACME_WEBROOT="/var/www/rr-nexus-ip-acme"
+RR_HEALTH_SERVICE_FILE="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
 RR_HEALTH_TIMER_FILE="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
 RR_UPDATE_SYSTEMD_DIR="${RR_UPDATE_SYSTEMD_DIR:-/etc/systemd/system}"
 RR_UPDATE_RECOVERY_UNIT_FILE="${RR_UPDATE_RECOVERY_UNIT_FILE:-${RR_UPDATE_SYSTEMD_DIR}/rr-update-recovery.service}"
@@ -1620,17 +1622,52 @@ rr_restore_update_writer_state() {
     RR_HEALTH_MONITOR_FROZEN=false
 }
 
+rr_health_units_are_strictly_absent() {
+    local unit="" load_state="" active_state="" unit_file_state=""
+    [ ! -e "$RR_HEALTH_SERVICE_FILE" ] && \
+        [ ! -L "$RR_HEALTH_SERVICE_FILE" ] && \
+        [ ! -e "$RR_HEALTH_TIMER_FILE" ] && \
+        [ ! -L "$RR_HEALTH_TIMER_FILE" ] || return 1
+    for unit in argo-rr-health.service argo-rr-health.timer; do
+        load_state=$(systemctl show --property=LoadState --value \
+            "$unit" 2>/dev/null) || return 1
+        active_state=$(systemctl show --property=ActiveState --value \
+            "$unit" 2>/dev/null) || return 1
+        unit_file_state=$(systemctl show --property=UnitFileState --value \
+            "$unit" 2>/dev/null) || return 1
+        # systemd versions in the supported OS matrix may expose an empty
+        # UnitFileState for a unit whose LoadState is already proven absent.
+        # Normalize only that exact combination; loaded/masked units and every
+        # non-empty state still have to match the strict absent tuple below.
+        if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+            unit_file_state=not-found
+        fi
+        [ "$load_state:$active_state:$unit_file_state" = \
+          not-found:inactive:not-found ] || return 1
+    done
+}
+
 rr_verify_update_writer_state() {
     local backup="${1:-$BACKUP_DIR}" unit="" active_marker="" enabled_marker=""
     # The candidate launcher owns the canonical renderer and validates
     # systemd's compiled FragmentPath/ExecStart/conditions/timer schedule.
     # Active/enabled state alone can otherwise bless an old timer after only
     # one of the two unit files was replaced.
-    [ -f "$RR_HEALTH_SERVICE_FILE" ] && [ ! -L "$RR_HEALTH_SERVICE_FILE" ] && \
-        [ -f "$RR_HEALTH_TIMER_FILE" ] && [ ! -L "$RR_HEALTH_TIMER_FILE" ] || \
-        return 1
-    rr_run_with_delegated_update_lock "$RR_LAUNCHER" \
-        --verify-health-unit-definitions || return 1
+    if [ ! -e "$RR_CONFIG_FILE" ] && [ ! -L "$RR_CONFIG_FILE" ]; then
+        # A runtime can be installed before the operator creates any node
+        # configuration. Its first and later script-only updates deliberately
+        # have no health units. Accept only complete on-disk and compiled
+        # absence; a stale unit or dangling path must never be normalized into
+        # the clean-host state.
+        rr_health_units_are_strictly_absent || return 1
+    else
+        [ -f "$RR_HEALTH_SERVICE_FILE" ] && \
+            [ ! -L "$RR_HEALTH_SERVICE_FILE" ] && \
+            [ -f "$RR_HEALTH_TIMER_FILE" ] && \
+            [ ! -L "$RR_HEALTH_TIMER_FILE" ] || return 1
+        rr_run_with_delegated_update_lock "$RR_LAUNCHER" \
+            --verify-health-unit-definitions || return 1
+    fi
     for unit in sing-box rr-nexus argo-rr-health.timer; do
         case "$unit" in
             sing-box) active_marker=singbox_was_running; enabled_marker=singbox_was_enabled ;;
@@ -3188,7 +3225,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "a6873ce56d4d6a4095adbcb3e024e256e897ea7beeab504144c8e0f8d6826784" ] && \
+        if [ "$actual" = "dd1461c50b309e52103db9c84c3d0ad0ed3244759ec813af0319d13064b74ed8" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
