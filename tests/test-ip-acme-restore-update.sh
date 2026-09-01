@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 INSTALLER="$REPO_ROOT/scripts/install-core.sh"
 RESTORE="$REPO_ROOT/modules/55-resilience.sh"
+NEXUS="$REPO_ROOT/modules/85-nexus.sh"
 EXTERNAL="$REPO_ROOT/scripts/update-external-state.py"
 IP_ACME_CORE="$REPO_ROOT/modules/86-nexus-ip-acme.sh"
 TEST_ROOT=$(mktemp -d /root/rr-ip-acme-restore-update.XXXXXX)
@@ -19,7 +20,7 @@ fail() {
     exit 1
 }
 
-bash -n "$INSTALLER" "$RESTORE"
+bash -n "$INSTALLER" "$RESTORE" "$NEXUS"
 python3 -m py_compile "$EXTERNAL"
 pass 'edited restore/update programs parse'
 
@@ -400,6 +401,69 @@ pass 'portable target capture enforces the exact legacy cert/gate matrix'
 pass 'Nginx restore preserves existing directory modes and safely creates only missing dirs'
 
 (
+    # Force the production compatibility branch through a cp shim that models
+    # the older Debian/Ubuntu parser: valued --update is rejected while
+    # --no-clobber and -T are accepted and delegated to the host cp.
+    copy_root="$TEST_ROOT/nginx-copy-noreplace"
+    mock_bin="$copy_root/bin"
+    mkdir -p "$mock_bin" "$copy_root/live"
+    real_cp=$(command -v cp)
+    cat > "$mock_bin/cp" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+saw_no_clobber=false
+saw_no_target_directory=false
+for argument in "$@"; do
+    case "$argument" in
+        --update=*) exit 64 ;;
+        --no-clobber) saw_no_clobber=true ;;
+        -T) saw_no_target_directory=true ;;
+    esac
+done
+[ "$saw_no_clobber" = true ] && [ "$saw_no_target_directory" = true ] || exit 65
+printf '%s\n' "$*" >> "$RR_TEST_CP_CALLS"
+if [ -n "${RR_TEST_CP_COLLISION_TARGET:-}" ]; then
+    mkdir -m 755 -- "$RR_TEST_CP_COLLISION_TARGET"
+fi
+exec "$RR_TEST_REAL_CP" "$@" 2>/dev/null
+EOF
+    chmod 755 "$mock_bin/cp"
+    # shellcheck disable=SC1090
+    RR_LIB_DIR="$REPO_ROOT"
+    RR_REPOSITORY=Xiaowu7z/RR-vps
+    source "$NEXUS"
+    export RR_TEST_REAL_CP="$real_cp"
+    export RR_TEST_CP_CALLS="$copy_root/cp.calls"
+    PATH="$mock_bin:$PATH"
+    export PATH
+
+    snapshot="$copy_root/snapshot"
+    target="$copy_root/live/rr-nexus.conf"
+    printf 'snapshot\n' > "$snapshot"
+    chmod 644 "$snapshot"
+    nexus_nginx_managed_path_is_fixed() { return 0; }
+    nexus_nginx_managed_directory_is_safe() { return 0; }
+    nexus_nginx_managed_path_is_owned() { return 0; }
+    nexus_nginx_restore_snapshot_path "$snapshot" "$target" || \
+        fail 'old-coreutils no-clobber fallback rejected an absent target'
+    cmp -s -- "$snapshot" "$target" || fail 'portable snapshot copy changed content'
+    grep -Fq -- '--no-clobber' "$RR_TEST_CP_CALLS" || \
+        fail 'old-coreutils fallback did not use no-clobber'
+    grep -Eq -- '(^| )-T( |$)' "$RR_TEST_CP_CALLS" || \
+        fail 'portable snapshot copy omitted no-target-directory'
+
+    collision="$copy_root/live/rr-nexus-ip.conf"
+    export RR_TEST_CP_COLLISION_TARGET="$collision"
+    if nexus_nginx_restore_snapshot_path "$snapshot" "$collision"; then
+        fail 'a directory raced into the restore target was accepted'
+    fi
+    [ -d "$collision" ] && \
+        [ ! -e "$collision/$(basename -- "$snapshot")" ] || \
+        fail 'a raced-in target directory was overwritten or populated'
+)
+pass 'Nginx snapshot copy is portable, no-clobbering, and directory-race safe'
+
+(
     # shellcheck disable=SC1090
     source "$RESTORE"
     NEXUS_CONFIG_FILE="$TEST_ROOT/nexus-firewall.json"
@@ -418,7 +482,7 @@ pass 'Nginx restore preserves existing directory modes and safely creates only m
 )
 pass 'short-lived IP ACME restore retains the TCP/80 firewall consumer'
 
-python3 - "$INSTALLER" "$RESTORE" "$IP_ACME_CORE" <<'PY'
+python3 - "$INSTALLER" "$RESTORE" "$IP_ACME_CORE" "$NEXUS" <<'PY'
 import pathlib
 import re
 import sys
@@ -426,6 +490,7 @@ import sys
 installer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 restore = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 core = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+nexus = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
 
 def function(text: str, name: str, next_name: str) -> str:
     start = text.index(name + "()")
@@ -461,6 +526,17 @@ nginx_restore = function(restore, "rr_restore_restore_nginx_files", "rr_restore_
 assert "install -d -m 755 /etc/nginx" not in nginx_restore
 assert "rr_restore_nginx_snapshot_paths_are_owned" in nginx_restore
 assert "nexus_nginx_restore_snapshot_path" in nginx_restore
+assert nginx_restore.count(
+    'nexus_nginx_copy_snapshot_noreplace "$source" "$target"'
+) == 2
+copy_noreplace = function(
+    nexus,
+    "nexus_nginx_copy_snapshot_noreplace",
+    "nexus_nginx_restore_snapshot_path",
+)
+assert "command cp --update=none --version" in copy_noreplace
+assert "command cp -a -T --update=none" in copy_noreplace
+assert "command cp -a -T --no-clobber" in copy_noreplace
 cleanup = function(installer, "rr_cleanup", "rr_fetch_release")
 assert "rr_republish_retryable_update_phase" in cleanup
 assert "rr_write_phase recovery_failed" not in cleanup

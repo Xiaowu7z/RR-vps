@@ -3695,8 +3695,16 @@ grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_RO
     scripts/install-core.sh
 grep -Fq 'if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP"; then' \
     scripts/update-recover.sh
-grep -Fq '/usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state' \
+# 完整卸载必须走捕获哈希后的精确 helper 删除路径；helper 已不再作为
+# 同一条 rm 命令的相邻参数出现，旧的相邻字符串断言会误报安全重构。
+grep -Fq 'rr_uninstall_remove_captured_runtime_helpers()' modules/95-install.sh
+grep -Fq 'local recovery_target="${RR_RECOVERY_SELF:-/usr/local/sbin/rr-update-recover}"' \
     modules/95-install.sh
+grep -Fq 'local external_target="${RR_UPDATE_EXTERNAL_HELPER:-/usr/local/sbin/rr-update-external-state}"' \
+    modules/95-install.sh
+grep -Fq 'unlink -- "$recovery_target"' modules/95-install.sh
+grep -Fq 'unlink -- "$external_target"' modules/95-install.sh
+grep -Fq 'if ! rr_uninstall_remove_captured_runtime_helpers; then' modules/95-install.sh
 grep -Fq 'systemctl restart --no-block sing-box' scripts/update-recover.sh
 grep -Fq 'systemctl start --no-block argo-rr-health.service' scripts/update-recover.sh
 grep -Fq 'rr_subscription_running' scripts/install-core.sh

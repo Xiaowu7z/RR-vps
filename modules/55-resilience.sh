@@ -6326,6 +6326,7 @@ rr_restore_restore_nginx_files() {
     local rollback="$1" source="" target="" ip_state=legacy ip_address=""
     declare -F nexus_nginx_managed_paths_are_owned >/dev/null 2>&1 && \
         declare -F nexus_nginx_unlink_owned_path >/dev/null 2>&1 && \
+        declare -F nexus_nginx_copy_snapshot_noreplace >/dev/null 2>&1 && \
         declare -F nexus_nginx_restore_snapshot_path >/dev/null 2>&1 && \
         declare -F nexus_ip_acme_parent_directory_is_safe >/dev/null 2>&1 || \
         return 1
@@ -6394,7 +6395,7 @@ rr_restore_restore_nginx_files() {
         target=/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf
         [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
         nexus_ip_acme_parent_directory_is_safe "$target" || return 1
-        cp -a --update=none -- "$source" "$target" || return 1
+        nexus_nginx_copy_snapshot_noreplace "$source" "$target" || return 1
         [ -f "$target" ] && [ ! -L "$target" ] && \
             cmp -s -- "$source" "$target" || return 1
         sync -f /etc/nginx/sites-available || return 1
@@ -6402,7 +6403,7 @@ rr_restore_restore_nginx_files() {
         target=/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf
         [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
         nexus_ip_acme_parent_directory_is_safe "$target" || return 1
-        cp -a --update=none -- "$source" "$target" || return 1
+        nexus_nginx_copy_snapshot_noreplace "$source" "$target" || return 1
         [ -L "$target" ] && [ "$(readlink -- "$target" 2>/dev/null)" = \
             /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf ] || return 1
         sync -f /etc/nginx/sites-enabled || return 1

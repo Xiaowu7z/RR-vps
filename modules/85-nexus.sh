@@ -3242,6 +3242,23 @@ nexus_nginx_snapshot_matches_path() {
     [ "$snapshot_metadata" = "$path_metadata" ] && cmp -s -- "$snapshot" "$path"
 }
 
+nexus_nginx_copy_snapshot_noreplace() {
+    # Snapshot restoration may create an absent fixed path, but must never
+    # replace a name that appears after the ownership preflight.  Older
+    # supported coreutils accepts --no-clobber but not the valued update mode;
+    # prefer the latter when supported so newer releases do not emit the
+    # --no-clobber deprecation warning.  -T also prevents a raced-in directory
+    # from being reinterpreted as a destination directory.
+    local snapshot="${1:-}" path="${2:-}"
+    [ -f "$snapshot" ] || [ -L "$snapshot" ] || return 2
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 2
+    if command cp --update=none --version >/dev/null 2>&1; then
+        command cp -a -T --update=none -- "$snapshot" "$path" || return 2
+    else
+        command cp -a -T --no-clobber -- "$snapshot" "$path" || return 2
+    fi
+}
+
 nexus_nginx_restore_snapshot_path() {
     local snapshot="${1:-}" path="${2:-}" parent=""
     nexus_nginx_managed_path_is_fixed "$path" || return 2
@@ -3249,7 +3266,7 @@ nexus_nginx_restore_snapshot_path() {
     [ ! -e "$path" ] && [ ! -L "$path" ] || return 2
     parent=$(dirname -- "$path") || return 2
     nexus_nginx_managed_directory_is_safe "$parent" || return 2
-    cp -a --update=none -- "$snapshot" "$path" || return 2
+    nexus_nginx_copy_snapshot_noreplace "$snapshot" "$path" || return 2
     nexus_nginx_snapshot_matches_path "$snapshot" "$path" || return 2
     sync -f "$parent" || return 2
     nexus_nginx_managed_path_is_owned "$path" || return 2
