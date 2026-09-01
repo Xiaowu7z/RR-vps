@@ -777,12 +777,87 @@ jobs:
             [ "$release_failed" = false ] || state=error
             printf '%s\n' "$state"
           }
+          rr_audit_current_specific_legacy_ambiguity() {
+            local root="$1" desired="$2" filtered="" backend="" table=""
+            local source="" target="" state=2
+            filtered=$(mktemp -d "$stage/current-specific-firewall.XXXXXX") || \
+              return 2
+            if ! chmod 700 "$filtered" || \
+               ! install -d -m 700 "$filtered/firewall"; then
+              rm -rf -- "$filtered"
+              return 2
+            fi
+            for backend in iptables ip6tables; do
+              for table in filter nat; do
+                source="$root/firewall/${backend}.${table}.rules"
+                target="$filtered/firewall/${backend}.${table}.rules"
+                if [ -f "$source" ] && [ ! -L "$source" ]; then
+                  if ! install -o 0 -g 0 -m 600 -- "$source" "$target"; then
+                    rm -rf -- "$filtered"
+                    return 2
+                  fi
+                elif [ -e "$source" ] || [ -L "$source" ]; then
+                  rm -rf -- "$filtered"
+                  return 2
+                fi
+                source="$root/firewall/${backend}.${table}.raw"
+                target="$filtered/firewall/${backend}.${table}.raw"
+                if [ -f "$source" ] && [ ! -L "$source" ]; then
+                  if ! python3 - "$source" "$target" "$table" <<'PY'
+          import shlex
+          import sys
+
+          source, target, table = sys.argv[1:]
+          wanted = "INPUT" if table == "filter" else "PREROUTING"
+          with open(source, encoding="utf-8") as input_file, \
+               open(target, "w", encoding="utf-8") as output_file:
+              for line in input_file:
+                  tokens = shlex.split(line)
+                  if (len(tokens) >= 3 and tokens[:2] == ["-A", wanted]
+                          and any(token in {"--dport", "--dports"}
+                                  for token in tokens)):
+                      output_file.write(line)
+          PY
+                  then
+                    rm -rf -- "$filtered"
+                    return 2
+                  fi
+                  chmod 600 "$target" || {
+                    rm -rf -- "$filtered"
+                    return 2
+                  }
+                elif [ -e "$source" ] || [ -L "$source" ]; then
+                  rm -rf -- "$filtered"
+                  return 2
+                fi
+              done
+            done
+            source="$root/firewall/ufw.unmanaged"
+            target="$filtered/firewall/ufw.unmanaged"
+            if [ -f "$source" ] && [ ! -L "$source" ]; then
+              if ! install -o 0 -g 0 -m 600 -- "$source" "$target"; then
+                rm -rf -- "$filtered"
+                return 2
+              fi
+            elif [ -e "$source" ] || [ -L "$source" ]; then
+              rm -rf -- "$filtered"
+              return 2
+            fi
+            rr_firewall_snapshot_has_ambiguous_legacy_rules \
+              "$filtered" "$desired" >>"$recovery_log" 2>&1
+            state=$?
+            rm -rf -- "$filtered" || return 2
+            case "$state" in
+              0|1) return "$state" ;;
+              *) return 2 ;;
+            esac
+          }
           rr_audit_reboot_cleared_quarantine_is_owned() {
             local directory="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
             local evidence="$directory/firewall-evidence"
             local desired="$evidence/desired.namespace"
             local snapshot="" raw_state=0 ambiguous_state=0
-            local current_ambiguous_state=0 result=1
+            local current_ambiguous_state=0 specific_ambiguous_state=0 result=1
             local release_failed=false
             reboot_cleared_gate=role-rejected
             [ "$role" = A ] || return 1
@@ -858,10 +933,25 @@ jobs:
                       "$snapshot" "$desired" >>"$recovery_log" 2>&1
                     current_ambiguous_state=$?
                     if [ "$current_ambiguous_state" -eq 0 ]; then
-                      reboot_cleared_gate=current-ambiguous
+                      rr_audit_current_specific_legacy_ambiguity \
+                        "$snapshot" "$desired"
+                      specific_ambiguous_state=$?
+                      if [ "$specific_ambiguous_state" -eq 0 ]; then
+                        reboot_current_ambiguity=specific
+                        reboot_cleared_gate=current-specific-ambiguous
+                      elif [ "$specific_ambiguous_state" -eq 1 ]; then
+                        reboot_current_ambiguity=broad-only
+                        reboot_cleared_gate=owned
+                        result=0
+                      else
+                        reboot_current_ambiguity=error
+                        reboot_cleared_gate=current-specific-error
+                      fi
                     elif [ "$current_ambiguous_state" -ne 1 ]; then
+                      reboot_current_ambiguity=error
                       reboot_cleared_gate=current-ambiguity-error
                     else
+                      reboot_current_ambiguity=absent
                       reboot_cleared_gate=owned
                       result=0
                     fi
@@ -1223,6 +1313,7 @@ jobs:
           reboot_cleared_owned=false
           reboot_cleared_gate=not-invoked
           reboot_old_ambiguity=not-invoked
+          reboot_current_ambiguity=not-invoked
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1454,6 +1545,8 @@ jobs:
             "$diag_nonce" "$role" "$reboot_cleared_gate"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_old_ambiguity=%s\n' \
             "$diag_nonce" "$role" "$reboot_old_ambiguity"
+          printf 'SAFE_DIAG nonce=%s role=%s reboot_current_ambiguity=%s\n' \
+            "$diag_nonce" "$role" "$reboot_current_ambiguity"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
@@ -1542,8 +1635,9 @@ jobs:
                [[ "$payload" =~ ^quarantine_probe=(not-present|load-failed|kind-invalid|evidence-invalid|raw-no-persistence|raw-error|ambiguous|ambiguous-error|ready-raw|ready-no-raw)$ ]] ||
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
-               [[ "$payload" =~ ^reboot_cleared_gate=(not-invoked|role-rejected|tempdir-failed|tempdir-meta-failed|config-load-failed|lock-failed|quarantine-inactive|quarantine-load-failed|kind-invalid|evidence-untrusted|artifacts-unowned|supervisor-unsettled|persistence-present|old-managed-absent|old-managed-error|old-ambiguous|old-ambiguity-error|current-capture-failed|current-verify-failed|current-managed-present|current-managed-error|current-ambiguous|current-ambiguity-error|release-failed|tempdir-cleanup-failed|owned)$ ]] ||
+               [[ "$payload" =~ ^reboot_cleared_gate=(not-invoked|role-rejected|tempdir-failed|tempdir-meta-failed|config-load-failed|lock-failed|quarantine-inactive|quarantine-load-failed|kind-invalid|evidence-untrusted|artifacts-unowned|supervisor-unsettled|persistence-present|old-managed-absent|old-managed-error|old-ambiguous|old-ambiguity-error|current-capture-failed|current-verify-failed|current-managed-present|current-managed-error|current-ambiguous|current-ambiguity-error|current-specific-ambiguous|current-specific-error|release-failed|tempdir-cleanup-failed|owned)$ ]] ||
                [[ "$payload" =~ ^reboot_old_ambiguity=(not-invoked|observed|absent)$ ]] ||
+               [[ "$payload" =~ ^reboot_current_ambiguity=(not-invoked|absent|broad-only|specific|error)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
