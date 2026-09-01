@@ -514,11 +514,21 @@ case "$table:$chain" in
         printf '%s\n' '-P PREROUTING ACCEPT' '-P INPUT ACCEPT' \
             '-P OUTPUT ACCEPT' '-P POSTROUTING ACCEPT'
         ;;
+    raw:PREROUTING) printf '%s\n' '-P PREROUTING ACCEPT' ;;
+    raw:)
+        printf '%s\n' '-P PREROUTING ACCEPT' '-P OUTPUT ACCEPT'
+        ;;
     *) exit 2 ;;
 esac
 EOF
 chmod 755 "$mock_bin/iptables"
 cp -p -- "$mock_bin/iptables" "$mock_bin/ip6tables"
+# Full uninstall treats an unreadable raw table as possible legacy
+# subscription-quarantine evidence.  Prove the disposable backend exposes a
+# deterministic empty inventory instead of accidentally exercising that
+# fail-closed error path.
+iptables -w 5 -t raw -S PREROUTING | grep -Fxq -- '-P PREROUTING ACCEPT'
+ip6tables -w 5 -t raw -S PREROUTING | grep -Fxq -- '-P PREROUTING ACCEPT'
 
 # Exercise the user-facing complete uninstall in the disposable container.
 printf 'y\n' | bash -c '
