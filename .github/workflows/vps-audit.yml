@@ -1099,6 +1099,19 @@ jobs:
           uninstall_state=not-run
           residue_state=unknown
           raw_uninstall_rc=0
+          rr_audit_trace_prepare_ephemeral_firewall_reboot() {
+            local prepare_result=0
+            exec 9>"$trace" || return 1
+            PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
+            BASH_XTRACEFD=9
+            set -x
+            rr_audit_prepare_ephemeral_firewall_reboot
+            prepare_result=$?
+            set +x
+            unset BASH_XTRACEFD
+            exec 9>&-
+            return "$prepare_result"
+          }
           rr_audit_locked_remediation() {
             local legacy_lock_state=0
             : > "$callback_marker"
@@ -1126,7 +1139,7 @@ jobs:
                      rr_uninstall_firewall_quarantine_artifacts_are_owned; then
                     firewall_repair=deferred-owned
                   elif [ "$live_raw" = present ] && \
-                       rr_audit_prepare_ephemeral_firewall_reboot; then
+                       rr_audit_trace_prepare_ephemeral_firewall_reboot; then
                     firewall_repair=reboot-required
                     reboot_state=prepared
                     reboot_required=true
