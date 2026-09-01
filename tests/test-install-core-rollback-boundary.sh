@@ -259,6 +259,9 @@ EOF
     }
     rr_restore_dir() { printf 'restore-dir:%s\n' "$1" >> "$operation_log"; }
     rr_restore_sqlite() { printf 'restore-db:%s\n' "$1" >> "$operation_log"; }
+    # IP-ACME directory replay is covered by the dedicated update/restore
+    # suite; this fixture isolates the health-writer rollback boundary.
+    rr_restore_ip_acme_update_directories() { return 0; }
     rr_install_restore_external_state_if_required() { return 0; }
     rr_restore_update_writer_state() {
         if [ "$restore_query_failure" = true ]; then

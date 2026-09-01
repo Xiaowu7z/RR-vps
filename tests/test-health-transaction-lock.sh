@@ -193,6 +193,10 @@ rr_prepare_recovery_runtime() { printf '%s\n' prepare-recovery >> "$operation_lo
 rr_discard_previous_transaction() { printf '%s\n' recover-old >> "$operation_log"; }
 rr_prune_stale_transactions() { printf '%s\n' prune-old >> "$operation_log"; }
 rr_write_transaction_format() { printf '%s\n' transaction-format >> "$operation_log"; }
+rr_set_private_marker() {
+    local target="$1"
+    (umask 077; : > "$target") && chmod 600 "$target"
+}
 rr_write_phase() { printf 'phase:%s\n' "$1" >> "$operation_log"; }
 rr_snapshot_external_state() { printf '%s\n' snapshot-external >> "$operation_log"; }
 rr_backup_file() { printf 'backup-file:%s\n' "$2" >> "$operation_log"; }
@@ -251,6 +255,9 @@ rr_restore_unit_state() {
         resume_health_active=true
     fi
 }
+# IP-ACME writer restoration has its own state-machine suite; this case
+# isolates a failed subscription resume after ordinary writers were restored.
+rr_restore_ip_acme_update_writer_state() { return 0; }
 rr_restart_health_service_bounded() { :; }
 rr_subscription_running() { return 1; }
 rr_stop_subscription_servers() { : > "$resume_failure_stopped"; }
@@ -440,5 +447,172 @@ systemctl() {
     esac
 }
 run_async_lock_case systemctl
+
+printf '%s\n' '[11/11] health unit pair rolls back partial publication and proves effective state'
+(
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/modules/30-singbox.sh"
+    health_unit_root="$TEST_ROOT/health-units"
+    RR_HEALTH_SERVICE_FILE="$health_unit_root/argo-rr-health.service"
+    RR_HEALTH_TIMER_FILE="$health_unit_root/argo-rr-health.timer"
+    mkdir -p "$health_unit_root"
+    chmod 700 "$health_unit_root"
+    printf '%s\n' old-service > "$RR_HEALTH_SERVICE_FILE"
+    printf '%s\n' old-timer > "$RR_HEALTH_TIMER_FILE"
+    cp -p -- "$RR_HEALTH_SERVICE_FILE" "$health_unit_root/service.before"
+    cp -p -- "$RR_HEALTH_TIMER_FILE" "$health_unit_root/timer.before"
+    fail_timer_publish=true
+    mv() {
+        local source="" target=""
+        source="${*: -2:1}"
+        target="${*: -1}"
+        if [ "$fail_timer_publish" = true ] && \
+           [ "$target" = "$RR_HEALTH_TIMER_FILE" ] && \
+           [[ "$source" = *'/.argo-rr-health.timer.'* ]]; then
+            return 42
+        fi
+        command mv "$@"
+    }
+    set +e
+    write_health_monitor_units
+    write_status=$?
+    set -e
+    [ "$write_status" -eq 1 ] || \
+        fail 'second health-unit rename failure was not exactly compensated'
+    cmp -s "$health_unit_root/service.before" "$RR_HEALTH_SERVICE_FILE" && \
+        cmp -s "$health_unit_root/timer.before" "$RR_HEALTH_TIMER_FILE" || \
+        fail 'partial health-unit publication did not restore both old files'
+
+    fail_timer_publish=false
+    HEALTH_TIMER_ENABLED=false
+    HEALTH_TIMER_ACTIVE=false
+    HEALTH_BAD_EFFECTIVE=false
+    HEALTH_MUTATION=""
+    HEALTH_MUTATION_VALUE=""
+    rr_firewall_fail_closed_quarantine_active() { return 1; }
+    systemctl() {
+        local operation="${1:-}" property="" unit=""
+        shift || true
+        case "$operation" in
+            --version) printf '%s\n' 'systemd 255 (mock)' ;;
+            daemon-reload) return 0 ;;
+            enable)
+                [ "${1:-}" != --now ] || shift
+                [ "${1:-}" = argo-rr-health.timer ] || return 1
+                HEALTH_TIMER_ENABLED=true
+                HEALTH_TIMER_ACTIVE=true
+                ;;
+            is-enabled)
+                [ "${1:-}" != --quiet ] || shift
+                [ "${1:-}" = argo-rr-health.timer ] && \
+                    [ "$HEALTH_TIMER_ENABLED" = true ]
+                ;;
+            is-active)
+                [ "${1:-}" != --quiet ] || shift
+                [ "${1:-}" = argo-rr-health.timer ] && \
+                    [ "$HEALTH_TIMER_ACTIVE" = true ]
+                ;;
+            show)
+                case "${1:-}" in
+                    --property=*) property="${1#--property=}"; shift ;;
+                    *) return 1 ;;
+                esac
+                [ "${1:-}" != --value ] || shift
+                unit="${1:-}"
+                if [ "$HEALTH_MUTATION" = "$property:$unit" ]; then
+                    printf '%s\n' "$HEALTH_MUTATION_VALUE"
+                    return 0
+                fi
+                case "$property:$unit" in
+                    LoadState:argo-rr-health.service|LoadState:argo-rr-health.timer)
+                        printf '%s\n' loaded ;;
+                    FragmentPath:argo-rr-health.service)
+                        printf '%s\n' "$RR_HEALTH_SERVICE_FILE" ;;
+                    FragmentPath:argo-rr-health.timer)
+                        printf '%s\n' "$RR_HEALTH_TIMER_FILE" ;;
+                    DropInPaths:argo-rr-health.service|DropInPaths:argo-rr-health.timer)
+                        printf '\n' ;;
+                    ExecStart:argo-rr-health.service)
+                        if [ "$HEALTH_BAD_EFFECTIVE" = true ]; then
+                            printf '%s\n' '{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; }'
+                        else
+                            printf '%s\n' '{ path=/usr/local/bin/rr ; argv[]=/usr/local/bin/rr --health-check ; ignore_errors=no ; }'
+                        fi
+                        ;;
+                    ExecStartPre:argo-rr-health.service|\
+                    ExecStartPost:argo-rr-health.service|\
+                    ExecReload:argo-rr-health.service|ExecStop:argo-rr-health.service|\
+                    ExecStopPost:argo-rr-health.service|ExecCondition:argo-rr-health.service)
+                        printf '\n' ;;
+                    Conditions:argo-rr-health.service)
+                        printf '%s\n' '{ path=/etc/argo_vmess.conf ; } { path=/usr/local/bin/rr ; }'
+                        ;;
+                    Conditions:argo-rr-health.timer|Asserts:argo-rr-health.service|\
+                    Asserts:argo-rr-health.timer)
+                        printf '\n' ;;
+                    User:argo-rr-health.service|Group:argo-rr-health.service)
+                        printf '%s\n' root ;;
+                    WorkingDirectory:argo-rr-health.service)
+                        printf '%s\n' / ;;
+                    DynamicUser:argo-rr-health.service|PrivateUsers:argo-rr-health.service|\
+                    PrivateMounts:argo-rr-health.service|PrivateNetwork:argo-rr-health.service|\
+                    RootEphemeral:argo-rr-health.service|ProtectHome:argo-rr-health.service|\
+                    ProtectSystem:argo-rr-health.service)
+                        printf '%s\n' no ;;
+                    RootDirectory:argo-rr-health.service|RootImage:argo-rr-health.service|\
+                    MountImages:argo-rr-health.service|ExtensionImages:argo-rr-health.service|\
+                    ExtensionDirectories:argo-rr-health.service|\
+                    TemporaryFileSystem:argo-rr-health.service|\
+                    BindPaths:argo-rr-health.service|BindReadOnlyPaths:argo-rr-health.service|\
+                    InaccessiblePaths:argo-rr-health.service|\
+                    JoinsNamespaceOf:argo-rr-health.service|\
+                    ReadOnlyPaths:argo-rr-health.service|ReadWritePaths:argo-rr-health.service|\
+                    Environment:argo-rr-health.service|EnvironmentFiles:argo-rr-health.service|\
+                    PassEnvironment:argo-rr-health.service|UnsetEnvironment:argo-rr-health.service|\
+                    PAMName:argo-rr-health.service|SystemCallFilter:argo-rr-health.service)
+                        printf '\n' ;;
+                    Unit:argo-rr-health.timer)
+                        printf '%s\n' argo-rr-health.service ;;
+                    TimersMonotonic:argo-rr-health.timer)
+                        printf '%s\n' '{ OnBootSec=30s ; } { OnUnitActiveSec=5min ; }' ;;
+                    TimersCalendar:argo-rr-health.timer)
+                        printf '\n' ;;
+                    RandomizedDelayUSec:argo-rr-health.timer)
+                        printf '%s\n' 15s ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            *) return 1 ;;
+        esac
+    }
+    setup_health_monitor || fail 'canonical health units failed effective verification'
+    rr_health_monitor_units_are_current || \
+        fail 'canonical health unit effective contract was not stable'
+    HEALTH_BAD_EFFECTIVE=true
+    if rr_health_monitor_units_are_current; then
+        fail 'hostile effective health ExecStart passed exact verification'
+    fi
+    HEALTH_BAD_EFFECTIVE=false
+    while IFS='|' read -r HEALTH_MUTATION HEALTH_MUTATION_VALUE; do
+        HEALTH_TIMER_ENABLED=false
+        HEALTH_TIMER_ACTIVE=false
+        if setup_health_monitor >/dev/null 2>&1; then
+            fail "hostile effective health mutation passed: $HEALTH_MUTATION"
+        fi
+        [ "$HEALTH_TIMER_ENABLED" = false ] || \
+            fail "health timer was enabled before full proof: $HEALTH_MUTATION"
+    done <<'EOF'
+DropInPaths:argo-rr-health.service|/run/systemd/system/argo-rr-health.service.d/evil.conf
+User:argo-rr-health.service|nobody
+WorkingDirectory:argo-rr-health.service|/tmp
+ExecStartPre:argo-rr-health.service|{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; }
+ExecReload:argo-rr-health.service|{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; }
+ExecStopPost:argo-rr-health.service|{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no ; }
+Environment:argo-rr-health.service|LD_PRELOAD=/tmp/evil.so
+SystemCallFilter:argo-rr-health.service|~statx
+TimersMonotonic:argo-rr-health.timer|{ OnBootSec=30s ; } { OnUnitActiveSec=5min ; } { OnStartupSec=1s ; }
+TimersCalendar:argo-rr-health.timer|*-*-* *:*:00
+EOF
+)
 
 printf '%s\n' 'health transaction lock regression: PASS'

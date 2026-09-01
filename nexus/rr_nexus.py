@@ -202,9 +202,42 @@ REMOTE_SECURITY_LOCK_PATH = Path("/run/rr-vps/locks/nexus-security.lock")
 LETSENCRYPT_LIVE_ROOT = Path(
     os.environ.get("RR_LE_LIVE_ROOT", "/etc/letsencrypt/live")
 )
+NEXUS_IP_CERT_PATH = Path(
+    os.environ.get("RR_NEXUS_IP_CERT", "/etc/rr-nexus/certs/ip.crt")
+)
+NEXUS_IP_KEY_PATH = Path(
+    os.environ.get("RR_NEXUS_IP_KEY", "/etc/rr-nexus/certs/ip.key")
+)
+NEXUS_IP_CERT_PENDING_PATH = Path(
+    os.environ.get(
+        "RR_NEXUS_IP_CERT_PENDING",
+        "/etc/rr-nexus/certs/.ip-cert-pending",
+    )
+)
+NEXUS_IP_CERTIFICATE_MODE = "acme-ip-shortlived"
+NEXUS_IP_CERT_MIN_VALID_SECONDS = 6 * 60 * 60
 REMOTE_CRED_PREFIX = "rrmgr1"
 REMOTE_FAIL_WINDOW = 30 * 60          # 远程钥匙验证失败窗口（秒）
 REMOTE_FAIL_LIMIT = 10                # 同 IP 窗口内失败次数上限
+
+
+def _public_ip_identity(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse the exact public-IP class accepted by the shell ACME issuer."""
+    candidate = (value or "").strip()
+    if not candidate or candidate.startswith("[") or candidate.endswith("]"):
+        return None
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if (
+        not address.is_global
+        or address.is_multicast
+        or getattr(address, "ipv4_mapped", None) is not None
+        or getattr(address, "scope_id", None) is not None
+    ):
+        return None
+    return address
 REMOTE_FAILURE_MAX_ROWS = 10_000      # 轮换来源也不能让持久失败表无界增长
 
 # A stolen 12-hour browser session must not be sufficient to establish new
@@ -383,27 +416,76 @@ def remote_key_load_or_create() -> bytes:
 
 
 def remote_cert_check(cfg: "NexusConfig") -> tuple[bool, str]:
-    """签发前提：公网证书模式（域名 + Let's Encrypt 真证书）。"""
+    """Verify the public panel identity before exposing bearer credentials.
+
+    DNS panels use their Certbot lineage.  A literal IP is accepted only for
+    the explicit short-lived ACME mode and only while the live pair is settled;
+    the legacy self-signed pair must never unlock subscriptions or remote keys.
+    """
     if cfg.mode != "public":
-        return False, "仅公网证书（域名 + Let's Encrypt）面板可签发远程钥匙"
+        return False, "仅公网可信证书面板可签发远程钥匙"
     domain = (cfg.domain or "").strip()
-    if not domain or domain == "ip" or re.fullmatch(r"[0-9.]+|[\da-fA-F:]+", domain):
-        return False, "面板域名无效，需要公网证书域名"
-    cert = LETSENCRYPT_LIVE_ROOT / domain / "fullchain.pem"
-    private_key = cert.with_name("privkey.pem")
+    try:
+        parsed_ip_identity = ipaddress.ip_address(domain)
+    except ValueError:
+        parsed_ip_identity = None
+    ip_identity = _public_ip_identity(domain)
+
+    if parsed_ip_identity is not None:
+        if ip_identity is None:
+            return False, "面板 IP 必须是可公开路由的全局地址"
+        if getattr(cfg, "certificate_mode", "") != NEXUS_IP_CERTIFICATE_MODE:
+            return False, "公网 IP 尚未启用可信短期 ACME 证书"
+        try:
+            NEXUS_IP_CERT_PENDING_PATH.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False, "公网 IP 证书发布状态无法确认"
+        else:
+            return False, "公网 IP 证书正在发布，暂不公开订阅或远程钥匙"
+        cert = NEXUS_IP_CERT_PATH
+        private_key = NEXUS_IP_KEY_PATH
+        minimum_valid_seconds = NEXUS_IP_CERT_MIN_VALID_SECONDS
+    else:
+        if not _is_dns_name(domain):
+            return False, "面板身份无效，需要可信公网域名或全局 IP"
+        cert = LETSENCRYPT_LIVE_ROOT / domain / "fullchain.pem"
+        private_key = cert.with_name("privkey.pem")
+        minimum_valid_seconds = 7 * 24 * 60 * 60
+
     if not cert.is_file() or not private_key.is_file():
-        return False, "未检测到完整的 Let's Encrypt 证书与私钥（{}）".format(cert.parent)
+        return False, "未检测到完整的可信证书与私钥（{}）".format(cert.parent)
     try:
         decoded = ssl._ssl._test_decode_cert(str(cert))
-        identities = {
-            value.lower()
-            for kind, value in decoded.get("subjectAltName", ())
-            if kind == "DNS"
-        }
-        if domain.lower() not in identities:
-            return False, "证书 SAN 与面板域名不一致"
+        if ip_identity is None:
+            identities = {
+                value.lower()
+                for kind, value in decoded.get("subjectAltName", ())
+                if kind == "DNS"
+            }
+            identity_matches = domain.lower() in identities
+        else:
+            identity_matches = False
+            for kind, value in decoded.get("subjectAltName", ()):
+                if kind != "IP Address":
+                    continue
+                try:
+                    if hmac.compare_digest(
+                        ipaddress.ip_address(value).packed,
+                        ip_identity.packed,
+                    ):
+                        identity_matches = True
+                        break
+                except ValueError:
+                    continue
+        if not identity_matches:
+            return False, "证书 SAN 与面板身份不一致"
         check_time = subprocess.run(
-            ["openssl", "x509", "-in", str(cert), "-noout", "-checkend", "604800"],
+            [
+                "openssl", "x509", "-in", str(cert), "-noout",
+                "-checkend", str(minimum_valid_seconds),
+            ],
             capture_output=True,
             timeout=5,
             check=False,
@@ -442,6 +524,8 @@ def remote_cert_check(cfg: "NexusConfig") -> tuple[bool, str]:
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return False, "无法验证面板 TLS 证书"
     if check_time.returncode != 0:
+        if ip_identity is not None:
+            return False, "公网 IP 证书已过期或将在 6 小时内过期"
         return False, "面板证书已过期或将在 7 天内过期"
     if (
         cert_public.returncode != 0
@@ -516,7 +600,8 @@ def remote_cred_parse(cred: str) -> dict | None:
         or not isinstance(addr, str)
         or not 1 <= len(addr) <= 253
         or any(ord(char) < 33 or ord(char) == 127 for char in addr)
-        or any(char in addr for char in "/@?#[]:")
+        or any(char in addr for char in "/@?#[]")
+        or not (_is_dns_name(addr) or _is_global_ip_address(addr))
         or not 1 <= port <= 65535
         or not isinstance(token, str)
         or not re.fullmatch(r"[0-9a-f]{64}", token)
@@ -944,9 +1029,13 @@ class NexusConfig:
         if self.mode == "local":
             return "http://127.0.0.1:{}".format(self.public_port or self.port)
         elif not self.domain or self.domain == "ip":
-            return "https://{}:{}".format(self.ssh_host, self.public_port or self.port)
+            return "https://{}:{}".format(
+                _url_host(self.ssh_host), self.public_port or self.port
+            )
         else:
-            return "https://{}:{}".format(self.domain, self.public_port or self.port)
+            return "https://{}:{}".format(
+                _url_host(self.domain), self.public_port or self.port
+            )
     ssh_host: str
     secure_cookie: bool
     traffic_mode: str = "both"
@@ -954,6 +1043,7 @@ class NexusConfig:
     sub_port: int = 0
     subscription_access_mode: str = "local"
     subscription_domain: str = ""
+    certificate_mode: str = ""
 
     @classmethod
     def load(cls) -> "NexusConfig":
@@ -973,6 +1063,7 @@ class NexusConfig:
         sub_port = int(raw.get("sub_port", 0))
         subscription_access_mode = str(raw.get("subscription_access_mode", "local"))
         subscription_domain = str(raw.get("subscription_domain", "")).strip()
+        certificate_mode = str(raw.get("certificate_mode", "")).strip()
         traffic_mode = str(raw.get("traffic_mode", "both") or "both")
         if (
             mode not in {"local", "public"}
@@ -987,6 +1078,8 @@ class NexusConfig:
             or any(ord(char) < 33 or ord(char) == 127 for char in ssh_host)
             or traffic_mode not in {"both", "upload"}
             or subscription_access_mode not in {"local", "https"}
+            or len(certificate_mode) > 64
+            or any(ord(char) < 33 or ord(char) == 127 for char in certificate_mode)
             or (
                 subscription_access_mode == "https"
                 and not _is_dns_name(subscription_domain)
@@ -1021,6 +1114,7 @@ class NexusConfig:
             sub_port=sub_port,
             subscription_access_mode=subscription_access_mode,
             subscription_domain=subscription_domain,
+            certificate_mode=certificate_mode,
         )
 
     @property
@@ -2836,6 +2930,11 @@ def _is_ip_address(value: str) -> bool:
         return False
 
 
+def _is_global_ip_address(value: str) -> bool:
+    """Return true only for an unbracketed, publicly routable IP literal."""
+    return _public_ip_identity(value) is not None
+
+
 def _is_dns_name(value: str) -> bool:
     return bool(
         re.fullmatch(
@@ -2849,6 +2948,20 @@ def _url_host(value: str) -> str:
     """Return an RFC 3986 host, adding brackets around an IPv6 literal."""
     host = (value or "").strip().strip("[]")
     return "[{}]".format(host) if ":" in host else host
+
+
+def _public_subscription_panel_is_trusted(config: NexusConfig) -> bool:
+    """Gate bearer subscription routes on the configured certificate identity."""
+    if config.mode != "public":
+        return False
+    if _is_dns_name(config.domain):
+        return True
+    return bool(
+        _is_global_ip_address(config.domain)
+        and getattr(config, "certificate_mode", "")
+        == NEXUS_IP_CERTIFICATE_MODE
+        and remote_cert_check(config)[0]
+    )
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
@@ -5758,12 +5871,10 @@ class Handler(BaseHTTPRequestHandler):
                 return (config.published_subscription_root / f"{token}{suffix}").is_file()
             return (config.subscription_root / f"{device_id}{suffix}").is_file()
 
-        if (
-            config.mode == "public"
-            and config.domain
-            and config.domain != "ip"
-            and not _is_ip_address(config.domain)
-        ):
+        # The mode bit alone is not proof: IP mode fails closed while the
+        # two-file publication journal is pending, on expiry, SAN/key mismatch,
+        # or when the chain is not anchored in the system CA bundle.
+        if _public_subscription_panel_is_trusted(config):
             port = config.public_port or config.port
             base = "https://{}".format(_url_host(config.domain))
             if port and port != 443:
@@ -5901,7 +6012,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(status, payload)
 
     def handle_public_subscription(self, device_id: str, token: str, fmt: str = "txt") -> None:
-        if STATE.config.mode != "public":
+        if not _public_subscription_panel_is_trusted(STATE.config):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         device = self.device_record(device_id)

@@ -34,6 +34,8 @@ NGINX_PATHS = (
     "/etc/nginx/sites-enabled/rr-nexus.conf",
     "/etc/nginx/sites-enabled/rr-nexus-port.conf",
     "/etc/nginx/sites-enabled/rr-nexus-ip.conf",
+    "/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf",
+    "/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf",
 )
 CERT_HOOK_PATHS = (
     "/etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh",
@@ -43,23 +45,57 @@ OTHER_PATHS = (
     "/etc/rr-cloudflared/token",
     "/etc/systemd/system/cloudflared.service",
 )
-MANAGED_PATHS = NGINX_PATHS + CERT_HOOK_PATHS + OTHER_PATHS
+NEXUS_IP_CERT_GATE_PATHS = (
+    "/usr/local/lib/rr-vps/nexus-ip-cert-gate",
+    "/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf",
+)
+NEXUS_IP_ACME_RUNTIME_PATHS = (
+    "/etc/systemd/system/rr-nexus-ip-acme.service",
+    "/etc/systemd/system/rr-nexus-ip-acme.timer",
+    "/etc/rr-nexus/certs/ip.crt",
+    "/etc/rr-nexus/certs/ip.key",
+    "/etc/rr-nexus/certs/.ip-cert-pending",
+    "/usr/local/lib/rr-vps/lego",
+    "/usr/local/lib/rr-vps/lego.install",
+)
+MANAGED_PATHS = (
+    NGINX_PATHS
+    + CERT_HOOK_PATHS
+    + OTHER_PATHS
+    + NEXUS_IP_CERT_GATE_PATHS
+    + NEXUS_IP_ACME_RUNTIME_PATHS
+)
 SERVICES = ("nginx", "cloudflared")
 TABLE_CHAINS = (("filter", "INPUT"), ("nat", "PREROUTING"))
+DEFAULT_MANAGED_FILE_LIMIT = 16 * 1024 * 1024
+# lego 5.4.0 is roughly 65 MiB after extraction on amd64.  Keep a tight,
+# explicit exception for this one pinned executable while retaining the
+# smaller ceiling for every other rollback file.
+LEGO_MANAGED_FILE_LIMIT = 72 * 1024 * 1024
 
 
 class StateError(RuntimeError):
     pass
 
 
-def root_path(path: str) -> Path:
+def managed_file_limit(path: str) -> int:
+    if path == "/usr/local/lib/rr-vps/lego":
+        return LEGO_MANAGED_FILE_LIMIT
+    return DEFAULT_MANAGED_FILE_LIMIT
+
+
+def external_root() -> Path:
     root = os.environ.get("RR_EXTERNAL_ROOT", "/")
     if not os.path.isabs(root):
         raise StateError("RR_EXTERNAL_ROOT must be absolute")
     root_real = os.path.realpath(root)
     if root_real != os.path.abspath(root):
         raise StateError("RR_EXTERNAL_ROOT must not contain symlinks")
-    return Path(root_real) / path.lstrip("/")
+    return Path(root_real)
+
+
+def root_path(path: str) -> Path:
+    return external_root() / path.lstrip("/")
 
 
 def fsync_dir(path: Path) -> None:
@@ -105,17 +141,31 @@ def validate_backup_dir(raw: str, tx_root_raw: str) -> Path:
 
 
 def require_safe_parent(path: Path, *, may_be_missing: bool) -> None:
-    if os.path.realpath(path) != str(path):
+    trust_root = external_root()
+    normalized = Path(os.path.abspath(path))
+    if normalized != path or os.path.realpath(path) != str(path):
         raise StateError(f"managed path parent contains a symlink: {path}")
-    current = path
-    while not (current.exists() or current.is_symlink()):
-        if not may_be_missing:
-            raise StateError(f"managed path parent is missing: {path}")
-        parent = current.parent
-        if parent == current:
-            raise StateError(f"cannot find managed path parent: {path}")
-        current = parent
+    try:
+        relative = path.relative_to(trust_root)
+    except ValueError as exc:
+        raise StateError("managed path escaped RR_EXTERNAL_ROOT") from exc
+    current = trust_root
     require_secure_dir(current)
+    if os.path.realpath(current) != str(current):
+        raise StateError(f"managed path parent contains a symlink: {current}")
+    for component in relative.parts:
+        current = current / component
+        try:
+            os.lstat(current)
+        except FileNotFoundError:
+            if may_be_missing:
+                return
+            raise StateError(f"managed path parent is missing: {path}")
+        except OSError as exc:
+            raise StateError(f"cannot inspect managed path parent {current}: {exc}") from exc
+        require_secure_dir(current)
+        if os.path.realpath(current) != str(current):
+            raise StateError(f"managed path parent contains a symlink: {current}")
 
 
 def run(argv: list[str], *, allowed: tuple[int, ...] = (0,), text: bool = True) -> subprocess.CompletedProcess[str]:
@@ -197,7 +247,8 @@ def source_entry(path: str, item_dir: Path, index: int) -> dict[str, Any]:
                 if not block:
                     break
                 total += len(block)
-                if total > 16 * 1024 * 1024:
+                limit = managed_file_limit(path)
+                if total > limit:
                     raise StateError(f"managed file exceeds snapshot limit: {path}")
                 digest.update(block)
                 write_all(target_fd, block)
@@ -394,7 +445,11 @@ def snapshot(backup: Path) -> None:
         raise
 
 
-def secure_snapshot_file(path: Path) -> bytes:
+def secure_snapshot_file(
+    path: Path, limit: int = DEFAULT_MANAGED_FILE_LIMIT
+) -> bytes:
+    if not isinstance(limit, int) or limit < 1 or limit > LEGO_MANAGED_FILE_LIMIT:
+        raise StateError("invalid snapshot file limit")
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
         raise StateError(f"unsafe snapshot file: {path}")
@@ -410,7 +465,7 @@ def secure_snapshot_file(path: Path) -> bytes:
             if not block:
                 break
             total += len(block)
-            if total > 16 * 1024 * 1024:
+            if total > limit:
                 raise StateError("snapshot file exceeds limit")
             chunks.append(block)
         return b"".join(chunks)
@@ -488,7 +543,9 @@ def restore_entry(directory: Path, entry: dict[str, Any]) -> None:
     item_name = entry.get("item")
     if not isinstance(item_name, str) or not item_name.isdigit():
         raise StateError("invalid saved item name")
-    data = secure_snapshot_file(directory / "items" / item_name)
+    data = secure_snapshot_file(
+        directory / "items" / item_name, managed_file_limit(path_name)
+    )
     if len(data) != entry.get("size") or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
         raise StateError("saved item integrity mismatch")
     fd, temporary_raw = tempfile.mkstemp(prefix=f".{destination.name}.rr-restore-", dir=destination.parent)
@@ -643,7 +700,8 @@ def compare_paths(directory: Path, entries: list[dict[str, Any]]) -> None:
                     if not block:
                         break
                     total += len(block)
-                    if total > 16 * 1024 * 1024:
+                    limit = managed_file_limit(entry["path"])
+                    if total > limit:
                         raise StateError(f"managed file exceeds verification limit: {entry['path']}")
                     chunks.append(block)
                 data = b"".join(chunks)

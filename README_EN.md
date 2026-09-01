@@ -12,11 +12,15 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 ### 7.2.0: rebuilt trust boundaries, hardened recovery, and verifiable releases
 
-7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. Stable consumes only an immutable GitHub Release that passed both ordinary CI and the three-host audit, pinned to the matching version tag; Beta remains isolated on its own branch.
+7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. The server core used for RR Nexus real-time traffic accounting is fixed to **sing-box 1.14.0**, built from one pinned upstream source commit. Stable consumes only an immutable GitHub Release whose exact current-`main` commit passed CI `push`, the three-host audit `push`, and the public-IP ACME `workflow_dispatch`; Beta remains isolated on its own branch.
 
-This release also removes public cleartext HTTP subscriptions. A standalone subscription endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Legacy public HTTP URLs stop working after the upgrade.
+This release also removes public cleartext HTTP subscriptions. A standalone endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Users without a domain can select Nexus trusted public-IP mode: RR obtains a short-lived Let's Encrypt IP certificate for a globally routable public IPv4 or IPv6 address and serves personal subscriptions through the same trusted HTTPS endpoint. Legacy public HTTP URLs stop working after the upgrade.
 
-Existing diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 features remain compatible. See the changelog for the trust-boundary, recovery, multi-distribution CI, and real-host audit evidence.
+Trusted public-IP mode is not a self-signed bypass. The IP must be globally routable, public TCP/80 must continuously reach the local ACME Webroot, and the certificate must match that exact IP and validate against the system CA store. RR publishes no public personal-subscription URL if any requirement fails; use trusted-domain HTTPS or a local SSH tunnel instead.
+
+Restore validates mount topology, object type, root ownership, write permissions, and hard-link/symlink boundaries before it queries target service state or changes RR-managed paths, then repeats that proof after freezing writers, after completing the rollback snapshot, and before recursive cleanup. If a late check fails after services have crossed the READY gate, restore clears READY, re-isolates Nginx and the managed runtime, and preserves recovery evidence. After acquiring both the shared update lock and the legacy compatibility lock, direct installation and update fail closed before release download or runtime preparation whenever the restore-marker path contains any object, including a dangling symlink; the installer does not remove that evidence.
+
+Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 remain available. See the prerequisites below for 7.2.0 `.rrbak` and NaiveProxy restore requirements, and see the changelog for the trust-boundary, recovery, multi-distribution CI, and real-host audit evidence.
 
 ## One-command installation
 
@@ -58,7 +62,7 @@ rr
 
 1. **Step 1: Install the node first** — open `rr` and choose option `1` to install the Sing-box core and configure protocols (VLESS Reality / Hysteria2 / TUIC / AnyTLS, etc.). You may also initialize the management framework only, without enabling any node yet.
 2. **Step 2: Then install the RR Nexus console** — after node configuration is complete, choose option `14` from the main menu to install the optional management console. The console reads ports and generates device subscriptions from the node configuration, so it must be installed after the node.
-3. Console access modes (local SSH tunnel / public domain / public direct) are chosen inside the `14` menu; see "RR Nexus · XingShu" below.
+3. Console access modes (local SSH tunnel / public domain / trusted public IP) are chosen inside the `14` menu; see "RR Nexus · XingShu" below.
 
 Show the installed version:
 
@@ -75,11 +79,17 @@ rr doctor
 rr doctor --repair
 rr doctor --report
 rr backup
-rr restore /path/file.rrbak
+rr restore /path/file.rrbak  # see prerequisites below
 rr update --check
 rr update --channel stable   # or beta
 rr update --rollback
 ```
+
+An `.rrbak` contains RR-managed data, not Certbot accounts or renewal configuration. If NaiveProxy is enabled in the backup, the destination must first run the current RR-vps and have a renewable Certbot lineage for the same domain. Before writing, restore verifies that the certificate is trusted by the system CA store, matches the domain and private key, has at least seven days of validity remaining, and uses the current deploy hook. A blank or unprepared destination is rejected. To migrate through a blank host, disable NaiveProxy on the source before creating the backup, then re-enable it and issue a certificate on the destination after restore.
+
+Copying only `fullchain.pem` and `privkey.pem` is insufficient: Certbot's `cert`, `chain`, `fullchain`, and `privkey` links under `live` must resolve to one `archive` generation, the renewal configuration must bind the production Let's Encrypt ACME account and RR's ACME Webroot, and the related paths must pass strict ownership and mode checks.
+
+Direct restore to a blank destination is supported only when NaiveProxy is disabled in the backup; subscriptions then default to loopback-only access. An existing destination's standalone HTTPS subscription access plane is preserved, but its trusted certificate and current deploy hook must also pass preflight. With active UFW, only simple user rules that can be proven disjoint from RR-managed ports are admitted. Rules on the same port, or complex rules whose ordering independence cannot be established safely, cause restore to reject before any firewall write; back up and reconcile those rules before retrying.
 
 ## Companion tool: RR Edge Atlas
 
@@ -99,15 +109,17 @@ rr update --rollback
 - Hysteria2 with configurable port hopping and interval
 - TUIC v5
 - AnyTLS
-- NaiveProxy (sing-box 1.13 native naive inbound with selectable HTTP/2, HTTP/3 over QUIC, or dual mode; configurable QUIC congestion control and a real Let's Encrypt certificate)
+- NaiveProxy (native naive inbound with selectable HTTP/2, HTTP/3 over QUIC, or dual mode; configurable QUIC congestion control and a real Let's Encrypt certificate; after RR Nexus is installed, its accounting server core is fixed to sing-box 1.14.0)
 - Independent protocol switches and ports
 - Independent IPv4/IPv6 inbound and outbound preferences
-- Public port mapping for trusted-domain HTTPS subscriptions on NAT/LXD; without a trusted certificate, subscriptions remain loopback-only
+- Trusted-domain HTTPS subscriptions, plus domain-free Nexus personal subscriptions on a globally routable public IPv4/IPv6 address with a short-lived Let's Encrypt certificate; NAT/LXD must map public TCP/80 and the selected HTTPS port precisely to this host
 - Sing-box validation, health checks, and guarded automatic restart
+- Target-scoped UFW/IPv4/IPv6 firewall transactions: a durable cross-boot gate is established and managed ingress is stopped before the first write; the gate is removed only after every participating backend's live and persistent state validates. Unprovable writes, saves, or compensation retain fail-closed evidence until a complete repair is revalidated
+- Menu, CLI, background-sync, health-repair, and certificate-deploy writers share a root-only transaction lock domain. Naive/Sing-box and public Nexus certificate pairs remain gated until atomic publication, effective systemd policy, and the actually served certificate are proved; durable pending evidence makes failures idempotently recoverable
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Durable Stable/Beta update transactions with multi-source fallback, three pinned SHA256 layers, boot-time recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery
+- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push, VPS push, and VPS workflow_dispatch evidence for one exact SHA before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
 - `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
-- Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and local rollback on health failure; it is not a full-machine backup
+- Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and automatic local rollback attempts on health failure; it is not a full-machine backup
 - No forced reservation of local port 443 for Argo
 - Optional RR Nexus web console with local-only or public HTTPS access
 - Per-device credentials, protocol links, QR codes, enable/disable state, and expiry
@@ -149,20 +161,24 @@ Protocol support matrix:
 | Hysteria2 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | TUIC v5 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | AnyTLS | ✅ | ✅ (not with Reality) | ✅ (recent versions) | ✅ (2.2.65+) | ✅ (1.3.8+) |
-| NaiveProxy H2 / H3 | ✅ (1.13+, platform-dependent builds) | ❌ | Depends on client core | Version-dependent | Version-dependent |
+| NaiveProxy H2 / H3 | ✅ (native naive; RR Nexus accounting core fixed to 1.14.0) | ❌ | Depends on client core | Version-dependent | Version-dependent |
 
-Tip: for fast recovery after screen lock/suspend, enable the active heartbeat mode (main menu 9 → 11) and prefer clients with sing-box core 1.13+.
+Tip: for fast recovery after screen lock/suspend, enable the active heartbeat mode (main menu 9 → 11) and prefer clients with sing-box core 1.14+.
 
 ## Subscription access security
 
-Public cleartext HTTP subscriptions have been removed. A standalone subscription endpoint has only the two secure states below. `SUB_ACCESS_MODE` describes the subscription service, not the RR Nexus console access mode.
+Public cleartext HTTP subscriptions have been removed. Nexus and the standalone subscription service use the states below. `SUB_ACCESS_MODE` describes only the standalone service; it is not the RR Nexus console mode.
 
 | Subscription state | Address | Security requirement |
 |---|---|---|
-| `SUB_ACCESS_MODE=https` | `https://trusted-domain:subscription-port/...` | `SUB_DOMAIN` must be a valid DNS name with a matching, valid, publicly trusted TLS certificate; the service refuses to start publicly when validation fails |
+| Trusted-domain Nexus | `https://trusted-domain[:panel-port]/sub/...` | The domain exactly matches a valid certificate anchored in the system CA store |
+| Trusted public-IP Nexus | IPv4: `https://PUBLIC-IPv4:panel-port/sub/...`; IPv6: `https://[PUBLIC-IPv6]:panel-port/sub/...` | The IP is globally routable; a Let's Encrypt `shortlived` IP certificate has settled atomically; SAN, private key, system-CA chain, and remaining validity all pass; public TCP/80 continuously reaches the ACME Webroot |
+| `SUB_ACCESS_MODE=https` | `https://trusted-domain:subscription-port/...` | `SUB_DOMAIN` is a valid DNS name with a matching, valid, publicly trusted TLS certificate; the service refuses to start publicly when validation fails |
 | `SUB_ACCESS_MODE=local` (default) | `http://127.0.0.1:subscription-port/...` | Binds only to loopback and does not open the subscription firewall port; HTTP never leaves the SSH tunnel |
 
-Without a trusted certificate, create a forward on the device that runs the client. For example, if RR reports subscription port `39291` and the example server IP is `203.0.113.10`:
+Let's Encrypt public-IP certificates are short-lived (currently roughly 6–7 days). RR runs a persistent renewal job every 12 hours and retains the HTTP-01 Webroot. If port 80 is blocked, the IP is not local, the chain is not trusted by the system CA store, the certificate expires, or pair publication remains pending, RR does not fall back to a self-signed subscription and emits no publicly shareable personal-subscription URL. Some old clients may not support trusted IP certificates yet; upgrade the client or use a domain/SSH tunnel.
+
+Without a certificate that satisfies those conditions, create a forward on the device that runs the client. For example, if RR reports subscription port `39291` and the example server IP is `203.0.113.10`:
 
 ```bash
 ssh -N -L 39291:127.0.0.1:39291 root@203.0.113.10
@@ -180,21 +196,21 @@ Choose menu option `14`, then select one access mode:
 |---|---|---|
 | Local (recommended) | `127.0.0.1:7900` through an SSH port forward | No public management port and no public certificate requirement |
 | Public domain | `https://` on a domain you control | The backend still binds only to loopback; Nginx proxies HTTPS and installation succeeds only after a Let's Encrypt certificate is issued |
-| Public direct | `https://` on the server IP with a self-signed certificate | Browser shows a certificate warning; the user must trust it manually |
+| Trusted public IP | Globally routable server IPv4/IPv6 with a short-lived Let's Encrypt IP certificate | Public TCP/80 must remain reachable; the certificate must match the exact IP and validate through the system CA store; there is no self-signed fallback |
 
-Public login and console content are HTTPS-only. In domain mode, port 80 serves only ACME challenges and, after certificate issuance, redirects to HTTPS; other cleartext requests do not receive console content. Direct-IP mode is HTTPS-only. RR Nexus uses Argon2id password hashes, application and Nginx login rate limits, CSRF protection, 12-hour sessions, eight one-time recovery codes, and an audit log.
+Public login and console content are HTTPS-only. In domain and trusted-IP modes, port 80 serves only ACME HTTP-01 challenges (domain mode may redirect to HTTPS after issuance); other cleartext requests receive neither console nor subscription content. RR Nexus uses Argon2id password hashes, application and Nginx login rate limits, CSRF protection, 12-hour sessions, eight one-time recovery codes, and an audit log.
 
 Each device is an access identity, not another administrator. It receives an independent UUID and protocol links. Disabling, deleting, expiring, or changing a quota commits the database first and then schedules a background Sing-box/subscription sync, normally taking effect in the next sync cycle. If the audit log reports a sync failure, retry it; a committed database change is not proof that runtime synchronization succeeded. An administrator-only note can be renamed without restarting the node or refreshing subscriptions.
 
-On a public domain console, personal subscriptions always use HTTPS `/sub/...` routes on that trusted domain. Nginx access logging is disabled for these requests, and backend error logs omit the URL, so the token is not written to request-line logs. A public-IP console with a self-signed certificate does not expose subscriptions on that address. If a separate trusted subscription domain exists, device links use its independent HTTPS endpoint; otherwise there is no publicly shareable subscription URL. A local console returns only loopback URLs such as `http://127.0.0.1:subscription-port/nexus/<random-token>.txt`, which require a second SSH port forward.
+Public-domain consoles and public-IP consoles that pass every certificate gate expose personal subscriptions through `/sub/...` on that same trusted HTTPS endpoint; IPv6 literals use URI brackets. Nginx access logging is disabled for these requests, and backend error logs omit the URL, so the token is not written to request-line logs. A legacy self-signed IP certificate is panel compatibility state only and never unlocks public subscriptions or remote keys. If trusted IP issuance or renewal fails, use a trusted subscription domain or a local SSH tunnel. A local console returns only loopback URLs such as `http://127.0.0.1:subscription-port/nexus/<random-token>.txt`, which require a second SSH port forward.
 
 A device can define a first automatic-reset date and a maximum number of monthly renewals. At each boundary, used/upload/download counters return to zero while the allowance stays unchanged; calendar anchoring prevents a 31st-of-the-month plan from drifting permanently after February. A depleted device remains blocked until the next scheduled or manual reset. After all renewals, it expires on the calculated final date. A quota-depleted device left untouched for 35 days is automatically deleted with its credential.
 
-Both the RR Nexus domain HTTPS route and the standalone subscription endpoint (trusted-domain TLS or loopback-only HTTP) attach the standard `Subscription-Userinfo` header, plus an hourly refresh recommendation. NekoBox, Clash-family clients, and other compatible apps can show usage, remaining allowance, and expiry. For clients that do not expose this header, all nine personal subscription formats dynamically add a first “used | remaining | expiry” entry: sing-box JSON and Clash YAML use a real-node copy, while URI/Base64 feeds use an explicitly labelled, non-connectable `127.0.0.1:9` marker. Do not select that marker as a proxy. Stored subscription artifacts remain unchanged.
+RR Nexus trusted-domain/public-IP HTTPS routes and the standalone subscription endpoint (trusted-domain TLS or loopback-only HTTP) attach the standard `Subscription-Userinfo` header, plus an hourly refresh recommendation. NekoBox, Clash-family clients, and other compatible apps can show usage, remaining allowance, and expiry. For clients that do not expose this header, all nine personal subscription formats dynamically add a first “used | remaining | expiry” entry: sing-box JSON and Clash YAML use a real-node copy, while URI/Base64 feeds use an explicitly labelled, non-connectable `127.0.0.1:9` marker. Do not select that marker as a proxy. Stored subscription artifacts remain unchanged.
 
 For local mode, run the command printed by the installer on your **own computer**. On first connection, verify the SSH host fingerprint before accepting it; do not disable host-key checking. Enter the server root password when prompted, keep that terminal open, and browse to `http://127.0.0.1:7900`. The command uses an SSH `-L` forward plus a 30-second client keepalive and fails fast when the forward cannot be created. To use personal subscriptions, also forward the subscription port as described above.
 
-RR Nexus downloads a SHA256-verified core built by the project GitHub Actions workflow from the official stable Sing-box source with the additional `with_v2ray_api` tag. It polls counters named by device ID every five seconds, persists upload and download totals, and revokes access when a quota is reached. These per-device figures are application-layer accounting; an abnormal Sing-box exit or the instant around a reload can still lose a small uncollected delta.
+RR Nexus downloads an accounting core built by the project GitHub Actions workflow from one pinned official sing-box 1.14.0 source commit with the additional `with_v2ray_api` tag. RR verifies its version, source revision, build tags, and SHA256. It polls counters named by device ID every five seconds, persists upload and download totals, and revokes access when a quota is reached. These per-device figures are application-layer accounting; an abnormal Sing-box exit or the instant around a reload can still lose a small uncollected delta.
 
 The server carrier-package meter is separate. It reads RX/TX byte counters from the selected Linux public interface, persists its baseline across panel restarts, and safely re-baselines after a VPS reboot, counter rollback, or interface change. The operator can enter the provider's current usage at any time; RR then re-baselines at that value and accumulates only subsequent traffic, which also covers mid-cycle panel installations. It can count RX+TX, TX only, or RX only. This is closer to provider billing than application counters, but provider-specific overhead and unit conversion still make the provider invoice authoritative. Exhausting this monitor raises a warning; it never takes the whole VPS offline automatically.
 

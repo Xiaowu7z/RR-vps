@@ -26,6 +26,106 @@ for rr_module in "$RR_MODULE_DIR"/*.sh; do
 done
 unset rr_module
 
+rr_cli_post_update() {
+    RR_PORTABLE_RESTORE=0 post_update_migrate
+}
+
+rr_cli_sync_subscriptions() {
+    migrate_config_schema && generate_node_and_sub
+}
+
+rr_cli_refresh_subscription() {
+    migrate_config_schema || return 1
+    load_config_with_defaults || return 1
+    if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        SUB_BIND_ADDRESS=127.0.0.1
+    else
+        select_entry_ip || return 1
+    fi
+    start_subscription_server
+}
+
+rr_cli_reload_singbox_certificate() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    # A certificate deploy hook is only allowed to restart the RR-managed
+    # systemd service.  restart_singbox re-emits and proves the complete
+    # effective unit (including the exact drop-in set), validates the config,
+    # and requires a new MainPID/InvocationID generation before succeeding.
+    # Refuse the legacy nohup fallback here because it has no systemd generation
+    # identity to prove to the hook.
+    [ -f "$service_file" ] && [ ! -L "$service_file" ] || return 1
+    # Preflight before restart_singbox's idempotent writer so a same-name
+    # foreign fragment or unknown drop-in is rejected with zero unit mutation.
+    rr_singbox_service_guards_are_effective || return 1
+    restart_singbox
+}
+
+rr_certificate_nginx_service_control() {
+    local nginx_bin="${RR_CERT_RELOAD_NGINX_BIN:-nginx}"
+    local readonly_systemctl="${RR_CERT_RELOAD_READONLY_SYSTEMCTL_BIN:-systemctl}"
+    case "$#:$1:${2:-}:${3:-}" in
+        2:reload:nginx:)
+            # modules/60 validates the complete Nginx configuration immediately
+            # before this adapter is called.  Use Nginx's native signal command
+            # so an unknown systemd drop-in can never substitute ExecReload.
+            "$nginx_bin" -s reload >/dev/null 2>&1
+            ;;
+        3:is-active:--quiet:nginx)
+            # Observation is non-mutating; the caller still requires the newly
+            # served TLS leaf before it can clear durable pending evidence.
+            "$readonly_systemctl" is-active --quiet nginx >/dev/null 2>&1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# Health pending compensation in modules/60 resolves this variable at call
+# time.  Override any ambient value with the RR-local adapter above.
+RR_CERT_RELOAD_SYSTEMCTL_BIN=rr_certificate_nginx_service_control
+
+rr_cli_sync_devices() {
+    migrate_config_schema && sync_nexus_devices
+}
+
+rr_cli_nexus_ip_acme_install() {
+    [ "$#" -eq 2 ] || return 2
+    nexus_activate_ip_acme_existing "$1" "$2"
+}
+
+rr_cli_nexus_ip_acme_uninstall() {
+    [ "$#" -eq 0 ] || return 2
+    nexus_uninstall_ip_acme_existing
+}
+
+rr_cli_nexus_ip_acme_renew() {
+    [ "$#" -eq 0 ] || return 2
+    nexus_ip_acme_service_entry
+}
+
+rr_cli_fw_toggle() {
+    nexus_fw_toggle "${1:-}" "${2:-}"
+}
+
+rr_cli_fw_ipmode() {
+    local entry_val="${1:-}" outbound_val="${2:-}"
+    load_config_with_defaults || return 1
+    case "$entry_val" in auto|ipv4|ipv6) ;; *) entry_val="$ENTRY_IP_MODE" ;; esac
+    case "$outbound_val" in
+        auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;;
+        *) outbound_val="$OUTBOUND_IP_MODE" ;;
+    esac
+    if apply_ip_preferences "$entry_val" "$outbound_val"; then
+        echo "{\"ok\":true,\"entry\":\"$entry_val\",\"outbound\":\"$outbound_val\"}"
+        return 0
+    fi
+    echo '{"ok":false,"error":"ip_mode_apply_failed"}'
+    return 1
+}
+
+rr_cli_set_update_channel() {
+    rr_set_update_channel "${1:-}"
+}
+
 if [ "$module_count" -lt 2 ] || ! declare -F main_menu >/dev/null 2>&1; then
     echo "RR-vps 模块不完整，请重新运行安装命令修复。" >&2
     exit 1
@@ -59,7 +159,7 @@ case "${1:-}" in
     update)
         case "${2:-}" in
             --channel)
-                rr_set_update_channel "${3:-}"
+                rr_run_mutating_entrypoint rr_cli_set_update_channel "${3:-}"
                 exit $?
                 ;;
             --check)
@@ -90,7 +190,7 @@ case "${1:-}" in
         exit $?
         ;;
     --set-update-channel)
-        rr_set_update_channel "${2:-}"
+        rr_run_mutating_entrypoint rr_cli_set_update_channel "${2:-}"
         exit $?
         ;;
     --recover-update)
@@ -110,8 +210,15 @@ case "${1:-}" in
         rr_restore_service_gate
         exit $?
         ;;
+    --singbox-certificate-gate)
+        rr_singbox_certificate_start_gate
+        exit $?
+        ;;
     --post-update)
-        post_update_migrate
+        # The public compatibility entry accepts update-transaction context
+        # from the installer, but portable restore is an internal orchestrator
+        # mode and must not be enabled by the caller's ambient environment.
+        rr_run_mutating_entrypoint rr_cli_post_update
         exit $?
         ;;
     --post-update-finalize)
@@ -123,25 +230,45 @@ case "${1:-}" in
         exit $?
         ;;
     --sync-subscriptions)
-        migrate_config_schema && generate_node_and_sub
+        rr_run_mutating_entrypoint rr_cli_sync_subscriptions
         exit $?
         ;;
     --refresh-subscription)
         # Certbot deploy hook entry point.  It only restarts the managed file
         # server after the new certificate has passed the same strict checks as
         # a normal install/update; it never regenerates node credentials.
-        migrate_config_schema || exit 1
-        load_config_with_defaults || exit 1
-        if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
-            SUB_BIND_ADDRESS=127.0.0.1
-        else
-            select_entry_ip || exit 1
-        fi
-        start_subscription_server
+        rr_run_mutating_entrypoint rr_cli_refresh_subscription
+        exit $?
+        ;;
+    --reload-singbox-certificate)
+        # Certbot deploy-hook entry point.  The hook already runs in an isolated
+        # shared-lock callback; rr_run_mutating_entrypoint authenticates that
+        # delegation through the root ancestor that still owns the exact lock
+        # inode instead of trying to acquire the same lock again.
+        [ "$#" -eq 1 ] || exit 2
+        rr_run_mutating_entrypoint rr_cli_reload_singbox_certificate
         exit $?
         ;;
     --sync-devices)
-        migrate_config_schema && sync_nexus_devices
+        rr_run_mutating_entrypoint rr_cli_sync_devices
+        exit $?
+        ;;
+    --nexus-ip-acme-install)
+        [ "$#" -eq 3 ] || {
+            echo "用法：rr --nexus-ip-acme-install <公网IP> <邮箱>" >&2
+            exit 2
+        }
+        rr_run_mutating_entrypoint rr_cli_nexus_ip_acme_install "$2" "$3"
+        exit $?
+        ;;
+    --nexus-ip-acme-renew)
+        [ "$#" -eq 1 ] || exit 2
+        rr_run_mutating_entrypoint rr_cli_nexus_ip_acme_renew
+        exit $?
+        ;;
+    --nexus-ip-acme-uninstall)
+        [ "$#" -eq 1 ] || exit 2
+        rr_run_mutating_entrypoint rr_cli_nexus_ip_acme_uninstall
         exit $?
         ;;
     --update-now)
@@ -155,6 +282,10 @@ case "${1:-}" in
         rr_run_health_check
         exit $?
         ;;
+    --verify-health-unit-definitions)
+        rr_health_monitor_unit_definitions_are_current
+        exit $?
+        ;;
     --version|-v)
         echo "RR-vps ${SCRIPT_VERSION}"
         exit 0
@@ -164,22 +295,13 @@ case "${1:-}" in
         exit $?
         ;;
     --fw-toggle)
-        nexus_fw_toggle "${2:-}" "${3:-}"
+        rr_run_mutating_entrypoint rr_cli_fw_toggle "${2:-}" "${3:-}"
         exit $?
         ;;
     --fw-ipmode)
         # 用法: rr --fw-ipmode auto|ipv4|ipv6 [auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only]
-        entry_val="${2:-}"
-        outbound_val="${3:-}"
-        load_config_with_defaults || exit 1
-        case "$entry_val" in auto|ipv4|ipv6) ;; *) entry_val="$ENTRY_IP_MODE" ;; esac
-        case "$outbound_val" in auto|prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;; *) outbound_val="$OUTBOUND_IP_MODE" ;; esac
-        if apply_ip_preferences "$entry_val" "$outbound_val"; then
-            echo "{\"ok\":true,\"entry\":\"$entry_val\",\"outbound\":\"$outbound_val\"}"
-            exit 0
-        fi
-        echo '{"ok":false,"error":"ip_mode_apply_failed"}'
-        exit 1
+        rr_run_mutating_entrypoint rr_cli_fw_ipmode "${2:-}" "${3:-}"
+        exit $?
         ;;
     --ver-info)
         nexus_ver_info_json

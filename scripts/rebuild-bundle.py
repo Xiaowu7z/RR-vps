@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import io
 import re
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -29,14 +30,54 @@ UPDATE_GUARD = BASE / "scripts/update-guard.sh"
 MANIFEST = BASE / "manifest.sha256"
 BUNDLE = BASE / "rr-bundle.tar.gz"
 
+RELEASE_MEMBER_PATTERN = re.compile(
+    r"^(?:rr|"
+    r"scripts/(?:naive-cert-hook|update-recover)\.sh|"
+    r"scripts/update-external-state\.py|"
+    r"modules/[0-9][0-9A-Za-z_-]*\.sh|"
+    r"nexus/(?:rr_nexus|sub_server)\.py|"
+    r"nexus/rr_nexus_lib/[A-Za-z0-9._-]+\.py|"
+    r"nexus/static/[A-Za-z0-9._-]+\.(?:html|css|js)|"
+    r"manifest\.sha256)$"
+)
+NEXUS_SOURCE_SUFFIXES = {".py", ".html", ".css", ".js"}
+USTAR_NAME_BYTES = 100
+
+
+def validate_release_member(relative: str, path: Path | None = None) -> None:
+    """Apply the installer's fixed payload schema before manifesting a file.
+
+    The bootstrap and runtime validators intentionally accept only three
+    fixed Nexus levels.  Refusing deeper source paths here keeps the generated
+    manifest and the raw-tar allow-list identical.  Archive names are also
+    kept in the fixed USTAR name field: this prevents an implicit PAX/GNU
+    extension from ever becoming part of a supposedly deterministic bundle.
+    """
+
+    if not RELEASE_MEMBER_PATTERN.fullmatch(relative):
+        raise ValueError(f"发布路径超出安装器固定层级：{relative}")
+    try:
+        archive_name = f"rr-bundle/{relative}".encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"发布路径必须是 ASCII：{relative}") from exc
+    if len(archive_name) > USTAR_NAME_BYTES:
+        raise ValueError(f"发布成员名超过 USTAR 100 字节限制：{relative}")
+    if path is None:
+        return
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ValueError(f"无法读取发布文件类型：{relative}") from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"发布成员必须是普通文件：{relative}")
+
 def release_files() -> list[str]:
     """Return the complete runtime payload in a deterministic order.
 
-    The 7.0 installer carried a hand-maintained Nexus allow-list.  That made a
-    successful source change surprisingly easy to omit from the hot-update
-    bundle.  Runtime file types are deliberately narrow, while discovery is
-    recursive so backend/frontend modules can be split without changing the
-    release builder again.
+    Nexus discovery is recursive only so schema drift is detected rather than
+    silently omitted.  The accepted files deliberately match the installer's
+    fixed copy contract: two root entry points, one flat library package and
+    one flat static directory.
     """
 
     members = [
@@ -51,11 +92,13 @@ def release_files() -> list[str]:
     )
     nexus_root = BASE / "nexus"
     for path in sorted(nexus_root.rglob("*"), key=lambda item: item.as_posix()):
-        if not path.is_file() or "__pycache__" in path.parts:
+        if "__pycache__" in path.parts or path.suffix not in NEXUS_SOURCE_SUFFIXES:
             continue
-        if path.suffix not in {".py", ".html", ".css", ".js"}:
-            continue
-        members.append(path.relative_to(BASE).as_posix())
+        relative = path.relative_to(BASE).as_posix()
+        validate_release_member(relative, path)
+        members.append(relative)
+    for relative in members:
+        validate_release_member(relative, BASE / relative)
     return members
 
 
@@ -139,8 +182,11 @@ def expected_manifest() -> bytes:
 
 def expected_bundle(manifest_raw: bytes) -> bytes:
     tar_buffer = io.BytesIO()
-    with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+    with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
         for relative in BUNDLE_MEMBERS:
+            validate_release_member(
+                relative, None if relative == "manifest.sha256" else BASE / relative
+            )
             raw = manifest_raw if relative == "manifest.sha256" else (BASE / relative).read_bytes()
             info = tarfile.TarInfo(name=f"rr-bundle/{relative}")
             info.size = len(raw)
@@ -150,6 +196,7 @@ def expected_bundle(manifest_raw: bytes) -> bytes:
             info.gid = 0
             info.uname = ""
             info.gname = ""
+            info.type = tarfile.REGTYPE
             archive.addfile(info, io.BytesIO(raw))
 
     gzip_buffer = io.BytesIO()
@@ -172,7 +219,7 @@ def verify_bundle_structure(bundle_raw: bytes, manifest_raw: bytes) -> None:
         if names != expected_names:
             raise ValueError("bundle 成员、顺序或覆盖范围不正确")
         for member in members:
-            if not member.isfile() or member.size <= 0:
+            if not member.isfile() or member.type != tarfile.REGTYPE or member.pax_headers or member.size <= 0:
                 raise ValueError(f"bundle 含非普通文件或空文件：{member.name}")
             relative = member.name.removeprefix("rr-bundle/")
             expected_mode = 0o755 if relative in EXEC_MEMBERS else 0o644

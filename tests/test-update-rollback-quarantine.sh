@@ -387,6 +387,9 @@ printf '%s\n' '[6/20] automatic/manual restore orchestration skips only the unsa
     export RR_HEALTH_SERVICE_FILE="$TEST_ROOT/fake-health.service"
     # shellcheck source=../scripts/update-recover.sh
     source "$REPO_ROOT/scripts/update-recover.sh"
+    # Exact managed-unit identity is covered by the service ownership suites;
+    # this fixture isolates rollback subscription orchestration.
+    rr_managed_service_start_is_safe() { return 0; }
     : > "$RR_HEALTH_SERVICE_FILE"
     restore_log="$TEST_ROOT/restore-systemctl.log"
     quarantine_active="$TEST_ROOT/restore-quarantine-active"
@@ -563,6 +566,7 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
     rr_restore_dir() { :; }
     rr_restore_sqlite() { :; }
     rr_install_restore_external_state_if_required() { :; }
+    rr_restore_ip_acme_update_directories() { :; }
     rr_read_trusted_phase() { printf 'runtime_swapped\n'; }
     rr_quiesce_health_monitor_for_rollback() { :; }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }

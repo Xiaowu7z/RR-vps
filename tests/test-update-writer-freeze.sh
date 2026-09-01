@@ -32,7 +32,20 @@ eval "$(extract_function rr_unit_activity_matches)"
 eval "$(extract_function rr_unit_file_state_matches)"
 eval "$(extract_function rr_capture_unit_activity_state)"
 eval "$(extract_function rr_capture_unit_file_state)"
+eval "$(extract_function rr_capture_ip_acme_update_state)"
 eval "$(extract_function rr_capture_update_writer_state)"
+RR_IP_ACME_STATE_ROOT="$TEST_ROOT/absent-ip-acme"
+RR_IP_ACME_WAS_PRESENT=true
+RR_IP_ACME_WAS_READY=true
+RR_IP_ACME_TIMER_WAS_ACTIVE=true
+RR_IP_ACME_TIMER_WAS_ENABLED=true
+rr_ip_acme_legacy_absent_state_is_exact() { return 0; }
+rr_capture_ip_acme_update_state || fail 'absent IP-ACME state was not captured'
+[ "$RR_IP_ACME_WAS_PRESENT" = false ] && \
+    [ "$RR_IP_ACME_WAS_READY" = false ] && \
+    [ "$RR_IP_ACME_TIMER_WAS_ACTIVE" = false ] && \
+    [ "$RR_IP_ACME_TIMER_WAS_ENABLED" = false ] || \
+    fail 'absent IP-ACME capture retained stale writer state'
 systemctl() {
     case "$1:${2:-}" in
         show:--property=LoadState) printf '%s\n' not-found ;;
@@ -42,6 +55,12 @@ systemctl() {
     esac
 }
 rr_subscription_running() { return 1; }
+rr_capture_ip_acme_update_state() {
+    RR_IP_ACME_WAS_PRESENT=false
+    RR_IP_ACME_WAS_READY=false
+    RR_IP_ACME_TIMER_WAS_ACTIVE=false
+    RR_IP_ACME_TIMER_WAS_ENABLED=false
+}
 RR_HEALTH_STATE_CAPTURED=false
 rr_capture_update_writer_state || fail 'inactive writers were reported as a snapshot failure'
 [ "$RR_HEALTH_STATE_CAPTURED" = true ] || fail 'health state was not marked captured'
@@ -52,7 +71,11 @@ rr_capture_update_writer_state || fail 'inactive writers were reported as a snap
     [ "$RR_SINGBOX_WAS_ENABLED" = false ] && \
     [ "$RR_NEXUS_WAS_ACTIVE" = false ] && \
     [ "$RR_NEXUS_WAS_ENABLED" = false ] && \
-    [ "$RR_SUBSCRIPTION_WAS_ACTIVE" = false ] || \
+    [ "$RR_SUBSCRIPTION_WAS_ACTIVE" = false ] && \
+    [ "$RR_IP_ACME_WAS_PRESENT" = false ] && \
+    [ "$RR_IP_ACME_WAS_READY" = false ] && \
+    [ "$RR_IP_ACME_TIMER_WAS_ACTIVE" = false ] && \
+    [ "$RR_IP_ACME_TIMER_WAS_ENABLED" = false ] || \
     fail 'inactive writer state was not preserved exactly'
 
 RR_HEALTH_STATE_CAPTURED=false
@@ -138,6 +161,7 @@ run_recovery_case() (
     local case_name="$1" wanted_failure="${2:-false}"
     local recovery_phase="${3:-snapshotting}"
     local precreated="${4:-false}"
+    local sync_fault=false
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
     export RR_TX_ROOT="$TEST_ROOT/$case_name/update"
     export RR_ACTIVE_TX="$RR_TX_ROOT/active"
@@ -151,6 +175,9 @@ run_recovery_case() (
     export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/$case_name/run/update-maintenance"
     # shellcheck source=../scripts/update-recover.sh
     source "$REPO_ROOT/scripts/update-recover.sh"
+    # Managed start identity has dedicated coverage.  This fixture exercises
+    # captured writer-state replay and intentionally does not install units.
+    rr_managed_service_start_is_safe() { return 0; }
 
     declare -A active=([sing-box]=false [rr-nexus]=false [argo-rr-health.timer]=false)
     declare -A enabled=([sing-box]=false [rr-nexus]=false [argo-rr-health.timer]=false)
@@ -258,20 +285,47 @@ run_recovery_case() (
         chmod 600 "$tx/phase" "$RR_ACTIVE_TX" "$RR_UPDATE_MAINTENANCE_FILE"
     fi
 
+    if [ "$wanted_failure" = sync-error ]; then
+        sync_fault=true
+        sync() {
+            if [ "$#" -eq 0 ] && [ "$sync_fault" = true ]; then
+                return 1
+            fi
+            command sync "$@"
+        }
+    fi
+
     if [ "$wanted_failure" = true ] || [ "$wanted_failure" = query-error ] || \
-       [ "$wanted_failure" = incoherent ]; then
+       [ "$wanted_failure" = incoherent ] || [ "$wanted_failure" = sync-error ]; then
         set +e
         main recover
         rc=$?
         set -e
         [ "$rc" -eq 1 ] || fail 'restart failure was reported as success'
-        [ "$(cat "$tx/phase")" = recovery_failed ] || fail 'restart failure did not set recovery_failed'
+        [ "$(cat "$tx/phase")" = "$recovery_phase" ] || \
+            fail 'retryable pre-mutation failure did not preserve its original phase'
         [ -e "$RR_ACTIVE_TX" ] || fail 'restart failure removed active transaction evidence'
         [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'restart failure removed the maintenance marker'
-        [ "${active[argo-rr-health.timer]:-false}" = false ] && \
-            [ "${active[argo-rr-health.service]:-false}" = false ] && \
-            [ "${enabled[argo-rr-health.timer]:-false}" = false ] || \
-            fail 'restart failure left a health writer active or enabled'
+        if [ "$recovery_phase" = state_recorded ]; then
+            if grep -Eq '^(enable|disable|restart|stop) (rr-nexus|sing-box|argo-rr-health.timer)' \
+                "$operation_log"; then
+                fail 'state-record durability failure touched a service before freezing began'
+            fi
+            [ "${active[argo-rr-health.timer]:-false}" = true ] && \
+                [ "${enabled[argo-rr-health.timer]:-false}" = true ] || \
+                fail 'state-record durability failure changed the untouched health timer'
+        else
+            [ "${active[argo-rr-health.timer]:-false}" = false ] && \
+                [ "${active[argo-rr-health.service]:-false}" = false ] && \
+                [ "${enabled[argo-rr-health.timer]:-false}" = false ] || \
+                fail 'restart failure left a health writer active or enabled'
+        fi
+        wanted_failure=false
+        sync_fault=false
+        main recover || fail 'retryable pre-mutation recovery did not succeed on a second boot'
+        [ "$(cat "$tx/phase")" = aborted ] && [ ! -e "$RR_ACTIVE_TX" ] && \
+            [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || \
+            fail 'second recovery did not durably consume the retryable transaction'
         return 0
     fi
 
@@ -297,6 +351,7 @@ run_recovery_case() (
 
 printf '%s\n' '[3/15] state-record crash recovery touches no service before freezing begins'
 run_recovery_case state-recorded false state_recorded
+run_recovery_case state-recorded-sync sync-error state_recorded
 
 printf '%s\n' '[4/15] pre-mutation crash recovery restores exact active/enabled state'
 run_recovery_case restore-success false
@@ -1087,6 +1142,10 @@ printf '%s\n' '[11/15] invalid evidence and systemd query errors fail closed wit
         [ ! -e "$timer_active" ] && [ ! -e "$timer_enabled" ] && [ ! -e "$service_active" ] ||
             fail "$1 left a health writer active or enabled"
     }
+    assert_health_untouched() {
+        [ -e "$timer_active" ] && [ -e "$timer_enabled" ] && [ -e "$service_active" ] ||
+            fail "$1 changed a writer before the state_recorded freeze boundary"
+    }
 
     legacy_tx="$RR_TX_ROOT/transactions/legacy-0644"
     mkdir -p "$legacy_tx"
@@ -1113,7 +1172,7 @@ printf '%s\n' '[11/15] invalid evidence and systemd query errors fail closed wit
     set -e
     [ "$rc" -eq 1 ] && [ -e "$RR_ACTIVE_TX" ] ||
         fail 'format-2 transaction accepted legacy 0644 active/phase metadata'
-    assert_health_frozen 'format-2 0644 transaction metadata'
+    assert_health_untouched 'format-2 0644 state-recorded metadata'
 
     arm_health
     missing_writer_state="$RR_TX_ROOT/transactions/missing-writer-state"

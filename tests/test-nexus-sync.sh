@@ -14,12 +14,29 @@ RR_REPOSITORY="example/rr-vps"
 source modules/85-nexus.sh
 
 echo "[1/5] executable timeout entrypoints"
-grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-devices' modules/60-update.sh
-grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-subscriptions' modules/60-update.sh
-if grep -Eq 'timeout[[:space:]]+[0-9]+[[:space:]]+(sync_nexus_devices|generate_node_and_sub)' modules/60-update.sh; then
-    echo "timeout still invokes a non-exported shell function" >&2
-    exit 1
-fi
+python3 - modules/60-update.sh <<'PY'
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+# A backslash-newline is shell lexical continuation, not a command boundary.
+semantic_source = re.sub(r"\\\r?\n", " ", source)
+for command in ("--sync-devices", "--sync-subscriptions"):
+    pattern = (
+        r'timeout\s+--kill-after=5\s+150\s+"\$RR_LAUNCHER"\s+'
+        + re.escape(command)
+        + r'(?=\s|[;&|])'
+    )
+    assert re.search(pattern, semantic_source), (
+        f"missing bounded executable {command} entrypoint"
+    )
+assert not re.search(
+    r'timeout\s+(?:--[^\s]+\s+)*[0-9]+\s+'
+    r'(?:sync_nexus_devices|generate_node_and_sub)(?=\s|[;&|])',
+    semantic_source,
+), "timeout still invokes a non-exported shell function"
+PY
 
 echo "[2/5] cross-process lock and atomic tree exchange"
 NEXUS_SYNC_LOCK_FILE="$test_root/sync.lock"

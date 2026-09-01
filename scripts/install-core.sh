@@ -50,16 +50,39 @@ RR_SINGBOX_WAS_ENABLED=false
 RR_NEXUS_WAS_ACTIVE=false
 RR_NEXUS_WAS_ENABLED=false
 RR_SUBSCRIPTION_WAS_ACTIVE=false
+RR_IP_ACME_WAS_PRESENT=false
+RR_IP_ACME_WAS_READY=false
+RR_IP_ACME_TIMER_WAS_ACTIVE=false
+RR_IP_ACME_TIMER_WAS_ENABLED=false
+RR_IP_ACME_STATE_ROOT="/var/lib/rr-nexus/ip-acme"
+RR_IP_ACME_WEBROOT="/var/www/rr-nexus-ip-acme"
 RR_HEALTH_TIMER_FILE="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+RR_UPDATE_SYSTEMD_DIR="${RR_UPDATE_SYSTEMD_DIR:-/etc/systemd/system}"
+RR_UPDATE_RECOVERY_UNIT_FILE="${RR_UPDATE_RECOVERY_UNIT_FILE:-${RR_UPDATE_SYSTEMD_DIR}/rr-update-recovery.service}"
 RR_UPDATE_LOCK_FILE="${RR_UPDATE_LOCK_FILE:-/run/rr-vps/locks/update.lock}"
 RR_LEGACY_UPDATE_LOCK_FILE="${RR_LEGACY_UPDATE_LOCK_FILE:-/run/lock/rr-update.lock}"
 RR_LEGACY_UPDATE_BRIDGE_FILE="${RR_LEGACY_UPDATE_BRIDGE_FILE:-/run/rr-vps/legacy-update-bridge}"
+RR_RESTORE_ACTIVE="${RR_RESTORE_ACTIVE:-/var/lib/rr-backup/active}"
 RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
 RR_COMMITTED_SETTLED_NAME="committed-settled"
 RR_COMMITTED_SETTLED_VALUE="rr-update-committed-settled-v1"
 
 rr_error() {
     echo "[RR-vps] $*" >&2
+}
+
+rr_install_release_after_locks() {
+    # Backup restore owns this marker and the same shared update lock.  Once
+    # both installer locks are held, any visible marker object is therefore
+    # authoritative evidence that the restore still needs the installed
+    # runtime it captured.  Do not inspect or repair it here: even a malformed
+    # regular file or dangling symlink must fail closed before release I/O.
+    if [ -e "$RR_RESTORE_ACTIVE" ] || [ -L "$RR_RESTORE_ACTIVE" ]; then
+        rr_error "检测到未完成的备份恢复事务，已拒绝安装/更新；请先完成或恢复该事务。"
+        return 1
+    fi
+    rr_fetch_release || return 1
+    rr_install_release
 }
 
 rr_prepare_update_lock_file() {
@@ -482,7 +505,8 @@ rr_run_with_delegated_update_lock() {
         # process tree must not inherit either flock fd: a nohup child could
         # otherwise keep the transaction locked after the installer exits.
         rr_close_inherited_installer_lock_fds
-        RR_UPDATE_LOCK_HELD=1 "$@"
+        RR_UPDATE_LOCK_OWNER=0 RR_UPDATE_LOCK_FDS_CLOSED=1 \
+            RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 "$@"
     )
 }
 
@@ -619,6 +643,477 @@ rr_capture_unit_file_state() {
     [ "$state" -eq 1 ] || return 1
     rr_unit_file_state_matches "$unit" disabled || return 1
     printf -v "$output_name" '%s' false
+}
+
+rr_ip_acme_tree_is_safe() {
+    local root="$1" kind="$2" scope="${3:-live}" expected="" backup_name=""
+    [ "$kind" = state ] || [ "$kind" = webroot ] || return 1
+    case "$scope" in
+        live)
+            [ "$root" = "$RR_IP_ACME_STATE_ROOT" ] || \
+                [ "$root" = "$RR_IP_ACME_WEBROOT" ] || return 1
+            rr_ip_acme_parent_chain_is_safe "$root" || return 1
+            ;;
+        backup)
+            [ -d "$BACKUP_DIR" ] && [ ! -L "$BACKUP_DIR" ] && \
+                [ "$(readlink -f -- "$BACKUP_DIR" 2>/dev/null)" = "$BACKUP_DIR" ] && \
+                [ "$(stat -c '%u:%g:%a' -- "$BACKUP_DIR" 2>/dev/null)" = 0:0:700 ] || \
+                return 1
+            if [ "$kind" = state ]; then
+                backup_name=nexus_ip_acme_state
+            else
+                backup_name=nexus_ip_acme_webroot
+            fi
+            expected="$BACKUP_DIR/$backup_name"
+            [ "$root" = "$expected" ] && \
+                [ -f "$BACKUP_DIR/had_${backup_name}" ] && \
+                [ ! -L "$BACKUP_DIR/had_${backup_name}" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    python3 - "$root" "$kind" <<'PY'
+import json
+import os
+import stat
+import sys
+
+root, kind = sys.argv[1:]
+if os.path.realpath(root) != root:
+    raise SystemExit(1)
+try:
+    root_info = os.lstat(root)
+except FileNotFoundError:
+    raise SystemExit(1)
+if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+    raise SystemExit(1)
+expected_root_mode = 0o700 if kind == "state" else 0o755
+if (root_info.st_uid, root_info.st_gid, stat.S_IMODE(root_info.st_mode)) != (0, 0, expected_root_mode):
+    raise SystemExit(1)
+if os.path.ismount(root):
+    raise SystemExit(1)
+
+marker_name = ".rr-nexus-ip-acme-owner"
+marker_value = "rr-nexus-ip-acme-v1" if kind == "state" else "rr-nexus-ip-acme-webroot-v1"
+marker = os.path.join(root, marker_name)
+count = 0
+for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+    current_info = os.lstat(current)
+    if not stat.S_ISDIR(current_info.st_mode) or stat.S_ISLNK(current_info.st_mode):
+        raise SystemExit(1)
+    if (current_info.st_uid, current_info.st_gid) != (0, 0):
+        raise SystemExit(1)
+    mode = stat.S_IMODE(current_info.st_mode)
+    if mode & 0o7022:
+        raise SystemExit(1)
+    for name in directories + files:
+        count += 1
+        if count > 10000:
+            raise SystemExit(1)
+        path = os.path.join(current, name)
+        info = os.lstat(path)
+        if (info.st_uid, info.st_gid) != (0, 0) or stat.S_ISLNK(info.st_mode):
+            raise SystemExit(1)
+        if stat.S_ISDIR(info.st_mode):
+            if stat.S_IMODE(info.st_mode) & 0o7022:
+                raise SystemExit(1)
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o7022:
+                raise SystemExit(1)
+            if info.st_size > 64 * 1024 * 1024:
+                raise SystemExit(1)
+        else:
+            raise SystemExit(1)
+
+try:
+    marker_info = os.lstat(marker)
+    with open(marker, "r", encoding="utf-8", newline="") as stream:
+        marker_data = stream.read()
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+if (not stat.S_ISREG(marker_info.st_mode) or marker_info.st_nlink != 1
+        or (marker_info.st_uid, marker_info.st_gid, stat.S_IMODE(marker_info.st_mode)) != (0, 0, 0o600)
+        or marker_data != marker_value + "\n"):
+    raise SystemExit(1)
+
+if kind == "state":
+    allowed = {marker_name, "config.json", "publication.json", "active", "candidate"}
+    if set(os.listdir(root)) - allowed:
+        raise SystemExit(1)
+    config_path = os.path.join(root, "config.json")
+    try:
+        info = os.lstat(config_path)
+        with open(config_path, "r", encoding="utf-8") as stream:
+            config = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SystemExit(1)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (0, 0, 0o600)
+            or not isinstance(config, dict)
+            or set(config) != {"version", "address", "email"}
+            or config.get("version") != 1
+            or not isinstance(config.get("address"), str)
+            or not isinstance(config.get("email"), str)):
+        raise SystemExit(1)
+PY
+}
+
+rr_ip_acme_parent_chain_is_safe() {
+    local target="${1:-}"
+    python3 - "$target" <<'PY'
+import os
+import stat
+import sys
+
+target = sys.argv[1]
+chains = {
+    "/var/lib/rr-nexus/ip-acme": (("/", 0o755), ("/var", 0o755), ("/var/lib", 0o755), ("/var/lib/rr-nexus", 0o700)),
+    "/var/www/rr-nexus-ip-acme": (("/", 0o755), ("/var", 0o755), ("/var/www", 0o755)),
+}
+if target not in chains:
+    raise SystemExit(1)
+for index, (path, expected_mode) in enumerate(chains[target]):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        # Only the immediate RR data parent may be absent.  Its ancestor was
+        # already proved canonical and privileged; the caller creates this
+        # one exact directory without chmodding an existing global parent.
+        if index == len(chains[target]) - 1:
+            continue
+        raise SystemExit(1)
+    except OSError:
+        raise SystemExit(1)
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != 0 or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != expected_mode):
+        raise SystemExit(1)
+    if os.path.realpath(path) != path:
+        raise SystemExit(1)
+if os.path.realpath(os.path.dirname(target)) != os.path.dirname(target):
+    raise SystemExit(1)
+PY
+}
+
+rr_ip_acme_prepare_parent() {
+    local target="${1:-}" parent="" mode=""
+    rr_ip_acme_parent_chain_is_safe "$target" || return 1
+    parent=$(dirname -- "$target") || return 1
+    case "$target" in
+        /var/lib/rr-nexus/ip-acme) mode=700 ;;
+        /var/www/rr-nexus-ip-acme) mode=755 ;;
+        *) return 1 ;;
+    esac
+    if [ ! -e "$parent" ] && [ ! -L "$parent" ]; then
+        install -d -m "$mode" "$parent" || return 1
+    fi
+    rr_ip_acme_parent_chain_is_safe "$target"
+}
+
+rr_ip_acme_candidate_runtime_is_exact() {
+    local address="${1:-}" module_dir="$PAYLOAD_DIR/modules"
+    [ -d "$module_dir" ] && [ ! -L "$module_dir" ] || return 1
+    RR_IP_ACME_AUDIT_MODULE_DIR="$module_dir" bash -s -- "$address" <<'BASH'
+set -eo pipefail
+address=${1:-}
+for module in "$RR_IP_ACME_AUDIT_MODULE_DIR"/*.sh; do
+    source "$module"
+done
+nexus_ip_acme_owned_state_is_safe "$address"
+nexus_ip_acme_webroot_is_safe
+nexus_ip_acme_nginx_http_site_is_current "$address"
+nexus_ip_acme_lego_marker_is_current
+nexus_ip_acme_pair_is_trusted \
+    "$NEXUS_IP_ACME_LIVE_CERT" "$NEXUS_IP_ACME_LIVE_KEY" "$address"
+nexus_ip_certificate_gate_artifacts_are_current \
+    "$NEXUS_IP_ACME_LIVE_CERT" "$NEXUS_IP_ACME_LIVE_KEY" \
+    "$NEXUS_IP_ACME_PENDING"
+nexus_ip_acme_unit_is_current "$NEXUS_IP_ACME_SERVICE_FILE" service
+nexus_ip_acme_unit_is_current "$NEXUS_IP_ACME_TIMER_FILE" timer
+nexus_ip_acme_effective_service_is_exact
+nexus_ip_acme_effective_timer_is_exact
+BASH
+}
+
+rr_ip_acme_exclusive_artifacts_are_absent() {
+    local artifact=""
+    for artifact in \
+        "$RR_IP_ACME_STATE_ROOT" "$RR_IP_ACME_WEBROOT" \
+        /etc/systemd/system/rr-nexus-ip-acme.service \
+        /etc/systemd/system/rr-nexus-ip-acme.timer \
+        /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+        /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+        /etc/rr-nexus/certs/.ip-cert-pending \
+        /usr/local/lib/rr-vps/lego /usr/local/lib/rr-vps/lego.install; do
+        [ ! -e "$artifact" ] && [ ! -L "$artifact" ] || return 1
+    done
+}
+
+rr_ip_acme_candidate_legacy_access_plane_is_exact() {
+    local address="${1:-}" module_dir="$PAYLOAD_DIR/modules"
+    [ -d "$module_dir" ] && [ ! -L "$module_dir" ] || return 1
+    RR_IP_ACME_AUDIT_MODULE_DIR="$module_dir" bash -s -- "$address" <<'BASH'
+set -eo pipefail
+address=${1:-}
+for module in "$RR_IP_ACME_AUDIT_MODULE_DIR"/*.sh; do
+    source "$module"
+done
+nexus_ip_certificate_pair_is_ready \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key "$address"
+script=/usr/local/lib/rr-vps/nexus-ip-cert-gate
+dropin=/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf
+script_present=false
+dropin_present=false
+[ ! -e "$script" ] && [ ! -L "$script" ] || script_present=true
+[ ! -e "$dropin" ] && [ ! -L "$dropin" ] || dropin_present=true
+[ "$script_present" = "$dropin_present" ] || exit 1
+[ "$script_present" = true ] || exit 0
+nexus_ip_certificate_gate_artifacts_are_current \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+    /etc/rr-nexus/certs/.ip-cert-pending
+nexus_nginx_exec_condition_set_is_exact \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+    /etc/rr-nexus/certs/.ip-cert-pending true
+BASH
+}
+
+rr_ip_acme_legacy_absent_state_is_exact() {
+    local cert_present=false key_present=false gate_present=false
+    local mode="" access_mode="" address=""
+    rr_ip_acme_exclusive_artifacts_are_absent || return 1
+    [ ! -L /etc/rr-nexus/certs/ip.crt ] && \
+        [ ! -L /etc/rr-nexus/certs/ip.key ] || return 1
+    [ -e /etc/rr-nexus/certs/ip.crt ] && cert_present=true
+    [ -e /etc/rr-nexus/certs/ip.key ] && key_present=true
+    [ "$cert_present" = "$key_present" ] || return 1
+    if [ -e /usr/local/lib/rr-vps/nexus-ip-cert-gate ] || \
+       [ -L /usr/local/lib/rr-vps/nexus-ip-cert-gate ] || \
+       [ -e /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf ] || \
+       [ -L /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf ]; then
+        gate_present=true
+    fi
+    if [ "$cert_present" = false ]; then
+        [ "$gate_present" = false ] || return 1
+        if [ -e /etc/rr-nexus/nexus.json ] || [ -L /etc/rr-nexus/nexus.json ]; then
+            [ -f /etc/rr-nexus/nexus.json ] && \
+                [ ! -L /etc/rr-nexus/nexus.json ] || return 1
+            access_mode=$(jq -r '.mode // empty' \
+                /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+            address=$(jq -r '.domain // empty' \
+                /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+            if [ "$access_mode" = public ] && [ -n "$address" ] && \
+               python3 - "$address" <<'PY'
+import ipaddress
+import sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PY
+            then
+                return 1
+            fi
+        fi
+        return 0
+    fi
+    [ -f /etc/rr-nexus/nexus.json ] && [ ! -L /etc/rr-nexus/nexus.json ] || return 1
+    mode=$(jq -r '.certificate_mode // "legacy-self-signed"' \
+        /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+    address=$(jq -r 'select(.mode == "public") | .domain // empty' \
+        /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+    [ "$mode" = legacy-self-signed ] && [ -n "$address" ] || return 1
+    # The helper proves the pair and accepts only the two historical gate
+    # states: both artifacts absent, or both current with the exact effective
+    # ExecCondition. Partial/foreign same-name objects always fail closed.
+    rr_ip_acme_candidate_legacy_access_plane_is_exact "$address"
+}
+
+rr_ip_acme_candidate_absent_runtime_is_exact() {
+    local artifact="" cert_present=false key_present=false gate_present=false
+    local mode="" address="" module_dir="$PAYLOAD_DIR/modules"
+    for artifact in \
+        "$RR_IP_ACME_STATE_ROOT" "$RR_IP_ACME_WEBROOT" \
+        /etc/systemd/system/rr-nexus-ip-acme.service \
+        /etc/systemd/system/rr-nexus-ip-acme.timer \
+        /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+        /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+        /etc/rr-nexus/certs/.ip-cert-pending \
+        /usr/local/lib/rr-vps/lego /usr/local/lib/rr-vps/lego.install; do
+        [ ! -e "$artifact" ] && [ ! -L "$artifact" ] || return 1
+    done
+    [ ! -L /etc/rr-nexus/certs/ip.crt ] && \
+        [ ! -L /etc/rr-nexus/certs/ip.key ] || return 1
+    [ -e /etc/rr-nexus/certs/ip.crt ] && cert_present=true
+    [ -e /etc/rr-nexus/certs/ip.key ] && key_present=true
+    [ "$cert_present" = "$key_present" ] || return 1
+    if [ -e /usr/local/lib/rr-vps/nexus-ip-cert-gate ] || \
+       [ -L /usr/local/lib/rr-vps/nexus-ip-cert-gate ] || \
+       [ -e /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf ] || \
+       [ -L /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf ]; then
+        gate_present=true
+    fi
+    if [ "$cert_present" = false ]; then
+        [ "$gate_present" = false ]
+        return $?
+    fi
+    [ -f /etc/rr-nexus/nexus.json ] && [ ! -L /etc/rr-nexus/nexus.json ] || return 1
+    mode=$(jq -r '.certificate_mode // "legacy-self-signed"' \
+        /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+    address=$(jq -r 'select(.mode == "public") | .domain // empty' \
+        /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+    [ "$mode" = legacy-self-signed ] && [ -n "$address" ] && \
+        [ "$gate_present" = true ] || return 1
+    [ -d "$module_dir" ] && [ ! -L "$module_dir" ] || return 1
+    RR_IP_ACME_AUDIT_MODULE_DIR="$module_dir" bash -s -- "$address" <<'BASH'
+set -eo pipefail
+address=${1:-}
+for module in "$RR_IP_ACME_AUDIT_MODULE_DIR"/*.sh; do
+    source "$module"
+done
+nexus_ip_certificate_pair_is_ready \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key "$address"
+nexus_ip_certificate_gate_artifacts_are_current \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+    /etc/rr-nexus/certs/.ip-cert-pending
+nexus_nginx_exec_condition_set_is_exact \
+    /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+    /etc/rr-nexus/certs/.ip-cert-pending true
+BASH
+}
+
+rr_capture_ip_acme_update_state() {
+    local timer_active=false timer_enabled=false service_active=false address="" mode=""
+    if [ ! -e "$RR_IP_ACME_STATE_ROOT" ] && [ ! -L "$RR_IP_ACME_STATE_ROOT" ]; then
+        # A missing owner root cannot authorize deleting or replaying any
+        # remaining writer/runtime fragment. A validated legacy self-signed
+        # pair may have either no gate (formal old baseline) or the exact
+        # current two-file/effective gate left by an earlier safe migration.
+        rr_ip_acme_legacy_absent_state_is_exact || return 1
+        RR_IP_ACME_WAS_PRESENT=false
+        RR_IP_ACME_WAS_READY=false
+        RR_IP_ACME_TIMER_WAS_ACTIVE=false
+        RR_IP_ACME_TIMER_WAS_ENABLED=false
+        return 0
+    fi
+    rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+    [ -f /etc/rr-nexus/nexus.json ] && [ ! -L /etc/rr-nexus/nexus.json ] || return 1
+    address=$(jq -r '.address' "$RR_IP_ACME_STATE_ROOT/config.json" 2>/dev/null) || return 1
+    mode=$(jq -r '.certificate_mode // empty' /etc/rr-nexus/nexus.json 2>/dev/null) || return 1
+    [ "$(jq -r '.domain // empty' /etc/rr-nexus/nexus.json 2>/dev/null)" = "$address" ] || return 1
+    # An interrupted first issuance is deliberately left untouched.  It must
+    # be recovered or uninstalled before an update can migrate the public
+    # access plane; advancing it inside a rollback transaction would create a
+    # new CA/publication generation that the snapshot did not authorize.
+    [ "$mode" = acme-ip-shortlived ] || return 1
+    rr_ip_acme_tree_is_safe "$RR_IP_ACME_WEBROOT" webroot || return 1
+    rr_ip_acme_candidate_runtime_is_exact "$address" || return 1
+    [ -f /etc/rr-nexus/certs/ip.crt ] && [ ! -L /etc/rr-nexus/certs/ip.crt ] && \
+        [ -f /etc/rr-nexus/certs/ip.key ] && [ ! -L /etc/rr-nexus/certs/ip.key ] && \
+        [ ! -e /etc/rr-nexus/certs/.ip-cert-pending ] && \
+        [ ! -L /etc/rr-nexus/certs/.ip-cert-pending ] || return 1
+    rr_capture_unit_activity_state rr-nexus-ip-acme.service service_active || return 1
+    [ "$service_active" = false ] || return 1
+    rr_capture_unit_activity_state rr-nexus-ip-acme.timer timer_active || return 1
+    rr_capture_unit_file_state rr-nexus-ip-acme.timer timer_enabled || return 1
+    [ "$timer_active" = true ] && [ "$timer_enabled" = true ] || return 1
+    RR_IP_ACME_WAS_PRESENT=true
+    RR_IP_ACME_WAS_READY=true
+    RR_IP_ACME_TIMER_WAS_ACTIVE="$timer_active"
+    RR_IP_ACME_TIMER_WAS_ENABLED="$timer_enabled"
+}
+
+rr_freeze_ip_acme_update_writer() {
+    [ "${RR_IP_ACME_WAS_PRESENT:-false}" = true ] || return 0
+    rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+    systemctl disable --now rr-nexus-ip-acme.timer >/dev/null 2>&1 || return 1
+    systemctl stop rr-nexus-ip-acme.service >/dev/null 2>&1 || return 1
+    rr_wait_unit_state rr-nexus-ip-acme.timer inactive && \
+        rr_wait_unit_state rr-nexus-ip-acme.service inactive && \
+        rr_unit_file_state_matches rr-nexus-ip-acme.timer disabled
+}
+
+rr_restore_ip_acme_update_directories() {
+    local target="" backup_name="" kind="" source=""
+    for target in "$RR_IP_ACME_STATE_ROOT" "$RR_IP_ACME_WEBROOT"; do
+        rr_ip_acme_prepare_parent "$target" || return 1
+        if [ "$target" = "$RR_IP_ACME_STATE_ROOT" ]; then
+            backup_name=nexus_ip_acme_state
+            kind=state
+        else
+            backup_name=nexus_ip_acme_webroot
+            kind=webroot
+        fi
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            rr_ip_acme_tree_is_safe "$target" "$kind" || return 1
+            # Re-prove the exact fixed parent at the destructive boundary.
+            # Do not delegate to rr_restore_dir: its generic second rm/mkdir
+            # would reopen a parent-exchange window after this proof.
+            rr_ip_acme_prepare_parent "$target" || return 1
+            rm -rf -- "$target" || return 1
+        fi
+        rr_ip_acme_prepare_parent "$target" || return 1
+        if [ -f "$BACKUP_DIR/had_${backup_name}" ]; then
+            source="$BACKUP_DIR/$backup_name"
+            rr_ip_acme_tree_is_safe "$source" "$kind" backup || return 1
+            cp -a -- "$source" "$target" || return 1
+            rr_ip_acme_tree_is_safe "$target" "$kind" || return 1
+        else
+            [ ! -e "$BACKUP_DIR/$backup_name" ] && \
+                [ ! -L "$BACKUP_DIR/$backup_name" ] || return 1
+            [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+        fi
+    done
+}
+
+rr_restore_ip_acme_update_writer_state() {
+    local backup="${1:-$BACKUP_DIR}"
+    if [ ! -f "$backup/ip_acme_was_present" ]; then
+        rr_ip_acme_legacy_absent_state_is_exact
+        return $?
+    fi
+    rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    if [ -f "$backup/ip_acme_timer_was_enabled" ]; then
+        systemctl enable rr-nexus-ip-acme.timer >/dev/null 2>&1 || return 1
+        rr_unit_file_state_matches rr-nexus-ip-acme.timer enabled || return 1
+    else
+        systemctl disable rr-nexus-ip-acme.timer >/dev/null 2>&1 || return 1
+        rr_unit_file_state_matches rr-nexus-ip-acme.timer disabled || return 1
+    fi
+    if [ -f "$backup/ip_acme_timer_was_running" ]; then
+        systemctl start rr-nexus-ip-acme.timer >/dev/null 2>&1 || return 1
+        rr_wait_unit_state rr-nexus-ip-acme.timer active || return 1
+    else
+        systemctl stop rr-nexus-ip-acme.timer >/dev/null 2>&1 || return 1
+        rr_wait_unit_state rr-nexus-ip-acme.timer inactive || return 1
+    fi
+    rr_wait_unit_state rr-nexus-ip-acme.service inactive
+}
+
+rr_verify_ip_acme_update_writer_state() {
+    local backup="${1:-$BACKUP_DIR}"
+    if [ ! -f "$backup/ip_acme_was_present" ]; then
+        # Candidate reconciliation may install the current fail-closed gate
+        # around a validated legacy self-signed IP pair.  That is not ACME
+        # state; allow only this exact compiled legacy runtime while requiring
+        # every ACME writer/store/challenge artifact to remain absent.
+        rr_ip_acme_candidate_absent_runtime_is_exact
+        return $?
+    fi
+    rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+    local address=""
+    address=$(jq -r '.address' "$RR_IP_ACME_STATE_ROOT/config.json" 2>/dev/null) || return 1
+    rr_ip_acme_candidate_runtime_is_exact "$address" || return 1
+    if [ -f "$backup/ip_acme_timer_was_enabled" ]; then
+        rr_unit_file_state_matches rr-nexus-ip-acme.timer enabled || return 1
+    else
+        rr_unit_file_state_matches rr-nexus-ip-acme.timer disabled || return 1
+    fi
+    if [ -f "$backup/ip_acme_timer_was_running" ]; then
+        rr_wait_unit_state rr-nexus-ip-acme.timer active || return 1
+    else
+        rr_wait_unit_state rr-nexus-ip-acme.timer inactive || return 1
+    fi
+    rr_wait_unit_state rr-nexus-ip-acme.service inactive
 }
 
 rr_quiesce_health_monitor_for_rollback() {
@@ -860,6 +1355,7 @@ rr_capture_update_writer_state() {
     rr_capture_unit_file_state sing-box singbox_enabled || return 1
     rr_capture_unit_activity_state rr-nexus nexus_active || return 1
     rr_capture_unit_file_state rr-nexus nexus_enabled || return 1
+    rr_capture_ip_acme_update_state || return 1
     rr_subscription_running && subscription_active=true
 
     # Publish the snapshot only after every systemd query was proved valid.
@@ -887,7 +1383,11 @@ rr_persist_update_writer_state() {
         "subscription_was_running:$RR_SUBSCRIPTION_WAS_ACTIVE" \
         "health_timer_was_enabled:$RR_HEALTH_TIMER_WAS_ENABLED" \
         "health_timer_was_running:$RR_HEALTH_TIMER_WAS_ACTIVE" \
-        "health_service_was_running:$RR_HEALTH_SERVICE_WAS_ACTIVE"; do
+        "health_service_was_running:$RR_HEALTH_SERVICE_WAS_ACTIVE" \
+        "ip_acme_was_present:$RR_IP_ACME_WAS_PRESENT" \
+        "ip_acme_was_ready:$RR_IP_ACME_WAS_READY" \
+        "ip_acme_timer_was_enabled:$RR_IP_ACME_TIMER_WAS_ENABLED" \
+        "ip_acme_timer_was_running:$RR_IP_ACME_TIMER_WAS_ACTIVE"; do
         [ "${marker#*:}" = true ] || continue
         rr_set_private_marker "$BACKUP_DIR/${marker%%:*}" || return 1
     done
@@ -948,6 +1448,7 @@ rr_clear_update_maintenance_marker() {
 
 rr_freeze_update_writers() {
     RR_UPDATE_WRITERS_FROZEN=true
+    rr_freeze_ip_acme_update_writer || return 1
     systemctl stop rr-nexus sing-box >/dev/null 2>&1 || true
     rr_wait_unit_state rr-nexus inactive || return 1
     rr_wait_unit_state sing-box inactive || return 1
@@ -955,8 +1456,31 @@ rr_freeze_update_writers() {
     rr_freeze_health_monitor || return 1
 }
 
+rr_installer_managed_service_start_is_safe() {
+    local unit="${1:-}"
+    case "$unit" in
+        sing-box|sing-box.service|rr-nexus|rr-nexus.service) ;;
+        *) return 1 ;;
+    esac
+    # The recovery helper is copied from the manifest-verified candidate to a
+    # root-owned path before the old runtime is hidden.  Its validator knows
+    # both the current renderer and the exact supported legacy rollback unit;
+    # never delegate this decision to the replaceable old launcher.
+    [ -x "$RR_RECOVERY_HELPER" ] && [ -f "$RR_RECOVERY_HELPER" ] && \
+        [ ! -L "$RR_RECOVERY_HELPER" ] || return 1
+    rr_run_with_delegated_update_lock "$RR_RECOVERY_HELPER" \
+        verify-service-start "$unit"
+}
+
 rr_restore_unit_state() {
     local unit="$1" active_marker="$2" enabled_marker="$3" load_state=""
+    case "$unit" in
+        sing-box|sing-box.service|rr-nexus|rr-nexus.service)
+            if [ -f "$active_marker" ] || [ -f "$enabled_marker" ]; then
+                rr_installer_managed_service_start_is_safe "$unit" || return 1
+            fi
+            ;;
+    esac
     load_state=$(systemctl show --property=LoadState --value \
         "$unit" 2>/dev/null) || return 1
     case "$load_state" in loaded|masked|not-found) ;; *) return 1 ;; esac
@@ -993,7 +1517,9 @@ rr_resume_subscription_bounded() {
         # Close both flock descriptors before exec so a surviving managed
         # subscription worker can never retain the install transaction locks.
         rr_close_inherited_installer_lock_fds
-        timeout --kill-after=5 30 env RR_UPDATE_LOCK_HELD=1 \
+        timeout --kill-after=5 30 env RR_UPDATE_LOCK_OWNER=0 \
+            RR_UPDATE_LOCK_FDS_CLOSED=1 RR_UPDATE_LOCK_HELD=1 \
+            RR_RESTORE_LOCK_HELD=1 \
             "$RR_LAUNCHER" --refresh-subscription
     ) >/dev/null 2>&1 || status=$?
     if [ "$status" -ne 0 ] || ! rr_subscription_running; then
@@ -1045,6 +1571,14 @@ rr_restart_health_service_bounded() {
 rr_restore_update_writer_state() {
     local backup="${1:-$BACKUP_DIR}" subscription_policy="${2:-normal}" failed=false
     local resume_subscription=false
+    if [ -f "$backup/singbox_was_running" ] || \
+       [ -f "$backup/singbox_was_enabled" ]; then
+        rr_installer_managed_service_start_is_safe sing-box || return 1
+    fi
+    if [ -f "$backup/nexus_was_running" ] || \
+       [ -f "$backup/nexus_was_enabled" ]; then
+        rr_installer_managed_service_start_is_safe rr-nexus || return 1
+    fi
     if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
         resume_subscription=true
     else
@@ -1053,6 +1587,9 @@ rr_restore_update_writer_state() {
     fi
     rr_restore_unit_state sing-box "$backup/singbox_was_running" \
         "$backup/singbox_was_enabled" || failed=true
+    # Restore the certificate writer before Nexus can serve public-IP
+    # subscriptions.  Its timer/service were deliberately disarmed first.
+    rr_restore_ip_acme_update_writer_state "$backup" || failed=true
     rr_restore_unit_state rr-nexus "$backup/nexus_was_running" \
         "$backup/nexus_was_enabled" || failed=true
     if [ "$subscription_policy" = normal ]; then
@@ -1085,6 +1622,15 @@ rr_restore_update_writer_state() {
 
 rr_verify_update_writer_state() {
     local backup="${1:-$BACKUP_DIR}" unit="" active_marker="" enabled_marker=""
+    # The candidate launcher owns the canonical renderer and validates
+    # systemd's compiled FragmentPath/ExecStart/conditions/timer schedule.
+    # Active/enabled state alone can otherwise bless an old timer after only
+    # one of the two unit files was replaced.
+    [ -f "$RR_HEALTH_SERVICE_FILE" ] && [ ! -L "$RR_HEALTH_SERVICE_FILE" ] && \
+        [ -f "$RR_HEALTH_TIMER_FILE" ] && [ ! -L "$RR_HEALTH_TIMER_FILE" ] || \
+        return 1
+    rr_run_with_delegated_update_lock "$RR_LAUNCHER" \
+        --verify-health-unit-definitions || return 1
     for unit in sing-box rr-nexus argo-rr-health.timer; do
         case "$unit" in
             sing-box) active_marker=singbox_was_running; enabled_marker=singbox_was_enabled ;;
@@ -1105,8 +1651,9 @@ rr_verify_update_writer_state() {
     if [ -f "$backup/subscription_was_running" ]; then
         rr_subscription_running || return 1
     else
-        ! rr_subscription_running
+        ! rr_subscription_running || return 1
     fi
+    rr_verify_ip_acme_update_writer_state "$backup"
 }
 
 rr_subscription_process_matches() {
@@ -1303,7 +1850,7 @@ allowed = re.compile(
     r"scripts/(?:naive-cert-hook|update-recover)\.sh|"
     r"scripts/update-external-state\.py|"
     r"modules/[0-9][0-9A-Za-z_-]*\.sh|"
-    r"nexus/[A-Za-z0-9._-]+\.py|"
+    r"nexus/(?:rr_nexus|sub_server)\.py|"
     r"nexus/rr_nexus_lib/[A-Za-z0-9._-]+\.py|"
     r"nexus/static/[A-Za-z0-9._-]+\.(?:html|css|js))$"
 )
@@ -1857,14 +2404,247 @@ rr_clear_active_transaction_pointer() {
     return 1
 }
 
+rr_render_update_recovery_unit() {
+    cat <<'EOF'
+[Unit]
+Description=RR-vps interrupted update recovery
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target
+ConditionPathExists=/var/lib/rr-update/active
+
+[Service]
+Type=oneshot
+Environment=RR_UPDATE_RECOVERY_SERVICE=1
+UMask=0077
+ExecStart=/usr/local/sbin/rr-update-recover recover
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+rr_update_recovery_unit_file_is_exact() {
+    local target="$RR_UPDATE_RECOVERY_UNIT_FILE" canonical="" parent="" mode=""
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = 0:0:644:1 ] || \
+        return 1
+    canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+    [ "$canonical" = "$target" ] || return 1
+    parent=$(dirname -- "$target") || return 1
+    [ -d "$parent" ] && [ ! -L "$parent" ] && \
+        [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+    canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+    [ "$canonical" = "$parent" ] || return 1
+    mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    cmp -s -- "$target" <(rr_render_update_recovery_unit)
+}
+
+rr_recovery_helper_file_is_safe() {
+    local target="$1" canonical="" parent="" mode=""
+    [[ "$target" = /* && "$target" != *[[:space:]]* ]] || return 1
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+          0:0:755:1 ] || return 1
+    canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+    [ "$canonical" = "$target" ] || return 1
+    parent=$(dirname -- "$target") || return 1
+    [ -d "$parent" ] && [ ! -L "$parent" ] && \
+        [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+    canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+    [ "$canonical" = "$parent" ] || return 1
+    mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+rr_recovery_helper_source_is_safe() {
+    local source="$1" canonical="" metadata=""
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    canonical=$(readlink -f -- "$source" 2>/dev/null) || return 1
+    [ "$canonical" = "$source" ] || return 1
+    metadata=$(stat -c '%u:%g:%a:%h' -- "$source" 2>/dev/null) || return 1
+    case "$metadata" in 0:0:755:1|0:0:644:1) ;; *) return 1 ;; esac
+}
+
+rr_recovery_helper_is_owned_or_absent() {
+    local target="$1" candidate="$2" installed_source="${3:-}"
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        return 0
+    fi
+    rr_recovery_helper_file_is_safe "$target" || return 1
+    rr_recovery_helper_source_is_safe "$candidate" || return 1
+    cmp -s -- "$target" "$candidate" && return 0
+    [ -n "$installed_source" ] || return 1
+    rr_recovery_helper_source_is_safe "$installed_source" || return 1
+    cmp -s -- "$target" "$installed_source"
+}
+
+rr_recovery_helper_is_exact() {
+    local target="$1" candidate="$2"
+    rr_recovery_helper_file_is_safe "$target" && \
+        rr_recovery_helper_source_is_safe "$candidate" && \
+        cmp -s -- "$target" "$candidate"
+}
+
+rr_update_recovery_effective_identity_is_exact() {
+    local load_state="" fragment="" dropins="" exec_start=""
+    local exec_start_pre="" exec_reload="" exec_condition=""
+    local user="" group="" working_directory="" dynamic_user=""
+    local private_users="" private_mounts="" root_directory="" root_image=""
+    local environment="" service_type="" remain_after_exit=""
+    local version_line="" systemd_version="" root_ephemeral=no
+    local property="" value="" protect_home="" protect_system=""
+    local -a empty_properties=(
+        RootDirectory RootImage MountImages ExtensionImages
+        ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths
+        InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths
+        EnvironmentFiles PassEnvironment UnsetEnvironment PAMName
+        SystemCallFilter
+    )
+    rr_update_recovery_unit_file_is_exact || return 1
+    load_state=$(systemctl show --property=LoadState --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    fragment=$(systemctl show --property=FragmentPath --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    dropins=$(systemctl show --property=DropInPaths --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$load_state" = loaded ] && [ "$fragment" = "$RR_UPDATE_RECOVERY_UNIT_FILE" ] && \
+        [ -z "${dropins//[[:space:]]/}" ] || return 1
+    exec_start=$(systemctl show --property=ExecStart --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    python3 - "$exec_start" <<'PY' || return 1
+import re
+import sys
+
+raw = sys.argv[1]
+matches = list(re.finditer(r"\{([^{}]*)\}", raw))
+if len(matches) != 1 or (raw[:matches[0].start()] + raw[matches[0].end():]).strip():
+    raise SystemExit(1)
+fields = {}
+for item in matches[0].group(1).split(";"):
+    item = item.strip()
+    if not item:
+        continue
+    if "=" not in item:
+        raise SystemExit(1)
+    key, value = item.split("=", 1)
+    key = key.strip()
+    if key in fields:
+        raise SystemExit(1)
+    fields[key] = value.strip()
+if (
+    (fields.get("path"), fields.get("argv[]"), fields.get("ignore_errors"))
+    != (
+        "/usr/local/sbin/rr-update-recover",
+        "/usr/local/sbin/rr-update-recover recover",
+        "no",
+    )
+    or raw.count("path=") != 1
+    or raw.count("argv[]=") != 1
+    or raw.count("ignore_errors=") != 1
+):
+    raise SystemExit(1)
+PY
+    exec_start_pre=$(systemctl show --property=ExecStartPre --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    exec_reload=$(systemctl show --property=ExecReload --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    exec_condition=$(systemctl show --property=ExecCondition --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ -z "${exec_start_pre//[[:space:]]/}" ] && \
+        [ -z "${exec_reload//[[:space:]]/}" ] && \
+        [ -z "${exec_condition//[[:space:]]/}" ] || return 1
+    user=$(systemctl show --property=User --value rr-update-recovery.service \
+        2>/dev/null) || return 1
+    group=$(systemctl show --property=Group --value rr-update-recovery.service \
+        2>/dev/null) || return 1
+    case "${user//[[:space:]]/}" in ""|root) ;; *) return 1 ;; esac
+    case "${group//[[:space:]]/}" in ""|root) ;; *) return 1 ;; esac
+    working_directory=$(systemctl show --property=WorkingDirectory --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    case "${working_directory//[[:space:]]/}" in ""|/) ;; *) return 1 ;; esac
+    dynamic_user=$(systemctl show --property=DynamicUser --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    private_users=$(systemctl show --property=PrivateUsers --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    private_mounts=$(systemctl show --property=PrivateMounts --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$dynamic_user" = no ] && [ "$private_users" = no ] && \
+        [ "$private_mounts" = no ] || return 1
+    for property in "${empty_properties[@]}"; do
+        value=$(systemctl show --property="$property" --value \
+            rr-update-recovery.service 2>/dev/null) || return 1
+        [ -z "$value" ] || return 1
+    done
+    version_line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$version_line" =~ ^systemd[[:space:]]+([0-9]+)([[:space:]]|$) ]] || \
+        return 1
+    systemd_version="${BASH_REMATCH[1]}"
+    if [ "$systemd_version" -ge 254 ]; then
+        root_ephemeral=$(systemctl show --property=RootEphemeral --value \
+            rr-update-recovery.service 2>/dev/null) || return 1
+    fi
+    [ "$root_ephemeral" = no ] || return 1
+    protect_home=$(systemctl show --property=ProtectHome --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$protect_home" = no ] || return 1
+    protect_system=$(systemctl show --property=ProtectSystem --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$protect_system" = no ] || return 1
+    environment=$(systemctl show --property=Environment --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$environment" = RR_UPDATE_RECOVERY_SERVICE=1 ] || return 1
+    service_type=$(systemctl show --property=Type --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    remain_after_exit=$(systemctl show --property=RemainAfterExit --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$service_type" = oneshot ] && [ "$remain_after_exit" = no ]
+}
+
+rr_update_recovery_unit_is_owned_or_absent() {
+    local dropin_dir="${RR_UPDATE_RECOVERY_UNIT_FILE}.d" load_state=""
+    local fragment="" dropins=""
+    if [ -e "$RR_UPDATE_RECOVERY_UNIT_FILE" ] || \
+       [ -L "$RR_UPDATE_RECOVERY_UNIT_FILE" ]; then
+        rr_update_recovery_effective_identity_is_exact
+        return
+    fi
+    if [ -e "$dropin_dir" ] || [ -L "$dropin_dir" ]; then
+        [ -d "$dropin_dir" ] && [ ! -L "$dropin_dir" ] || return 1
+        [ -z "$(find "$dropin_dir" -mindepth 1 -maxdepth 1 -print -quit \
+            2>/dev/null)" ] || return 1
+    fi
+    load_state=$(systemctl show --property=LoadState --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    fragment=$(systemctl show --property=FragmentPath --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    dropins=$(systemctl show --property=DropInPaths --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$load_state" = not-found ] && [ -z "${fragment//[[:space:]]/}" ] && \
+        [ -z "${dropins//[[:space:]]/}" ]
+}
+
 rr_prepare_recovery_runtime() {
     local recovery_source="$PAYLOAD_DIR/scripts/update-recover.sh"
     local recovery_target="$RR_RECOVERY_HELPER"
     local recovery_tmp=""
     local external_source="$PAYLOAD_DIR/scripts/update-external-state.py"
     local external_tmp=""
+    local unit_dir="" unit_tmp=""
     [ -s "$recovery_source" ] && bash -n "$recovery_source" || return 1
     [ -s "$external_source" ] && python3 -m py_compile "$external_source" || return 1
+    # Resolve ownership before the first helper, transaction or unit write.
+    # A previous RR release is accepted only when the installed helper is an
+    # exact root-owned copy of that release's runtime source.
+    rr_recovery_helper_is_owned_or_absent "$RR_RECOVERY_HELPER" \
+        "$recovery_source" "$RR_LIB_DIR/scripts/update-recover.sh" || return 1
+    rr_recovery_helper_is_owned_or_absent "$RR_UPDATE_EXTERNAL_HELPER" \
+        "$external_source" "$RR_LIB_DIR/scripts/update-external-state.py" || \
+        return 1
+    # An unrelated service using this name (or any effective drop-in) remains
+    # untouched and is never enabled by the updater.
+    rr_update_recovery_unit_is_owned_or_absent || return 1
     mkdir -p /usr/local/sbin /etc/systemd/system "$RR_TX_ROOT/transactions" || return 1
     chmod 700 "$RR_TX_ROOT"
     external_tmp=$(mktemp /usr/local/sbin/.rr-update-external-state.XXXXXX) || return 1
@@ -1882,24 +2662,23 @@ rr_prepare_recovery_runtime() {
         rm -f "$recovery_tmp"
         return 1
     }
-    cat > /etc/systemd/system/rr-update-recovery.service <<'EOF'
-[Unit]
-Description=RR-vps interrupted update recovery
-DefaultDependencies=no
-After=local-fs.target
-Before=network.target
-ConditionPathExists=/var/lib/rr-update/active
-
-[Service]
-Type=oneshot
-Environment=RR_UPDATE_RECOVERY_SERVICE=1
-UMask=0077
-ExecStart=/usr/local/sbin/rr-update-recover recover
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    rr_recovery_helper_is_exact "$RR_UPDATE_EXTERNAL_HELPER" \
+        "$external_source" || return 1
+    rr_recovery_helper_is_exact "$RR_RECOVERY_HELPER" "$recovery_source" || \
+        return 1
+    unit_dir=$(dirname -- "$RR_UPDATE_RECOVERY_UNIT_FILE") || return 1
+    unit_tmp=$(mktemp "$unit_dir/.rr-update-recovery.service.XXXXXX") || return 1
+    if ! rr_render_update_recovery_unit > "$unit_tmp" || \
+       ! chown 0:0 "$unit_tmp" || ! chmod 644 "$unit_tmp" || \
+       ! sync -f "$unit_tmp" || \
+       ! mv -f -- "$unit_tmp" "$RR_UPDATE_RECOVERY_UNIT_FILE" || \
+       ! sync -f "$unit_dir"; then
+        [ -e "$unit_tmp" ] || [ -L "$unit_tmp" ] || unit_tmp=""
+        [ -z "$unit_tmp" ] || rm -f -- "$unit_tmp"
+        return 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || return 1
+    rr_update_recovery_effective_identity_is_exact || return 1
     systemctl enable rr-update-recovery.service >/dev/null 2>&1 || return 1
 }
 
@@ -2032,13 +2811,42 @@ rr_snapshot_runtime() {
     rr_backup_file /etc/sing-box/private.key singbox_private.key || return 1
     rr_backup_file /usr/local/bin/sing-box singbox_binary || return 1
     rr_backup_file /etc/systemd/system/sing-box.service singbox.service || return 1
+    rr_backup_dir /etc/systemd/system/sing-box.service.d singbox.service.d || return 1
     rr_backup_file /etc/systemd/system/argo-rr-health.service health.service || return 1
     rr_backup_file /etc/systemd/system/argo-rr-health.timer health.timer || return 1
     rr_backup_file /usr/local/bin/auto_update_sub.py auto_update_sub.py || return 1
     rr_backup_file /etc/rr-nexus/nexus.json nexus.json || return 1
     rr_backup_file /etc/systemd/system/rr-nexus.service nexus.service || return 1
+    rr_backup_dir /etc/systemd/system/rr-nexus.service.d nexus.service.d || return 1
     rr_backup_file /etc/rr-update/channel update_channel || return 1
     rr_backup_file /var/lib/rr-nexus/remote.key remote.key || return 1
+    if [ -f "$BACKUP_DIR/ip_acme_was_present" ]; then
+        rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+        rr_ip_acme_tree_is_safe "$RR_IP_ACME_WEBROOT" webroot || return 1
+        rr_backup_dir "$RR_IP_ACME_STATE_ROOT" nexus_ip_acme_state || return 1
+        rr_backup_dir "$RR_IP_ACME_WEBROOT" nexus_ip_acme_webroot || return 1
+        rr_ip_acme_tree_is_safe "$RR_IP_ACME_STATE_ROOT" state || return 1
+        rr_ip_acme_tree_is_safe "$RR_IP_ACME_WEBROOT" webroot || return 1
+        rr_ip_acme_tree_is_safe \
+            "$BACKUP_DIR/nexus_ip_acme_state" state backup || return 1
+        rr_ip_acme_tree_is_safe \
+            "$BACKUP_DIR/nexus_ip_acme_webroot" webroot backup || return 1
+        # cp -a alone does not make file contents crash durable.  Flush both
+        # trees before replacing the generic had_* files with exact private
+        # publication markers.
+        sync || return 1
+        rr_set_private_marker "$BACKUP_DIR/had_nexus_ip_acme_state" || return 1
+        rr_set_private_marker "$BACKUP_DIR/had_nexus_ip_acme_webroot" || return 1
+    else
+        [ ! -e "$BACKUP_DIR/had_nexus_ip_acme_state" ] && \
+            [ ! -L "$BACKUP_DIR/had_nexus_ip_acme_state" ] && \
+            [ ! -e "$BACKUP_DIR/had_nexus_ip_acme_webroot" ] && \
+            [ ! -L "$BACKUP_DIR/had_nexus_ip_acme_webroot" ] || return 1
+    fi
+    # This durable boundary distinguishes an in-progress, still-live
+    # `snapshotting` phase from every later phase that is allowed to replay
+    # these directories.  It is written for both present and absent state.
+    rr_set_private_marker "$BACKUP_DIR/ip_acme_directories_complete" || return 1
     rr_backup_dir /etc/rr-naive rr-naive || return 1
     rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db || return 1
     rr_backup_dir /tmp/sub_server sub_server || return 1
@@ -2120,16 +2928,24 @@ rr_rollback() {
     rr_restore_file singbox_private.key /etc/sing-box/private.key || rollback_failed=true
     rr_restore_file singbox_binary /usr/local/bin/sing-box || rollback_failed=true
     rr_restore_file singbox.service /etc/systemd/system/sing-box.service || rollback_failed=true
+    rr_restore_dir singbox.service.d /etc/systemd/system/sing-box.service.d || rollback_failed=true
     rr_restore_file health.service /etc/systemd/system/argo-rr-health.service || rollback_failed=true
     rr_restore_file health.timer /etc/systemd/system/argo-rr-health.timer || rollback_failed=true
     rr_restore_file auto_update_sub.py /usr/local/bin/auto_update_sub.py || rollback_failed=true
     rr_restore_file nexus.json /etc/rr-nexus/nexus.json || rollback_failed=true
     rr_restore_file nexus.service /etc/systemd/system/rr-nexus.service || rollback_failed=true
+    rr_restore_dir nexus.service.d /etc/systemd/system/rr-nexus.service.d || rollback_failed=true
     rr_restore_file update_channel /etc/rr-update/channel || rollback_failed=true
     rr_restore_file remote.key /var/lib/rr-nexus/remote.key || rollback_failed=true
     rr_restore_dir rr-naive /etc/rr-naive || rollback_failed=true
     rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db || rollback_failed=true
     rr_restore_dir sub_server /tmp/sub_server || rollback_failed=true
+
+    # The ACME account/store is destination-owned security state.  Restore it
+    # from this same-host update snapshot before replaying the fixed runtime
+    # files; never accept a candidate-created link/mount/tree as a deletion
+    # boundary.
+    rr_restore_ip_acme_update_directories || rollback_failed=true
 
     rr_install_restore_external_state_if_required || rollback_failed=true
     systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
@@ -2169,6 +2985,23 @@ rr_rollback() {
     if declare -F rr_restore_update_writer_state >/dev/null; then
         rr_restore_update_writer_state "$BACKUP_DIR" "$subscription_policy" || rollback_failed=true
     else
+        if { [ -f "$BACKUP_DIR/singbox_was_running" ] || \
+             [ -f "$BACKUP_DIR/singbox_was_enabled" ]; } && \
+           ! rr_installer_managed_service_start_is_safe sing-box; then
+            rollback_failed=true
+        fi
+        if { [ -f "$BACKUP_DIR/nexus_was_running" ] || \
+             [ -f "$BACKUP_DIR/nexus_was_enabled" ]; } && \
+           ! rr_installer_managed_service_start_is_safe rr-nexus; then
+            rollback_failed=true
+        fi
+        if [ "$rollback_failed" = true ]; then
+            ROLLBACK_FAILED=true
+            KEEP_TRANSACTION=true
+            rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            rr_error "严重：旧版服务身份无法证明；所有写入服务保持停机，事务证据已保留。"
+            return 1
+        fi
         if [ -f "$BACKUP_DIR/health_timer_was_enabled" ]; then
             systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || true
         else
@@ -2239,8 +3072,21 @@ rr_rollback() {
     return 0
 }
 
+rr_republish_retryable_update_phase() {
+    local original="${1:-}" current=""
+    case "$original" in state_recorded|freezing|snapshotting|prepared) ;;
+        *) return 1 ;;
+    esac
+    current=$(rr_read_trusted_phase "$TX_DIR") || return 1
+    case "$current" in
+        "$original") return 0 ;;
+        aborted|recovery_failed) rr_write_phase "$original" ;;
+        *) return 1 ;;
+    esac
+}
+
 rr_cleanup() {
-    local result="${1:-0}" cleanup_phase=""
+    local result="${1:-0}" cleanup_phase="" retry_phase=""
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
         if cleanup_phase=$(rr_read_trusted_phase "$TX_DIR"); then
             if [ "$cleanup_phase" = committed ]; then
@@ -2263,6 +3109,7 @@ rr_cleanup() {
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" != true ] && \
        [ "$RR_UPDATE_WRITERS_FROZEN" = true ] && \
        [[ "$cleanup_phase" =~ ^(freezing|snapshotting|prepared)$ ]]; then
+        retry_phase="$cleanup_phase"
         if rr_restore_update_writer_state "$BACKUP_DIR" normal && \
            rr_sync_host_state_before_terminal && \
            rr_write_phase aborted && \
@@ -2270,9 +3117,12 @@ rr_cleanup() {
            rr_clear_active_transaction_pointer "$TX_DIR"; then
             :
         else
-            cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
-            [ "$cleanup_phase" = aborted ] || \
-                rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            # An early snapshot may not contain either IP-ACME directory yet.
+            # Preserve its retryable phase even if `aborted` was published
+            # before pointer/maintenance cleanup failed; recovery_failed has a
+            # post-mutation completeness contract and would strand this host.
+            rr_republish_retryable_update_phase "$retry_phase" \
+                >/dev/null 2>&1 || true
             ROLLBACK_FAILED=true
             KEEP_TRANSACTION=true
             result=1
@@ -2285,14 +3135,14 @@ rr_cleanup() {
        [ "$RR_UPDATE_WRITERS_FROZEN" != true ] && \
        [ "$RR_UPDATE_MAINTENANCE_ACTIVE" = true ] && \
        [ "$ROLLBACK_FAILED" != true ] && [ "$cleanup_phase" = state_recorded ]; then
+        retry_phase="$cleanup_phase"
         if rr_sync_host_state_before_terminal && \
            rr_write_phase aborted && rr_clear_update_maintenance_marker "$TX_DIR" && \
            rr_clear_active_transaction_pointer "$TX_DIR"; then
             :
         else
-            cleanup_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf invalid)
-            [ "$cleanup_phase" = aborted ] || \
-                rr_write_phase recovery_failed >/dev/null 2>&1 || true
+            rr_republish_retryable_update_phase "$retry_phase" \
+                >/dev/null 2>&1 || true
             ROLLBACK_FAILED=true
             KEEP_TRANSACTION=true
             result=1
@@ -2338,7 +3188,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "f2d3c38c0abcedfc5e33e7a61fe21d7c880fd4b8b0bf405f0a6f4d939f08f338" ] && \
+        if [ "$actual" = "6253907ab2f0ff832bbcccb927780b961dc56062f1642776cff8367b7267353c" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -2522,6 +3372,14 @@ rr_install_release() {
     fi
 
     rr_write_phase migrating || return 1
+    # The snapshot froze the short-lived certificate timer before copying its
+    # account/store.  Re-arm exactly its pre-update state before Nexus
+    # reconciliation; a failed unit/state proof is a normal rollback trigger.
+    if ! rr_restore_ip_acme_update_writer_state "$BACKUP_DIR"; then
+        rr_error "候选版本无法恢复升级前的 IP 证书续签状态，正在回滚。"
+        rr_rollback
+        return 1
+    fi
     if ! RR_UPDATE_TRANSACTION=1 \
         RR_UPDATE_SINGBOX_WAS_RUNNING="$([ -f "$BACKUP_DIR/singbox_was_running" ] && printf true || printf false)" \
         RR_UPDATE_NEXUS_WAS_RUNNING="$([ -f "$BACKUP_DIR/nexus_was_running" ] && printf true || printf false)" \
@@ -2615,8 +3473,7 @@ if ! rr_acquire_legacy_update_lock "$RR_LEGACY_UPDATE_LOCK_FILE"; then
     UPDATE_LOCK_FD=""
     exit 1
 fi
-rr_fetch_release || exit 1
-rr_install_release || exit 1
+rr_install_release_after_locks || exit 1
 
 if [ "$RR_MODE" = "--upgrade" ]; then
     # --post-update 已完成迁移与服务恢复；这里不得再用 || true 掩盖失败，

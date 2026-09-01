@@ -144,7 +144,7 @@ echo "[3/13] Fresh-install port selection regression"
         printf '%s\n' nginx-test >> "$call_log"
     }
     certbot() {
-        printf '%s\n' certbot >> "$call_log"
+        printf 'certbot:%s\n' "$*" >> "$call_log"
         mkdir -p "$RR_LE_LIVE_ROOT/naive.example.com"
         printf '%s\n' certificate > "$RR_LE_LIVE_ROOT/naive.example.com/fullchain.pem"
         printf '%s\n' private-key > "$RR_LE_LIVE_ROOT/naive.example.com/privkey.pem"
@@ -159,6 +159,16 @@ echo "[3/13] Fresh-install port selection regression"
     }
     certificate_identity_matches() { return 0; }
     certificate_private_key_matches() { return 0; }
+    certificate_chain_is_trusted() { return 0; }
+    rr_certbot_webroot_lineage_is_renewable() {
+        printf 'lineage:%s\n' "$1" >> "$call_log"
+        return 0
+    }
+    rr_enable_certbot_renewal_runtime() {
+        [ "${1:-}" = naive.example.com ] || return 1
+        printf 'renewal-runtime:%s\n' "$1" >> "$call_log"
+        return 0
+    }
     systemctl() {
         if [ "${1:-}" = is-active ]; then
             return 1
@@ -175,9 +185,16 @@ echo "[3/13] Fresh-install port selection regression"
     grep -Fq 'systemctl:enable --now nginx' "$call_log"
     grep -Fq 'firewall:80:tcp' "$call_log"
     [ $(( 8#$(stat -c %a "$(dirname "$RR_NAIVE_ACME_WEBROOT")") & 1 )) -eq 1 ]
-    certbot_line=$(grep -n '^certbot$' "$call_log" | cut -d: -f1)
+    certbot_line=$(grep -n '^certbot:' "$call_log" | cut -d: -f1)
+    lineage_line=$(grep -n '^lineage:naive.example.com$' "$call_log" | tail -1 | cut -d: -f1)
+    runtime_line=$(grep -n '^renewal-runtime:naive\.example\.com$' "$call_log" | cut -d: -f1)
+    deploy_line=$(grep -n '^deploy-hook$' "$call_log" | cut -d: -f1)
     firewall_line=$(grep -n '^firewall:80:tcp$' "$call_log" | cut -d: -f1)
     [ "$firewall_line" -lt "$certbot_line" ]
+    grep -Eq '^certbot:.*--cert-name naive\.example\.com([[:space:]]|$)' "$call_log"
+    [ "$certbot_line" -lt "$lineage_line" ]
+    [ "$lineage_line" -lt "$runtime_line" ]
+    [ "$runtime_line" -lt "$deploy_line" ]
     [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/fullchain.pem")" = 600 ]
     [ "$(stat -c %a "$RR_NAIVE_CERT_DIR/privkey.pem")" = 600 ]
 
@@ -194,6 +211,203 @@ echo "[3/13] Fresh-install port selection regression"
     [ ! -e "$RR_NAIVE_ACME_NGINX_SITE" ]
 )
 
+# NaiveProxy 和订阅 HTTPS 采用同一信任边界：SAN、期限和私钥都匹配仍
+# 不足以接受自签叶子证书，必须能锚定目标机信任的 CA。
+(
+    load_modules_for_tests
+    cert_root=$(mktemp -d)
+    trap 'rm -rf "$cert_root"' EXIT
+    RR_CA_BUNDLE="$cert_root/ca.crt"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+        -subj '/CN=RR Naive validation CA' \
+        -addext 'basicConstraints=critical,CA:TRUE' \
+        -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+        -keyout "$cert_root/ca.key" -out "$RR_CA_BUNDLE" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj '/CN=naive.example.test' \
+        -addext 'subjectAltName=DNS:naive.example.test' \
+        -keyout "$cert_root/trusted.key" -out "$cert_root/trusted.csr" >/dev/null 2>&1
+    openssl x509 -req -days 30 -in "$cert_root/trusted.csr" \
+        -CA "$RR_CA_BUNDLE" -CAkey "$cert_root/ca.key" \
+        -CAserial "$cert_root/ca.srl" -CAcreateserial -copy_extensions copy \
+        -out "$cert_root/trusted.crt" >/dev/null 2>&1
+    naive_certificate_pair_valid "$cert_root/trusted.crt" \
+        "$cert_root/trusted.key" naive.example.test
+
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+        -subj '/CN=naive.example.test' \
+        -addext 'subjectAltName=DNS:naive.example.test' \
+        -keyout "$cert_root/self-signed.key" \
+        -out "$cert_root/self-signed.crt" >/dev/null 2>&1
+    if naive_certificate_pair_valid "$cert_root/self-signed.crt" \
+        "$cert_root/self-signed.key" naive.example.test; then
+        echo "Naive certificate validation accepted a matching self-signed leaf." >&2
+        exit 1
+    fi
+)
+
+# A trusted hand-copied leaf is not a renewable Certbot lineage.  Keep the
+# proof on every reuse/update path and pin new issuance to the requested name.
+python3 - <<'PY'
+from pathlib import Path
+
+config = Path("modules/20-config.sh").read_text(encoding="utf-8")
+singbox = Path("modules/30-singbox.sh").read_text(encoding="utf-8")
+nexus = Path("modules/85-nexus.sh").read_text(encoding="utf-8")
+update = Path("modules/60-update.sh").read_text(encoding="utf-8")
+installer = Path("modules/95-install.sh").read_text(encoding="utf-8")
+hook_script = Path("scripts/naive-cert-hook.sh").read_text(encoding="utf-8")
+
+validator = config[
+    config.index("rr_certbot_webroot_lineage_is_renewable() {"):
+    config.index("\ndeploy_subscription_cert_hook() {")
+]
+for token in (
+    "https://acme-v02.api.letsencrypt.org/directory",
+    "live member is not a root-owned symlink",
+    "mixed archive generations",
+    "private_key.json",
+    "regr.json",
+    "meta.json",
+    "webroot_map",
+    "authenticator",
+    "acme_renewal_info",
+    "parse_certificate_pem",
+    "MAX_CERTIFICATES = 16",
+    "verify_direct_issuer",
+    "pass_fds=(child_fd, issuer_fd)",
+    "fullchain.pem is not the exact cert.pem plus chain.pem",
+    "leaf certificate SAN policy is not exact",
+    '["pkey", "-check", "-noout", "-passin", "pass:"]',
+    "privkey.pem does not match cert.pem",
+    "jwk_integer",
+    "account RSA key has invalid CRT parameters",
+    '"pkey", "-inform", "DER", "-check", "-noout"',
+    "renewal account id does not match the account JWK",
+    "usedforsecurity=False",
+    "secret file is accessible by group/other",
+):
+    assert token in validator
+
+subscription = config[config.index("start_subscription_server() {"):]
+pair = subscription.index("subscription_certificate_pair_valid")
+lineage = subscription.index(
+    'rr_certbot_webroot_lineage_is_renewable "$SUB_DOMAIN"', pair
+)
+runtime = subscription.index("rr_certbot_renewal_runtime_is_ready", lineage)
+hook = subscription.index("rr_certificate_deploy_hook_is_current", runtime)
+assert pair < lineage < runtime < hook
+assert 'rr_certbot_renewal_runtime_is_ready "$SUB_DOMAIN"' in subscription[runtime:hook]
+
+ensure = singbox[
+    singbox.index("ensure_naive_certificate() {"):
+    singbox.index("\nrr_certificate_deploy_hook_is_current() {")
+]
+update_pair = ensure.index("if ! naive_certificate_pair_valid")
+update_lineage = ensure.index(
+    'rr_certbot_webroot_lineage_is_renewable "$naive_domain"', update_pair
+)
+update_runtime = ensure.index("rr_certbot_renewal_runtime_is_ready", update_lineage)
+assert 'rr_certbot_renewal_runtime_is_ready "$naive_domain"' in ensure[
+    update_runtime:update_runtime + 256
+]
+update_sync = ensure.index("sync_naive_certificate_pair", update_runtime)
+reuse_pair = ensure.index("if naive_certificate_pair_valid", update_sync)
+reuse_lineage = ensure.index(
+    'rr_certbot_webroot_lineage_is_renewable "$naive_domain"', reuse_pair
+)
+certbot = ensure.index("certbot certonly", reuse_lineage)
+assert '--cert-name "$naive_domain"' in ensure[certbot:]
+post_pair = ensure.index("naive_certificate_pair_valid", certbot)
+post_lineage = ensure.index(
+    'rr_certbot_webroot_lineage_is_renewable "$naive_domain"', post_pair
+)
+post_runtime = ensure.index("rr_enable_certbot_renewal_runtime", post_lineage)
+assert 'rr_enable_certbot_renewal_runtime "$naive_domain"' in ensure[
+    post_runtime:post_runtime + 256
+]
+post_sync = ensure.index("sync_naive_certificate_pair", post_runtime)
+assert update_pair < update_lineage < update_runtime < update_sync < reuse_pair < reuse_lineage
+assert certbot < post_pair < post_lineage < post_sync
+
+post_update = update[
+    update.index("post_update_migrate() {"):
+    update.index("\nensure_runtime_health() {")
+]
+naive_branch = post_update[post_update.index('if [ "${NAIVE_ENABLED:-false}" = true ]; then'):]
+assert 'ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || return 1' in naive_branch
+assert "deploy_naive_cert_hook || return 1" not in naive_branch.split("fi", 1)[0]
+
+enable = nexus[
+    nexus.index("nexus_enable_public_https() {"):
+    nexus.index("\nnexus_remove_public_proxy() {")
+]
+nexus_certbot = enable.index("certbot certonly")
+assert '--cert-name "$domain"' in enable[nexus_certbot:]
+nexus_pair = enable.index("subscription_certificate_pair_valid", nexus_certbot)
+nexus_lineage = enable.index(
+    'rr_certbot_webroot_lineage_is_renewable "$domain"', nexus_pair
+)
+nexus_hook = enable.index("nexus_certificate_deploy_hook_is_ready", nexus_lineage)
+nexus_runtime = enable.index("rr_enable_certbot_renewal_runtime", nexus_hook)
+assert nexus_certbot < nexus_pair < nexus_lineage < nexus_hook < nexus_runtime
+assert 'rr_enable_certbot_renewal_runtime "$domain"' in enable[
+    nexus_runtime:nexus_runtime + 256
+]
+nexus_final_runtime = enable.index(
+    'rr_certbot_renewal_runtime_is_ready "$domain"', nexus_runtime
+)
+assert enable.index("systemctl reload nginx", nexus_runtime) < nexus_final_runtime
+
+reconcile = nexus[
+    nexus.index("nexus_reconcile_public_proxy() {"):
+    nexus.index("\nnexus_public_proxy_health_check() {")
+]
+reconcile_pair = reconcile.index("subscription_certificate_pair_valid")
+reconcile_lineage = reconcile.index(
+    'rr_certbot_webroot_lineage_is_renewable "$domain"', reconcile_pair
+)
+reconcile_hook = reconcile.index("nexus_certificate_deploy_hook_is_ready", reconcile_lineage)
+reconcile_http = reconcile.index(
+    "nexus_firewall_open_accounted 80 tcp http_created", reconcile_hook
+)
+reconcile_panel = reconcile.index(
+    'nexus_firewall_open_accounted "$port" tcp panel_created', reconcile_http
+)
+reconcile_runtime = reconcile.index(
+    'rr_certbot_renewal_runtime_is_ready "$domain"', reconcile_hook
+)
+assert reconcile_pair < reconcile_lineage < reconcile_hook
+assert reconcile_hook < reconcile_http < reconcile_panel < reconcile_runtime
+
+for token in (
+    'NEXUS_CONFIG_FILE="${RR_CERT_HOOK_NEXUS_CONFIG_FILE:-/etc/rr-nexus/nexus.json}"',
+    'certificate_pair_valid "$RENEWED_LINEAGE/fullchain.pem"',
+    'openssl pkey -in "$private_key" -check -noout -passin pass:',
+    '"$NGINX_BIN" -t',
+    '"$NGINX_BIN" -s reload',
+):
+    assert token in hook_script
+nexus_reload = hook_script[
+    hook_script.index("reload_nexus_certificate() {"):
+    hook_script.index("\n# One renewed lineage can serve several RR consumers.")
+]
+assert nexus_reload.index("certificate_pair_valid") < nexus_reload.index('"$NGINX_BIN" -t')
+assert nexus_reload.count('"$NGINX_BIN" -s reload') == 1
+aggregate = hook_script[hook_script.index("hook_failed=0"):]
+assert 'deploy_naive_certificate || hook_failed=1' in aggregate
+assert 'refresh_subscription_certificate || hook_failed=1' in aggregate
+assert 'reload_nexus_certificate || hook_failed=1' in aggregate
+assert 'return "$hook_failed"' in aggregate
+
+repair = installer[
+    installer.index("_install_repair_existing() {"):
+    installer.index("\n_install_prompt_identity() {")
+]
+repair_cert = repair[repair.index('if [ "$NAIVE_ENABLED" = "true" ]; then'):]
+assert "ensure_naive_certificate" in repair_cert
+assert "return 1" in repair_cert[:repair_cert.index("\n    fi")]
+PY
+
 # IP 直连模式只能切换 RR 自己的 Nginx 站点。发行版 default 和用户站点
 # 必须原样保留；nginx -t 失败时还必须恢复旧 RR 配置及 unit 状态。
 run_nexus_ip_nginx_case() (
@@ -206,23 +420,36 @@ run_nexus_ip_nginx_case() (
     local cert_identity_before=""
     local key_identity_before=""
     local fixture_stat_bin=""
+    local original_cert_address="192.0.2.11"
     load_modules_for_tests
     nexus_nginx_tmp=$(mktemp -d)
     trap 'rm -rf "$nexus_nginx_tmp"' EXIT
+    # The fixture lives below the shared /tmp parent.  Bind the ownership
+    # proof to this private root, matching the dedicated Nginx tests, rather
+    # than weakening the production default trust root (/).
+    NEXUS_NGINX_TRUST_ROOT="$nexus_nginx_tmp"
     NEXUS_NGINX_AVAILABLE_DIR="$nexus_nginx_tmp/sites-available"
     NEXUS_NGINX_ENABLED_DIR="$nexus_nginx_tmp/sites-enabled"
     NEXUS_CERT_DIR="$nexus_nginx_tmp/certs"
     NEXUS_NGINX_SITE="$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus.conf"
+    NEXUS_IP_CERT_GATE_SCRIPT="$nexus_nginx_tmp/runtime/nexus-ip-cert-gate"
+    NEXUS_IP_CERT_GATE_DROPIN="$nexus_nginx_tmp/systemd/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+    NEXUS_RESTORE_GATE_DROPIN="$nexus_nginx_tmp/systemd/nginx.service.d/zzzz-rr-restore-gate.conf"
     mkdir -p "$NEXUS_NGINX_AVAILABLE_DIR" "$NEXUS_NGINX_ENABLED_DIR" \
         "$NEXUS_CERT_DIR" "$nexus_nginx_tmp/before"
 
+    [ "$update_transaction" != 1 ] || original_cert_address="192.0.2.10"
     printf '%s\n' 'distro default' > "$NEXUS_NGINX_AVAILABLE_DIR/default"
     printf '%s\n' 'user site' > "$NEXUS_NGINX_AVAILABLE_DIR/unrelated.conf"
-    printf '%s\n' 'old domain site' > "$NEXUS_NGINX_SITE"
-    printf '%s\n' 'old custom-port site' > "${NEXUS_NGINX_SITE}.port"
-    printf '%s\n' "old ip site $case_name" > "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
-    printf '%s\n' "old certificate $case_name" > "$NEXUS_CERT_DIR/ip.crt"
-    printf '%s\n' "old private key $case_name" > "$NEXUS_CERT_DIR/ip.key"
+    nexus_emit_nginx_domain_http_site_v711 old.example.com > "$NEXUS_NGINX_SITE"
+    nexus_emit_nginx_domain_custom_site old.example.com 19443 \
+        /var/www/rr-nexus-certbot true > "${NEXUS_NGINX_SITE}.port"
+    nexus_emit_nginx_ip_site "$original_cert_address" 19443 \
+        legacy-self-signed true > "$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus-ip.conf"
+    command openssl req -x509 -nodes -days 2 -newkey rsa:2048 \
+        -keyout "$NEXUS_CERT_DIR/ip.key" -out "$NEXUS_CERT_DIR/ip.crt" \
+        -subj "/CN=${original_cert_address}" \
+        -addext "subjectAltName=IP:${original_cert_address}" >/dev/null 2>&1
     chmod "$cert_mode" "$NEXUS_CERT_DIR/ip.crt"
     chmod "$key_mode" "$NEXUS_CERT_DIR/ip.key"
     ln -s "$NEXUS_NGINX_AVAILABLE_DIR/default" "$NEXUS_NGINX_ENABLED_DIR/default"
@@ -239,35 +466,36 @@ run_nexus_ip_nginx_case() (
 
     nginx_active=true
     nginx_enabled=false
+    nexus_firewall_state=closed
     [ "$update_transaction" != 1 ] && [ "$expect_success" = true ] && nginx_active=false
     RR_UPDATE_TRANSACTION="$update_transaction"
     apt-get() { :; }
-    openssl() {
-        local output=""
-        local key_output=""
-        if [ "${1:-}" = x509 ]; then
-            # Force the transaction to replace the old certificate as well as
-            # the site, so rollback proves both artifacts are restored.
-            return 1
-        fi
-        [ "${1:-}" = req ] || return 1
-        shift
-        while [ "$#" -gt 0 ]; do
-            case "$1" in
-                -out) output="$2"; shift 2 ;;
-                -keyout) key_output="$2"; shift 2 ;;
-                *) shift ;;
-            esac
-        done
-        printf '%s\n' 'new certificate' > "$output"
-        printf '%s\n' 'new private key' > "$key_output"
-    }
     nginx() {
         [ "${1:-}" = -t ] || return 1
         return "$nginx_test_rc"
     }
     systemctl() {
         case "${1:-}" in
+            daemon-reload) return 0 ;;
+            show)
+                case "$*" in
+                    'show nginx.service --property=LoadState --value')
+                        printf '%s\n' loaded
+                        ;;
+                    'show nginx.service --property=DropInPaths --value')
+                        printf '%s\n' "$NEXUS_IP_CERT_GATE_DROPIN"
+                        ;;
+                    'show nginx.service --property=ExecCondition --value')
+                        printf '{ path=%s ; argv[]=%s %s %s %s ; ignore_errors=no ; }\n' \
+                            "$NEXUS_IP_CERT_GATE_SCRIPT" \
+                            "$NEXUS_IP_CERT_GATE_SCRIPT" \
+                            "$NEXUS_CERT_DIR/ip.crt" \
+                            "$NEXUS_CERT_DIR/ip.key" \
+                            "$NEXUS_CERT_DIR/.ip-cert-pending"
+                        ;;
+                    *) return 1 ;;
+                esac
+                ;;
             is-active) [ "$nginx_active" = true ] ;;
             is-enabled) [ "$nginx_enabled" = true ] ;;
             enable)
@@ -283,7 +511,16 @@ run_nexus_ip_nginx_case() (
             *) return 1 ;;
         esac
     }
-    open_protocol_firewall() { :; }
+    rr_validate_protocol_firewall() {
+        [ "$1" = 18443 ] && [ "$2" = tcp ] && \
+            [ "$nexus_firewall_state" = "$3" ]
+    }
+    open_protocol_firewall() { nexus_firewall_state=open; }
+    close_protocol_firewall() { nexus_firewall_state=closed; }
+    rr_firewall_protocol_tuple_needed_after_updates() { return 1; }
+    # A regression fixture must never arm the host-wide emergency quarantine.
+    # Negative cases assert the fail-closed status without mutating real paths.
+    nexus_firewall_fail_closed() { return 3; }
     if [ "$update_transaction" = 1 ]; then
         # The production contract is root:root, while pre-push validation may
         # run as an unprivileged developer.  Map only these private fixtures'
@@ -645,6 +882,10 @@ snapshot_function=$(awk '
     capture && /^}$/ { exit }
 ' scripts/install-core.sh)
 install_snapshot_test_stubs() {
+    rr_set_private_marker() {
+        local target="$1"
+        (umask 077; : > "$target") && chmod 600 "$target"
+    }
     rr_write_transaction_format() { printf '2\n' > "$TX_DIR/transaction-format"; }
     rr_capture_update_writer_state() {
         RR_SINGBOX_WAS_ACTIVE=false
@@ -810,6 +1051,7 @@ rollback_function=$(awk '
     rr_restore_file() { return 0; }
     rr_restore_dir() { return 0; }
     rr_restore_sqlite() { return 0; }
+    rr_restore_ip_acme_update_directories() { return 0; }
     rr_install_restore_external_state_if_required() { return 0; }
     rr_read_trusted_phase() { printf '%s\n' runtime_swapped; }
     rr_quiesce_health_monitor_for_rollback() { return 0; }
@@ -830,15 +1072,23 @@ echo "[5/13] Fresh-install crypto material regression"
     rm -f "$CONFIG_FILE"
     VL_ENABLED=true
     HY2_ENABLED=false
+    PRIVATE_KEY=""
     PUBLIC_KEY=""
     SHORT_ID=""
     if validate_subscription_crypto_material >/dev/null 2>&1; then
         echo "Empty Reality material was accepted." >&2
         exit 1
     fi
-    PUBLIC_KEY=$(printf 'a%.0s' {1..43})
+    PRIVATE_KEY=$(printf 'A%.0s' {1..43})
+    PUBLIC_KEY=$(rr_reality_public_from_private "$PRIVATE_KEY")
     SHORT_ID=0123abcd
     validate_subscription_crypto_material
+    PUBLIC_KEY=$(printf 'a%.0s' {1..43})
+    if validate_subscription_crypto_material >/dev/null 2>&1; then
+        echo "Mismatched Reality private/public keys were accepted." >&2
+        exit 1
+    fi
+    PUBLIC_KEY=$(rr_reality_public_from_private "$PRIVATE_KEY")
 
     # T10/A10：HY2 证书 pin 缺失必须降级（停用 HY2 并继续），不得整体判拒回滚。
     VL_ENABLED=false
@@ -975,6 +1225,12 @@ echo "[5/13] Fresh-install crypto material regression"
         }
     }
     mkdir() { return 0; }
+    chmod() {
+        [ "$1" = 700 ] || {
+            echo "A restored private directory was not forced to mode 700." >&2
+            return 1
+        }
+    }
     mv() { return 0; }
     rr_restore_apply_tree "$backup_guard_tmp/private-tree"
 )
@@ -1054,6 +1310,7 @@ EOF
         "$local_rollback/rootfs/etc/rr-nexus" "$live_dir"
     NEXUS_CONFIG_FILE="$live_dir/nexus.json"
     NEXUS_SERVICE_FILE="$live_dir/rr-nexus.service"
+    NEXUS_SERVICE_GUARD_DROPIN="$nexus_restore_tmp/systemd/rr-nexus.service.d/40-rr-nexus-guards.conf"
 
     jq -n '{
         mode:"public", listen:"127.0.0.1", port:7900,
@@ -1106,6 +1363,9 @@ EOF
             *) return 0 ;;
         esac
     }
+    # This fixture covers portable access-state retention, not service guard
+    # installation.  Keep that orthogonal preflight entirely inside the mock.
+    rr_nexus_service_start_preflight() { return 0; }
 
     # The generic portable tree application must not install the source
     # nexus.json or its source-machine certificate files at all.
@@ -1230,6 +1490,10 @@ EOF
     rr_restore_stop_managed_runtime() { return 0; }
     rr_restore_remove_managed_fixed_tunnel() { return 0; }
     rr_restore_clear_derived_state() { return 0; }
+    # IP-ACME replay has dedicated transaction tests.  This fixture isolates
+    # portable Nexus access-state and enablement rollback semantics.
+    rr_restore_replace_target_ip_acme_state() { return 0; }
+    rr_restore_rearm_target_ip_acme() { return 0; }
     rr_restore_clear_managed_tree() { return 0; }
     rr_restore_apply_tree() {
         cp "$1/rootfs/etc/rr-nexus/nexus.json" "$NEXUS_CONFIG_FILE"
@@ -1239,6 +1503,9 @@ EOF
     rr_restore_regenerate_runtime_files() { return 0; }
     rr_restore_restore_nginx() { return 0; }
     rr_restore_apply_cloudflared_snapshot() { return 0; }
+    rr_restore_restore_firewall_snapshot() { return 0; }
+    rr_restore_verify_firewall_snapshot() { return 0; }
+    rr_restore_require_effective_gates_or_isolate() { return 0; }
     rr_restore_migrate_with_original_state() { return 0; }
     rr_restore_rollback_stage "$rollback_stage"
     cmp -s "$rollback_tree/rootfs/etc/rr-nexus/nexus.json" "$NEXUS_CONFIG_FILE" || {
@@ -1260,9 +1527,11 @@ EOF
     trap 'rm -rf "$recovery_tmp"' EXIT
     RR_BACKUP_WORK_DIR="$recovery_tmp"
     RR_RESTORE_ACTIVE="$recovery_tmp/active"
+    RR_RESTORE_RUNTIME_READY="$recovery_tmp/runtime-ready"
     RR_RESTORE_LOCK_HELD=1
     recovery_log="$recovery_tmp/recovery.log"
-    rr_restore_resume_frozen_writers() {
+    rr_restore_require_effective_gates_or_isolate() { return 0; }
+    rr_restore_resume_snapshot_writers() {
         local rollback="$1"
         printf '%s,%s,%s,%s,%s\n' \
             "$([ -f "$rollback/singbox_was_running" ] && printf true || printf false)" \
@@ -1305,7 +1574,7 @@ EOF
     rr_restore_write_phase "$retry_stage" frozen
     rr_restore_publish_marker "$RR_RESTORE_ACTIVE" "$retry_stage"
     resume_should_fail=true
-    rr_restore_resume_frozen_writers() { [ "$resume_should_fail" != true ]; }
+    rr_restore_resume_snapshot_writers() { [ "$resume_should_fail" != true ]; }
     if rr_restore_recover_active 2>/dev/null; then
         echo "A failed pre-mutation service resume was reported as recovered." >&2
         exit 1
@@ -1422,237 +1691,162 @@ EOF
         exit 1
     }
 
-    # The legacy bootstrap release is mutable, so only product-pinned
-    # executable bytes may be consumed from it.  Validate both architecture
-    # anchors and exercise the complete fallback without trusting release
-    # metadata or a downloaded checksum file.
-    nexus_validate_pinned_core_constants
-    [ "$(nexus_pinned_core_asset_field amd64 size)" = 20610257 ]
-    [ "$(nexus_pinned_core_asset_field amd64 sha256)" = \
-        9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad ]
-    [ "$(nexus_pinned_core_asset_field arm64 size)" = 18978144 ]
-    [ "$(nexus_pinned_core_asset_field arm64 sha256)" = \
-        28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0 ]
-    [ "$NEXUS_CORE_PINNED_SOURCE_COMMIT" = \
-        b5ebaa1fc0f2b94256180b95468e73ef53caa27d ]
-    [ "$NEXUS_CORE_PINNED_AUDIT_RUN" = 33071792235 ]
-    [ "$NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS" = \
-        "v1.13.20 v1.13.21" ]
-    for allowed_upstream_tag in v1.13.20 v1.13.21; do
-        printf '{"tag_name":"%s"}\n' "$allowed_upstream_tag" > \
-            "$checksum_tmp/allowed-upstream.json"
-        nexus_pinned_core_fallback_allowed \
-            "$checksum_tmp/allowed-upstream.json"
+    # The only accepted traffic core is the native 1.14.0 build whose source,
+    # immutable releases, metadata, checksums and runtime identity all close on
+    # the audited official commit.  There is no mutable/older fallback.
+    [ "$NEXUS_CORE_TARGET_VERSION" = 1.14.0 ]
+    [ "$NEXUS_CORE_TARGET_TAG" = v1.14.0 ]
+    [ "$NEXUS_CORE_SOURCE_COMMIT" = \
+        0b8995879f29a9b98ee027bc17b75e101445b238 ]
+    [ "$NEXUS_CORE_UPSTREAM_RELEASE_ID" = 379452161 ]
+    [ "$NEXUS_CORE_GO_VERSION" = go1.25.5 ]
+    [ "$NEXUS_CORE_MIN_GO_VERSION" = 1.25.0 ]
+    [ "$NEXUS_CORE_RELEASE_REVISION" = 1 ]
+
+    version="$NEXUS_CORE_TARGET_VERSION"
+    upstream_tag="$NEXUS_CORE_TARGET_TAG"
+    release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"
+    builder_commit=$(printf 'c%.0s' {1..40})
+    asset_base="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/"
+    fixture_root="$checksum_tmp/exact-1.14"
+    mkdir -p "$fixture_root"
+
+    write_exact_core_binary() {
+        local target="$1"
+        local arch="$2"
+        mkdir -p "$(dirname -- "$target")"
+        cat > "$target" <<EOF
+#!/bin/sh
+printf '%s\n' \\
+  'sing-box version ${NEXUS_CORE_TARGET_VERSION}' \\
+  '' \\
+  'Environment: ${NEXUS_CORE_GO_VERSION} linux/${arch}' \\
+  'Tags: ${NEXUS_CORE_EXPECTED_BUILD_TAGS}' \\
+  'Revision: ${NEXUS_CORE_SOURCE_COMMIT}' \\
+  'CGO: disabled'
+EOF
+        chmod 755 "$target"
+    }
+
+    for fixture_arch in amd64 arm64; do
+        fixture_dir="$fixture_root/sing-box-${version}-linux-${fixture_arch}"
+        write_exact_core_binary "$fixture_dir/sing-box" "$fixture_arch"
+        tar -czf "$fixture_root/rr-sing-box-${version}-linux-${fixture_arch}.tar.gz" \
+            -C "$fixture_root" \
+            "sing-box-${version}-linux-${fixture_arch}/sing-box"
+        nexus_validate_traffic_core_binary "$fixture_dir/sing-box" "$fixture_arch"
     done
-    printf '%s\n' '{"tag_name":"v1.13.22"}' > \
-        "$checksum_tmp/unknown-upstream.json"
-    if nexus_pinned_core_fallback_allowed \
-        "$checksum_tmp/unknown-upstream.json"; then
-        echo "Unknown upstream version selected the pinned Nexus core." >&2
-        exit 1
-    fi
-    if nexus_pinned_core_asset_field 386 sha256 >/dev/null 2>&1; then
-        echo "Unsupported architecture received a pinned Nexus digest." >&2
-        exit 1
-    fi
-    (
-        bad_sha="$NEXUS_CORE_PINNED_AMD64_SHA256"
-        NEXUS_CORE_PINNED_AMD64_SHA256="${bad_sha%?}g"
-        if nexus_validate_pinned_core_constants; then
-            echo "Malformed pinned Nexus digest was accepted." >&2
-            exit 1
-        fi
-    )
-    (
-        NEXUS_CORE_PINNED_FALLBACK_UPSTREAM_TAGS="v1.13.20 v1.13.21 v1.13.22"
-        if nexus_validate_pinned_core_constants; then
-            echo "Widened pinned Nexus upstream allowlist was accepted." >&2
-            exit 1
-        fi
-    )
-    (
-        status_root="$checksum_tmp/status"
-        mkdir -p "$status_root"
-        target_mode=missing
-        seen_target_url="$status_root/seen-target-url"
-        curl() {
-            local output="" argument="" url=""
-            while [ "$#" -gt 0 ]; do
-                argument="$1"
-                shift
-                case "$argument" in
-                    -o) output="$1"; shift ;;
-                    https://*) url="$argument" ;;
-                esac
-            done
-            if [ "$url" = "$NEXUS_CORE_UPSTREAM_API" ]; then
-                printf '%s\n' \
-                    '{"tag_name":"v1.13.20"}' > "$output"
-                return 0
-            fi
-            printf '%s\n' "$url" > "$seen_target_url"
-            case "$target_mode" in
-                missing) printf '%s' 404; return 22 ;;
-                forbidden) printf '%s' 403; return 22 ;;
-                timeout) printf '%s' 404; return 28 ;;
-                malformed)
-                    printf '%s\n' '{"immutable":false}' > "$output"
-                    printf '%s' 200
-                    return 0
-                    ;;
-                *) return 1 ;;
+    sha256sum \
+        "$fixture_root/rr-sing-box-${version}-linux-amd64.tar.gz" \
+        "$fixture_root/rr-sing-box-${version}-linux-arm64.tar.gz" | \
+        sed "s#  ${fixture_root}/#  #" > "$fixture_root/SHA256SUMS"
+
+    cat > "$fixture_root/BUILD_INFO" <<EOF
+SING_BOX_VERSION=${version}
+SING_BOX_TAG=${upstream_tag}
+SOURCE_COMMIT=${NEXUS_CORE_SOURCE_COMMIT}
+RR_BUILDER_COMMIT=${builder_commit}
+RR_CORE_RELEASE=${release_tag}
+GO_VERSION=${NEXUS_CORE_GO_VERSION}
+CGO_ENABLED=0
+BUILD_TAG=with_v2ray_api
+BUILD_TAGS=${NEXUS_CORE_EXPECTED_BUILD_TAGS}
+SOURCE=https://github.com/SagerNet/sing-box/tree/${upstream_tag}
+EOF
+    jq -n --arg tag "$upstream_tag" \
+        --argjson release_id "$NEXUS_CORE_UPSTREAM_RELEASE_ID" '{
+            id: $release_id,
+            tag_name: $tag,
+            draft: false,
+            prerelease: false,
+            immutable: true,
+            author: {login:"github-actions[bot]"},
+            url: ("https://api.github.com/repos/SagerNet/sing-box/releases/" +
+                ($release_id | tostring)),
+            html_url: ("https://github.com/SagerNet/sing-box/releases/tag/" + $tag)
+        }' > "$fixture_root/upstream.json"
+    jq -n --arg tag "$release_tag" --arg target "$builder_commit" \
+        --arg base "$asset_base" --arg version "$version" '{
+            tag_name: $tag,
+            target_commitish: $target,
+            draft: false,
+            prerelease: false,
+            immutable: true,
+            author: {login:"github-actions[bot]"},
+            assets: [
+                "BUILD_INFO", "SHA256SUMS",
+                "rr-sing-box-\($version)-linux-amd64.tar.gz",
+                "rr-sing-box-\($version)-linux-arm64.tar.gz"
+            ] | map({
+                name: ., browser_download_url: ($base + .), state:"uploaded",
+                uploader:{login:"github-actions[bot]"}
+            })
+        }' > "$fixture_root/release.json"
+
+    nexus_validate_upstream_core_release "$fixture_root/upstream.json"
+    nexus_validate_traffic_core_release "$fixture_root/release.json" "$upstream_tag"
+    nexus_validate_core_build_info \
+        "$fixture_root/BUILD_INFO" "$version" "$release_tag" "$builder_commit"
+    RR_AWK_BIN=mawk nexus_validate_core_checksums \
+        "$fixture_root/SHA256SUMS" "$version"
+
+    amd64_archive_source="$fixture_root/rr-sing-box-${version}-linux-amd64.tar.gz"
+    arm64_archive_source="$fixture_root/rr-sing-box-${version}-linux-arm64.tar.gz"
+    curl() {
+        local output="" argument="" url=""
+        while [ "$#" -gt 0 ]; do
+            argument="$1"
+            shift
+            case "$argument" in
+                -o) output="$1"; shift ;;
+                https://*) url="$argument" ;;
             esac
-        }
-        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
-            echo "Missing exact Nexus core release did not report fallback status." >&2
-            exit 1
-        else
-            [ "$?" -eq 44 ]
-        fi
-        [ "$(cat "$seen_target_url")" = \
-            "${NEXUS_CORE_RELEASE_API}/rr-nexus-core-v1.13.20-r1" ]
-        target_mode=forbidden
-        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
-            echo "Forbidden Nexus metadata response was accepted." >&2
-            exit 1
-        else
-            [ "$?" -eq 1 ]
-        fi
-        target_mode=timeout
-        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
-            echo "Curl timeout carrying a 404 status selected Nexus fallback." >&2
-            exit 1
-        else
-            [ "$?" -eq 1 ]
-        fi
-        target_mode=malformed
-        if nexus_fetch_traffic_core_release "$status_root/release.json"; then
-            echo "Malformed mutable Nexus metadata was accepted." >&2
-            exit 1
-        else
-            [ "$?" -eq 1 ]
-        fi
-    )
-    (
-        fallback_root="$checksum_tmp/fallback"
-        payload_root="$checksum_tmp/payload"
-        mkdir -p "$fallback_root" \
-            "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64"
-        cat > "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box" <<'EOF'
-#!/bin/sh
-printf '%s\n' 'sing-box version 1.13.19 with_v2ray_api'
-EOF
-        chmod 755 "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box"
-        tar -czf "$payload_root/core.tar.gz" -C "$payload_root" \
-            "sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64/sing-box"
-        payload_archive="$payload_root/core.tar.gz"
-        NEXUS_CORE_PINNED_AMD64_SIZE=$(stat -c %s "$payload_root/core.tar.gz")
-        NEXUS_CORE_PINNED_AMD64_SHA256=$(sha256sum "$payload_root/core.tar.gz" | awk '{print $1}')
-        SYS_ARCH=amd64
-        nexus_fetch_traffic_core_release() {
-            printf '%s\n' '{"tag_name":"v1.13.21"}' > "${1}.upstream"
-            return 44
-        }
-        curl() {
-            local output="" argument="" url=""
-            while [ "$#" -gt 0 ]; do
-                argument="$1"
-                shift
-                case "$argument" in
-                    -o) output="$1"; shift ;;
-                    https://*) url="$argument" ;;
-                esac
-            done
-            [ "$url" = \
-                "https://github.com/${RR_REPOSITORY}/releases/download/${NEXUS_CORE_PINNED_RELEASE_TAG}/rr-sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-amd64.tar.gz" ] || return 1
-            cp "$payload_archive" "$output"
-        }
-        nexus_download_traffic_core "$fallback_root"
-        [ "$(get_singbox_version "$fallback_root/sing-box")" = \
-            "$NEXUS_CORE_PINNED_VERSION" ]
-        [ "$(nexus_traffic_core_version)" = "$NEXUS_CORE_PINNED_VERSION" ]
+        done
+        case "$url" in
+            "$NEXUS_CORE_UPSTREAM_API")
+                cp "$fixture_root/upstream.json" "$output" ;;
+            "${NEXUS_CORE_RELEASE_API}/${release_tag}")
+                cp "$fixture_root/release.json" "$output" ;;
+            "${asset_base}BUILD_INFO")
+                cp "$fixture_root/BUILD_INFO" "$output" ;;
+            "${asset_base}SHA256SUMS")
+                cp "$fixture_root/SHA256SUMS" "$output" ;;
+            "${asset_base}rr-sing-box-${version}-linux-amd64.tar.gz")
+                cp "$amd64_archive_source" "$output" ;;
+            "${asset_base}rr-sing-box-${version}-linux-arm64.tar.gz")
+                cp "$arm64_archive_source" "$output" ;;
+            *) return 1 ;;
+        esac
+    }
+    for fixture_arch in amd64 arm64; do
+        download_root="$checksum_tmp/download-${fixture_arch}"
+        mkdir -p "$download_root"
+        SYS_ARCH="$fixture_arch"
+        nexus_download_traffic_core "$download_root"
+        nexus_validate_traffic_core_binary "$download_root/sing-box" "$fixture_arch"
+        [ "$(get_singbox_version "$download_root/sing-box")" = "$version" ]
+    done
+    [ "$(nexus_traffic_core_version)" = "$version" ]
 
-        cp "$payload_root/core.tar.gz" "$payload_root/core-tampered.tar.gz"
-        printf X | dd of="$payload_root/core-tampered.tar.gz" \
-            bs=1 seek=0 count=1 conv=notrunc status=none
-        [ "$(stat -c %s "$payload_root/core-tampered.tar.gz")" = \
-            "$NEXUS_CORE_PINNED_AMD64_SIZE" ]
-        payload_archive="$payload_root/core-tampered.tar.gz"
-        mkdir -p "$checksum_tmp/fallback-tampered"
-        if nexus_download_traffic_core "$checksum_tmp/fallback-tampered" \
-            >/dev/null 2>&1; then
-            echo "Same-size tampered pinned Nexus archive was accepted." >&2
-            exit 1
-        fi
-
-        cp "$payload_root/core.tar.gz" "$payload_root/core-wrong-size.tar.gz"
-        printf X >> "$payload_root/core-wrong-size.tar.gz"
-        payload_archive="$payload_root/core-wrong-size.tar.gz"
-        NEXUS_CORE_PINNED_AMD64_SHA256=$(sha256sum "$payload_archive" | awk '{print $1}')
-        mkdir -p "$checksum_tmp/fallback-wrong-size"
-        if nexus_download_traffic_core "$checksum_tmp/fallback-wrong-size" \
-            >/dev/null 2>&1; then
-            echo "Wrong-size pinned Nexus archive with a matching digest was accepted." >&2
-            exit 1
-        fi
-    )
     (
-        # The architecture-specific trust anchor is part of the executable
-        # path, not just a constant table.  Exercise the arm64 URL, size and
-        # digest selection independently from the amd64 negative cases above.
-        fallback_root="$checksum_tmp/fallback-arm64"
-        payload_root="$checksum_tmp/payload-arm64"
-        mkdir -p "$fallback_root" \
-            "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64"
-        cat > "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box" <<'EOF'
-#!/bin/sh
-printf '%s\n' 'sing-box version 1.13.19 with_v2ray_api'
-EOF
-        chmod 755 "$payload_root/sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box"
-        tar -czf "$payload_root/core.tar.gz" -C "$payload_root" \
-            "sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64/sing-box"
-        NEXUS_CORE_PINNED_ARM64_SIZE=$(stat -c %s "$payload_root/core.tar.gz")
-        NEXUS_CORE_PINNED_ARM64_SHA256=$(sha256sum "$payload_root/core.tar.gz" | awk '{print $1}')
-        SYS_ARCH=arm64
-        nexus_fetch_traffic_core_release() {
-            printf '%s\n' '{"tag_name":"v1.13.20"}' > "${1}.upstream"
-            return 44
-        }
-        curl() {
-            local output="" argument="" url=""
-            while [ "$#" -gt 0 ]; do
-                argument="$1"
-                shift
-                case "$argument" in
-                    -o) output="$1"; shift ;;
-                    https://*) url="$argument" ;;
-                esac
-            done
-            [ "$url" = \
-                "https://github.com/${RR_REPOSITORY}/releases/download/${NEXUS_CORE_PINNED_RELEASE_TAG}/rr-sing-box-${NEXUS_CORE_PINNED_VERSION}-linux-arm64.tar.gz" ] || return 1
-            cp "$payload_root/core.tar.gz" "$output"
-        }
-        nexus_download_traffic_core "$fallback_root"
-        [ "$(get_singbox_version "$fallback_root/sing-box")" = \
-            "$NEXUS_CORE_PINNED_VERSION" ]
-    )
-    (
-        nexus_fetch_traffic_core_release() { return 1; }
+        curl() { return 1; }
         if nexus_traffic_core_version >/dev/null 2>&1; then
-            echo "Transport failure silently selected the pinned Nexus core." >&2
+            echo "Transport failure silently selected a traffic core." >&2
             exit 1
         fi
     )
-    (
-        nexus_fetch_traffic_core_release() {
-            printf '%s\n' '{"tag_name":"v1.13.22"}' > "${1}.upstream"
-            return 44
-        }
-        if nexus_traffic_core_version >/dev/null 2>&1; then
-            echo "Unexpected upstream version selected the pinned Nexus core." >&2
-            exit 1
-        fi
-    )
+    cp "$amd64_archive_source" "$fixture_root/tampered-amd64.tar.gz"
+    printf X | dd of="$fixture_root/tampered-amd64.tar.gz" \
+        bs=1 seek=0 count=1 conv=notrunc status=none
+    amd64_archive_source="$fixture_root/tampered-amd64.tar.gz"
+    SYS_ARCH=amd64
+    mkdir -p "$checksum_tmp/download-tampered"
+    if nexus_download_traffic_core "$checksum_tmp/download-tampered" \
+        >/dev/null 2>&1; then
+        echo "A same-size tampered 1.14 archive was accepted." >&2
+        exit 1
+    fi
+    amd64_archive_source="$fixture_root/rr-sing-box-${version}-linux-amd64.tar.gz"
 
     digest_a=$(printf 'a%.0s' {1..64})
     digest_b=$(printf 'b%.0s' {1..64})
@@ -1694,12 +1888,32 @@ EOF
         exit 1
     fi
 
-    version=1.2.3
-    upstream_tag="v${version}"
-    release_tag="rr-nexus-core-${upstream_tag}-r1"
+    version="$NEXUS_CORE_TARGET_VERSION"
+    upstream_tag="$NEXUS_CORE_TARGET_TAG"
+    release_tag="rr-nexus-core-${upstream_tag}-r${NEXUS_CORE_RELEASE_REVISION}"
     builder_commit=$(printf 'c%.0s' {1..40})
-    source_commit=$(printf 'd%.0s' {1..40})
+    source_commit="$NEXUS_CORE_SOURCE_COMMIT"
     asset_base="https://github.com/${RR_REPOSITORY}/releases/download/${release_tag}/"
+
+    assert_bad_upstream_release() {
+        local fixture="$1"
+        if nexus_validate_upstream_core_release "$fixture"; then
+            echo "Invalid official sing-box release metadata was accepted: ${fixture##*.}" >&2
+            exit 1
+        fi
+    }
+    jq '.tag_name = "v1.14.1"' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.tag"
+    jq '.id += 1' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.id"
+    jq '.draft = true' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.draft"
+    jq '.prerelease = true' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.prerelease"
+    jq '.immutable = false' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.mutable"
+    jq '.author.login = "attacker"' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.author"
+    jq '.url = "https://example.invalid/release"' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.url"
+    jq '.html_url = "https://example.invalid/tag"' "$fixture_root/upstream.json" > "$checksum_tmp/upstream.html"
+    for bad in tag id draft prerelease mutable author url html; do
+        assert_bad_upstream_release "$checksum_tmp/upstream.$bad"
+    done
+
     jq -n --arg tag "$release_tag" --arg target "$builder_commit" --arg base "$asset_base" \
         --arg version "$version" '{
             tag_name: $tag,
@@ -1707,11 +1921,15 @@ EOF
             draft: false,
             prerelease: false,
             immutable: true,
+            author: {login:"github-actions[bot]"},
             assets: [
                 "BUILD_INFO", "SHA256SUMS",
                 "rr-sing-box-\($version)-linux-amd64.tar.gz",
                 "rr-sing-box-\($version)-linux-arm64.tar.gz"
-            ] | map({name: ., browser_download_url: ($base + .)})
+            ] | map({
+                name: ., browser_download_url: ($base + .), state:"uploaded",
+                uploader:{login:"github-actions[bot]"}
+            })
         }' > "$checksum_tmp/release.good"
     nexus_validate_traffic_core_release "$checksum_tmp/release.good" "$upstream_tag"
 
@@ -1722,7 +1940,7 @@ EOF
             exit 1
         fi
     }
-    jq '.tag_name = "rr-nexus-core-v1.2.4-r1"' "$checksum_tmp/release.good" > "$checksum_tmp/release.tag"
+    jq '.tag_name = "rr-nexus-core-v1.14.1-r1"' "$checksum_tmp/release.good" > "$checksum_tmp/release.tag"
     jq '.target_commitish = "main"' "$checksum_tmp/release.good" > "$checksum_tmp/release.target"
     jq '.draft = true' "$checksum_tmp/release.good" > "$checksum_tmp/release.draft"
     jq '.prerelease = true' "$checksum_tmp/release.good" > "$checksum_tmp/release.prerelease"
@@ -1733,7 +1951,11 @@ EOF
     jq '.assets[3] = .assets[2]' "$checksum_tmp/release.good" > "$checksum_tmp/release.duplicate"
     jq '.assets[0].browser_download_url = "https://example.invalid/BUILD_INFO"' \
         "$checksum_tmp/release.good" > "$checksum_tmp/release.url"
-    for bad in tag target draft prerelease mutable missing extra duplicate url; do
+    jq '.author.login = "attacker"' "$checksum_tmp/release.good" > "$checksum_tmp/release.author"
+    jq '.assets[0].state = "open"' "$checksum_tmp/release.good" > "$checksum_tmp/release.state"
+    jq '.assets[0].uploader.login = "attacker"' \
+        "$checksum_tmp/release.good" > "$checksum_tmp/release.uploader"
+    for bad in tag target draft prerelease mutable missing extra duplicate url author state uploader; do
         assert_bad_core_release "$checksum_tmp/release.$bad"
     done
 
@@ -1743,7 +1965,10 @@ SING_BOX_TAG=${upstream_tag}
 SOURCE_COMMIT=${source_commit}
 RR_BUILDER_COMMIT=${builder_commit}
 RR_CORE_RELEASE=${release_tag}
+GO_VERSION=${NEXUS_CORE_GO_VERSION}
+CGO_ENABLED=0
 BUILD_TAG=with_v2ray_api
+BUILD_TAGS=${NEXUS_CORE_EXPECTED_BUILD_TAGS}
 SOURCE=https://github.com/SagerNet/sing-box/tree/${upstream_tag}
 EOF
     nexus_validate_core_build_info \
@@ -1756,24 +1981,33 @@ EOF
             exit 1
         fi
     }
-    sed 's/^SING_BOX_VERSION=.*/SING_BOX_VERSION=1.2.4/' \
+    sed 's/^SING_BOX_VERSION=.*/SING_BOX_VERSION=1.14.1/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.version"
-    sed 's/^SING_BOX_TAG=.*/SING_BOX_TAG=v1.2.4/' \
+    sed 's/^SING_BOX_TAG=.*/SING_BOX_TAG=v1.14.1/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.tag"
-    sed 's/^SOURCE_COMMIT=.*/SOURCE_COMMIT=not-a-commit/' \
+    sed 's/^SOURCE_COMMIT=.*/SOURCE_COMMIT=0000000000000000000000000000000000000000/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.source-commit"
     sed 's/^RR_BUILDER_COMMIT=.*/RR_BUILDER_COMMIT=0000000000000000000000000000000000000000/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.builder"
-    sed 's/^RR_CORE_RELEASE=.*/RR_CORE_RELEASE=rr-nexus-core-v1.2.4-r1/' \
+    sed 's/^RR_CORE_RELEASE=.*/RR_CORE_RELEASE=rr-nexus-core-v1.14.1-r1/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.release"
+    sed 's/^GO_VERSION=.*/GO_VERSION=go9.9.9/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.go-version"
+    sed 's/^CGO_ENABLED=.*/CGO_ENABLED=1/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.cgo"
     sed 's/^BUILD_TAG=.*/BUILD_TAG=with_quic/' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.build-tag"
+    sed 's/^BUILD_TAGS=.*/BUILD_TAGS=with_v2ray_api/' \
+        "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.build-tags"
     sed 's#^SOURCE=.*#SOURCE=https://example.invalid/source#' \
         "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.source"
     cp "$checksum_tmp/BUILD_INFO.good" "$checksum_tmp/BUILD_INFO.duplicate"
     printf 'SING_BOX_TAG=%s\n' "$upstream_tag" >> "$checksum_tmp/BUILD_INFO.duplicate"
     sed 's/$/\r/' "$checksum_tmp/BUILD_INFO.good" > "$checksum_tmp/BUILD_INFO.crlf"
-    for bad in version tag source-commit builder release build-tag source duplicate crlf; do
+    grep -v '^SOURCE_COMMIT=' "$checksum_tmp/BUILD_INFO.good" > \
+        "$checksum_tmp/BUILD_INFO.missing" || true
+    for bad in version tag source-commit builder release go-version cgo build-tag \
+        build-tags source duplicate crlf missing; do
         assert_bad_build_info "$checksum_tmp/BUILD_INFO.$bad"
     done
 )
@@ -3034,32 +3268,86 @@ echo "[8/13] RR Nexus per-device traffic helpers"
     NEXUS_DB_FILE="$nexus_tmp/nexus.db"
     NEXUS_CONFIG_FILE="$nexus_tmp/nexus.json"
     SINGBOX_BIN="$nexus_tmp/sing-box"
-    cat > "$SINGBOX_BIN" <<'SH'
+    SYS_ARCH=amd64
+    write_test_core_identity() {
+        local version_line="$1"
+        local tags_line="$2"
+        local revision_line="$3"
+        local cgo_line="$4"
+        cat > "$SINGBOX_BIN" <<EOF
 #!/bin/sh
-echo 'sing-box version test with_v2ray_api'
-SH
-    chmod +x "$SINGBOX_BIN"
-    nexus_core_supports_traffic
-    # A newer already-installed core that contains with_v2ray_api is always
-    # retained.  The pinned bootstrap is only a replacement for an official
-    # build that cannot provide Nexus traffic statistics, never a generic
-    # version downgrade policy.
-    cat > "$SINGBOX_BIN" <<'SH'
-#!/bin/sh
-echo 'sing-box version 9.9.9 with_v2ray_api'
-SH
-    chmod +x "$SINGBOX_BIN"
+printf '%s\n' \\
+  'sing-box version ${version_line}' \\
+  '' \\
+  'Environment: ${NEXUS_CORE_GO_VERSION} linux/${SYS_ARCH}' \\
+  'Tags: ${tags_line}' \\
+  '${revision_line}' \\
+  '${cgo_line}'
+EOF
+        chmod 755 "$SINGBOX_BIN"
+    }
+
     download_marker="$nexus_tmp/download-called"
     nexus_download_traffic_core() { : > "$download_marker"; return 1; }
     managed_singbox_running() { return 1; }
     build_singbox_config() { SINGBOX_CONFIG_CHANGED=false; return 0; }
     any_node_protocol_enabled() { return 1; }
     ensure_node_service_running() { return 0; }
+
+    # Only the exact native, audited 1.14 identity is retained.  Semver alone
+    # is not a trust signal: an older version, a forged high version, missing
+    # revision, CGO build, or partial tag set must all enter the verified
+    # download/upgrade transaction.
+    write_test_core_identity \
+        "$NEXUS_CORE_TARGET_VERSION" "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: disabled"
+    nexus_core_supports_traffic
     nexus_enable_traffic_engine >/dev/null
     [ ! -e "$download_marker" ] || {
-        echo "A newer traffic-capable Nexus core was replaced by the pinned fallback." >&2
+        echo "The exact audited sing-box 1.14 core was needlessly replaced." >&2
         exit 1
     }
+
+    assert_core_requires_upgrade() {
+        local reason="$1"
+        rm -f "$download_marker"
+        if nexus_core_supports_traffic; then
+            echo "Invalid sing-box identity was accepted: $reason" >&2
+            exit 1
+        fi
+        if nexus_enable_traffic_engine >/dev/null 2>&1; then
+            echo "The mocked failed replacement unexpectedly succeeded: $reason" >&2
+            exit 1
+        fi
+        [ -e "$download_marker" ] || {
+            echo "Invalid sing-box identity did not trigger upgrade: $reason" >&2
+            exit 1
+        }
+    }
+
+    write_test_core_identity \
+        1.13.19 "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: disabled"
+    assert_core_requires_upgrade "legacy 1.13.19"
+    write_test_core_identity \
+        9.9.9 "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: disabled"
+    assert_core_requires_upgrade "forged high version"
+    write_test_core_identity \
+        "$NEXUS_CORE_TARGET_VERSION" "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "" "CGO: disabled"
+    assert_core_requires_upgrade "missing Revision"
+    write_test_core_identity \
+        "$NEXUS_CORE_TARGET_VERSION" "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: enabled"
+    assert_core_requires_upgrade "CGO-enabled binary"
+    write_test_core_identity \
+        "$NEXUS_CORE_TARGET_VERSION" with_v2ray_api \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: disabled"
+    assert_core_requires_upgrade "incomplete build tags"
+    write_test_core_identity \
+        "$NEXUS_CORE_TARGET_VERSION" "$NEXUS_CORE_EXPECTED_BUILD_TAGS" \
+        "Revision: $NEXUS_CORE_SOURCE_COMMIT" "CGO: disabled"
     python3 - "$NEXUS_DB_FILE" <<'PY'
 import sqlite3
 import sys
@@ -3080,6 +3368,7 @@ PY
     jq -n --arg database "$NEXUS_DB_FILE" --arg subscriptions "$nexus_tmp/subscriptions" \
         '{mode:"local",listen:"127.0.0.1",port:7900,domain:"",database:$database,subscription_root:$subscriptions}' \
         > "$NEXUS_CONFIG_FILE"
+    chmod 600 "$NEXUS_CONFIG_FILE"
     for protocol in vmess vless hysteria2 tuic anytls; do
         nexus_protocol_users "$protocol" 'e219c8c7-b669-4c75-b33b-a9e5227a8a24' | \
             jq -e '.[1].name == "dev_012345abcdef"' >/dev/null
@@ -3163,6 +3452,7 @@ with sqlite3.connect(database) as connection:
     )
 PY
     printf '{"mode":"public"}\n' > "$NEXUS_CONFIG_FILE"
+    chmod 600 "$NEXUS_CONFIG_FILE"
 
     load_config_with_defaults() { return 0; }
     validate_subscription_crypto_material() { return 0; }
@@ -3372,9 +3662,11 @@ grep -Fq 'rr_download_file "$bundle_url" "$bundle_tmp" 10' modules/60-update.sh
 grep -Fq 'rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true' modules/60-update.sh
 grep -Fq 'rr_download "$RR_MANIFEST_URL" "$STAGE_ROOT/manifest.sha256" true' scripts/install-core.sh
 grep -Fq 'RR_RELEASE_TAG="v' install.sh scripts/install-core.sh
-grep -Fq 'gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS' .github/workflows/release.yml
-grep -Fq -- '--notes-file release-draft-notes.md \' .github/workflows/release.yml
-grep -Fq -- '--draft' .github/workflows/release.yml
+grep -Fq 'complete_owned_draft_assets()' .github/workflows/release.yml
+grep -Fq 'publish_draft_and_confirm()' .github/workflows/release.yml
+grep -Fq 'api --method POST --input release-create-request.json \' .github/workflows/release.yml
+grep -Fq '{tag_name:$tag,target_commitish:$target,name:$title,body:$body,' .github/workflows/release.yml
+grep -Fq 'draft:true,prerelease:false}' .github/workflows/release.yml
 grep -Fq 'assert_latest_product' .github/workflows/release.yml
 grep -Fq 'assert_release_gate' .github/workflows/release.yml
 grep -Fq 'assert_immutable_releases_enabled' .github/workflows/release.yml
@@ -3401,7 +3693,7 @@ grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_R
     scripts/install-core.sh
 grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"' \
     scripts/install-core.sh
-grep -Fq 'rr_restore_external_state_if_required "$tx" "$RR_BACKUP" || failed=true' \
+grep -Fq 'if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP"; then' \
     scripts/update-recover.sh
 grep -Fq '/usr/local/sbin/rr-update-recover /usr/local/sbin/rr-update-external-state' \
     modules/95-install.sh
@@ -3414,15 +3706,17 @@ if grep -Rq --exclude=validate.sh 'subscription_server\.py' scripts modules; the
     echo "Update or rollback still searches for the nonexistent subscription_server.py process." >&2
     exit 1
 fi
-grep -Fq 'NAIVE_QUIC_CC=reno' modules/70-protocols.sh
+grep -Fq 'NAIVE_QUIC_CC="${NAIVE_QUIC_CC:-bbr}"' modules/20-config.sh
+grep -Fq '3) desired_naive_quic_cc=reno ;;' modules/70-protocols.sh
 grep -Fxq 'rr_check_system || exit 1' install.sh
 grep -Fq 'rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db' install.sh
 grep -Fq 'rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db' install.sh
 grep -Fq 'ROLLBACK_FAILED=true' install.sh
 grep -Fq 'rr_version_ge "$release_version" "$installed_version"' install.sh
 grep -Fq 'command -v timeout >/dev/null 2>&1' modules/60-update.sh
-grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-devices' modules/60-update.sh
-grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-subscriptions' modules/60-update.sh
+grep -Fq 'timeout --kill-after=5 150 "$RR_LAUNCHER" \' modules/60-update.sh
+grep -Fq -- '--sync-devices >/dev/null 2>&1; then' modules/60-update.sh
+grep -Fq -- '--sync-subscriptions >/dev/null 2>&1; then' modules/60-update.sh
 grep -Fq 'nexus_download_traffic_core "$rr_core_dir"' modules/30-singbox.sh
 grep -Fq 'archive_name="rr-sing-box-${version}-linux-${SYS_ARCH}.tar.gz"' modules/85-nexus.sh
 grep -Fq 'NEXUS_CORE_RELEASE_REVISION=1' modules/85-nexus.sh
@@ -3434,8 +3728,12 @@ grep -Fq 'nexus_validate_core_build_info' modules/85-nexus.sh
 grep -Fq 'SOURCE_COMMIT=${SOURCE_SHA}' .github/workflows/build-nexus-core.yml
 grep -Fq 'RR_BUILDER_COMMIT=${BUILDER_SHA}' .github/workflows/build-nexus-core.yml
 grep -Fq 'RR_CORE_RELEASE=${RELEASE_TAG}' .github/workflows/build-nexus-core.yml
-grep -Fq -- '--target "$BUILDER_SHA"' .github/workflows/build-nexus-core.yml
-grep -Fq -- '--draft' .github/workflows/build-nexus-core.yml
+grep -Fq 'adopt_or_create_draft()' .github/workflows/build-nexus-core.yml
+grep -Fq 'ensure_draft_assets()' .github/workflows/build-nexus-core.yml
+grep -Fq -- '-f "tag_name=${TAG}" -f "target_commitish=${BUILDER_SHA}"' \
+    .github/workflows/build-nexus-core.yml
+grep -Fq -- '-F draft=true -F prerelease=false -f make_latest=false' \
+    .github/workflows/build-nexus-core.yml
 grep -Fq -- '-F draft=false -f make_latest=false' .github/workflows/build-nexus-core.yml
 grep -Fq 'assert_immutable_releases_enabled' .github/workflows/build-nexus-core.yml
 grep -Fq 'IMMUTABLE_RELEASES_READ_TOKEN' .github/workflows/build-nexus-core.yml
@@ -3458,40 +3756,32 @@ if grep -Eq 'gh release (upload|edit|delete-asset).*\brr-nexus-core|--clobber' \
     exit 1
 fi
 python3 - <<'PY'
-import pathlib
-import shlex
+from pathlib import Path
+import re
 
-commands = []
-for workflow in pathlib.Path(".github/workflows").glob("*.yml"):
-    lines = workflow.read_text(encoding="utf-8").splitlines()
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].lstrip()
-        if not stripped.startswith("gh release create "):
-            index += 1
-            continue
-        parts = [stripped]
-        while parts[-1].rstrip().endswith("\\"):
-            index += 1
-            if index >= len(lines):
-                raise SystemExit(f"{workflow}: unterminated gh release create command")
-            parts.append(lines[index].strip())
-        tokens = shlex.split(" ".join(part.rstrip().removesuffix("\\") for part in parts))
-        commands.append((workflow, tokens))
-        index += 1
+release = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+core = Path(".github/workflows/build-nexus-core.yml").read_text(encoding="utf-8")
+for name, workflow in (("product", release), ("core", core)):
+    if "gh release create" in workflow:
+        raise SystemExit(f"{name}: legacy non-reconcilable gh release creator remains")
+    normalized = " ".join(re.sub(r"\\\s*\n\s*", " ", workflow).split())
+    if 'api --method POST "/repos/${GITHUB_REPOSITORY}/releases"' not in normalized and \
+       'api --method POST --input release-create-request.json "/repos/${GITHUB_REPOSITORY}/releases"' not in normalized:
+        raise SystemExit(f"{name}: exact-ID API draft creator is missing")
+    for required in (
+        "publish_draft_and_confirm()",
+        'api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}"',
+        "verify_published_release()",
+        ".immutable == true",
+    ):
+        if required not in normalized:
+            raise SystemExit(f"{name}: publication contract missing {required!r}")
 
-if len(commands) != 2:
-    raise SystemExit(f"expected exactly two gh release creators, found {len(commands)}")
-for workflow, tokens in commands:
-    for required in ("--draft", "--verify-tag", "--target"):
-        if tokens.count(required) != 1:
-            raise SystemExit(f"{workflow}: expected exactly one {required}")
-    forbidden = [
-        token for token in tokens
-        if token == "--latest" or token.startswith("--latest=") or token == "--prerelease"
-    ]
-    if forbidden:
-        raise SystemExit(f"{workflow}: draft creator has unsafe publication flags: {forbidden}")
+if "complete_owned_draft_assets()" not in release:
+    raise SystemExit("product: resumable exact-slot asset uploader is missing")
+for required in ("adopt_or_create_draft()", "ensure_draft_assets()"):
+    if required not in core:
+        raise SystemExit(f"core: resumable publication contract missing {required!r}")
 PY
 grep -Fq '/usr/local/bin/rr --update-now' nexus/rr_nexus.py
 grep -Fq 'MAX_JSON_BODY_BYTES = 1024 * 1024' nexus/rr_nexus.py

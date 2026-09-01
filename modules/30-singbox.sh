@@ -4,6 +4,205 @@
 # ==========================================
 # 3. 安装并配置 Sing-box 内核
 # ==========================================
+RR_SINGBOX_TLS_PAIR_PENDING_FILE="${RR_SINGBOX_TLS_PAIR_PENDING_FILE:-/etc/sing-box/.pair-pending}"
+RR_NAIVE_CERT_PAIR_PENDING_FILE="${RR_NAIVE_CERT_PAIR_PENDING_FILE:-/etc/rr-naive/.pair-pending}"
+RR_CERTIFICATE_PAIR_PENDING_VALUE="rr-certificate-pair-pending-v1"
+
+rr_certificate_pair_pending_is_exact() {
+    local marker="$1" expected_size=$(( ${#RR_CERTIFICATE_PAIR_PENDING_VALUE} + 1 ))
+    local -a lines=()
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h:%s' -- "$marker" 2>/dev/null)" = \
+        "0:0:600:1:${expected_size}" ] || return 1
+    mapfile -t lines < "$marker" || return 1
+    [ "${#lines[@]}" -eq 1 ] && \
+        [ "${lines[0]}" = "$RR_CERTIFICATE_PAIR_PENDING_VALUE" ]
+}
+
+rr_certificate_pair_pending_publish() {
+    local marker="$1" directory="" temporary=""
+    directory=$(dirname -- "$marker") || return 1
+    install -d -o 0 -g 0 -m 700 -- "$directory" || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ] || return 1
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        rr_certificate_pair_pending_is_exact "$marker"
+        return $?
+    fi
+    temporary=$(mktemp "$directory/.pair-pending.XXXXXX") || return 1
+    if ! printf '%s\n' "$RR_CERTIFICATE_PAIR_PENDING_VALUE" > "$temporary" || \
+       ! chown 0:0 "$temporary" || ! chmod 600 "$temporary" || \
+       ! sync -f "$temporary" || ! mv -f -- "$temporary" "$marker" || \
+       ! sync -f "$directory" || ! rr_certificate_pair_pending_is_exact "$marker"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+rr_certificate_pair_pending_clear() {
+    local marker="$1" directory=""
+    rr_certificate_pair_pending_is_exact "$marker" || return 1
+    directory=$(dirname -- "$marker") || return 1
+    rm -f -- "$marker" || return 1
+    sync -f "$directory" || return 1
+    [ ! -e "$marker" ] && [ ! -L "$marker" ]
+}
+
+rr_certificate_private_key_pair_matches() {
+    local certificate="$1" private_key="$2" cert_public="" key_public=""
+    [ -s "$certificate" ] && [ -s "$private_key" ] || return 1
+    openssl x509 -in "$certificate" -noout >/dev/null 2>&1 || return 1
+    openssl pkey -in "$private_key" -check -noout -passin pass: \
+        >/dev/null 2>&1 || return 1
+    cert_public=$(openssl x509 -in "$certificate" -pubkey -noout 2>/dev/null | \
+        sha256sum | awk '{print $1}') || return 1
+    key_public=$(openssl pkey -in "$private_key" -pubout 2>/dev/null | \
+        sha256sum | awk '{print $1}') || return 1
+    [[ "$cert_public" =~ ^[0-9a-f]{64}$ ]] && [ "$cert_public" = "$key_public" ]
+}
+
+rr_publish_certificate_pair() {
+    local certificate_source="$1" key_source="$2" certificate_target="$3"
+    local key_target="$4" marker="$5" validator="$6" directory=""
+    shift 6
+    directory=$(dirname -- "$certificate_target") || return 1
+    [ "$(dirname -- "$key_target")" = "$directory" ] || return 1
+    [ "$(dirname -- "$marker")" = "$directory" ] || return 1
+    "$validator" "$certificate_source" "$key_source" "$@" || return 1
+    sync -f "$certificate_source" && sync -f "$key_source" || return 1
+    rr_certificate_pair_pending_publish "$marker" || return 1
+    mv -f -- "$key_source" "$key_target" || return 1
+    sync -f "$directory" || return 1
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ] && \
+       [ "${RR_TEST_CERT_PAIR_FAIL_AFTER_FIRST:-0}" = 1 ]; then
+        return 1
+    fi
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ] && \
+       [ "${RR_TEST_CERT_PAIR_CRASH_AFTER_FIRST:-0}" = 1 ]; then
+        kill -KILL "$$"
+    fi
+    mv -f -- "$certificate_source" "$certificate_target" || return 1
+    sync -f "$directory" || return 1
+    "$validator" "$certificate_target" "$key_target" "$@" || return 1
+    rr_certificate_pair_pending_clear "$marker"
+}
+
+rr_singbox_certificate_start_gate_for_paths() {
+    local self_certificate="$1" self_key="$2" self_marker="$3"
+    local naive_certificate="$4" naive_key="$5" naive_marker="$6" marker=""
+    for marker in "$self_marker" "$naive_marker"; do
+        [ ! -e "$marker" ] && [ ! -L "$marker" ] || return 78
+    done
+    if [ -e "$self_certificate" ] || [ -L "$self_certificate" ] || \
+       [ -e "$self_key" ] || [ -L "$self_key" ]; then
+        rr_certificate_private_key_pair_matches \
+            "$self_certificate" "$self_key" || return 78
+    fi
+    if [ -e "$naive_certificate" ] || [ -L "$naive_certificate" ] || \
+       [ -e "$naive_key" ] || [ -L "$naive_key" ]; then
+        rr_certificate_private_key_pair_matches \
+            "$naive_certificate" "$naive_key" || return 78
+    fi
+    return 0
+}
+
+rr_singbox_certificate_start_gate() {
+    rr_singbox_certificate_start_gate_for_paths \
+        /etc/sing-box/cert.pem /etc/sing-box/private.key \
+        /etc/sing-box/.pair-pending \
+        /etc/rr-naive/fullchain.pem /etc/rr-naive/privkey.pem \
+        /etc/rr-naive/.pair-pending
+}
+
+rr_publish_regular_file_atomic() {
+    local source="$1" target="$2" target_mode="$3"
+    local directory="" base="" temporary="" backup="" mode="" fault=""
+    local target_existed=false
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    [[ "$target" = /* && "$target" != *[[:space:]]* ]] || return 1
+    directory=$(dirname -- "$target") || return 1
+    base=$(basename -- "$target") || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] && \
+        [ "$(stat -c '%u:%g' -- "$directory" 2>/dev/null)" = 0:0 ] || return 1
+    mode=$(stat -c %a -- "$directory" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ $((8#$mode & 8#022)) -eq 0 ] || \
+        return 1
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        [ -f "$target" ] && [ ! -L "$target" ] && \
+            [ "$(stat -c '%u:%g:%h' -- "$target" 2>/dev/null)" = 0:0:1 ] || \
+            return 1
+        target_existed=true
+    fi
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ]; then
+        fault="${RR_TEST_ATOMIC_PUBLISH_FAULT:-}"
+        case "$fault" in ""|copy|file-fsync|rename|dir-fsync) ;; *) return 1 ;; esac
+    fi
+    if [ "$target_existed" = true ]; then
+        backup=$(mktemp "$directory/.${base}.rr-rollback.XXXXXX") || return 1
+        if ! cp -p -- "$target" "$backup" || ! sync -f "$backup"; then
+            rm -f -- "$backup"
+            return 1
+        fi
+    fi
+    temporary=$(mktemp "$directory/.${base}.rr-publish.XXXXXX") || {
+        rm -f -- "$backup"
+        return 1
+    }
+    if [ "$fault" = copy ] || \
+       ! install -o 0 -g 0 -m "$target_mode" -- "$source" "$temporary" || \
+       [ "$fault" = file-fsync ] || ! sync -f "$temporary" || \
+       [ "$fault" = rename ] || ! mv -f -- "$temporary" "$target"; then
+        rm -f -- "$temporary" "$backup"
+        return 1
+    fi
+    if [ "$fault" = dir-fsync ] || ! sync -f "$directory"; then
+        if [ "$target_existed" = true ]; then
+            mv -f -- "$backup" "$target" || return 2
+            backup=""
+        else
+            unlink -- "$target" || return 2
+        fi
+        sync -f "$directory" || return 2
+        return 1
+    fi
+    if ! [ -f "$target" ] || [ -L "$target" ] || \
+       [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" != \
+         "0:0:${target_mode}:1" ] || ! cmp -s -- "$source" "$target"; then
+        if [ "$target_existed" = true ]; then
+            mv -f -- "$backup" "$target" || return 2
+            backup=""
+        else
+            unlink -- "$target" || return 2
+        fi
+        sync -f "$directory" || return 2
+        return 2
+    fi
+    if [ -n "$backup" ]; then
+        rm -f -- "$backup" || return 2
+        sync -f "$directory" >/dev/null 2>&1 || true
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+          "0:0:${target_mode}:1" ] && cmp -s -- "$source" "$target"
+}
+
+rr_remove_regular_file_atomic() {
+    local target="$1" expected_sha="${2:-}" directory="" actual_sha=""
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        return 0
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%h' -- "$target" 2>/dev/null)" = 0:0:1 ] || \
+        return 1
+    [[ "$expected_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    actual_sha=$(sha256sum -- "$target" 2>/dev/null | awk '{print $1}') || \
+        return 1
+    [ "$actual_sha" = "$expected_sha" ] || return 1
+    directory=$(dirname -- "$target") || return 1
+    unlink -- "$target" || return 1
+    sync -f "$directory"
+}
+
 install_singbox() {
     if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
         printf '%s\n' '[安全拒绝] 热更新候选迁移不得下载或替换 Sing-box 内核。' >&2
@@ -23,6 +222,7 @@ install_singbox() {
     local actual_digest=""
     local old_binary=""
     local old_config=""
+    local published_binary_sha=""
     local installed_version=""
     local was_running=false
     local validate_current_config=false
@@ -126,32 +326,41 @@ install_singbox() {
     mkdir -p /etc/sing-box
     if [ -x "$SINGBOX_BIN" ]; then
         old_binary="$sb_tmp_dir/sing-box.previous"
-        cp -p "$SINGBOX_BIN" "$old_binary" || { rm -rf "$sb_tmp_dir"; return 1; }
+        cp -p "$SINGBOX_BIN" "$old_binary" && sync -f "$old_binary" || \
+            { rm -rf "$sb_tmp_dir"; return 1; }
     fi
     if [ -f /etc/sing-box/config.json ]; then
         old_config="$sb_tmp_dir/config.json.previous"
-        cp -p /etc/sing-box/config.json "$old_config" || { rm -rf "$sb_tmp_dir"; return 1; }
+        cp -p /etc/sing-box/config.json "$old_config" && \
+            sync -f "$old_config" || { rm -rf "$sb_tmp_dir"; return 1; }
     fi
     # 内核升级只停/重启 systemd 管理的 sing-box 服务；绝不主动清理或杀死
     # 非 systemd 的手动进程（替换二进制不影响已运行进程——旧 inode 继续承载
     # 流量，新配置由后续 systemd 服务接管）。
     systemctl is-active --quiet sing-box 2>/dev/null && was_running=true
 
-    install -m 755 "$candidate" "${SINGBOX_BIN}.new" || { rm -rf "$sb_tmp_dir"; return 1; }
-    mv -f "${SINGBOX_BIN}.new" "$SINGBOX_BIN"
+    rr_publish_regular_file_atomic "$candidate" "$SINGBOX_BIN" 755 || \
+        { rm -rf "$sb_tmp_dir"; return 1; }
+    published_binary_sha=$(sha256sum -- "$SINGBOX_BIN" | awk '{print $1}') || \
+        { rm -rf "$sb_tmp_dir"; return 1; }
 
     # 旧进程继续提供流量；新内核先生成并自检配置，成功后才做一次快速重启。
     if [ "$validate_current_config" = true ]; then
         if ! build_singbox_config; then
             if [ -n "$old_binary" ]; then
-                install -m 755 "$old_binary" "$SINGBOX_BIN"
+                rr_restore_transaction_file_atomic "$old_binary" "$SINGBOX_BIN" || \
+                    { rm -rf "$sb_tmp_dir"; return 1; }
             else
-                rm -f "$SINGBOX_BIN"
+                rr_remove_regular_file_atomic "$SINGBOX_BIN" \
+                    "$published_binary_sha" || { rm -rf "$sb_tmp_dir"; return 1; }
             fi
             if [ -n "$old_config" ]; then
-                cp -p "$old_config" /etc/sing-box/config.json
+                rr_restore_transaction_file_atomic "$old_config" \
+                    /etc/sing-box/config.json || { rm -rf "$sb_tmp_dir"; return 1; }
             else
-                rm -f /etc/sing-box/config.json
+                rr_remove_regular_file_atomic /etc/sing-box/config.json \
+                    "${SINGBOX_CONFIG_PUBLISHED_SHA256:-}" || \
+                    { rm -rf "$sb_tmp_dir"; return 1; }
             fi
             rm -rf "$sb_tmp_dir"
             echo -e "${RED}[失败] 新内核与当前节点配置不兼容，已保留旧内核和运行配置。${RESET}"
@@ -159,14 +368,19 @@ install_singbox() {
         fi
         if [ "$was_running" = true ] && ! restart_singbox_systemd_only; then
             if [ -n "$old_binary" ]; then
-                install -m 755 "$old_binary" "$SINGBOX_BIN"
+                rr_restore_transaction_file_atomic "$old_binary" "$SINGBOX_BIN" || \
+                    { rm -rf "$sb_tmp_dir"; return 1; }
             else
-                rm -f "$SINGBOX_BIN"
+                rr_remove_regular_file_atomic "$SINGBOX_BIN" \
+                    "$published_binary_sha" || { rm -rf "$sb_tmp_dir"; return 1; }
             fi
             if [ -n "$old_config" ]; then
-                cp -p "$old_config" /etc/sing-box/config.json
+                rr_restore_transaction_file_atomic "$old_config" \
+                    /etc/sing-box/config.json || { rm -rf "$sb_tmp_dir"; return 1; }
             else
-                rm -f /etc/sing-box/config.json
+                rr_remove_regular_file_atomic /etc/sing-box/config.json \
+                    "${SINGBOX_CONFIG_PUBLISHED_SHA256:-}" || \
+                    { rm -rf "$sb_tmp_dir"; return 1; }
             fi
             # 回滚后同样只通过 systemd 拉起旧内核，绝不触碰手动进程。
             restart_singbox_systemd_only >/dev/null 2>&1 || true
@@ -209,12 +423,36 @@ ensure_singbox_core() {
     return 0
 }
 
-write_singbox_systemd_unit() {
-    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
-    local unit_tmp=""
-    install -d -m 755 "$(dirname "$service_file")" || return 1
-    unit_tmp=$(mktemp "$(dirname "$service_file")/.sing-box.service.XXXXXX") || return 1
-    if ! cat > "$unit_tmp" <<EOF
+rr_render_singbox_systemd_unit() {
+    cat <<'EOF'
+[Unit]
+Description=Sing-box service managed by RR-vps
+Wants=network-online.target
+After=network-online.target nss-lookup.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/sing-box
+ExecStartPre=/usr/local/bin/rr --singbox-certificate-gate
+ExecStartPre=/usr/local/bin/sing-box check -c /etc/sing-box/config.json
+ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=2
+TimeoutStopSec=10
+KillMode=mixed
+LimitNOFILE=1048576
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+rr_render_singbox_systemd_unit_legacy_710() {
+    cat <<'EOF'
 [Unit]
 Description=Sing-box service managed by RR-vps
 Wants=network-online.target
@@ -227,7 +465,7 @@ User=root
 WorkingDirectory=/etc/sing-box
 ExecStartPre=/usr/local/bin/sing-box check -c /etc/sing-box/config.json
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10
@@ -237,22 +475,357 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+write_singbox_systemd_unit() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local unit_tmp="" unit_dir=""
+    rr_singbox_service_is_owned_or_absent || return 1
+    unit_dir=$(dirname -- "$service_file") || return 1
+    install -d -o 0 -g 0 -m 755 "$unit_dir" || return 1
+    [ -d "$unit_dir" ] && [ ! -L "$unit_dir" ] || return 1
+    [ "$(stat -c '%u:%g' -- "$unit_dir" 2>/dev/null)" = 0:0 ] || return 1
+    unit_tmp=$(mktemp "$unit_dir/.sing-box.service.XXXXXX") || return 1
+    if ! rr_render_singbox_systemd_unit > "$unit_tmp"
     then
         rm -f "$unit_tmp"
         return 1
     fi
-    chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
-    mv -f "$unit_tmp" "$service_file" || { rm -f "$unit_tmp"; return 1; }
+    chown 0:0 "$unit_tmp" && chmod 644 "$unit_tmp" && \
+        sync -f "$unit_tmp" && mv -f -- "$unit_tmp" "$service_file" && \
+        sync -f "$unit_dir" || { rm -f -- "$unit_tmp"; return 1; }
+    [ -f "$service_file" ] && [ ! -L "$service_file" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$service_file" 2>/dev/null)" = \
+            0:0:644:1 ] && \
+        cmp -s -- "$service_file" <(rr_render_singbox_systemd_unit)
+}
+
+rr_singbox_service_guards_are_effective() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local unit="sing-box.service" load_state="" fragment="" exec_start_pre=""
+    local exec_start="" exec_reload="" interval="" burst="" restart=""
+    local restart_prevent="" user="" working_directory="" dynamic_user=""
+    local private_network="" root_directory="" root_image="" conditions="" asserts=""
+    local dropin_paths="" exec_condition="" restore_present=false firewall_present=false
+    local -a rr_singbox_gate_lines=()
+    local systemd_root="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}"
+    local restore_name="${RR_RESTORE_GATE_DROPIN_NAME:-zzzz-rr-restore-gate.conf}"
+    local firewall_name="${RR_RESTORE_FIREWALL_GATE_DROPIN_NAME:-zzzzz-rr-firewall-quarantine.conf}"
+    local restore_dropin="$systemd_root/sing-box.service.d/$restore_name"
+    local firewall_dropin="$systemd_root/sing-box.service.d/$firewall_name"
+    local restore_argv="/bin/sh -c [ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate"
+    local firewall_marker="/var/lib/rr-vps/firewall-quarantine"
+    load_state=$(systemctl show --property=LoadState --value "$unit" 2>/dev/null) || return 1
+    [ "$load_state" = loaded ] || return 1
+    fragment=$(systemctl show --property=FragmentPath --value "$unit" 2>/dev/null) || return 1
+    [ "$fragment" = "$service_file" ] || return 1
+    [ -f "$service_file" ] && [ ! -L "$service_file" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$service_file" 2>/dev/null)" = \
+            0:0:644:1 ] || return 1
+    cmp -s -- "$service_file" <(rr_render_singbox_systemd_unit) || return 1
+    exec_start_pre=$(systemctl show --property=ExecStartPre --value "$unit" 2>/dev/null) || return 1
+    python3 - "$exec_start_pre" <<'PY' || return 1
+import re
+import sys
+
+raw = sys.argv[1]
+records = []
+for encoded in re.findall(r"\{([^{}]*)\}", raw):
+    fields = {}
+    for item in encoded.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key.strip() in fields:
+            raise SystemExit(1)
+        fields[key.strip()] = value.strip()
+    records.append(
+        (fields.get("path"), fields.get("argv[]"), fields.get("ignore_errors"))
+    )
+expected = [
+    ("/usr/local/bin/rr", "/usr/local/bin/rr --singbox-certificate-gate", "no"),
+    (
+        "/usr/local/bin/sing-box",
+        "/usr/local/bin/sing-box check -c /etc/sing-box/config.json",
+        "no",
+    ),
+]
+if (
+    records != expected
+    or raw.count("{") != 2
+    or raw.count("path=") != 2
+    or raw.count("argv[]=") != 2
+):
+    raise SystemExit(1)
+PY
+    exec_start=$(systemctl show --property=ExecStart --value "$unit" 2>/dev/null) || return 1
+    exec_reload=$(systemctl show --property=ExecReload --value "$unit" 2>/dev/null) || return 1
+    python3 - "$exec_start" "$exec_reload" <<'PY' || return 1
+import re
+import sys
+
+
+def one_record(raw):
+    encoded = re.findall(r"\{([^{}]*)\}", raw)
+    if len(encoded) != 1 or raw.count("{") != 1 or raw.count("}") != 1:
+        raise SystemExit(1)
+    fields = {}
+    for item in encoded[0].split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in fields:
+            raise SystemExit(1)
+        fields[key] = value.strip()
+    return fields.get("path"), fields.get("argv[]"), fields.get("ignore_errors")
+
+
+if one_record(sys.argv[1]) != (
+    "/usr/local/bin/sing-box",
+    "/usr/local/bin/sing-box run -c /etc/sing-box/config.json",
+    "no",
+):
+    raise SystemExit(1)
+if one_record(sys.argv[2]) != (
+    "/bin/kill",
+    "/bin/kill -HUP $MAINPID",
+    "no",
+):
+    raise SystemExit(1)
+PY
+    user=$(systemctl show --property=User --value "$unit" 2>/dev/null) || return 1
+    working_directory=$(systemctl show --property=WorkingDirectory --value \
+        "$unit" 2>/dev/null) || return 1
+    dynamic_user=$(systemctl show --property=DynamicUser --value "$unit" 2>/dev/null) || return 1
+    private_network=$(systemctl show --property=PrivateNetwork --value \
+        "$unit" 2>/dev/null) || return 1
+    root_directory=$(systemctl show --property=RootDirectory --value \
+        "$unit" 2>/dev/null) || return 1
+    root_image=$(systemctl show --property=RootImage --value "$unit" 2>/dev/null) || return 1
+    conditions=$(systemctl show --property=Conditions --value "$unit" 2>/dev/null) || return 1
+    asserts=$(systemctl show --property=Asserts --value "$unit" 2>/dev/null) || return 1
+    [ "$user" = root ] && [ "$working_directory" = /etc/sing-box ] && \
+        [ "$dynamic_user" = no ] && [ "$private_network" = no ] && \
+        [ -z "$root_directory" ] && [ -z "$root_image" ] && \
+        [ -z "$conditions" ] && [ -z "$asserts" ] || return 1
+    dropin_paths=$(systemctl show --property=DropInPaths --value "$unit" 2>/dev/null) || return 1
+    python3 - "$dropin_paths" "$restore_dropin" "$firewall_dropin" <<'PY' || return 1
+import os
+import sys
+
+raw, restore, firewall = sys.argv[1:]
+paths = raw.split()
+if len(paths) != len(set(paths)) or paths not in ([], [restore], [firewall], [restore, firewall]):
+    raise SystemExit(1)
+if any(not path.startswith("/") or os.path.normpath(path) != path for path in paths):
+    raise SystemExit(1)
+PY
+    case " $dropin_paths " in *" $restore_dropin "*) restore_present=true ;; esac
+    case " $dropin_paths " in *" $firewall_dropin "*) firewall_present=true ;; esac
+    if [ "$restore_present" = true ]; then
+        [ -f "$restore_dropin" ] && [ ! -L "$restore_dropin" ] && \
+            [ "$(stat -c '%u:%g:%a:%h' -- "$restore_dropin" 2>/dev/null)" = \
+                0:0:644:1 ] || return 1
+        mapfile -t rr_singbox_gate_lines < "$restore_dropin" || return 1
+        [ "${#rr_singbox_gate_lines[@]}" -eq 2 ] && \
+            [ "${rr_singbox_gate_lines[0]}" = '[Service]' ] && \
+            [ "${rr_singbox_gate_lines[1]}" = \
+                "ExecCondition=/bin/sh -c '[ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate'" ] || return 1
+    fi
+    if [ "$firewall_present" = true ]; then
+        [ -f "$firewall_dropin" ] && [ ! -L "$firewall_dropin" ] && \
+            [ "$(stat -c '%u:%g:%a:%h' -- "$firewall_dropin" 2>/dev/null)" = \
+                0:0:644:1 ] || return 1
+        mapfile -t rr_singbox_gate_lines < "$firewall_dropin" || return 1
+        [ "${#rr_singbox_gate_lines[@]}" -eq 3 ] && \
+            [ "${rr_singbox_gate_lines[0]}" = '[Service]' ] && \
+            [ "${rr_singbox_gate_lines[1]}" = \
+                'ExecCondition=/usr/bin/test ! -e /var/lib/rr-vps/firewall-quarantine' ] && \
+            [ "${rr_singbox_gate_lines[2]}" = \
+                'ExecCondition=/usr/bin/test ! -L /var/lib/rr-vps/firewall-quarantine' ] || return 1
+    fi
+    exec_condition=$(systemctl show --property=ExecCondition --value \
+        "$unit" 2>/dev/null) || return 1
+    python3 - "$exec_condition" "$restore_present" "$restore_argv" \
+        "$firewall_present" "$firewall_marker" <<'PY' || return 1
+import re
+import sys
+
+raw, restore_present, restore_argv, firewall_present, marker = sys.argv[1:]
+records = []
+for encoded in re.findall(r"\{([^{}]*)\}", raw):
+    fields = {}
+    for item in encoded.split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in fields:
+            raise SystemExit(1)
+        fields[key] = value.strip()
+    records.append((fields.get("path"), fields.get("argv[]"), fields.get("ignore_errors")))
+expected = []
+if restore_present == "true":
+    expected.append(("/bin/sh", restore_argv, "no"))
+if firewall_present == "true":
+    expected.extend(
+        [
+            ("/usr/bin/test", f"/usr/bin/test ! -e {marker}", "no"),
+            ("/usr/bin/test", f"/usr/bin/test ! -L {marker}", "no"),
+        ]
+    )
+if records != expected or raw.count("{") != len(expected) or raw.count("}") != len(expected):
+    raise SystemExit(1)
+PY
+    interval=$(systemctl show --property=StartLimitIntervalUSec --value \
+        "$unit" 2>/dev/null) || return 1
+    case "$interval" in 1min|60s|60000000|60000000us) ;; *) return 1 ;; esac
+    burst=$(systemctl show --property=StartLimitBurst --value "$unit" 2>/dev/null) || return 1
+    [ "$burst" = 5 ] || return 1
+    restart=$(systemctl show --property=Restart --value "$unit" 2>/dev/null) || return 1
+    [ "$restart" = on-failure ] || return 1
+    restart_prevent=$(systemctl show --property=RestartPreventExitStatus --value \
+        "$unit" 2>/dev/null) || return 1
+    [ "$restart_prevent" = 78 ] || return 1
+    rr_singbox_effective_control_hooks_are_empty || return 1
+    if declare -F rr_firewall_effective_marker_view_is_safe \
+        >/dev/null 2>&1; then
+        rr_firewall_effective_marker_view_is_safe sing-box.service || return 1
+    fi
+}
+
+rr_singbox_effective_control_hooks_are_empty() {
+    local property="" value=""
+    for property in ExecStartPost ExecStop ExecStopPost; do
+        value=$(systemctl show --property="$property" --value \
+            sing-box.service 2>/dev/null) || return 1
+        rr_health_effective_exec_vector_is_exact "$value" || return 1
+    done
+}
+
+rr_singbox_legacy_service_is_owned() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local load_state="" fragment="" dropins="" exec_start="" exec_pre=""
+    local exec_reload="" exec_condition="" value="" property=""
+    [ -f "$service_file" ] && [ ! -L "$service_file" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$service_file" 2>/dev/null)" = \
+          0:0:644:1 ] && \
+        cmp -s -- "$service_file" \
+            <(rr_render_singbox_systemd_unit_legacy_710) || return 1
+    load_state=$(systemctl show --property=LoadState --value \
+        sing-box.service 2>/dev/null) || return 1
+    fragment=$(systemctl show --property=FragmentPath --value \
+        sing-box.service 2>/dev/null) || return 1
+    [ "$load_state" = loaded ] && [ "$fragment" = "$service_file" ] || return 1
+    dropins=$(systemctl show --property=DropInPaths --value \
+        sing-box.service 2>/dev/null) || return 1
+    if [ -n "$dropins" ]; then
+        declare -F rr_restore_effective_conditions_are_managed \
+            >/dev/null 2>&1 || return 1
+        rr_restore_effective_conditions_are_managed sing-box.service || return 1
+    else
+        exec_condition=$(systemctl show --property=ExecCondition --value \
+            sing-box.service 2>/dev/null) || return 1
+        rr_health_effective_exec_vector_is_exact "$exec_condition" || return 1
+    fi
+    exec_start=$(systemctl show --property=ExecStart --value \
+        sing-box.service 2>/dev/null) || return 1
+    exec_pre=$(systemctl show --property=ExecStartPre --value \
+        sing-box.service 2>/dev/null) || return 1
+    exec_reload=$(systemctl show --property=ExecReload --value \
+        sing-box.service 2>/dev/null) || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_start" \
+        /usr/local/bin/sing-box \
+        '/usr/local/bin/sing-box run -c /etc/sing-box/config.json' || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_pre" \
+        /usr/local/bin/sing-box \
+        '/usr/local/bin/sing-box check -c /etc/sing-box/config.json' || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_reload" /bin/kill \
+        '/bin/kill -HUP $MAINPID' || return 1
+    rr_singbox_effective_control_hooks_are_empty || return 1
+    for property in User Group; do
+        value=$(systemctl show --property="$property" --value \
+            sing-box.service 2>/dev/null) || return 1
+        case "$value" in ""|root) ;; *) return 1 ;; esac
+    done
+    value=$(systemctl show --property=WorkingDirectory --value \
+        sing-box.service 2>/dev/null) || return 1
+    [ "$value" = /etc/sing-box ] || return 1
+    for property in DynamicUser PrivateUsers PrivateMounts PrivateNetwork; do
+        value=$(systemctl show --property="$property" --value \
+            sing-box.service 2>/dev/null) || return 1
+        [ "$value" = no ] || return 1
+    done
+    if declare -F rr_firewall_effective_marker_view_is_safe \
+        >/dev/null 2>&1; then
+        rr_firewall_effective_marker_view_is_safe sing-box.service || return 1
+    else
+        for property in RootDirectory RootImage Environment EnvironmentFiles \
+            PAMName SystemCallFilter; do
+            value=$(systemctl show --property="$property" --value \
+                sing-box.service 2>/dev/null) || return 1
+            [ -z "$value" ] || return 1
+        done
+    fi
+    value=$(systemctl show --property=StartLimitIntervalUSec --value \
+        sing-box.service 2>/dev/null) || return 1
+    case "$value" in 1min|60s|60000000|60000000us) ;; *) return 1 ;; esac
+    value=$(systemctl show --property=StartLimitBurst --value \
+        sing-box.service 2>/dev/null) || return 1
+    [ "$value" = 5 ] || return 1
+    value=$(systemctl show --property=RestartPreventExitStatus --value \
+        sing-box.service 2>/dev/null) || return 1
+    [[ "$value" =~ ^[[:space:]{}]*$ ]]
+}
+
+rr_singbox_service_is_owned_or_absent() {
+    local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local dropin_dir="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}/sing-box.service.d"
+    local load_state="" fragment="" dropins=""
+    if [ -e "$service_file" ] || [ -L "$service_file" ]; then
+        if cmp -s -- "$service_file" <(rr_render_singbox_systemd_unit); then
+            rr_singbox_service_guards_are_effective
+        else
+            rr_singbox_legacy_service_is_owned
+        fi
+        return
+    fi
+    if [ -e "$dropin_dir" ] || [ -L "$dropin_dir" ]; then
+        [ -d "$dropin_dir" ] && [ ! -L "$dropin_dir" ] && \
+            [ -z "$(find "$dropin_dir" -mindepth 1 -maxdepth 1 -print -quit \
+                2>/dev/null)" ] || return 1
+    fi
+    load_state=$(systemctl show --property=LoadState --value \
+        sing-box.service 2>/dev/null) || return 1
+    fragment=$(systemctl show --property=FragmentPath --value \
+        sing-box.service 2>/dev/null) || return 1
+    dropins=$(systemctl show --property=DropInPaths --value \
+        sing-box.service 2>/dev/null) || return 1
+    [ "$load_state" = not-found ] && [ -z "$fragment" ] && [ -z "$dropins" ]
 }
 
 setup_systemd() {
+    if rr_firewall_fail_closed_quarantine_active; then
+        echo -e "${RED}[安全拒绝] 防火墙隔离尚未经精确修复，拒绝启动 Sing-box。${RESET}" >&2
+        return 1
+    fi
     write_singbox_systemd_unit || return 1
     systemctl daemon-reload || return 1
+    rr_singbox_service_guards_are_effective || return 1
+    rr_singbox_service_guards_are_effective || return 1
     systemctl enable sing-box >/dev/null 2>&1 || return 1
     restart_singbox
 }
 
 ensure_node_service_running() {
+    if rr_firewall_fail_closed_quarantine_active; then
+        echo -e "${RED}[安全拒绝] 防火墙隔离尚未经精确修复，拒绝启动 Sing-box。${RESET}" >&2
+        return 1
+    fi
     load_config_with_defaults || return 1
     any_node_protocol_enabled || return 0
     if [ ! -f /etc/systemd/system/sing-box.service ]; then
@@ -262,19 +835,8 @@ ensure_node_service_running() {
     fi
 }
 
-write_health_monitor_units() {
-    local health_service_file="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
-    local health_timer_file="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
-    local service_tmp=""
-    local timer_tmp=""
-    install -d -m 755 "$(dirname "$health_service_file")" \
-        "$(dirname "$health_timer_file")" || return 1
-    service_tmp=$(mktemp "$(dirname "$health_service_file")/.argo-rr-health.service.XXXXXX") || return 1
-    timer_tmp=$(mktemp "$(dirname "$health_timer_file")/.argo-rr-health.timer.XXXXXX") || {
-        rm -f "$service_tmp"
-        return 1
-    }
-    if ! cat > "$service_tmp" <<EOF
+rr_render_health_monitor_service() {
+    cat <<'EOF'
 [Unit]
 Description=RR-vps runtime health check
 Wants=network-online.target
@@ -288,12 +850,10 @@ ExecStart=/usr/local/bin/rr --health-check
 TimeoutStartSec=180
 Nice=10
 EOF
-    then
-        rm -f "$service_tmp" "$timer_tmp"
-        return 1
-    fi
+}
 
-    if ! cat > "$timer_tmp" <<EOF
+rr_render_health_monitor_timer() {
+    cat <<'EOF'
 [Unit]
 Description=Check RR-vps runtime every five minutes
 
@@ -306,29 +866,464 @@ Unit=argo-rr-health.service
 [Install]
 WantedBy=timers.target
 EOF
-    then
-        rm -f "$service_tmp" "$timer_tmp"
+}
+
+rr_health_unit_parent_is_safe() {
+    local directory="$1" mode=""
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    [ "$(stat -c '%u:%g' -- "$directory" 2>/dev/null)" = 0:0 ] || return 1
+    mode=$(stat -c %a -- "$directory" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+rr_health_unit_target_is_safe_or_absent() {
+    local target="$1" mode=""
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        return 0
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] || return 1
+    [ "$(stat -c '%u:%g:%h' -- "$target" 2>/dev/null)" = 0:0:1 ] || return 1
+    mode=$(stat -c %a -- "$target" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+rr_health_monitor_unit_files_are_current() {
+    local service_file="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
+    local timer_file="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+    local service_parent="" timer_parent=""
+    [ "$(stat -c '%u:%g:%h:%a' -- "$service_file" 2>/dev/null)" = \
+        0:0:1:644 ] || return 1
+    [ "$(stat -c '%u:%g:%h:%a' -- "$timer_file" 2>/dev/null)" = \
+        0:0:1:644 ] || return 1
+    [ ! -L "$service_file" ] && [ ! -L "$timer_file" ] || return 1
+    [ "$(readlink -f -- "$service_file" 2>/dev/null)" = "$service_file" ] && \
+        [ "$(readlink -f -- "$timer_file" 2>/dev/null)" = "$timer_file" ] || \
+        return 1
+    service_parent=$(dirname -- "$service_file") || return 1
+    timer_parent=$(dirname -- "$timer_file") || return 1
+    rr_health_unit_parent_is_safe "$service_parent" && \
+        rr_health_unit_parent_is_safe "$timer_parent" || return 1
+    cmp -s -- "$service_file" <(rr_render_health_monitor_service) || return 1
+    cmp -s -- "$timer_file" <(rr_render_health_monitor_timer)
+}
+
+rr_health_effective_exec_vector_is_exact() {
+    local raw="$1"
+    shift
+    [ $(( $# % 2 )) -eq 0 ] || return 1
+    python3 - "$raw" "$@" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+spec = sys.argv[2:]
+expected = [(spec[i], spec[i + 1], "no") for i in range(0, len(spec), 2)]
+matches = list(re.finditer(r"\{([^{}]*)\}", raw))
+residual = raw
+for match in reversed(matches):
+    residual = residual[:match.start()] + residual[match.end():]
+if residual.strip():
+    raise SystemExit(1)
+records = []
+for match in matches:
+    fields = {}
+    for item in match.group(1).split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(1)
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in fields:
+            raise SystemExit(1)
+        fields[key] = value.strip()
+    records.append(
+        (fields.get("path"), fields.get("argv[]"), fields.get("ignore_errors"))
+    )
+if records != expected:
+    raise SystemExit(1)
+for key in ("path=", "argv[]=", "ignore_errors="):
+    if raw.count(key) != len(expected):
+        raise SystemExit(1)
+PY
+}
+
+rr_health_dropin_file_is_exact() {
+    local kind="$1" target="$2" marker=""
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+          0:0:644:1 ] || return 1
+    [ "$(readlink -f -- "$target" 2>/dev/null)" = "$target" ] || return 1
+    case "$kind" in
+        restore)
+            cmp -s -- "$target" <(printf '%s\n' '[Service]' \
+                "ExecCondition=/bin/sh -c '[ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate'")
+            ;;
+        firewall)
+            marker="${RR_FIREWALL_QUARANTINE_FILE:-${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}/firewall-quarantine}"
+            cmp -s -- "$target" <(printf '%s\n' '[Service]' \
+                "ExecCondition=/usr/bin/test ! -e $marker" \
+                "ExecCondition=/usr/bin/test ! -L $marker")
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+rr_health_effective_dropins_are_exact() {
+    local root="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}"
+    local directory="$root/argo-rr-health.service.d" entry=""
+    local restore="$directory/${RR_RESTORE_GATE_DROPIN_NAME:-zzzz-rr-restore-gate.conf}"
+    local firewall="$directory/${RR_FIREWALL_GATE_DROPIN_NAME:-zzzzz-rr-firewall-quarantine.conf}"
+    local raw="" expected=""
+    local -a entries=()
+    if [ -e "$directory" ] || [ -L "$directory" ]; then
+        [ -d "$directory" ] && [ ! -L "$directory" ] && \
+            rr_health_unit_parent_is_safe "$directory" || return 1
+        while IFS= read -r -d '' entry; do
+            entries+=("$entry")
+        done < <(find "$directory" -mindepth 1 -maxdepth 1 -print0 \
+            2>/dev/null | sort -z)
+        for entry in "${entries[@]}"; do
+            case "$entry" in
+                "$restore") rr_health_dropin_file_is_exact restore "$entry" || return 1 ;;
+                "$firewall") rr_health_dropin_file_is_exact firewall "$entry" || return 1 ;;
+                *) return 1 ;;
+            esac
+        done
+    fi
+    [ ! -e "$restore" ] && [ ! -L "$restore" ] || expected="$restore"
+    if [ -e "$firewall" ] || [ -L "$firewall" ]; then
+        [ -z "$expected" ] || expected+=" "
+        expected+="$firewall"
+    fi
+    raw=$(systemctl show --property=DropInPaths --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    [ "$raw" = "$expected" ] || return 1
+    printf '%s\n' "$expected"
+}
+
+rr_health_effective_namespace_is_exact() {
+    local unit=argo-rr-health.service version_line="" systemd_version=""
+    local property="" value="" root_ephemeral=no
+    version_line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
+    [[ "$version_line" =~ ^systemd[[:space:]]+([0-9]+)([[:space:]]|$) ]] || \
+        return 1
+    systemd_version="${BASH_REMATCH[1]}"
+    for property in User Group; do
+        value=$(systemctl show --property="$property" --value "$unit" \
+            2>/dev/null) || return 1
+        case "$value" in ""|root) ;; *) return 1 ;; esac
+    done
+    value=$(systemctl show --property=WorkingDirectory --value "$unit" \
+        2>/dev/null) || return 1
+    case "$value" in ""|/) ;; *) return 1 ;; esac
+    for property in DynamicUser PrivateUsers PrivateMounts PrivateNetwork; do
+        value=$(systemctl show --property="$property" --value "$unit" \
+            2>/dev/null) || return 1
+        [ "$value" = no ] || return 1
+    done
+    for property in RootDirectory RootImage MountImages ExtensionImages \
+        ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths \
+        InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths \
+        Environment EnvironmentFiles PassEnvironment UnsetEnvironment PAMName \
+        SystemCallFilter; do
+        value=$(systemctl show --property="$property" --value "$unit" \
+            2>/dev/null) || return 1
+        [ -z "$value" ] || return 1
+    done
+    if [ "$systemd_version" -ge 254 ]; then
+        root_ephemeral=$(systemctl show --property=RootEphemeral --value "$unit" \
+            2>/dev/null) || return 1
+    fi
+    [ "$root_ephemeral" = no ] || return 1
+    value=$(systemctl show --property=ProtectHome --value "$unit" \
+        2>/dev/null) || return 1
+    [ "$value" = no ] || return 1
+    value=$(systemctl show --property=ProtectSystem --value "$unit" \
+        2>/dev/null) || return 1
+    [ "$value" = no ] || return 1
+}
+
+rr_health_effective_conditions_are_exact() {
+    local raw="" asserts=""
+    raw=$(systemctl show --property=Conditions --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    asserts=$(systemctl show --property=Asserts --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    [ -z "$asserts" ] || return 1
+    python3 - "$raw" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1]
+matches = list(re.finditer(r"\{([^{}]*)\}", raw))
+residual = raw
+for match in reversed(matches):
+    residual = residual[:match.start()] + residual[match.end():]
+if residual.strip() or len(matches) != 2:
+    raise SystemExit(1)
+paths = []
+for match in matches:
+    fields = {}
+    for item in match.group(1).split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(1)
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in fields:
+            raise SystemExit(1)
+        fields[key] = value.strip()
+    path = fields.get("parameter", fields.get("path"))
+    if path is None:
+        raise SystemExit(1)
+    paths.append(path)
+if paths != ["/etc/argo_vmess.conf", "/usr/local/bin/rr"]:
+    raise SystemExit(1)
+PY
+}
+
+rr_health_timer_schedule_is_exact() {
+    local raw="" calendar="" randomized="" timer_unit=""
+    timer_unit=$(systemctl show --property=Unit --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ "$timer_unit" = argo-rr-health.service ] || return 1
+    raw=$(systemctl show --property=TimersMonotonic --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    calendar=$(systemctl show --property=TimersCalendar --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ -z "$calendar" ] || return 1
+    python3 - "$raw" <<'PY' || return 1
+import re
+import sys
+
+raw = sys.argv[1]
+matches = list(re.finditer(r"\{([^{}]*)\}", raw))
+residual = raw
+for match in reversed(matches):
+    residual = residual[:match.start()] + residual[match.end():]
+if residual.strip() or len(matches) != 2:
+    raise SystemExit(1)
+schedule = []
+for match in matches:
+    fields = {}
+    for item in match.group(1).split(";"):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in fields:
+            raise SystemExit(1)
+        fields[key] = value.strip()
+    keys = [
+        key for key in fields
+        if key in {"OnBootSec", "OnBootUSec", "OnUnitActiveSec", "OnUnitActiveUSec",
+                   "OnActiveSec", "OnActiveUSec", "OnStartupSec", "OnStartupUSec",
+                   "OnUnitInactiveSec", "OnUnitInactiveUSec"}
+    ]
+    if len(keys) != 1:
+        raise SystemExit(1)
+    schedule.append((keys[0].replace("USec", "Sec"), fields[keys[0]]))
+accepted_30 = {"30s", "30sec", "30000000us", "30000000"}
+accepted_5m = {"5min", "5m", "300s", "300000000us", "300000000"}
+if schedule[0][0] != "OnBootSec" or schedule[0][1] not in accepted_30:
+    raise SystemExit(1)
+if schedule[1][0] != "OnUnitActiveSec" or schedule[1][1] not in accepted_5m:
+    raise SystemExit(1)
+PY
+    randomized=$(systemctl show --property=RandomizedDelayUSec --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    case "$randomized" in 15s|15sec|15000000us|15000000) ;; *) return 1 ;; esac
+}
+
+rr_health_restore_published_unit() {
+    local target="$1" backup="$2" existed="$3" parent=""
+    parent=$(dirname -- "$target") || return 1
+    if [ "$existed" = true ]; then
+        [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+        mv -f -- "$backup" "$target" || return 1
+    else
+        rm -f -- "$target" || return 1
+    fi
+    sync -f "$parent"
+}
+
+write_health_monitor_units() {
+    local service_file="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
+    local timer_file="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+    local service_parent="" timer_parent="" service_tmp="" timer_tmp=""
+    local service_backup="" timer_backup="" service_existed=false
+    local timer_existed=false published_service=false published_timer=false
+    local failed=false rollback_failed=false cleanup_path=""
+    service_parent=$(dirname -- "$service_file") || return 1
+    timer_parent=$(dirname -- "$timer_file") || return 1
+    install -d -o 0 -g 0 -m 755 -- "$service_parent" "$timer_parent" || return 1
+    rr_health_unit_parent_is_safe "$service_parent" || return 1
+    rr_health_unit_parent_is_safe "$timer_parent" || return 1
+    rr_health_unit_target_is_safe_or_absent "$service_file" || return 1
+    rr_health_unit_target_is_safe_or_absent "$timer_file" || return 1
+    service_tmp=$(mktemp "$service_parent/.argo-rr-health.service.XXXXXX") || return 1
+    timer_tmp=$(mktemp "$timer_parent/.argo-rr-health.timer.XXXXXX") || {
+        rm -f -- "$service_tmp"
+        return 1
+    }
+    if ! rr_render_health_monitor_service > "$service_tmp" || \
+       ! rr_render_health_monitor_timer > "$timer_tmp" || \
+       ! chown 0:0 -- "$service_tmp" "$timer_tmp" || \
+       ! chmod 644 -- "$service_tmp" "$timer_tmp" || \
+       ! sync -f "$service_tmp" || ! sync -f "$timer_tmp"; then
+        rm -f -- "$service_tmp" "$timer_tmp"
         return 1
     fi
-    chmod 644 "$service_tmp" "$timer_tmp" || {
-        rm -f "$service_tmp" "$timer_tmp"
+    if [ -e "$service_file" ]; then
+        service_existed=true
+        service_backup=$(mktemp "$service_parent/.argo-rr-health.service.backup.XXXXXX") || \
+            failed=true
+        [ "$failed" = true ] || \
+            cp -p -- "$service_file" "$service_backup" || failed=true
+        [ "$failed" = true ] || sync -f "$service_backup" || failed=true
+    fi
+    if [ "$failed" = false ] && [ -e "$timer_file" ]; then
+        timer_existed=true
+        timer_backup=$(mktemp "$timer_parent/.argo-rr-health.timer.backup.XXXXXX") || \
+            failed=true
+        [ "$failed" = true ] || cp -p -- "$timer_file" "$timer_backup" || failed=true
+        [ "$failed" = true ] || sync -f "$timer_backup" || failed=true
+    fi
+    if [ "$failed" = false ]; then
+        mv -f -- "$service_tmp" "$service_file" || failed=true
+        if [ "$failed" = false ]; then
+            service_tmp=""
+            published_service=true
+            sync -f "$service_parent" || failed=true
+        fi
+    fi
+    if [ "$failed" = false ]; then
+        mv -f -- "$timer_tmp" "$timer_file" || failed=true
+        if [ "$failed" = false ]; then
+            timer_tmp=""
+            published_timer=true
+            sync -f "$timer_parent" || failed=true
+        fi
+    fi
+    if [ "$failed" = false ]; then
+        rr_health_monitor_unit_files_are_current || failed=true
+    fi
+    if [ "$failed" = true ]; then
+        if [ "$published_timer" = true ]; then
+            rr_health_restore_published_unit "$timer_file" "$timer_backup" \
+                "$timer_existed" || rollback_failed=true
+            timer_backup=""
+        fi
+        if [ "$published_service" = true ]; then
+            rr_health_restore_published_unit "$service_file" "$service_backup" \
+                "$service_existed" || rollback_failed=true
+            service_backup=""
+        fi
+        for cleanup_path in "$service_tmp" "$timer_tmp" "$service_backup" \
+            "$timer_backup"; do
+            [ -n "$cleanup_path" ] || continue
+            rm -f -- "$cleanup_path" || true
+        done
+        [ "$rollback_failed" = false ] || return 2
         return 1
-    }
-    mv -f "$service_tmp" "$health_service_file" || {
-        rm -f "$service_tmp" "$timer_tmp"
-        return 1
-    }
-    mv -f "$timer_tmp" "$health_timer_file" || {
-        rm -f "$timer_tmp"
-        return 1
-    }
+    fi
+    for cleanup_path in "$service_backup" "$timer_backup"; do
+        [ -n "$cleanup_path" ] || continue
+        rm -f -- "$cleanup_path" || return 1
+    done
+    sync -f "$service_parent" || return 1
+    [ "$timer_parent" = "$service_parent" ] || sync -f "$timer_parent" || return 1
+    return 0
+}
+
+rr_health_monitor_unit_definitions_are_current() {
+    local service_file="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"
+    local timer_file="${RR_HEALTH_TIMER_FILE:-/etc/systemd/system/argo-rr-health.timer}"
+    local service_load="" timer_load="" service_fragment="" timer_fragment=""
+    local timer_dropins="" exec_start="" exec_start_pre="" exec_reload=""
+    local exec_condition="" expected_dropins="" marker=""
+    local property="" value=""
+    local -a condition_spec=()
+    rr_health_monitor_unit_files_are_current || return 1
+    service_load=$(systemctl show --property=LoadState --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    timer_load=$(systemctl show --property=LoadState --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ "$service_load" = loaded ] && [ "$timer_load" = loaded ] || return 1
+    service_fragment=$(systemctl show --property=FragmentPath --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    timer_fragment=$(systemctl show --property=FragmentPath --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ "$service_fragment" = "$service_file" ] && \
+        [ "$timer_fragment" = "$timer_file" ] || return 1
+    timer_dropins=$(systemctl show --property=DropInPaths --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ -z "$timer_dropins" ] || return 1
+    expected_dropins=$(rr_health_effective_dropins_are_exact) || return 1
+    exec_start=$(systemctl show --property=ExecStart --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_start" /usr/local/bin/rr \
+        '/usr/local/bin/rr --health-check' || return 1
+    exec_start_pre=$(systemctl show --property=ExecStartPre --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    exec_reload=$(systemctl show --property=ExecReload --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_start_pre" || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_reload" || return 1
+    for property in ExecStartPost ExecStop ExecStopPost; do
+        value=$(systemctl show --property="$property" --value \
+            argo-rr-health.service 2>/dev/null) || return 1
+        rr_health_effective_exec_vector_is_exact "$value" || return 1
+    done
+    if [[ " $expected_dropins " == \
+          *"/${RR_RESTORE_GATE_DROPIN_NAME:-zzzz-rr-restore-gate.conf} "* ]]; then
+        condition_spec+=(/bin/sh \
+            '/bin/sh -c [ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate')
+    fi
+    if [[ " $expected_dropins " == \
+          *"/${RR_FIREWALL_GATE_DROPIN_NAME:-zzzzz-rr-firewall-quarantine.conf} "* ]]; then
+        marker="${RR_FIREWALL_QUARANTINE_FILE:-${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}/firewall-quarantine}"
+        condition_spec+=(/usr/bin/test "/usr/bin/test ! -e $marker" \
+            /usr/bin/test "/usr/bin/test ! -L $marker")
+    fi
+    exec_condition=$(systemctl show --property=ExecCondition --value \
+        argo-rr-health.service 2>/dev/null) || return 1
+    rr_health_effective_exec_vector_is_exact "$exec_condition" \
+        "${condition_spec[@]}" || return 1
+    rr_health_effective_conditions_are_exact || return 1
+    rr_health_effective_namespace_is_exact || return 1
+    value=$(systemctl show --property=Conditions --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ -z "$value" ] || return 1
+    value=$(systemctl show --property=Asserts --value \
+        argo-rr-health.timer 2>/dev/null) || return 1
+    [ -z "$value" ] || return 1
+    rr_health_timer_schedule_is_exact
+}
+
+rr_health_monitor_units_are_current() {
+    rr_health_monitor_unit_definitions_are_current || return 1
+    systemctl is-enabled --quiet argo-rr-health.timer || return 1
+    systemctl is-active --quiet argo-rr-health.timer
 }
 
 setup_health_monitor() {
+    if rr_firewall_fail_closed_quarantine_active; then
+        echo -e "${RED}[安全拒绝] 防火墙隔离尚未经精确修复，拒绝启用健康重启。${RESET}" >&2
+        return 1
+    fi
     write_health_monitor_units || return 1
     systemctl daemon-reload >/dev/null 2>&1 || return 1
+    rr_health_monitor_unit_definitions_are_current || return 1
     systemctl enable --now argo-rr-health.timer >/dev/null 2>&1 || return 1
-    return 0
+    rr_health_monitor_units_are_current
 }
 
 # ==========================================
@@ -339,7 +1334,10 @@ setup_health_monitor() {
 # 重建（幂等：文件完整时零开销直接返回）。重建失败则返回 1，让调用方拒绝生成
 # 引用缺失证书的无效配置/订阅。
 ensure_tls_certificates() {
-    if [ -s /etc/sing-box/cert.pem ] && [ -s /etc/sing-box/private.key ]; then
+    if rr_certificate_private_key_pair_matches \
+        /etc/sing-box/cert.pem /etc/sing-box/private.key && \
+       [ ! -e "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" ] && \
+       [ ! -L "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" ]; then
         return 0
     fi
     any_node_protocol_enabled || return 0
@@ -350,9 +1348,19 @@ ensure_tls_certificates() {
 
 generate_certs_and_keys() {
     load_config_with_defaults || return 1
-    mkdir -p /etc/sing-box
+    install -d -o 0 -g 0 -m 700 /etc/sing-box || return 1
 
-    if [ ! -s "/etc/sing-box/cert.pem" ] || [ ! -s "/etc/sing-box/private.key" ]; then
+    if rr_certificate_private_key_pair_matches \
+        /etc/sing-box/cert.pem /etc/sing-box/private.key; then
+        if [ -e "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" ] || \
+           [ -L "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" ]; then
+            rr_certificate_pair_pending_clear \
+                "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" || return 1
+        fi
+    fi
+
+    if ! rr_certificate_private_key_pair_matches \
+        /etc/sing-box/cert.pem /etc/sing-box/private.key; then
         echo -e "${YELLOW}正在生成自签证书 (bing.com)...${RESET}"
         local cert_tmp_dir=""
         cert_tmp_dir=$(mktemp -d /tmp/rr-cert.XXXXXX) || return 1
@@ -369,16 +1377,26 @@ generate_certs_and_keys() {
             rm -rf "$cert_tmp_dir"
             return 1
         fi
-        install -m 600 "$cert_tmp_dir/private.key" /etc/sing-box/private.key || { rm -rf "$cert_tmp_dir"; return 1; }
-        install -m 600 "$cert_tmp_dir/cert.pem" /etc/sing-box/cert.pem || { rm -rf "$cert_tmp_dir"; return 1; }
+        chmod 600 "$cert_tmp_dir/private.key" "$cert_tmp_dir/cert.pem" || {
+            rm -rf "$cert_tmp_dir"
+            return 1
+        }
+        rr_publish_certificate_pair \
+            "$cert_tmp_dir/cert.pem" "$cert_tmp_dir/private.key" \
+            /etc/sing-box/cert.pem /etc/sing-box/private.key \
+            "$RR_SINGBOX_TLS_PAIR_PENDING_FILE" \
+            rr_certificate_private_key_pair_matches || {
+                rm -rf "$cert_tmp_dir"
+                return 1
+            }
         rm -rf "$cert_tmp_dir"
         echo -e "${GREEN}[成功] 自签证书已生成 (SHA256: $CERT_SHA256)${RESET}"
     fi
 
     # Always derive the published pin from the certificate currently served.
     # This repairs empty/stale hashes without rotating the certificate.
-    if ! openssl x509 -in /etc/sing-box/cert.pem -noout >/dev/null 2>&1 || \
-       ! openssl pkey -in /etc/sing-box/private.key -noout >/dev/null 2>&1; then
+    if ! rr_certificate_private_key_pair_matches \
+        /etc/sing-box/cert.pem /etc/sing-box/private.key; then
         echo -e "${RED}[失败] TLS 证书或私钥损坏，拒绝生成无效节点。${RESET}"
         return 1
     fi
@@ -389,9 +1407,14 @@ generate_certs_and_keys() {
     fi
     safe_sed "CERT_SHA256" "$CERT_SHA256" || return 1
 
-    if [[ ! "$PRIVATE_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
-       [[ ! "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
-       [[ ! "$SHORT_ID" =~ ^[0-9a-fA-F]{8}$ ]]; then
+    local reality_material_valid=false derived_existing_public=""
+    if [[ "$PRIVATE_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] && \
+       [[ "$PUBLIC_KEY" =~ ^[A-Za-z0-9_-]{43}$ ]] && \
+       [[ "$SHORT_ID" =~ ^[0-9a-fA-F]{8}$ ]]; then
+        derived_existing_public=$(rr_reality_public_from_private "$PRIVATE_KEY" 2>/dev/null) || true
+        [ "$derived_existing_public" = "$PUBLIC_KEY" ] && reality_material_valid=true
+    fi
+    if [ "$reality_material_valid" != true ]; then
         # A completed installation with partial Reality material may already
         # have clients using its private key.  Never rotate it silently during
         # repair/update; only an unfinished first install may replace it.
@@ -415,6 +1438,127 @@ generate_certs_and_keys() {
 # 与 generate_certs_and_keys 不同：不触碰 TLS 证书，只轮换密钥三件套，
 # 供 ensure_credential_integrity 检测到掩码/损坏 Reality 材料时调用。
 # ==========================================
+rr_reality_public_from_private() {
+    local private_key="$1" temporary="" private_der="" public_der="" result=""
+    [[ "$private_key" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
+    temporary=$(mktemp -d /tmp/rr-reality-derive.XXXXXX) || return 1
+    private_der="$temporary/private.der"
+    public_der="$temporary/public.der"
+    if ! RR_REALITY_PRIVATE_INPUT="$private_key" python3 - "$private_der" <<'PY'
+import base64
+import os
+import pathlib
+
+raw = os.environ.get("RR_REALITY_PRIVATE_INPUT", "")
+try:
+    decoded = base64.urlsafe_b64decode(raw + "=")
+except Exception:
+    raise SystemExit(1)
+if len(decoded) != 32:
+    raise SystemExit(1)
+path = pathlib.Path(__import__("sys").argv[1])
+path.write_bytes(bytes.fromhex("302e020100300506032b656e04220420") + decoded)
+PY
+    then
+        rm -rf -- "$temporary"
+        return 1
+    fi
+    chmod 600 "$private_der" || { rm -rf -- "$temporary"; return 1; }
+    openssl pkey -inform DER -in "$private_der" -pubout -outform DER \
+        -out "$public_der" >/dev/null 2>&1 || {
+            rm -rf -- "$temporary"
+            return 1
+        }
+    result=$(python3 - "$public_der" <<'PY'
+import base64
+import pathlib
+import sys
+
+value = pathlib.Path(sys.argv[1]).read_bytes()
+prefix = bytes.fromhex("302a300506032b656e032100")
+if len(value) != len(prefix) + 32 or not value.startswith(prefix):
+    raise SystemExit(1)
+print(base64.urlsafe_b64encode(value[len(prefix):]).decode("ascii").rstrip("="))
+PY
+    ) || { rm -rf -- "$temporary"; return 1; }
+    rm -rf -- "$temporary"
+    [[ "$result" =~ ^[A-Za-z0-9_-]{43}$ ]] || return 1
+    printf '%s\n' "$result"
+}
+
+rr_publish_reality_key_triplet() {
+    local private_key="$1" public_key="$2" short_id="$3"
+    local derived="" config_dir="" temporary="" encoded_private=""
+    local encoded_public="" encoded_short=""
+    [[ "$private_key" =~ ^[A-Za-z0-9_-]{43}$ ]] && \
+        [[ "$public_key" =~ ^[A-Za-z0-9_-]{43}$ ]] && \
+        [[ "$short_id" =~ ^[0-9a-fA-F]{8}$ ]] || return 1
+    derived=$(rr_reality_public_from_private "$private_key") || return 1
+    [ "$derived" = "$public_key" ] || return 1
+    [ -f "$CONFIG_FILE" ] && [ ! -L "$CONFIG_FILE" ] || return 1
+    config_dir=$(dirname -- "$CONFIG_FILE") || return 1
+    [ -d "$config_dir" ] && [ ! -L "$config_dir" ] || return 1
+    temporary=$(mktemp "$config_dir/.rr-reality-triplet.XXXXXX") || return 1
+    printf -v encoded_private '%q' "$private_key"
+    printf -v encoded_public '%q' "$public_key"
+    printf -v encoded_short '%q' "$short_id"
+    if ! RR_REALITY_PRIVATE_ENCODED="$encoded_private" \
+         RR_REALITY_PUBLIC_ENCODED="$encoded_public" \
+         RR_REALITY_SHORT_ENCODED="$encoded_short" \
+         python3 - "$CONFIG_FILE" "$temporary" <<'PY'
+import os
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+values = {
+    "PRIVATE_KEY": os.environ["RR_REALITY_PRIVATE_ENCODED"],
+    "PUBLIC_KEY": os.environ["RR_REALITY_PUBLIC_ENCODED"],
+    "SHORT_ID": os.environ["RR_REALITY_SHORT_ENCODED"],
+}
+counts = {key: 0 for key in values}
+output = []
+for raw in source.read_text(encoding="utf-8").splitlines():
+    key = raw.split("=", 1)[0] if "=" in raw else ""
+    if key in values:
+        counts[key] += 1
+        if counts[key] > 1:
+            raise SystemExit("duplicate Reality setting")
+        output.append(f"{key}={values[key]}")
+    else:
+        output.append(raw)
+for key in ("PRIVATE_KEY", "PUBLIC_KEY", "SHORT_ID"):
+    if counts[key] == 0:
+        output.append(f"{key}={values[key]}")
+target.write_text("\n".join(output) + "\n", encoding="utf-8")
+PY
+    then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    chown 0:0 "$temporary" && chmod 600 "$temporary" && \
+        sync -f "$temporary" || { rm -f -- "$temporary"; return 1; }
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ] && \
+       [ "${RR_TEST_REALITY_FAIL_BEFORE_COMMIT:-0}" = 1 ]; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ] && \
+       [ "${RR_TEST_REALITY_CRASH_BEFORE_COMMIT:-0}" = 1 ]; then
+        kill -KILL "$$"
+    fi
+    mv -f -- "$temporary" "$CONFIG_FILE" && sync -f "$config_dir" || {
+        rm -f -- "$temporary"
+        return 1
+    }
+    PRIVATE_KEY="$private_key"
+    PUBLIC_KEY="$public_key"
+    SHORT_ID="$short_id"
+    derived=$(rr_reality_public_from_private "$PRIVATE_KEY") || return 1
+    [ "$derived" = "$PUBLIC_KEY" ]
+}
+
 rotate_reality_keypair() {
     if [ ! -x "$SINGBOX_BIN" ]; then
         echo -e "${RED}Sing-box 核心未安装，无法生成 Reality 密钥${RESET}"
@@ -432,9 +1576,14 @@ rotate_reality_keypair() {
         echo -e "${RED}Reality 密钥生成失败，请确保 sing-box 版本 >= 1.8${RESET}"
         return 1
     fi
-    safe_sed "PRIVATE_KEY" "$PRIVATE_KEY" || return 1
-    safe_sed "PUBLIC_KEY" "$PUBLIC_KEY" || return 1
-    safe_sed "SHORT_ID" "$SHORT_ID" || return 1
+    local derived_public=""
+    derived_public=$(rr_reality_public_from_private "$PRIVATE_KEY") || return 1
+    [ "$derived_public" = "$PUBLIC_KEY" ] || {
+        echo -e "${RED}Reality 密钥生成结果不匹配，原配置未改动${RESET}"
+        return 1
+    }
+    rr_publish_reality_key_triplet \
+        "$PRIVATE_KEY" "$PUBLIC_KEY" "$SHORT_ID" || return 1
     echo -e "${GREEN}[成功] Reality 密钥已重新生成${RESET}"
     return 0
 }
@@ -442,7 +1591,10 @@ rotate_reality_keypair() {
 validate_subscription_crypto_material() {
     if [ "${VL_ENABLED:-false}" = "true" ]; then
         if [[ ! "${PUBLIC_KEY:-}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
-           [[ ! "${SHORT_ID:-}" =~ ^[0-9a-fA-F]{8}$ ]]; then
+           [[ ! "${PRIVATE_KEY:-}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
+           [[ ! "${SHORT_ID:-}" =~ ^[0-9a-fA-F]{8}$ ]] || \
+           [ "$(rr_reality_public_from_private "$PRIVATE_KEY" 2>/dev/null)" != \
+             "$PUBLIC_KEY" ]; then
             echo -e "${RED}[错误] Reality 公钥或 Short ID 缺失，拒绝输出不可用的 VLESS 节点。${RESET}" >&2
             return 1
         fi
@@ -470,6 +1622,7 @@ build_singbox_config() {
     # 保证生成的 sing-box 配置与订阅永不含掩码值（幂等，真值只回写一次）。
     ensure_credential_integrity || return 1
     SINGBOX_CONFIG_CHANGED=false
+    SINGBOX_CONFIG_PUBLISHED_SHA256=""
 
     local vm_users='[{"name":"legacy","uuid":"'"$UUID"'","alterId":0}]'
     local vl_users='[{"name":"legacy","uuid":"'"$UUID"'","flow":"xtls-rprx-vision"}]'
@@ -685,75 +1838,44 @@ build_singbox_config() {
         return 0
     fi
 
-    [ -f /etc/sing-box/config.json ] && cp -p /etc/sing-box/config.json /etc/sing-box/config.json.bak
-    mv "$tmp_config" /etc/sing-box/config.json
-    chmod 600 /etc/sing-box/config.json 2>/dev/null || true
+    if [ -e /etc/sing-box/config.json ] || \
+       [ -L /etc/sing-box/config.json ]; then
+        rr_publish_regular_file_atomic /etc/sing-box/config.json \
+            /etc/sing-box/config.json.bak 600 || {
+            rm -f -- "$tmp_config"
+            return 1
+        }
+    fi
+    if ! rr_publish_regular_file_atomic "$tmp_config" \
+        /etc/sing-box/config.json 600; then
+        rm -f -- "$tmp_config"
+        return 1
+    fi
+    rm -f -- "$tmp_config" || return 1
+    SINGBOX_CONFIG_PUBLISHED_SHA256=$(sha256sum -- \
+        /etc/sing-box/config.json 2>/dev/null | awk '{print $1}') || return 1
+    [[ "$SINGBOX_CONFIG_PUBLISHED_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
     SINGBOX_CONFIG_CHANGED=true
 }
 
 ensure_singbox_service_guards() {
-    local unit_file="/etc/systemd/system/sing-box.service"
-    [ -f "$unit_file" ] || return 0
-
-    local changed=false
-    if ! grep -q '^StartLimitIntervalSec=' "$unit_file" 2>/dev/null; then
-        sed -i '/^\[Unit\]$/a StartLimitIntervalSec=60' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^StartLimitBurst=' "$unit_file" 2>/dev/null; then
-        sed -i '/^StartLimitIntervalSec=/a StartLimitBurst=5' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^Wants=.*network-online.target' "$unit_file" 2>/dev/null; then
-        sed -i '/^\[Unit\]$/a Wants=network-online.target' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^After=.*network-online.target' "$unit_file" 2>/dev/null; then
-        sed -i '/^Wants=network-online.target/a After=network-online.target nss-lookup.target' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^ExecStartPre=/usr/local/bin/sing-box check ' "$unit_file" 2>/dev/null; then
-        sed -i '/^ExecStart=/i ExecStartPre=/usr/local/bin/sing-box check -c /etc/sing-box/config.json' "$unit_file"
-        changed=true
-    fi
-    if grep -q '^RestartSec=10$' "$unit_file" 2>/dev/null; then
-        sed -i 's/^RestartSec=10$/RestartSec=2/' "$unit_file"
-        changed=true
-    fi
-    if grep -q '^Restart=always$' "$unit_file" 2>/dev/null; then
-        sed -i 's/^Restart=always$/Restart=on-failure/' "$unit_file"
-        changed=true
-    elif ! grep -q '^Restart=' "$unit_file" 2>/dev/null; then
-        sed -i '/^ExecStart=/a Restart=on-failure' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^RestartSec=' "$unit_file" 2>/dev/null; then
-        sed -i '/^Restart=/a RestartSec=2' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^TimeoutStopSec=' "$unit_file" 2>/dev/null; then
-        sed -i '/^RestartSec=/a TimeoutStopSec=10' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^KillMode=' "$unit_file" 2>/dev/null; then
-        sed -i '/^TimeoutStopSec=/a KillMode=mixed' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^LimitNOFILE=' "$unit_file" 2>/dev/null; then
-        sed -i '/^KillMode=/a LimitNOFILE=1048576' "$unit_file"
-        changed=true
-    fi
-    if ! grep -q '^UMask=' "$unit_file" 2>/dev/null; then
-        sed -i '/^LimitNOFILE=/a UMask=0077' "$unit_file"
-        changed=true
-    fi
-    [ "$changed" = true ] && systemctl daemon-reload >/dev/null 2>&1
-    return 0
+    local unit_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    [ ! -e "$unit_file" ] && [ ! -L "$unit_file" ] && return 0
+    [ -f "$unit_file" ] && [ ! -L "$unit_file" ] || return 1
+    # The unit is entirely RR-managed.  Re-emitting one exact fragment avoids
+    # a sequence of in-place sed edits that can be interrupted after only some
+    # guards have landed.  Effective manager properties are re-proved after
+    # daemon-reload, so an overriding drop-in cannot hide a partial repair.
+    write_singbox_systemd_unit || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    rr_singbox_service_guards_are_effective
 }
 
 stop_singbox_instances() {
     # 先停止 systemd 单元，避免 Restart=on-failure 在清理旧进程时再次拉起。
-    if [ -f /etc/systemd/system/sing-box.service ]; then
+    if [ -f /etc/systemd/system/sing-box.service ] && \
+       rr_singbox_service_guards_are_effective; then
+        rr_singbox_service_guards_are_effective || return 1
         systemctl stop sing-box >/dev/null 2>&1 || true
     fi
 
@@ -770,21 +1892,69 @@ stop_singbox_instances() {
     ! managed_singbox_running
 }
 
+rr_singbox_service_generation() {
+    local main_pid="" invocation_id=""
+    main_pid=$(systemctl show --property=MainPID --value \
+        sing-box.service 2>/dev/null) || return 1
+    invocation_id=$(systemctl show --property=InvocationID --value \
+        sing-box.service 2>/dev/null) || return 1
+    [[ "$main_pid" =~ ^[0-9]+$ ]] || return 1
+    case "$invocation_id" in
+        "") invocation_id=- ;;
+        *) [[ "$invocation_id" =~ ^[0-9a-fA-F]{32}$ ]] || return 1 ;;
+    esac
+    printf '%s %s\n' "$main_pid" "$invocation_id"
+}
+
+rr_singbox_wait_for_new_generation() {
+    local previous_pid="$1" previous_invocation="$2"
+    local generation="" current_pid="" current_invocation="" retry=0
+    while [ "$retry" -lt 20 ]; do
+        if systemctl is-active --quiet sing-box.service; then
+            generation=$(rr_singbox_service_generation) || generation=""
+            if [ -n "$generation" ]; then
+                read -r current_pid current_invocation <<<"$generation"
+                if [ "$current_pid" -gt 1 ] 2>/dev/null && \
+                   [ "$current_pid" != "$previous_pid" ] && \
+                   [ "$current_invocation" != - ] && \
+                   [ "$current_invocation" != 00000000000000000000000000000000 ] && \
+                   [ "$current_invocation" != "$previous_invocation" ]; then
+                    return 0
+                fi
+            fi
+        fi
+        sleep 0.25
+        retry=$((retry + 1))
+    done
+    return 1
+}
+
 restart_singbox() {
-    ensure_singbox_service_guards
+    local unit_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    if rr_firewall_fail_closed_quarantine_active; then
+        echo -e "${RED}[安全拒绝] 防火墙隔离尚未经精确修复，拒绝重启 Sing-box。${RESET}" >&2
+        return 1
+    fi
+    ensure_singbox_service_guards || return 1
 
     if ! "$SINGBOX_BIN" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
         echo -e "${RED}[警告] Sing-box 配置校验失败，未重启现有节点。${RESET}"
         return 1
     fi
 
-    if [ -f /etc/systemd/system/sing-box.service ]; then
+    if [ -f "$unit_file" ]; then
         local was_active=false
-        local main_pid=""
+        local main_pid="" previous_invocation="" generation=""
         local pid=""
-        local retry=0
         systemctl is-active --quiet sing-box && was_active=true
-        main_pid=$(systemctl show sing-box -p MainPID --value 2>/dev/null)
+        generation=$(rr_singbox_service_generation) || return 1
+        read -r main_pid previous_invocation <<<"$generation"
+        if [ "$was_active" = true ]; then
+            [ "$main_pid" -gt 1 ] 2>/dev/null && \
+                [ "$previous_invocation" != - ] && \
+                [ "$previous_invocation" != 00000000000000000000000000000000 ] || \
+                return 1
+        fi
 
         # 清理旧版菜单遗留的孤立实例，但不触碰正在承载流量的 systemd 主进程。
         while IFS= read -r pid; do
@@ -794,32 +1964,32 @@ restart_singbox() {
             fi
         done < <(managed_singbox_pids)
 
+        rr_singbox_service_guards_are_effective || return 1
         systemctl reset-failed sing-box >/dev/null 2>&1 || true
         if [ "$was_active" = true ]; then
-            systemctl restart sing-box >/dev/null 2>&1 || true
-        else
-            stop_singbox_instances >/dev/null 2>&1 || true
-            systemctl start sing-box >/dev/null 2>&1 || true
-        fi
-
-        while [ "$retry" -lt 20 ] && ! systemctl is-active --quiet sing-box; do
-            sleep 0.25
-            retry=$((retry + 1))
-        done
-        if ! systemctl is-active --quiet sing-box; then
-            # 端口仍被旧孤立进程占用时，执行一次受控清理后重试。
-            stop_singbox_instances >/dev/null 2>&1 || true
-            systemctl reset-failed sing-box >/dev/null 2>&1 || true
-            systemctl start sing-box >/dev/null 2>&1 || true
-            sleep 1
-            if ! systemctl is-active --quiet sing-box; then
-                echo -e "${RED}[警告] Sing-box 启动后退出，请查看：journalctl -u sing-box -n 50 --no-pager${RESET}"
+            rr_singbox_service_guards_are_effective || return 1
+            systemctl restart sing-box >/dev/null 2>&1 || {
+                echo -e "${RED}[警告] systemd 拒绝重启 Sing-box；旧实例状态不代表新配置已加载。${RESET}" >&2
                 return 1
-            fi
+            }
+        else
+            stop_singbox_instances >/dev/null 2>&1 || return 1
+            rr_singbox_service_guards_are_effective || return 1
+            systemctl start sing-box >/dev/null 2>&1 || {
+                echo -e "${RED}[警告] systemd 无法启动 Sing-box。${RESET}" >&2
+                return 1
+            }
+        fi
+        if ! rr_singbox_wait_for_new_generation "$main_pid" "$previous_invocation"; then
+            echo -e "${RED}[警告] Sing-box 未进入新的 systemd invocation；拒绝把旧 active 状态误报为成功。${RESET}" >&2
+            return 1
         fi
     else
         stop_singbox_instances >/dev/null 2>&1 || true
-        nohup "$SINGBOX_BIN" run -c /etc/sing-box/config.json > /dev/null 2>&1 &
+        (
+            rr_close_inherited_firewall_lock_fd || exit 1
+            exec nohup "$SINGBOX_BIN" run -c /etc/sing-box/config.json
+        ) > /dev/null 2>&1 &
         sleep 1
         if ! managed_singbox_running; then
             echo -e "${RED}[警告] Sing-box 启动失败！请检查配置: cat /etc/sing-box/config.json${RESET}"
@@ -834,12 +2004,109 @@ restart_singbox() {
 # 的手动进程（如用户手动跑的 sing-box）。替换二进制不影响已运行进程，
 # 新配置由 systemd 服务接管；无 systemd 单元时仅提示并跳过。
 restart_singbox_systemd_only() {
-    ensure_singbox_service_guards
-    if [ ! -f /etc/systemd/system/sing-box.service ]; then
+    local unit_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+    local generation="" previous_pid="" previous_invocation=""
+    if rr_firewall_fail_closed_quarantine_active; then
+        echo -e "${RED}[安全拒绝] 防火墙隔离尚未经精确修复，拒绝重启 Sing-box。${RESET}" >&2
+        return 1
+    fi
+    ensure_singbox_service_guards || return 1
+    if [ ! -f "$unit_file" ]; then
         echo -e "${YELLOW}[警告] 未检测到 systemd 单元，跳过服务重启；手动运行的 sing-box 进程不会被触碰。${RESET}"
         return 0
     fi
-    systemctl restart sing-box >/dev/null 2>&1
+    generation=$(rr_singbox_service_generation) || return 1
+    read -r previous_pid previous_invocation <<<"$generation"
+    rr_singbox_service_guards_are_effective || return 1
+    systemctl restart sing-box >/dev/null 2>&1 || return 1
+    rr_singbox_wait_for_new_generation "$previous_pid" "$previous_invocation"
+}
+
+rr_restore_transaction_file_atomic() {
+    local snapshot="${1:-}" target="${2:-}" directory="" base=""
+    local snapshot_metadata="" target_metadata="" temporary_metadata=""
+    local snapshot_directory="" snapshot_directory_metadata=""
+    local directory_metadata="" owner="" group="" mode="" links=""
+    local directory_owner="" directory_group="" directory_mode=""
+    local temporary="" fault="" directory_sync_failed=false
+
+    [ -n "$snapshot" ] && [ -n "$target" ] || return 1
+    [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    snapshot_metadata=$(stat -c '%u:%g:%a:%h' -- "$snapshot" 2>/dev/null) || \
+        return 1
+    IFS=: read -r owner group mode links <<<"$snapshot_metadata"
+    [ "$owner:$group:$links" = 0:0:1 ] && [[ "$mode" =~ ^[0-7]{3,4}$ ]] && \
+        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    snapshot_directory=$(dirname -- "$snapshot") || return 1
+    [ -d "$snapshot_directory" ] && [ ! -L "$snapshot_directory" ] || return 1
+    snapshot_directory_metadata=$(
+        stat -c '%u:%g:%a' -- "$snapshot_directory" 2>/dev/null
+    ) || return 1
+    IFS=: read -r directory_owner directory_group directory_mode \
+        <<<"$snapshot_directory_metadata"
+    [ "$directory_owner:$directory_group" = 0:0 ] && \
+        [[ "$directory_mode" =~ ^[0-7]{3,4}$ ]] && \
+        [ $((8#$directory_mode & 8#022)) -eq 0 ] || return 1
+
+    directory=$(dirname -- "$target") || return 1
+    base=$(basename -- "$target") || return 1
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    directory_metadata=$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null) || \
+        return 1
+    IFS=: read -r directory_owner directory_group directory_mode \
+        <<<"$directory_metadata"
+    [ "$directory_owner:$directory_group" = 0:0 ] && \
+        [[ "$directory_mode" =~ ^[0-7]{3,4}$ ]] && \
+        [ $((8#$directory_mode & 8#022)) -eq 0 ] || return 1
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        [ -f "$target" ] && [ ! -L "$target" ] || return 1
+        target_metadata=$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null) || \
+            return 1
+        IFS=: read -r owner group mode links <<<"$target_metadata"
+        [ "$owner:$group:$links" = 0:0:1 ] && \
+            [[ "$mode" =~ ^[0-7]{3,4}$ ]] && \
+            [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    fi
+
+    if [ "${RR_TEST_FAULTS:-0}" = 1 ]; then
+        fault="${RR_TEST_CONFIG_RESTORE_FAULT:-}"
+        case "$fault" in
+            ""|copy|file-fsync|rename|dir-fsync) ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    temporary=$(mktemp "$directory/.${base}.rr-restore.XXXXXX") || return 1
+    if [ "$fault" = copy ] || ! cp -p -- "$snapshot" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    temporary_metadata=$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null) || {
+        rm -f -- "$temporary"
+        return 1
+    }
+    if [ "$temporary_metadata" != "$snapshot_metadata" ] || \
+       ! cmp -s -- "$snapshot" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if [ "$fault" = file-fsync ] || ! sync -f "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if [ "$fault" = rename ] || ! mv -f -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+
+    if [ "$fault" = dir-fsync ] || ! sync -f "$directory"; then
+        directory_sync_failed=true
+    fi
+    [ -f "$target" ] && [ ! -L "$target" ] && \
+        [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+            "$snapshot_metadata" ] && cmp -s -- "$snapshot" "$target" || return 1
+    [ "$directory_sync_failed" = false ]
 }
 
 restore_config_transaction_snapshot() {
@@ -851,14 +2118,17 @@ restore_config_transaction_snapshot() {
 
     ensure_subscription_root || return 1
 
-    cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE" || return 1
+    rr_restore_transaction_file_atomic \
+        "$tx_dir/argo_vmess.conf" "$CONFIG_FILE" || return 1
     if [ -f "$tx_dir/had_runtime_config" ]; then
-        cp -p "$tx_dir/config.json" /etc/sing-box/config.json || return 1
+        rr_restore_transaction_file_atomic \
+            "$tx_dir/config.json" /etc/sing-box/config.json || return 1
     else
         rm -f /etc/sing-box/config.json
     fi
     if [ -f "$tx_dir/had_worker" ]; then
-        cp -p "$tx_dir/auto_update_sub.py" /usr/local/bin/auto_update_sub.py || return 1
+        rr_restore_transaction_file_atomic \
+            "$tx_dir/auto_update_sub.py" /usr/local/bin/auto_update_sub.py || return 1
     else
         rm -f /usr/local/bin/auto_update_sub.py
     fi
@@ -935,7 +2205,8 @@ apply_config_transaction() {
         value="$2"
         shift 2
         if ! safe_sed "$key" "$value"; then
-            if cp -p "$tx_dir/argo_vmess.conf" "$CONFIG_FILE"; then
+            if rr_restore_transaction_file_atomic \
+                "$tx_dir/argo_vmess.conf" "$CONFIG_FILE"; then
                 rm -rf "$tx_dir"
             else
                 echo -e "${RED}[严重] 配置回滚失败，备份保留在 ${tx_dir}。${RESET}" >&2
@@ -1010,7 +2281,8 @@ sync_runtime_state() {
     [ -f "$CONFIG_FILE" ] || return 1
     migrate_config_schema || return 1
     load_config_with_defaults || return 1
-    local was_running=false
+    local was_running=false hop_label="" hop_enabled=false hop_port=""
+    local hop_specs="" hop_status=0
     managed_singbox_running && was_running=true
 
     if ! build_singbox_config; then
@@ -1019,17 +2291,47 @@ sync_runtime_state() {
     if [ "$SINGBOX_CONFIG_CHANGED" = true ] && [ "$was_running" = true ]; then
         restart_singbox || return 1
     fi
-    if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_HOP_PORTS" ]; then
+    for hop_label in HY2 TU5; do
+        case "$hop_label" in
+            HY2)
+                hop_enabled="${HY2_ENABLED:-false}"
+                hop_port="${HY2_PORT:-}"
+                hop_specs="${HY2_HOP_PORTS:-}"
+                ;;
+            TU5)
+                hop_enabled="${TU5_ENABLED:-false}"
+                hop_port="${TU5_PORT:-}"
+                hop_specs="${TU5_HOP_PORTS:-}"
+                ;;
+        esac
+        [ "$hop_enabled" = true ] && [ -n "$hop_specs" ] || continue
         if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
-            rr_validate_hop_rules "HY2" "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1 || {
-                echo -e "${RED}[错误] HY2 跳跃规则只读检查失败，热更新未修改防火墙。${RESET}" >&2
+            rr_validate_hop_rules "$hop_label" "$hop_port" "$hop_specs" \
+                >/dev/null 2>&1 || {
+                echo -e "${RED}[错误] ${hop_label} 跳跃规则只读检查失败，热更新未修改防火墙。${RESET}" >&2
                 return 1
             }
-        elif ! install_hop_rules "HY2" "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1; then
-            echo -e "${RED}[错误] HY2 跳跃规则无法应用到当前入口地址族，运行状态未同步。${RESET}" >&2
-            return 1
+        else
+            hop_status=0
+            install_hop_rules "$hop_label" "$hop_port" "$hop_specs" \
+                >/dev/null 2>&1 || hop_status=$?
+            case "$hop_status" in
+                0) ;;
+                1)
+                    echo -e "${RED}[错误] ${hop_label} 跳跃规则无法应用，已证明防火墙保持原态。${RESET}" >&2
+                    return 1
+                    ;;
+                2)
+                    echo -e "${RED}[严重] ${hop_label} 跳跃规则补偿不完整，Sing-box 已停止并验证 inactive。${RESET}" >&2
+                    return 2
+                    ;;
+                3|*)
+                    echo -e "${RED}[紧急] ${hop_label} 跳跃规则补偿不完整，且无法验证 Sing-box 已停止。${RESET}" >&2
+                    return 3
+                    ;;
+            esac
         fi
-    fi
+    done
     generate_node_and_sub || return 1
     return 0
 }
@@ -1073,6 +2375,8 @@ rr_validate_hop_rules() {
                 -j DNAT --to-destination ":${main_port}" >/dev/null 2>&1 && found=true
         [ "$found" = true ] || return 1
     done
+    rr_firewall_hop_program_first_match_is_safe "$label" "$main_port" \
+        "$spec_list" post
 }
 
 # NAIVE-SUPPORT：Let’s Encrypt 真证书申请与续签（NaiveProxy 专用）
@@ -1117,7 +2421,7 @@ prepare_naive_acme_webroot() {
     local site_backup=""
     local old_enabled_target=""
     local had_site=false
-    local had_enabled=false
+    local had_enabled=false firewall_status=0
 
     is_valid_domain "$naive_domain" || {
         echo -e "${RED}[失败] NaiveProxy 域名格式无效。${RESET}" >&2
@@ -1218,7 +2522,8 @@ EOF
         }
     fi
     rm -f "$site_backup"
-    open_protocol_firewall 80 tcp || return 1
+    open_protocol_firewall 80 tcp || firewall_status=$?
+    [ "$firewall_status" -eq 0 ] || return "$firewall_status"
     return 0
 }
 
@@ -1227,22 +2532,38 @@ naive_certificate_pair_valid() {
     [ -s "$certificate" ] && [ -s "$private_key" ] || return 1
     certificate_identity_matches "$certificate" "$domain" || return 1
     openssl x509 -in "$certificate" -noout -checkend 604800 >/dev/null 2>&1 || return 1
-    certificate_private_key_matches "$certificate" "$private_key"
+    certificate_private_key_matches "$certificate" "$private_key" || return 1
+    certificate_chain_is_trusted "$certificate"
 }
 
 sync_naive_certificate_pair() {
     local source_dir="$1" target_dir="$2" domain="$3" cert_tmp="" key_tmp=""
+    local marker=""
     naive_certificate_pair_valid "$source_dir/fullchain.pem" "$source_dir/privkey.pem" "$domain" || return 1
     install -d -m 700 "$target_dir" || return 1
     cert_tmp=$(mktemp "$target_dir/.fullchain.XXXXXX") || return 1
     key_tmp=$(mktemp "$target_dir/.privkey.XXXXXX") || { rm -f "$cert_tmp"; return 1; }
     install -m 600 "$source_dir/fullchain.pem" "$cert_tmp" && \
-        install -m 600 "$source_dir/privkey.pem" "$key_tmp" && \
-        mv -f "$key_tmp" "$target_dir/privkey.pem" && \
-        mv -f "$cert_tmp" "$target_dir/fullchain.pem" || {
-            rm -f "$cert_tmp" "$key_tmp"
-            return 1
-        }
+        install -m 600 "$source_dir/privkey.pem" "$key_tmp" || {
+        rm -f "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    # Certbot atomically rotates four live symlinks, but the two reads above
+    # are necessarily separate.  Validate the captured temporary pair before
+    # either destination name is replaced, so a cross-generation read cannot
+    # publish a mismatched pair.  Each final rename is atomic and no daemon is
+    # reloaded until both names have committed.
+    naive_certificate_pair_valid "$cert_tmp" "$key_tmp" "$domain" || {
+        rm -f "$cert_tmp" "$key_tmp"
+        return 1
+    }
+    marker="$target_dir/.pair-pending"
+    rr_publish_certificate_pair "$cert_tmp" "$key_tmp" \
+        "$target_dir/fullchain.pem" "$target_dir/privkey.pem" "$marker" \
+        naive_certificate_pair_valid "$domain" || {
+        rm -f "$cert_tmp" "$key_tmp"
+        return 1
+    }
 }
 
 ensure_naive_certificate() {
@@ -1264,11 +2585,26 @@ ensure_naive_certificate() {
             echo -e "${RED}[失败] 热更新候选不会签发或续签 NaiveProxy 证书。${RESET}" >&2
             return 1
         fi
+        rr_certbot_webroot_lineage_is_renewable "$naive_domain" || {
+            echo -e "${RED}[失败] 热更新候选要求目标机已有结构完整的生产 Webroot lineage。${RESET}" >&2
+            return 1
+        }
+        rr_certbot_renewal_runtime_is_ready "$naive_domain" || {
+            echo -e "${RED}[失败] 热更新候选要求 Certbot 定时器及该域名的本机 ACME HTTP 路由就绪。${RESET}" >&2
+            return 1
+        }
         install -d -m 700 "$naive_cert_dir" || return 1
         sync_naive_certificate_pair "${le_live_root}/${naive_domain}" \
             "$naive_cert_dir" "$naive_domain" || return 1
-        deploy_naive_cert_hook
-        return $?
+        if [ "${RR_PORTABLE_RESTORE:-0}" = 1 ]; then
+            rr_certificate_deploy_hook_is_current || {
+                echo -e "${RED}[失败] Portable restore 要求目标机已有可信且当前版本的证书续签钩子。${RESET}" >&2
+                return 1
+            }
+        else
+            deploy_naive_cert_hook || return 1
+        fi
+        return 0
     fi
     install -d -m 700 "$naive_cert_dir" || return 1
 
@@ -1279,9 +2615,14 @@ ensure_naive_certificate() {
     # 仅复用 SAN、有效期和私钥都匹配的在线 lineage。Portable restore
     # 带来的叶子证书没有目标机续签配置，必须在这里重新建立 lineage。
     if naive_certificate_pair_valid "${le_live_root}/${naive_domain}/fullchain.pem" \
-        "${le_live_root}/${naive_domain}/privkey.pem" "$naive_domain"; then
+        "${le_live_root}/${naive_domain}/privkey.pem" "$naive_domain" && \
+       rr_certbot_webroot_lineage_is_renewable "$naive_domain"; then
+        rr_enable_certbot_renewal_runtime "$naive_domain" || {
+            echo -e "${RED}[失败] certbot.timer 或该域名的本机 ACME HTTP 路由未就绪；未强制续签现有有效证书。${RESET}" >&2
+            return 1
+        }
         sync_naive_certificate_pair "${le_live_root}/${naive_domain}" "$naive_cert_dir" "$naive_domain" || return 1
-        deploy_naive_cert_hook
+        deploy_naive_cert_hook || return 1
         return 0
     fi
 
@@ -1289,14 +2630,48 @@ ensure_naive_certificate() {
     # nginx(www-data) 读不了挑战文件 → LE 403。显式 chmod + umask 022。
     echo -e "${YELLOW}正在为 ${naive_domain} 申请 Let’s Encrypt 真证书……${RESET}"
     if ! (umask 022 && certbot certonly --webroot -w "$webroot" -d "$naive_domain" \
+        --cert-name "$naive_domain" \
         -m "$le_email" --agree-tos --non-interactive --quiet --force-renewal 2>/dev/null); then
         echo -e "${RED}[失败] 证书申请失败：请确认 ${naive_domain} 已解析到本机公网 IP、80 端口可访问；如日志提示邮箱被拒（invalid email），请在 /etc/argo_vmess.conf 添加 LE_EMAIL=你的邮箱 后重试。${RESET}" >&2
         return 1
     fi
+    naive_certificate_pair_valid "${le_live_root}/${naive_domain}/fullchain.pem" \
+        "${le_live_root}/${naive_domain}/privkey.pem" "$naive_domain" || return 1
+    rr_certbot_webroot_lineage_is_renewable "$naive_domain" || return 1
+    rr_enable_certbot_renewal_runtime "$naive_domain" || {
+        echo -e "${RED}[失败] certbot.timer 或该域名的本机 ACME HTTP 路由未就绪，拒绝把证书报告为可自动续签。${RESET}" >&2
+        return 1
+    }
     sync_naive_certificate_pair "${le_live_root}/${naive_domain}" "$naive_cert_dir" "$naive_domain" || return 1
-    deploy_naive_cert_hook
+    deploy_naive_cert_hook || return 1
     echo -e "${GREEN}[成功] NaiveProxy Let’s Encrypt 真证书已就绪（/etc/rr-naive/）。${RESET}"
     return 0
+}
+
+rr_certificate_deploy_hook_is_current() {
+    # Portable restore 的候选迁移只能读取全局 ACME 状态。严格确认部署钩子
+    # 已由目标机预先安装，不能在事务中创建、替换或清理任何全局文件。
+    local hook_dir="${RR_LE_RENEW_HOOK_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
+    local hook_source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
+    local hook_file="${hook_dir}/rr-certificates.sh"
+    local legacy_hook="${hook_dir}/rr-naive-cert.sh"
+
+    [ -f "$hook_source" ] && [ ! -L "$hook_source" ] && [ -s "$hook_source" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h' -- "$hook_source" 2>/dev/null)" = 0:0:755:1 ] || return 1
+    bash -n "$hook_source" >/dev/null 2>&1 || return 1
+    [ -d "$hook_dir" ] && [ ! -L "$hook_dir" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$hook_dir" 2>/dev/null)" = 0:0:700 ] || return 1
+    [ -f "$hook_file" ] && [ ! -L "$hook_file" ] && [ -s "$hook_file" ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h' -- "$hook_file" 2>/dev/null)" = 0:0:700:1 ] || return 1
+    bash -n "$hook_file" >/dev/null 2>&1 || return 1
+    cmp -s -- "$hook_source" "$hook_file" || return 1
+    [ ! -e "$legacy_hook" ] && [ ! -L "$legacy_hook" ]
+}
+
+naive_cert_hook_is_current() {
+    # Compatibility wrapper for callers/tests introduced before the shared
+    # NaiveProxy + subscription TLS hook gained its generic validator name.
+    rr_certificate_deploy_hook_is_current
 }
 
 deploy_naive_cert_hook() {
@@ -1304,13 +2679,5 @@ deploy_naive_cert_hook() {
     # 同一 lineage 也承载订阅 HTTPS 时安全刷新订阅进程。
     local naive_domain="${1:-$NAIVE_DOMAIN}"
     [ -n "$naive_domain" ] || return 0
-    local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
-    local hook_source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
-    mkdir -p "$hook_dir"
-    local hook_file="${hook_dir}/rr-certificates.sh"
-    [ -s "$hook_source" ] && bash -n "$hook_source" || return 1
-    install -d -m 700 "$hook_dir" || return 1
-    install -m 700 "$hook_source" "$hook_file" || return 1
-    rm -f "${hook_dir}/rr-naive-cert.sh"
-    return 0
+    rr_install_certificate_deploy_hook
 }

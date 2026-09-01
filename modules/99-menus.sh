@@ -84,8 +84,19 @@ sb_control_menu() {
                 else
                     local rollback_ok=false
                     if [ -f /etc/sing-box/config.json.bak ]; then
-                        cp -p /etc/sing-box/config.json.bak /etc/sing-box/config.json
-                        restart_singbox >/dev/null 2>&1 && rollback_ok=true
+                        # A failed restart must never turn the live JSON into a
+                        # partially copied generation.  Publish the validated
+                        # snapshot through the same durable atomic helper used
+                        # by config transactions, then prove the restored file
+                        # before asking systemd to load it.
+                        if rr_restore_transaction_file_atomic \
+                                /etc/sing-box/config.json.bak \
+                                /etc/sing-box/config.json && \
+                           "$SINGBOX_BIN" check -c \
+                                /etc/sing-box/config.json >/dev/null 2>&1 && \
+                           restart_singbox >/dev/null 2>&1; then
+                            rollback_ok=true
+                        fi
                     fi
                     if [ "$rollback_ok" = true ]; then
                         echo -e "${RED}[失败] 新配置启动失败，已恢复并启动修改前配置${RESET}"
@@ -195,6 +206,10 @@ apply_subscription_ports() {
     local new_local_port="$1"
     local new_ipv4_public_port="$2"
     local new_ipv6_public_port="$3"
+    local desired_firewall_state=closed
+    local transaction_status=0
+    local -a port_updates=()
+    local -a port_operations=()
 
     load_config_with_defaults || return 1
     local old_local_port="$SUB_PORT"
@@ -230,20 +245,33 @@ apply_subscription_ports() {
         return 0
     fi
 
-    if ! apply_config_transaction "修改订阅端口" \
-        "SUB_PORT" "$new_local_port" \
-        "SUB_PUBLIC_PORT_IPV4" "$new_ipv4_public_port" \
-        "SUB_PUBLIC_PORT_IPV6" "$new_ipv6_public_port"; then
-        return 1
-    fi
+    port_updates=(
+        "SUB_PORT" "$new_local_port"
+        "SUB_PUBLIC_PORT_IPV4" "$new_ipv4_public_port"
+        "SUB_PUBLIC_PORT_IPV6" "$new_ipv6_public_port")
     if [ "$new_local_port" != "$old_local_port" ]; then
-        close_protocol_firewall "$old_local_port" tcp || return 1
-        if [ "${SUB_ACCESS_MODE:-local}" = https ]; then
-            open_protocol_firewall "$new_local_port" tcp || return 1
-        else
-            # Secure local mode must remain unreachable off-host even after a
-            # port change or an upgrade from the legacy public HTTP listener.
-            close_protocol_firewall "$new_local_port" tcp || return 1
+        [ "${SUB_ACCESS_MODE:-local}" != https ] || desired_firewall_state=open
+        port_operations=(
+            "protocol|closed|${old_local_port}|tcp"
+            "protocol|${desired_firewall_state}|${new_local_port}|tcp")
+        declare -F apply_config_firewall_batch >/dev/null 2>&1 || return 1
+        apply_config_firewall_batch "修改订阅端口" preserve \
+            port_operations port_updates || transaction_status=$?
+        if [ "$transaction_status" -ne 0 ]; then
+            echo -e "${RED}[失败] 订阅端口配置与防火墙未能作为一个事务提交；已尝试恢复原态。${RESET}" >&2
+            return "$transaction_status"
+        fi
+    else
+        # Public mapping changes do not add a live firewall tuple, but they
+        # still share the same process-wide lock, config rollback proof and
+        # indeterminate fail-closed contract as a local listener-port change.
+        # An empty firewall stage is intentional here.
+        declare -F apply_config_firewall_batch >/dev/null 2>&1 || return 1
+        apply_config_firewall_batch "修改订阅公网映射端口" preserve \
+            port_operations port_updates || transaction_status=$?
+        if [ "$transaction_status" -ne 0 ]; then
+            echo -e "${RED}[失败] 订阅公网映射配置事务未能证明完整提交或回滚。${RESET}" >&2
+            return "$transaction_status"
         fi
     fi
 
@@ -579,8 +607,28 @@ ip_stack_menu() {
 # ==========================================
 # 14. 终极主面板逻辑
 # ==========================================
+rr_menu_run_writer() {
+    local callback="$1" result=0
+    shift
+    rr_run_mutating_entrypoint "$callback" "$@" || result=$?
+    case "$result" in
+        0) return 0 ;;
+        75)
+            echo -e "${RED}[忙碌] 更新、备份、恢复或另一管理写操作正在运行；本次操作未执行。${RESET}" >&2
+            ;;
+        76)
+            echo -e "${RED}[安全拒绝] 共享事务锁不可信；本次操作未执行。${RESET}" >&2
+            ;;
+        *)
+            echo -e "${RED}[失败] 管理操作未完成（状态 ${result}）。${RESET}" >&2
+            ;;
+    esac
+    return "$result"
+}
+
 main_menu() {
-    ensure_runtime_health
+    rr_run_health_check || \
+        echo -e "${YELLOW}[提示] 启动前健康检查未通过；写操作仍受事务锁与隔离门保护。${RESET}" >&2
     while true; do
         check_update
 
@@ -646,20 +694,20 @@ main_menu() {
         read -p "请输入数字选择操作 [0-14]: " menu_choice
 
         case "$menu_choice" in
-            1) install_main ;;
+            1) rr_menu_run_writer install_main || : ;;
             2) if [ -f "$CONFIG_FILE" ]; then show_info; else echo -e "${RED}请先选择 1 进行安装！${RESET}"; sleep 2; fi ;;
-            3) if [ -f "$CONFIG_FILE" ]; then change_cdn; else echo -e "${RED}请先选择 1 进行安装！${RESET}"; sleep 2; fi ;;
-            4) if [ -f "$CONFIG_FILE" ]; then refresh_argo; else echo -e "${RED}请先选择 1 进行安装！${RESET}"; sleep 2; fi ;;
-            5) install_f2b ;;
+            3) if [ -f "$CONFIG_FILE" ]; then rr_menu_run_writer change_cdn || :; else echo -e "${RED}请先选择 1 进行安装！${RESET}"; sleep 2; fi ;;
+            4) if [ -f "$CONFIG_FILE" ]; then rr_menu_run_writer refresh_argo || :; else echo -e "${RED}请先选择 1 进行安装！${RESET}"; sleep 2; fi ;;
+            5) rr_menu_run_writer install_f2b || : ;;
             6) uninstall_all ;;
-            7) toggle_auto_update ;;
+            7) rr_menu_run_writer toggle_auto_update || : ;;
             8) do_update ;;
-            9) protocol_menu ;;
+            9) rr_menu_run_writer protocol_menu || : ;;
             10) show_ports ;;
-            11) sb_control_menu ;;
-            12) ip_stack_menu ;;
-            13) subscription_port_menu ;;
-            14) nexus_menu ;;
+            11) rr_menu_run_writer sb_control_menu || : ;;
+            12) rr_menu_run_writer ip_stack_menu || : ;;
+            13) rr_menu_run_writer subscription_port_menu || : ;;
+            14) rr_menu_run_writer nexus_menu || : ;;
             0) clear; exit 0 ;;
             *) echo "输入无效，请重新选择"; sleep 1 ;;
         esac
