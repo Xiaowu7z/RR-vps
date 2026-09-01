@@ -777,6 +777,260 @@ jobs:
             [ "$release_failed" = false ] || state=error
             printf '%s\n' "$state"
           }
+          rr_audit_runtime_repair_recover_journal() {
+            local parent="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
+            local journal="$parent/audit-runtime-repair"
+            local intent="$journal/intent" entry="" nonce=""
+            local runtime_temp="" launcher_temp="" canonical="" metadata=""
+            local last_byte=""
+            local -a entries=() intent_lines=()
+            rr_audit_path_absent "$journal" && return 0
+            [ -d "$parent" ] && [ ! -L "$parent" ] && \
+              [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || \
+              return 1
+            [ -d "$journal" ] && [ ! -L "$journal" ] && \
+              [ "$(stat -c '%u:%g:%a' -- "$journal" 2>/dev/null)" = 0:0:700 ] || \
+              return 1
+            canonical=$(readlink -e -- "$journal" 2>/dev/null) || return 1
+            [ "$canonical" = "$journal" ] || return 1
+            command -v mountpoint >/dev/null 2>&1 || return 1
+            mountpoint -q -- "$journal" && return 1
+            mapfile -t entries < <(find "$journal" -mindepth 1 -maxdepth 1 \
+              -printf '%f\n' 2>/dev/null | LC_ALL=C sort) || return 1
+            if [ "${#entries[@]}" -eq 0 ]; then
+              rmdir -- "$journal" || return 1
+              sync -f "$parent"
+              return
+            fi
+            [ "${#entries[@]}" -eq 1 ] || return 1
+            entry="${entries[0]}"
+            if [[ "$entry" =~ ^\.intent\.([0-9a-f]{32})$ ]]; then
+              metadata=$(stat -c '%u:%g:%h' -- "$journal/$entry" 2>/dev/null) || \
+                return 1
+              [ -f "$journal/$entry" ] && [ ! -L "$journal/$entry" ] && \
+                [ "$metadata" = 0:0:1 ] || return 1
+              rm -f -- "$journal/$entry" || return 1
+              rmdir -- "$journal" || return 1
+              sync -f "$parent"
+              return
+            fi
+            [ "$entry" = intent ] || return 1
+            [ -f "$intent" ] && [ ! -L "$intent" ] && \
+              [ "$(stat -c '%u:%g:%h:%a' -- "$intent" 2>/dev/null)" = \
+                0:0:1:600 ] || return 1
+            mapfile -t intent_lines < "$intent" || return 1
+            [ "${#intent_lines[@]}" -eq 4 ] || return 1
+            [ "${intent_lines[0]}" = runtime-repair-v1 ] || return 1
+            [[ "${intent_lines[1]}" =~ ^nonce=([0-9a-f]{32})$ ]] || return 1
+            nonce="${BASH_REMATCH[1]}"
+            runtime_temp="/usr/local/lib/.rr-audit-runtime.${nonce}"
+            launcher_temp="/usr/local/bin/.rr-audit-launcher.${nonce}"
+            [ "${intent_lines[2]}" = "runtime=$runtime_temp" ] || return 1
+            [ "${intent_lines[3]}" = "launcher=$launcher_temp" ] || return 1
+            last_byte=$(tail -c 1 -- "$intent" 2>/dev/null | \
+              od -An -tx1 | tr -d ' \n') || return 1
+            [ "$last_byte" = 0a ] || return 1
+            if ! rr_audit_path_absent "$runtime_temp"; then
+              [ -d "$runtime_temp" ] && [ ! -L "$runtime_temp" ] || return 1
+              canonical=$(readlink -e -- "$runtime_temp" 2>/dev/null) || return 1
+              [ "$canonical" = "$runtime_temp" ] || return 1
+              metadata=$(stat -c '%u:%g:%a' -- "$runtime_temp" 2>/dev/null) || \
+                return 1
+              case "$metadata" in 0:0:700|0:0:755) ;; *) return 1 ;; esac
+              mountpoint -q -- "$runtime_temp" && return 1
+              rm -rf -- "$runtime_temp" || return 1
+            fi
+            if ! rr_audit_path_absent "$launcher_temp"; then
+              [ -f "$launcher_temp" ] && [ ! -L "$launcher_temp" ] || return 1
+              canonical=$(readlink -e -- "$launcher_temp" 2>/dev/null) || return 1
+              [ "$canonical" = "$launcher_temp" ] || return 1
+              metadata=$(stat -c '%u:%g:%h:%a' -- "$launcher_temp" \
+                2>/dev/null) || return 1
+              case "$metadata" in 0:0:1:600|0:0:1:755) ;; *) return 1 ;; esac
+              rm -f -- "$launcher_temp" || return 1
+            fi
+            rm -f -- "$intent" || return 1
+            rmdir -- "$journal" || return 1
+            sync -f /usr/local/lib || return 1
+            sync -f /usr/local/bin || return 1
+            sync -f "$parent"
+          }
+          rr_audit_runtime_pair_matches_candidate() {
+            local runtime_root="$1" launcher="$2" candidate="$3"
+            [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || return 1
+            [ -f "$launcher" ] && [ ! -L "$launcher" ] || return 1
+            cmp -s -- "$runtime_root/manifest.sha256" \
+              "$candidate/manifest.sha256" || return 1
+            cmp -s -- "$launcher" "$candidate/rr" || return 1
+            (
+              RR_LIB_DIR="$runtime_root"
+              RR_LAUNCHER="$launcher"
+              RR_UNINSTALL_RUNTIME_OWNERSHIP_CAPTURED=false
+              RR_UNINSTALL_RUNTIME_MANIFEST_SHA256=""
+              RR_UNINSTALL_UPDATE_GUARD_SHA256=""
+              rr_uninstall_runtime_tree_is_owned
+            )
+          }
+          rr_audit_rebuild_deleted_runtime_for_uninstall() {
+            local candidate="$runtime"
+            local parent="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
+            local journal="$parent/audit-runtime-repair" intent=""
+            local nonce="" runtime_temp="" launcher_temp=""
+            local digest="" relative="" extra="" source="" target=""
+            local mode="" target_parent="" runtime_was_absent=false
+            local launcher_was_absent=false
+            [ "$role" = A ] && [ "$reboot_cleared_owned" = true ] || return 1
+            [ "$RR_LIB_DIR" = /usr/local/lib/rr ] && \
+              [ "$RR_LAUNCHER" = /usr/local/bin/rr ] || return 1
+            rr_audit_reboot_cleared_quarantine_is_owned || return 1
+            rr_audit_quarantine_supervisor_is_quiescent || return 1
+            rr_audit_callable_state subscription_server_running | \
+              grep -qx absent || return 1
+            rr_audit_callable_state managed_singbox_running | \
+              grep -qx absent || return 1
+            rr_audit_cloudflared_state | grep -qx absent || return 1
+            for target in /usr/local/sbin/rr-update-recover \
+              /usr/local/sbin/rr-update-external-state \
+              /var/lib/rr-update/active /run/rr-vps/update-maintenance \
+              /var/lib/rr-backup/active /run/rr-vps/restore-live; do
+              rr_audit_path_absent "$target" || return 1
+            done
+            for target in rr-update-recovery.service \
+              rr-restore-recovery.service rr-restore-watchdog.service \
+              rr-subscription-quarantine.service rr-nexus.service \
+              rr-subscription.service sing-box.service \
+              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+              argo-rr-health.timer argo-rr-health.service \
+              cloudflared.service; do
+              rr_audit_unit_absent "$target" || return 1
+            done
+            [ -d "$candidate" ] && [ ! -L "$candidate" ] || return 1
+            rr_bundle_tree_is_valid "$candidate" >>"$recovery_log" 2>&1 || \
+              return 1
+            rr_uninstall_path_ancestors_are_trusted \
+              /usr/local/lib/.rr-audit-runtime-probe || return 1
+            rr_uninstall_path_ancestors_are_trusted \
+              /usr/local/bin/.rr-audit-launcher-probe || return 1
+            rr_audit_runtime_repair_recover_journal || return 1
+            rr_audit_path_absent "$RR_LIB_DIR" && runtime_was_absent=true
+            rr_audit_path_absent "$RR_LAUNCHER" && launcher_was_absent=true
+            [ "$runtime_was_absent" = true ] || \
+              { [ -d "$RR_LIB_DIR" ] && [ ! -L "$RR_LIB_DIR" ]; } || return 1
+            [ "$launcher_was_absent" = true ] || \
+              { [ -f "$RR_LAUNCHER" ] && [ ! -L "$RR_LAUNCHER" ]; } || return 1
+            if [ "$runtime_was_absent" = false ] && \
+               [ "$launcher_was_absent" = false ]; then
+              rr_audit_runtime_pair_matches_candidate \
+                "$RR_LIB_DIR" "$RR_LAUNCHER" "$candidate" && \
+                rr_audit_reboot_cleared_quarantine_is_owned && \
+                rr_audit_quarantine_supervisor_is_quiescent
+              return
+            fi
+            nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || return 1
+            [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+            runtime_temp="/usr/local/lib/.rr-audit-runtime.${nonce}"
+            launcher_temp="/usr/local/bin/.rr-audit-launcher.${nonce}"
+            rr_audit_path_absent "$journal" || return 1
+            mkdir -m 700 -- "$journal" || return 1
+            chown 0:0 -- "$journal" || return 1
+            intent="$journal/.intent.${nonce}"
+            if ! printf 'runtime-repair-v1\nnonce=%s\nruntime=%s\nlauncher=%s\n' \
+                   "$nonce" "$runtime_temp" "$launcher_temp" > "$intent" || \
+               ! chmod 600 "$intent" || ! chown 0:0 "$intent" || \
+               ! sync -f "$intent" || ! mv -T -- "$intent" "$journal/intent" || \
+               ! sync -f "$journal" || ! sync -f "$parent"; then
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            fi
+            intent="$journal/intent"
+            if ! mkdir -m 700 -- "$runtime_temp" || \
+               ! chown 0:0 -- "$runtime_temp" || \
+               ! install -o 0 -g 0 -m 600 /dev/null "$launcher_temp"; then
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            fi
+            while read -r digest relative extra; do
+              [ -n "$digest" ] && [ -n "$relative" ] && [ -z "$extra" ] || {
+                rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+                return 1
+              }
+              [ "$relative" != rr ] || continue
+              case "$relative" in
+                scripts/*.sh|scripts/*.py|nexus/*.py|nexus/rr_nexus_lib/*.py)
+                  mode=755
+                  ;;
+                modules/*.sh|nexus/static/*.html|nexus/static/*.css|\
+                nexus/static/*.js)
+                  mode=644
+                  ;;
+                *)
+                  rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+                  return 1
+                  ;;
+              esac
+              source="$candidate/$relative"
+              target="$runtime_temp/$relative"
+              target_parent=$(dirname -- "$target") || {
+                rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+                return 1
+              }
+              if ! install -d -o 0 -g 0 -m 755 -- "$target_parent" || \
+                 ! install -o 0 -g 0 -m "$mode" -- "$source" "$target"; then
+                rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+                return 1
+              fi
+            done < "$candidate/manifest.sha256"
+            if ! install -o 0 -g 0 -m 644 -- "$candidate/manifest.sha256" \
+                   "$runtime_temp/manifest.sha256" || \
+               ! install -o 0 -g 0 -m 755 -- "$candidate/rr" \
+                   "$launcher_temp" || ! chmod 755 "$runtime_temp" || ! sync || \
+               ! rr_audit_runtime_pair_matches_candidate \
+                   "$runtime_temp" "$launcher_temp" "$candidate"; then
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            fi
+            if [ "$runtime_was_absent" = false ] && \
+               ! rr_audit_runtime_pair_matches_candidate \
+                   "$RR_LIB_DIR" "$launcher_temp" "$candidate"; then
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            fi
+            if [ "$launcher_was_absent" = false ] && \
+               ! rr_audit_runtime_pair_matches_candidate \
+                   "$runtime_temp" "$RR_LAUNCHER" "$candidate"; then
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            fi
+            rr_audit_reboot_cleared_quarantine_is_owned && \
+              rr_audit_quarantine_supervisor_is_quiescent || {
+              rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+              return 1
+            }
+            if [ "$runtime_was_absent" = true ]; then
+              mv -Tn -- "$runtime_temp" "$RR_LIB_DIR" || {
+                rr_audit_runtime_repair_recover_journal >/dev/null 2>&1 || true
+                return 1
+              }
+              sync -f /usr/local/lib || return 1
+              rr_audit_runtime_pair_matches_candidate \
+                "$RR_LIB_DIR" "$launcher_temp" "$candidate" || return 1
+            fi
+            rr_audit_reboot_cleared_quarantine_is_owned && \
+              rr_audit_quarantine_supervisor_is_quiescent || return 1
+            if [ "$launcher_was_absent" = true ]; then
+              mv -Tn -- "$launcher_temp" "$RR_LAUNCHER" || return 1
+              sync -f /usr/local/bin || return 1
+            fi
+            if ! rr_audit_runtime_pair_matches_candidate \
+                   "$RR_LIB_DIR" "$RR_LAUNCHER" "$candidate" || \
+               ! rr_audit_reboot_cleared_quarantine_is_owned || \
+               ! rr_audit_quarantine_supervisor_is_quiescent; then
+              return 1
+            fi
+            rr_audit_runtime_repair_recover_journal || return 1
+            rr_audit_runtime_pair_matches_candidate \
+              "$RR_LIB_DIR" "$RR_LAUNCHER" "$candidate"
+          }
           rr_audit_current_specific_legacy_ambiguity() {
             local root="$1" desired="$2" filtered="" backend="" table=""
             local source="" target="" state=2
@@ -1315,6 +1569,7 @@ jobs:
           reboot_old_ambiguity=not-invoked
           reboot_current_ambiguity=not-invoked
           supervisor_release=not-invoked
+          runtime_repair=not-needed
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1429,6 +1684,24 @@ jobs:
                 orphan_state=removed
               else
                 orphan_state=rejected
+                remediation_failed=true
+              fi
+            fi
+            runtime_repair_needed=false
+            rr_audit_path_absent "$RR_LIB_DIR" && runtime_repair_needed=true
+            rr_audit_path_absent "$RR_LAUNCHER" && runtime_repair_needed=true
+            rr_audit_path_absent \
+              "${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}/audit-runtime-repair" || \
+              runtime_repair_needed=true
+            if [ "$reboot_cleared_owned" = true ] && \
+               [ "$runtime_repair_needed" = true ] && \
+               rr_audit_product_evidence_present; then
+              if [ "$remediation_failed" = true ]; then
+                runtime_repair=not-run
+              elif rr_audit_rebuild_deleted_runtime_for_uninstall; then
+                runtime_repair=installed
+              else
+                runtime_repair=rejected
                 remediation_failed=true
               fi
             fi
@@ -1582,6 +1855,8 @@ jobs:
             "$diag_nonce" "$role" "$reboot_current_ambiguity"
           printf 'SAFE_DIAG nonce=%s role=%s supervisor_release=%s\n' \
             "$diag_nonce" "$role" "$supervisor_release"
+          printf 'SAFE_DIAG nonce=%s role=%s runtime_repair=%s\n' \
+            "$diag_nonce" "$role" "$runtime_repair"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
@@ -1674,6 +1949,7 @@ jobs:
                [[ "$payload" =~ ^reboot_old_ambiguity=(not-invoked|observed|absent)$ ]] ||
                [[ "$payload" =~ ^reboot_current_ambiguity=(not-invoked|absent|broad-only|specific|error)$ ]] ||
                [[ "$payload" =~ ^supervisor_release=(not-invoked|quiescent-owned|fallback)$ ]] ||
+               [[ "$payload" =~ ^runtime_repair=(not-needed|not-run|installed|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
