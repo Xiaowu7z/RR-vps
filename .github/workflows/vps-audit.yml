@@ -61,6 +61,7 @@ jobs:
           ssh-keygen -F "$host" -f "$known_hosts" >/dev/null
           ssh_opts=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes
             -o LogLevel=ERROR -o PreferredAuthentications=password
             -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
             -o StrictHostKeyChecking=yes
@@ -269,7 +270,7 @@ jobs:
           chmod 600 "$install_log"
           if ! printf '%s\n' \
             7 1 24443 18080 21443 22443 3 28443 "$naive_domain" \
-            23443 25443 y 30000:30010 30s '' '' \
+            23443 25443 n '' '' \
             | bash -c '
                 set -o pipefail
                 for module_file in /usr/local/lib/rr/modules/*.sh; do
@@ -316,6 +317,16 @@ jobs:
           test "$(grep -c '^INSTALL_COMPLETE=true$' /etc/argo_vmess.conf)" -eq 1
           grep -qx 'SUB_ACCESS_MODE=https' /etc/argo_vmess.conf
           grep -Fqx "SUB_DOMAIN=${naive_domain}" /etc/argo_vmess.conf
+          bash -c '
+            set -e
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            load_config_with_defaults
+            test -z "$HY2_HOP_PORTS"
+            rr_netfilter_rr_namespace_is_empty
+          '
           test "$(stat -c %a /etc/argo_vmess.conf)" = 600
           test "$(stat -c %a /etc/sing-box/config.json)" = 600
           test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
@@ -482,6 +493,7 @@ jobs:
           ssh-keygen -F "$host" -f "$known_hosts" >/dev/null
           ssh_opts=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes
             -o LogLevel=ERROR -o PreferredAuthentications=password
             -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
             -o StrictHostKeyChecking=yes
@@ -1212,8 +1224,30 @@ jobs:
             assert_product_quarantine_firewall
           }
 
+          upgrade_log=/root/rr-audit-upgrade.log
+          rm -f -- "$upgrade_log"
+          (umask 077; : > "$upgrade_log")
+          test "$(stat -c '%u:%g:%a:%h' -- "$upgrade_log")" = 0:0:600:1
+          emit_safe_upgrade_diag() {
+            local log="$1"
+            local checkpoint_re="" phase_re="" writer_re=""
+            [ -f "$log" ] && [ ! -L "$log" ] || return 0
+            [ "$(stat -c '%u:%g:%a:%h' -- "$log" 2>/dev/null)" = \
+              0:0:600:1 ] || return 0
+            checkpoint_re='(pre-snapshot|phase-switching|old-runtime-move|runtime-install|phase-runtime-swapped|launcher-install|quarantine-suspend|phase-migrating|ip-acme-pre|post-update|writer-verify|durability-sync|phase-commit|unknown)'
+            phase_re='(state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating)'
+            writer_re='(singbox-identity|nexus-identity|subscription-freeze|singbox-restore|ip-acme-restore|nexus-restore|health-timer-restore|health-service-restart|health-quiesce|subscription-resume|unknown)'
+            LC_ALL=C grep -aE \
+              "^\\[RR-vps\\] DIAG (update_failure_gate=${checkpoint_re} rollback_phase=${phase_re}|rollback_writer_gate=${writer_re})$" \
+              -- "$log" >&2 || true
+          }
+
           assert_pure_v710_recovery_runtime
-          install_candidate >/root/rr-audit-upgrade.log 2>&1
+          if ! install_candidate >"$upgrade_log" 2>&1; then
+            emit_safe_upgrade_diag "$upgrade_log"
+            echo 'B candidate upgrade failed; root-only log retained on the VPS.' >&2
+            exit 1
+          fi
           assert_candidate_runtime
           printf 'first-upgrade-complete\n' > /root/rr-audit-stage
           set +e
@@ -1224,7 +1258,12 @@ jobs:
           test "$rollback_rc" -eq 3
           assert_legacy_quarantine
           printf 'manual-rollback-complete\n' > /root/rr-audit-stage
-          install_candidate >>/root/rr-audit-upgrade.log 2>&1
+          test "$(stat -c '%u:%g:%a:%h' -- "$upgrade_log")" = 0:0:600:1
+          if ! install_candidate >>"$upgrade_log" 2>&1; then
+            emit_safe_upgrade_diag "$upgrade_log"
+            echo 'B candidate re-upgrade failed; root-only log retained on the VPS.' >&2
+            exit 1
+          fi
           assert_candidate_runtime
           status_json=$(/usr/local/sbin/rr-update-recover status)
           jq -e '.subscription_quarantine.active == false' <<<"$status_json" >/dev/null
@@ -1437,6 +1476,7 @@ jobs:
           ssh-keygen -F "$host" -f "$known_hosts" >/dev/null
           ssh_opts=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes
             -o LogLevel=ERROR -o PreferredAuthentications=password
             -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
             -o StrictHostKeyChecking=yes
@@ -1494,8 +1534,166 @@ jobs:
             "$expected_guard_sha" "$stage/update-guard.sh" \
             | sha256sum -c - >/root/rr-audit-transfer-sha.log 2>&1
 
-          # This is an owner-authorized disposable host.  First use the
-          # product uninstaller, then remove only enumerated RR-owned residue.
+          cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
+          chmod 700 "$cleanup_runtime"
+          tar --no-same-owner --no-same-permissions -xzf \
+            "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime" --strip-components=1
+          for module_file in "$cleanup_runtime"/modules/*.sh; do
+            # shellcheck disable=SC1090
+            source "$module_file"
+          done
+
+          # This owner-authorized disposable host can retain four exact fixed
+          # fixtures after an interrupted cross-machine audit.  One fixture
+          # deliberately resembles an RR-owned rule, so remove only these exact
+          # tuples under the candidate firewall lock before invoking any older
+          # product uninstaller.  Persistence is optional until install_deps
+          # establishes C's independent netfilter-persistent backend.
+          netfilter_normalize_log=/root/rr-audit-netfilter-normalize.log
+          : > "$netfilter_normalize_log"
+          chmod 600 "$netfilter_normalize_log"
+          rr_audit_remove_rule_all() {
+            local backend="$1" table="$2" chain="$3" state=0
+            shift 3
+            while :; do
+              if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                   >/dev/null 2>&1; then
+                if ! "$backend" -w 5 -t "$table" -D "$chain" "$@" \
+                     >>"$netfilter_normalize_log" 2>&1; then
+                  return 1
+                fi
+              else
+                state=$?
+                [ "$state" -eq 1 ] && return 0
+                return "$state"
+              fi
+            done
+          }
+          rr_audit_assert_rule_absent() {
+            local backend="$1" table="$2" chain="$3" state=0
+            shift 3
+            if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                 >/dev/null 2>&1; then
+              return 1
+            else
+              state=$?
+              [ "$state" -eq 1 ]
+            fi
+          }
+          rr_audit_clean_fixture_backend() {
+            local backend="$1"
+            rr_audit_remove_rule_all "$backend" filter INPUT \
+              -p tcp --dport 65431 -m comment \
+              --comment argo-rr-managed-block -j DROP || return 1
+            rr_audit_remove_rule_all "$backend" nat PREROUTING \
+              -p udp --dport 65432 -m comment \
+              --comment argo-rr-audit-fixture -j REDIRECT --to-ports 65431 || return 1
+            rr_audit_remove_rule_all "$backend" filter INPUT \
+              -p tcp --dport 65433 -m comment \
+              --comment rr-audit-user-sentinel -j ACCEPT || return 1
+            rr_audit_remove_rule_all "$backend" nat PREROUTING \
+              -p udp --dport 65434 -m comment \
+              --comment rr-audit-user-sentinel -j REDIRECT --to-ports 65433 || return 1
+          }
+          rr_audit_assert_fixture_backend_clean() {
+            local backend="$1"
+            rr_audit_assert_rule_absent "$backend" filter INPUT \
+              -p tcp --dport 65431 -m comment \
+              --comment argo-rr-managed-block -j DROP || return 1
+            rr_audit_assert_rule_absent "$backend" nat PREROUTING \
+              -p udp --dport 65432 -m comment \
+              --comment argo-rr-audit-fixture -j REDIRECT --to-ports 65431 || return 1
+            rr_audit_assert_rule_absent "$backend" filter INPUT \
+              -p tcp --dport 65433 -m comment \
+              --comment rr-audit-user-sentinel -j ACCEPT || return 1
+            rr_audit_assert_rule_absent "$backend" nat PREROUTING \
+              -p udp --dport 65434 -m comment \
+              --comment rr-audit-user-sentinel -j REDIRECT --to-ports 65433 || return 1
+          }
+          rr_audit_persist_fixture_cleanup() {
+            local mode="$1"
+            case "$mode" in optional|required) ;; *) return 1 ;; esac
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+              netfilter-persistent save >>"$netfilter_normalize_log" 2>&1
+            elif command -v service >/dev/null 2>&1 && \
+                 [ -x /etc/init.d/iptables ]; then
+              service iptables save >>"$netfilter_normalize_log" 2>&1
+            elif [ "$mode" = optional ]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+          rr_audit_cleanup_cross_fixture() {
+            local mode="$1" backend="" failed=false
+            rr_firewall_lock_acquire || return 1
+            for backend in iptables ip6tables; do
+              if ! command -v "$backend" >/dev/null 2>&1; then
+                failed=true
+              elif ! rr_audit_clean_fixture_backend "$backend"; then
+                failed=true
+              fi
+            done
+            if [ "$failed" = false ]; then
+              if ! rr_audit_persist_fixture_cleanup "$mode"; then
+                failed=true
+              fi
+            fi
+            for backend in iptables ip6tables; do
+              if ! command -v "$backend" >/dev/null 2>&1; then
+                failed=true
+              elif ! rr_audit_assert_fixture_backend_clean "$backend"; then
+                failed=true
+              fi
+            done
+            rr_firewall_lock_release || failed=true
+            [ "$failed" = false ]
+          }
+          rr_audit_remove_ufw_for_netfilter() {
+            local failed=false status=""
+            rr_firewall_lock_acquire || return 1
+            if rr_ufw_installed; then
+              if ! command -v ufw >/dev/null 2>&1; then
+                failed=true
+              else
+                if ufw --force disable >>"$netfilter_normalize_log" 2>&1; then
+                  :
+                else
+                  :
+                fi
+                if ! status=$(LC_ALL=C ufw status \
+                     2>>"$netfilter_normalize_log"); then
+                  failed=true
+                elif [ "$status" != 'Status: inactive' ]; then
+                  failed=true
+                fi
+              fi
+              if [ "$failed" = false ]; then
+                if ! DEBIAN_FRONTEND=noninteractive \
+                     apt-get -o DPkg::Lock::Timeout=120 purge -y ufw \
+                     >>"$netfilter_normalize_log" 2>&1; then
+                  failed=true
+                fi
+              fi
+            fi
+            if rr_ufw_installed; then
+              failed=true
+            fi
+            if [ "$failed" = false ]; then
+              if rr_audit_persist_fixture_cleanup optional; then
+                :
+              else
+                failed=true
+              fi
+            fi
+            rr_firewall_lock_release || failed=true
+            [ "$failed" = false ]
+          }
+          rr_audit_cleanup_cross_fixture optional
+
+          # First use the product uninstaller, then remove only enumerated
+          # RR-owned residue.  The exact cross-audit fixtures are already gone,
+          # so an older uninstaller cannot mistake them for live product state.
           if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
             if ! bash -c '
               set -o pipefail
@@ -1530,14 +1728,6 @@ jobs:
             fi
           fi
 
-          cleanup_runtime=$(mktemp -d /root/rr-audit-cleanup.XXXXXX)
-          chmod 700 "$cleanup_runtime"
-          tar --no-same-owner --no-same-permissions -xzf \
-            "$stage/rr-bundle.tar.gz" -C "$cleanup_runtime" --strip-components=1
-          for module_file in "$cleanup_runtime"/modules/*.sh; do
-            # shellcheck disable=SC1090
-            source "$module_file"
-          done
           if [ -e /etc/argo_vmess.conf ] && [ ! -x /usr/local/bin/rr ]; then
             if ! CLEANUP_RUNTIME="$cleanup_runtime" bash -c '
                 set -o pipefail
@@ -1565,6 +1755,11 @@ jobs:
               echo 'C candidate pre-clean failed; root-only log retained on VPS.' >&2
               exit 1
             fi
+          fi
+          rr_audit_cleanup_cross_fixture optional
+          if ! rr_audit_remove_ufw_for_netfilter; then
+            echo 'C audit could not remove inactive UFW before netfilter coverage.' >&2
+            exit 1
           fi
           stop_subscription_servers >/root/rr-audit-orphan-cleanup.log 2>&1 || true
           rm -rf -- "$cleanup_runtime"
@@ -1655,6 +1850,8 @@ jobs:
             rr-update-committed-settled-v1
           test ! -e /run/rr-vps/update-maintenance
 
+          # A remains the active-UFW gate.  C now proves the independent raw
+          # netfilter persistence path after explicit dependency installation.
           bash -c '
             set -eo pipefail
             for module_file in /usr/local/lib/rr/modules/*.sh; do
@@ -1663,6 +1860,19 @@ jobs:
             done
             install_deps </dev/null
           ' >/root/rr-audit-deps.log 2>&1
+          if rr_ufw_installed; then
+            echo 'C audit dependency install unexpectedly restored UFW.' >&2
+            exit 1
+          fi
+          command -v netfilter-persistent >/dev/null 2>&1
+          rr_firewall_persistence_backend_available
+          rr_audit_cleanup_cross_fixture required
+          hop_main_port=65435
+          hop_spec=65436:65437
+          install_hop_rules HY2 "$hop_main_port" "$hop_spec"
+          rr_validate_hop_rules HY2 "$hop_main_port" "$hop_spec"
+          remove_hop_ports "$hop_main_port" HY2 "$hop_spec"
+          rr_netfilter_rr_namespace_is_empty
           printf '%s\n' 0 '' '' '' | bash -c '
             set -o pipefail
             for module_file in /usr/local/lib/rr/modules/*.sh; do
@@ -2010,6 +2220,7 @@ jobs:
           }
           ssh_common=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes
             -o LogLevel=ERROR -o PreferredAuthentications=password
             -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
@@ -5247,6 +5458,7 @@ jobs:
           prepare_known_hosts "$RR_C_HOST" "$RR_C_HOST_KEY" "$c_known_hosts"
           ssh_common=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes
             -o LogLevel=ERROR -o PreferredAuthentications=password
             -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
@@ -5255,29 +5467,119 @@ jobs:
           cleanup_b() {
             SSHPASS="$RR_B_PASS" sshpass -e ssh "${ssh_common[@]}" \
               -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
-              bash -s <<'REMOTE_CLEANUP'
+              bash -s -- "$panel_port" "$node_port" <<'REMOTE_CLEANUP'
           set -euo pipefail
           umask 077
-          if [ -x /usr/local/bin/rr ]; then
-            /usr/local/bin/rr --nexus-ip-acme-uninstall \
-              >>/root/rr-audit-ip-acme.log 2>&1 || true
-            bash -c '
+          panel_port="$1"
+          node_port="$2"
+          failed=false
+          rr_audit_unit_absent() {
+            local unit="$1" load_state="" active_state="" unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" \
+              2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" \
+              2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" \
+              2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            [ "$load_state:$active_state:$unit_file_state" = \
+              not-found:inactive:not-found ]
+          }
+          if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
+             [ -e /usr/local/lib/rr ] || [ -L /usr/local/lib/rr ]; then
+            if [ ! -x /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
+               [ ! -d /usr/local/lib/rr/modules ] || [ -L /usr/local/lib/rr ]; then
+              failed=true
+            elif ! bash -c '
               set -o pipefail
               for module_file in /usr/local/lib/rr/modules/*.sh; do
                 # shellcheck disable=SC1090
                 source "$module_file"
               done
-              rr_run_with_update_locks direct 180 uninstall_all_locked
-            ' >>/root/rr-audit-ip-acme.log 2>&1 || true
+              if declare -F rr_run_with_update_locks >/dev/null 2>&1 &&
+                 declare -F uninstall_all_locked >/dev/null 2>&1; then
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              elif declare -F uninstall_all >/dev/null 2>&1; then
+                printf "%s\n" y | uninstall_all
+              else
+                exit 1
+              fi
+            ' >>/root/rr-audit-ip-acme.log 2>&1; then
+              failed=true
+            fi
           fi
-          rm -rf -- /root/rr-audit-ip-candidate
+          for residue in \
+            /usr/local/bin/rr /usr/local/lib/rr /usr/local/bin/sing-box \
+            /etc/argo_vmess.conf /etc/sing-box /etc/rr-nexus \
+            /var/lib/rr-nexus \
+            /etc/systemd/system/sing-box.service \
+            /etc/systemd/system/rr-nexus.service \
+            /var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme \
+            /etc/systemd/system/rr-nexus-ip-acme.service \
+            /etc/systemd/system/rr-nexus-ip-acme.timer \
+            /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-available/rr-nexus-ip.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip.conf \
+            /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+            /etc/rr-nexus/certs/.ip-cert-pending \
+            /usr/local/lib/rr-vps/nexus-ip-cert-gate \
+            /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
+            if [ -e "$residue" ] || [ -L "$residue" ]; then
+              failed=true
+            fi
+          done
+          for unit in sing-box.service rr-nexus.service \
+            rr-nexus-ip-acme.service rr-nexus-ip-acme.timer; do
+            rr_audit_unit_absent "$unit" || failed=true
+          done
+          if ! command -v ss >/dev/null 2>&1; then
+            failed=true
+          else
+            for port in 80 "$panel_port" "$node_port"; do
+              port_state=""
+              if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then
+                failed=true
+              elif grep -q . <<<"$port_state"; then
+                failed=true
+              fi
+            done
+          fi
+          rm -rf -- /root/rr-audit-ip-candidate || failed=true
+          if [ -e /root/rr-audit-ip-candidate ] || \
+             [ -L /root/rr-audit-ip-candidate ]; then
+            failed=true
+          fi
+          [ "$failed" = false ]
           REMOTE_CLEANUP
           }
           finish_ip_audit() {
             local body_status=$? cleanup_status=0
             trap - EXIT
             if [ "$cleanup_required" = true ]; then
-              cleanup_b || cleanup_status=$?
+              if cleanup_b; then
+                :
+              else
+                cleanup_status=$?
+                echo 'IP ACME audit cleanup failed; inspect the root-only VPS log and residual services.' >&2
+              fi
             fi
             rm -f -- "$ipv4_subscription"
             [ "$body_status" -ne 0 ] && exit "$body_status"
@@ -5328,16 +5630,51 @@ jobs:
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
 
-          if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
-            bash -c '
+          if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
+             [ -e /usr/local/lib/rr ] || [ -L /usr/local/lib/rr ]; then
+            if [ ! -x /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
+               [ ! -d /usr/local/lib/rr/modules ] || [ -L /usr/local/lib/rr ]; then
+              echo 'B IP-ACME pre-clean found incomplete or linked runtime residue.' >&2
+              exit 1
+            fi
+            if ! bash -c '
               set -o pipefail
               for module_file in /usr/local/lib/rr/modules/*.sh; do
                 # shellcheck disable=SC1090
                 source "$module_file"
               done
-              rr_run_with_update_locks direct 180 uninstall_all_locked
-            ' >>"$audit_log" 2>&1
+              if declare -F rr_run_with_update_locks >/dev/null 2>&1 &&
+                 declare -F uninstall_all_locked >/dev/null 2>&1; then
+                rr_audit_waited_uninstall() {
+                  local deadline=$((SECONDS + 180)) remaining=0 result=0
+                  while :; do
+                    remaining=$((deadline - SECONDS))
+                    [ "$remaining" -ge 1 ] || return 75
+                    if rr_run_with_update_locks direct "$remaining" \
+                        uninstall_all_locked; then
+                      return 0
+                    else
+                      result=$?
+                    fi
+                    [ "$result" = 75 ] || return "$result"
+                    sleep 1
+                  done
+                }
+                rr_audit_waited_uninstall
+              elif declare -F uninstall_all >/dev/null 2>&1; then
+                printf "%s\n" y | uninstall_all
+              else
+                exit 1
+              fi
+            ' >>"$audit_log" 2>&1; then
+              echo 'B IP-ACME pre-clean failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
           fi
+          test ! -e /usr/local/bin/rr
+          test ! -L /usr/local/bin/rr
+          test ! -e /usr/local/lib/rr
+          test ! -L /usr/local/lib/rr
           printf '%s  %s\n' \
             "$expected_bundle_sha" "$stage/rr-bundle.tar.gz" \
             "$expected_core_sha" "$stage/install-core.sh" \

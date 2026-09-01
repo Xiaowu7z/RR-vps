@@ -34,7 +34,7 @@ make_phase() {
     chmod 600 "$transaction/phase"
 }
 
-printf '%s\n' '[1/12] cleanup preserves a committed transaction even if the active flag is stale'
+printf '%s\n' '[1/13] cleanup preserves a committed transaction even if the active flag is stale'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -94,7 +94,7 @@ printf '%s\n' '[1/12] cleanup preserves a committed transaction even if the acti
         fail 'writer verification failure published settled evidence'
 )
 
-printf '%s\n' '[2/12] direct rollback also refuses a trusted committed phase'
+printf '%s\n' '[2/13] direct rollback also refuses a trusted committed phase'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -343,16 +343,16 @@ EOF
         fail 'rollback terminal phase was published before restored host state was durable'
 )
 
-printf '%s\n' '[3/12] rollback re-freezes a candidate-reenabled health timer before old restore'
+printf '%s\n' '[3/13] rollback re-freezes a candidate-reenabled health timer before old restore'
 run_migrating_rollback health-success false
 
-printf '%s\n' '[4/12] systemctl query/bus failure blocks rollback before old runtime mutation'
+printf '%s\n' '[4/13] systemctl query/bus failure blocks rollback before old runtime mutation'
 run_migrating_rollback health-query-failure true
 
-printf '%s\n' '[5/12] inconsistent absent-but-enabled health service blocks rollback'
+printf '%s\n' '[5/13] inconsistent absent-but-enabled health service blocks rollback'
 run_migrating_rollback health-state-mismatch false false false true
 
-printf '%s\n' '[6/12] generic inactive and disabled checks reject query errors but accept absent units'
+printf '%s\n' '[6/13] generic inactive and disabled checks reject query errors but accept absent units'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_unit_activity_matches)"
@@ -387,13 +387,132 @@ printf '%s\n' '[6/12] generic inactive and disabled checks reject query errors b
         fail 'writer restore rejected a proven absent unit'
 )
 
-printf '%s\n' '[7/12] writer restore query failure retains maintenance and active evidence'
+printf '%s\n' '[7/13] managed writer recovery clears StartLimitHit only after identity proof'
+(
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_unit_activity_matches)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_wait_unit_state)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_unit_file_state_matches)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_restore_unit_state)"
+    active_marker="$TEST_ROOT/start-limit.active"
+    enabled_marker="$TEST_ROOT/start-limit.enabled"
+    operation_log="$TEST_ROOT/start-limit.log"
+    : > "$active_marker"
+    : > "$enabled_marker"
+    : > "$operation_log"
+    identity_status=0
+    reset_status=0
+    start_limit_hit=true
+    mock_active_state=inactive
+    mock_unit_file_state=disabled
+    sleep() { :; }
+    rr_installer_managed_service_start_is_safe() {
+        printf '%s\n' identity >> "$operation_log"
+        return "$identity_status"
+    }
+    systemctl() {
+        local property=""
+        case "${1:-}" in
+            show)
+                property="${2#--property=}"
+                case "$property" in
+                    LoadState) printf '%s\n' loaded ;;
+                    ActiveState) printf '%s\n' "$mock_active_state" ;;
+                    UnitFileState) printf '%s\n' "$mock_unit_file_state" ;;
+                    *) return 1 ;;
+                esac
+                ;;
+            enable)
+                printf '%s\n' enable >> "$operation_log"
+                mock_unit_file_state=enabled
+                ;;
+            reset-failed)
+                printf '%s\n' reset-failed >> "$operation_log"
+                [ "$reset_status" -eq 0 ] || return "$reset_status"
+                start_limit_hit=false
+                ;;
+            restart)
+                printf '%s\n' restart >> "$operation_log"
+                [ "$start_limit_hit" = false ] || return 75
+                mock_active_state=active
+                ;;
+            stop)
+                printf '%s\n' stop >> "$operation_log"
+                mock_active_state=inactive
+                ;;
+            disable)
+                printf '%s\n' disable >> "$operation_log"
+                mock_unit_file_state=disabled
+                ;;
+            *) return 1 ;;
+        esac
+    }
+
+    rr_restore_unit_state rr-nexus "$active_marker" "$enabled_marker" ||
+        fail 'proved managed writer did not recover after clearing StartLimitHit'
+    [ "$(tr '\n' ' ' < "$operation_log")" = \
+      'identity enable reset-failed restart ' ] ||
+        fail 'managed writer identity/reset/restart ordering changed'
+
+    : > "$operation_log"
+    identity_status=1
+    start_limit_hit=true
+    mock_active_state=inactive
+    if rr_restore_unit_state rr-nexus "$active_marker" "$enabled_marker"; then
+        fail 'managed writer restore accepted a failed identity proof'
+    fi
+    [ "$(cat "$operation_log")" = identity ] ||
+        fail 'identity failure still reset or restarted a managed writer'
+
+    : > "$operation_log"
+    identity_status=0
+    reset_status=74
+    start_limit_hit=true
+    mock_active_state=inactive
+    if rr_restore_unit_state rr-nexus "$active_marker" "$enabled_marker"; then
+        fail 'managed writer restore accepted a reset-failed error'
+    fi
+    grep -Fxq reset-failed "$operation_log" ||
+        fail 'managed writer did not attempt the proved reset-failed boundary'
+    ! grep -Fxq restart "$operation_log" ||
+        fail 'managed writer restarted after reset-failed failed'
+
+    : > "$operation_log"
+    reset_status=0
+    start_limit_hit=true
+    mock_active_state=inactive
+    rm -f -- "$active_marker"
+    rr_restore_unit_state rr-nexus "$active_marker" "$enabled_marker" ||
+        fail 'inactive managed writer state was not restored'
+    ! grep -Fxq reset-failed "$operation_log" ||
+        fail 'inactive managed writer unexpectedly cleared StartLimitHit'
+    ! grep -Fxq restart "$operation_log" ||
+        fail 'inactive managed writer unexpectedly restarted'
+)
+for checkpoint in phase-switching old-runtime-move runtime-install \
+    phase-runtime-swapped launcher-install quarantine-suspend phase-migrating \
+    ip-acme-pre post-update writer-verify durability-sync phase-commit; do
+    grep -Fq "RR_UPDATE_CHECKPOINT=$checkpoint" \
+        "$REPO_ROOT/scripts/install-core.sh" ||
+        fail "installer omitted fixed update checkpoint $checkpoint"
+done
+grep -Fq 'DIAG update_failure_gate=${RR_UPDATE_CHECKPOINT} rollback_phase=${rollback_phase}' \
+    "$REPO_ROOT/scripts/install-core.sh" ||
+    fail 'installer rollback omitted the fixed failure-gate diagnostic'
+grep -Fq 'DIAG rollback_writer_gate=${writer_failure_gate}' \
+    "$REPO_ROOT/scripts/install-core.sh" ||
+    fail 'installer rollback omitted the fixed writer-gate diagnostic'
+
+printf '%s\n' '[8/13] writer restore query failure retains maintenance and active evidence'
 run_migrating_rollback writer-restore-query-failure false true false
 
-printf '%s\n' '[8/12] failed global durability barrier never publishes or clears a terminal rollback'
+printf '%s\n' '[9/13] failed global durability barrier never publishes or clears a terminal rollback'
 run_migrating_rollback rollback-sync-failure false false true
 
-printf '%s\n' '[9/12] prior aborted transactions are cleared durably before their directory is pruned'
+printf '%s\n' '[10/13] prior aborted transactions are cleared durably before their directory is pruned'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -565,7 +684,7 @@ printf '%s\n' '[9/12] prior aborted transactions are cleared durably before thei
     [ -d "$incomplete_tx" ] || fail 'pre-phase SIGKILL orphan was deleted as terminal'
 )
 
-printf '%s\n' '[10/12] settled format-2 retirement does not depend on rollback backup metadata'
+printf '%s\n' '[11/13] settled format-2 retirement does not depend on rollback backup metadata'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -632,7 +751,7 @@ printf '%s\n' '[10/12] settled format-2 retirement does not depend on rollback b
         fail 'settled retirement repeated candidate finalization'
 )
 
-printf '%s\n' '[11/12] installer retires a legacy committed window without a v2 finalizer'
+printf '%s\n' '[12/13] installer retires a legacy committed window without a v2 finalizer'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -695,7 +814,7 @@ printf '%s\n' '[11/12] installer retires a legacy committed window without a v2 
         fail 'legacy committed retirement invoked the unsupported v2 finalizer'
 )
 
-printf '%s\n' '[12/12] unconfigured hot update accepts only strict health-unit absence'
+printf '%s\n' '[13/13] unconfigured hot update accepts only strict health-unit absence'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" \

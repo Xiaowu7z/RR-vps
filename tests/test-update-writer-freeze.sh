@@ -181,6 +181,7 @@ run_recovery_case() (
 
     declare -A active=([sing-box]=false [rr-nexus]=false [argo-rr-health.timer]=false)
     declare -A enabled=([sing-box]=false [rr-nexus]=false [argo-rr-health.timer]=false)
+    declare -A start_limit_hit=([sing-box]=true [rr-nexus]=true)
     operation_log="$TEST_ROOT/$case_name/operations"
     mkdir -p "$RR_TX_ROOT/transactions" "$(dirname "$RR_UPDATE_MAINTENANCE_FILE")"
     : > "$operation_log"
@@ -246,8 +247,19 @@ run_recovery_case() (
                     active[$unit]=false
                 fi
                 ;;
+            'reset-failed rr-nexus'|'reset-failed sing-box')
+                unit="$option"
+                if [ "$wanted_failure" = reset-error ] && [ "$unit" = rr-nexus ]; then
+                    return 74
+                fi
+                start_limit_hit[$unit]=false
+                ;;
             'restart rr-nexus'|'restart sing-box'|'restart argo-rr-health.timer')
                 unit="$option"
+                if [ "$unit" != argo-rr-health.timer ] && \
+                   [ "${start_limit_hit[$unit]:-true}" = true ]; then
+                    return 75
+                fi
                 if [ "$wanted_failure" = true ] && [ "$unit" = rr-nexus ]; then
                     return 1
                 fi
@@ -295,8 +307,9 @@ run_recovery_case() (
         }
     fi
 
-    if [ "$wanted_failure" = true ] || [ "$wanted_failure" = query-error ] || \
-       [ "$wanted_failure" = incoherent ] || [ "$wanted_failure" = sync-error ]; then
+    if [ "$wanted_failure" = true ] || [ "$wanted_failure" = reset-error ] || \
+       [ "$wanted_failure" = query-error ] || [ "$wanted_failure" = incoherent ] || \
+       [ "$wanted_failure" = sync-error ]; then
         set +e
         main recover
         rc=$?
@@ -307,7 +320,7 @@ run_recovery_case() (
         [ -e "$RR_ACTIVE_TX" ] || fail 'restart failure removed active transaction evidence'
         [ -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'restart failure removed the maintenance marker'
         if [ "$recovery_phase" = state_recorded ]; then
-            if grep -Eq '^(enable|disable|restart|stop) (rr-nexus|sing-box|argo-rr-health.timer)' \
+            if grep -Eq '^(enable|disable|reset-failed|restart|stop) (rr-nexus|sing-box|argo-rr-health.timer)' \
                 "$operation_log"; then
                 fail 'state-record durability failure touched a service before freezing began'
             fi
@@ -320,6 +333,10 @@ run_recovery_case() (
                 [ "${enabled[argo-rr-health.timer]:-false}" = false ] || \
                 fail 'restart failure left a health writer active or enabled'
         fi
+        if [ "$wanted_failure" = reset-error ] && \
+           grep -Fxq 'restart rr-nexus' "$operation_log"; then
+            fail 'standalone recovery restarted Nexus after reset-failed failed'
+        fi
         wanted_failure=false
         sync_fault=false
         main recover || fail 'retryable pre-mutation recovery did not succeed on a second boot'
@@ -331,7 +348,7 @@ run_recovery_case() (
 
     main recover
     if [ "$recovery_phase" = state_recorded ]; then
-        if grep -Eq '^(enable|disable|restart|stop) (rr-nexus|sing-box|argo-rr-health.timer)$' "$operation_log"; then
+        if grep -Eq '^(enable|disable|reset-failed|restart|stop) (rr-nexus|sing-box|argo-rr-health.timer)$' "$operation_log"; then
             fail 'state-record crash recovery changed a service that had not been frozen'
         fi
         [ "${active[rr-nexus]}" = true ] && [ "${enabled[rr-nexus]}" = true ] || \
@@ -347,6 +364,15 @@ run_recovery_case() (
     [ "$(cat "$tx/phase")" = aborted ] || fail 'pre-mutation recovery did not end as aborted'
     [ ! -e "$RR_ACTIVE_TX" ] || fail 'successful pre-mutation recovery left active state'
     [ ! -e "$RR_UPDATE_MAINTENANCE_FILE" ] || fail 'successful recovery left maintenance marker'
+    if [ "$recovery_phase" != state_recorded ]; then
+        reset_line=$(grep -n '^reset-failed rr-nexus$' "$operation_log" | head -n 1 | cut -d: -f1)
+        restart_line=$(grep -n '^restart rr-nexus$' "$operation_log" | head -n 1 | cut -d: -f1)
+        [[ "$reset_line" =~ ^[0-9]+$ && "$restart_line" =~ ^[0-9]+$ ]] && \
+            [ "$reset_line" -lt "$restart_line" ] || \
+            fail 'standalone recovery did not clear StartLimitHit before Nexus restart'
+        ! grep -Fxq 'reset-failed sing-box' "$operation_log" || \
+            fail 'standalone recovery reset an inactive Sing-box unit'
+    fi
 )
 
 printf '%s\n' '[3/15] state-record crash recovery touches no service before freezing begins'
@@ -457,9 +483,31 @@ set -e
 
 printf '%s\n' '[7/15] restart failure is fail-closed and retains transaction evidence'
 run_recovery_case restore-failure true
+run_recovery_case restore-reset-error reset-error
 run_recovery_case restore-query-error query-error
 run_recovery_case restore-absent absent
 run_recovery_case restore-incoherent incoherent
+legacy_writer_restore=$(awk '
+    /^rr_restore_recorded_writer_state\(\) \{/ { copying=1 }
+    copying {
+        print
+        line=$0
+        opens=gsub(/\{/, "", line)
+        line=$0
+        closes=gsub(/\}/, "", line)
+        depth += opens - closes
+        if (depth == 0) exit
+    }
+' "$REPO_ROOT/scripts/update-recover.sh")
+for unit in sing-box rr-nexus; do
+    reset_line=$(grep -n "systemctl reset-failed $unit" <<< "$legacy_writer_restore" \
+        | head -n 1 | cut -d: -f1)
+    restart_line=$(grep -n "systemctl restart --no-block $unit" \
+        <<< "$legacy_writer_restore" | head -n 1 | cut -d: -f1)
+    [[ "$reset_line" =~ ^[0-9]+$ && "$restart_line" =~ ^[0-9]+$ ]] && \
+        [ "$reset_line" -lt "$restart_line" ] || \
+        fail "legacy writer restore does not clear StartLimitHit before $unit restart"
+done
 
 printf '%s\n' '[8/15] a committed crash retries finalization before clearing maintenance'
 (
