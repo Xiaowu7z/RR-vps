@@ -777,6 +777,62 @@ jobs:
             [ "$release_failed" = false ] || state=error
             printf '%s\n' "$state"
           }
+          rr_audit_reboot_cleared_quarantine_is_owned() {
+            local directory="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
+            local evidence="$directory/firewall-evidence"
+            local desired="$evidence/desired.namespace"
+            local snapshot="" raw_state=0 ambiguous_state=0 result=1
+            local release_failed=false
+            [ "$role" = A ] || return 1
+            snapshot=$(mktemp -d "$stage/reboot-cleared-firewall.XXXXXX") || \
+              return 1
+            chmod 700 "$snapshot" || {
+              rm -rf -- "$snapshot"
+              return 1
+            }
+            if ! load_config_with_defaults >>"$recovery_log" 2>&1 || \
+               ! rr_firewall_lock_acquire; then
+              rm -rf -- "$snapshot"
+              return 1
+            fi
+            if ! rr_firewall_fail_closed_quarantine_active || \
+               ! rr_firewall_load_fail_closed_quarantine || \
+               [ "$RR_FIREWALL_QUARANTINE_EVIDENCE_KIND" != \
+                 firewall-evidence-v1 ] || \
+               ! rr_firewall_quarantine_evidence_is_trusted || \
+               ! rr_uninstall_firewall_quarantine_artifacts_are_owned || \
+               ! rr_audit_quarantine_supervisor_is_quiescent || \
+               rr_firewall_persistence_backend_available || \
+               ! rr_restore_firewall_snapshot_has_managed_raw_rules \
+                   "$evidence/firewall"; then
+              result=1
+            else
+              rr_firewall_snapshot_has_ambiguous_legacy_rules \
+                "$evidence" "$desired" >>"$recovery_log" 2>&1
+              ambiguous_state=$?
+              if [ "$ambiguous_state" -ne 1 ]; then
+                result=1
+              elif ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
+                   >>"$recovery_log" 2>&1 || \
+                   ! rr_restore_verify_firewall_pre_mutation_snapshot "$snapshot" \
+                   >>"$recovery_log" 2>&1; then
+                result=1
+              else
+                rr_restore_firewall_snapshot_has_managed_raw_rules \
+                  "$snapshot/firewall" >>"$recovery_log" 2>&1
+                raw_state=$?
+                if [ "$raw_state" -eq 1 ] && \
+                   rr_firewall_snapshots_match_after_clear \
+                     "$evidence" "$snapshot" >>"$recovery_log" 2>&1; then
+                  result=0
+                fi
+              fi
+            fi
+            rr_firewall_lock_release || release_failed=true
+            rm -rf -- "$snapshot" || result=1
+            [ "$release_failed" = false ] || result=1
+            return "$result"
+          }
           rr_audit_quarantine_supervisor_is_quiescent() {
             local load_state="" active_state="" file_state="" unit=""
             local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
@@ -1117,6 +1173,7 @@ jobs:
           live_raw=not-probed
           reboot_state=not-needed
           reboot_required=false
+          reboot_cleared_owned=false
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1180,6 +1237,11 @@ jobs:
                     if [ "$live_raw" = present ]; then reboot_state=rejected; fi
                     remediation_failed=true
                   fi
+                elif [ "$locked_quarantine_probe" = evidence-invalid ] && \
+                     rr_audit_reboot_cleared_quarantine_is_owned; then
+                  live_raw=absent
+                  firewall_repair=deferred-owned
+                  reboot_cleared_owned=true
                 elif rr_run_without_inherited_update_lock_fds \
                        rr_audit_repair_firewall_without_update_fds; then
                   firewall_repair=success
@@ -1231,15 +1293,49 @@ jobs:
             fi
             if [ "$remediation_failed" = false ] && \
                rr_audit_product_evidence_present; then
+              rr_audit_original_stop_nodes_definition=""
+              if [ "$reboot_cleared_owned" = true ]; then
+                rr_audit_original_stop_nodes_definition=$(declare -f \
+                  rr_firewall_stop_nodes_on_indeterminate_commit) || \
+                  remediation_failed=true
+                if [ "$remediation_failed" = false ]; then
+                  rr_audit_renamed_stop_nodes_definition=${rr_audit_original_stop_nodes_definition/#rr_firewall_stop_nodes_on_indeterminate_commit/rr_audit_original_stop_nodes_on_indeterminate_commit}
+                  eval "$rr_audit_renamed_stop_nodes_definition" || \
+                    remediation_failed=true
+                fi
+                if [ "$remediation_failed" = false ]; then
+                  rr_audit_reboot_gate_once=true
+                  rr_firewall_stop_nodes_on_indeterminate_commit() {
+                    if [ "$rr_audit_reboot_gate_once" = true ]; then
+                      rr_audit_reboot_gate_once=false
+                      if rr_audit_reboot_cleared_quarantine_is_owned && \
+                         rr_firewall_quiesce_durable_ingress; then
+                        return 0
+                      fi
+                    fi
+                    rr_audit_original_stop_nodes_on_indeterminate_commit
+                  }
+                fi
+              fi
               exec 9>"$trace"
               PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
               BASH_XTRACEFD=9
               set -x
-              uninstall_all_locked >"$product_log" 2>&1
-              raw_uninstall_rc=$?
+              if [ "$remediation_failed" = false ]; then
+                uninstall_all_locked >"$product_log" 2>&1
+                raw_uninstall_rc=$?
+              else
+                raw_uninstall_rc=2
+              fi
               set +x
               unset BASH_XTRACEFD
               exec 9>&-
+              if [ -n "$rr_audit_original_stop_nodes_definition" ]; then
+                eval "$rr_audit_original_stop_nodes_definition" || \
+                  raw_uninstall_rc=2
+                unset -f rr_audit_original_stop_nodes_on_indeterminate_commit \
+                  2>/dev/null || true
+              fi
               chmod 600 "$trace" "$product_log"
               case "$raw_uninstall_rc" in
                 0) uninstall_state=success ;;
