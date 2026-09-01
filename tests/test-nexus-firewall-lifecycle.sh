@@ -481,6 +481,7 @@ pass 'install defers public activation and rolls back metadata on later setup fa
         case "$*" in
             'daemon-reload') return 0 ;;
             'enable rr-nexus') NEXUS_ENABLED=true; return 0 ;;
+            'reset-failed rr-nexus') return 0 ;;
             'restart rr-nexus')
                 NEXUS_ACTIVE=true
                 NEXUS_PID=$((NEXUS_PID + 101))
