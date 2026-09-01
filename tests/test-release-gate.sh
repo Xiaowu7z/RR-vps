@@ -8357,6 +8357,7 @@ for fragment in (
 ):
     assert fragment in b_job[upgrade_log_init:first_candidate_upgrade]
 assert "grep -aE 'DIAG'" not in safe_diag
+assert "|migrating|unknown)'" in safe_diag
 assert b_job.count('            emit_safe_upgrade_diag "$upgrade_log"\n') == 2
 assert b_job.count("root-only log retained on the VPS.") == 2
 first_rollback = b_job.index(

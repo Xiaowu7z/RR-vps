@@ -28,6 +28,30 @@ def require_fragment(body: str, fragment: str, label: str) -> None:
 
 def assert_contract(candidate: dict) -> None:
     candidate_jobs = candidate["jobs"]
+    ssh_option_blocks: list[str] = []
+    for job in candidate_jobs.values():
+        for step in job.get("steps", ()):
+            body = step.get("run")
+            if not body:
+                continue
+            lines = body.splitlines()
+            for index, line in enumerate(lines):
+                if line.strip() not in {"ssh_opts=(", "ssh_common=("}:
+                    continue
+                end = index + 1
+                while end < len(lines) and lines[end].strip() != ")":
+                    end += 1
+                if end == len(lines):
+                    raise AssertionError("unterminated SSH option array")
+                ssh_option_blocks.append("\n".join(lines[index:end + 1]))
+    assert len(ssh_option_blocks) == 5
+    for block in ssh_option_blocks:
+        tokens = block.split()
+        pairs = list(zip(tokens, tokens[1:]))
+        assert pairs.count(("-o", "ServerAliveInterval=30")) == 1
+        assert pairs.count(("-o", "ServerAliveCountMax=6")) == 1
+        assert pairs.count(("-o", "TCPKeepAlive=yes")) == 1
+
     push_condition = "github.event_name == 'push' && github.ref == 'refs/heads/main'"
     for name in (
         "debian-full",
@@ -78,6 +102,9 @@ def assert_contract(candidate: dict) -> None:
         "rr_firewall_persistence_backend_available",
         "netfilter-persistent save",
         "service iptables save",
+        'install_hop_rules HY2 "$hop_main_port" "$hop_spec"',
+        'rr_validate_hop_rules HY2 "$hop_main_port" "$hop_spec"',
+        'remove_hop_ports "$hop_main_port" HY2 "$hop_spec"',
     ):
         require_fragment(transaction_audit, fragment, "Ubuntu netfilter audit")
     cleanup_definition = transaction_audit.index(
@@ -85,6 +112,26 @@ def assert_contract(candidate: dict) -> None:
     )
     ufw_definition = transaction_audit.index(
         "rr_audit_remove_ufw_for_netfilter()", cleanup_definition
+    )
+    fixture_helper = transaction_audit[cleanup_definition:ufw_definition]
+    fixture_lock = fixture_helper.index("rr_firewall_lock_acquire")
+    fixture_clean = fixture_helper.index(
+        "rr_audit_clean_fixture_backend", fixture_lock
+    )
+    fixture_persist = fixture_helper.index(
+        "rr_audit_persist_fixture_cleanup", fixture_clean
+    )
+    fixture_proof = fixture_helper.index(
+        "rr_audit_assert_fixture_backend_clean", fixture_persist
+    )
+    fixture_release = fixture_helper.index(
+        "rr_firewall_lock_release", fixture_proof
+    )
+    assert fixture_helper.count("rr_firewall_lock_acquire") == 1
+    assert fixture_helper.count("rr_firewall_lock_release") == 1
+    assert (
+        fixture_lock < fixture_clean < fixture_persist
+        < fixture_proof < fixture_release
     )
     first_optional = transaction_audit.index(
         "rr_audit_cleanup_cross_fixture optional", ufw_definition
@@ -95,10 +142,15 @@ def assert_contract(candidate: dict) -> None:
     ufw_status = ufw_helper.index("status=$(LC_ALL=C ufw status", ufw_disable)
     ufw_purge = ufw_helper.index("purge -y ufw", ufw_status)
     ufw_absent = ufw_helper.rindex("if rr_ufw_installed")
-    ufw_release = ufw_helper.index("rr_firewall_lock_release", ufw_absent)
+    ufw_persist = ufw_helper.index(
+        "rr_audit_persist_fixture_cleanup optional", ufw_absent
+    )
+    ufw_release = ufw_helper.index("rr_firewall_lock_release", ufw_persist)
     assert ufw_helper.count("rr_ufw_installed") == 2
+    assert ufw_helper.count("rr_audit_persist_fixture_cleanup optional") == 1
     assert (
-        ufw_lock < ufw_disable < ufw_status < ufw_purge < ufw_absent < ufw_release
+        ufw_lock < ufw_disable < ufw_status < ufw_purge
+        < ufw_absent < ufw_persist < ufw_release
     )
     assert "return" not in ufw_helper[
         ufw_helper.index("\n", ufw_lock) + 1 : ufw_release
@@ -127,8 +179,20 @@ def assert_contract(candidate: dict) -> None:
     required_cleanup = transaction_audit.index(
         "rr_audit_cleanup_cross_fixture required", install_dependencies
     )
+    hop_install = transaction_audit.index(
+        'install_hop_rules HY2 "$hop_main_port" "$hop_spec"', required_cleanup
+    )
+    hop_validate = transaction_audit.index(
+        'rr_validate_hop_rules HY2 "$hop_main_port" "$hop_spec"', hop_install
+    )
+    hop_remove = transaction_audit.index(
+        'remove_hop_ports "$hop_main_port" HY2 "$hop_spec"', hop_validate
+    )
+    hop_absent = transaction_audit.index(
+        "rr_netfilter_rr_namespace_is_empty", hop_remove
+    )
     framework_install = transaction_audit.index(
-        "install_main", required_cleanup
+        "install_main", hop_absent
     )
     assert (
         cleanup_definition
@@ -141,6 +205,10 @@ def assert_contract(candidate: dict) -> None:
         < first_candidate
         < install_dependencies
         < required_cleanup
+        < hop_install
+        < hop_validate
+        < hop_remove
+        < hop_absent
         < framework_install
     )
     assert transaction_audit.count("rr_audit_cleanup_cross_fixture optional") == 2
@@ -198,6 +266,143 @@ def assert_contract(candidate: dict) -> None:
     for key, value in expected_secret_bindings.items():
         assert audit["env"].get(key) == value, key
     body = audit["run"]
+    cleanup_start = body.index("cleanup_b() {")
+    cleanup_end = body.index("finish_ip_audit() {", cleanup_start)
+    cleanup = body[cleanup_start:cleanup_end]
+    for fragment in (
+        "failed=false",
+        'bash -s -- "$panel_port" "$node_port"',
+        "rr_audit_unit_absent()",
+        "rr_audit_http_routes_absent()",
+        "rr_audit_capture_nginx_generation()",
+        "rr_audit_old_nginx_workers_retired()",
+        "rr_audit_prove_nginx_generation_retired()",
+        "rr_route_evidence=false",
+        "rr_route_evidence=true",
+        '[ "$rr_route_evidence" = true ]',
+        "rr_audit_capture_nginx_generation || failed=true",
+        "rr_audit_prove_nginx_generation_retired || failed=true",
+        '[ "$current_start" != "$expected_start" ] || return 1',
+        "systemctl reload nginx.service",
+        "elif ! bash -c '",
+        "for residue in",
+        "/usr/local/bin/rr /usr/local/lib/rr /usr/local/bin/sing-box",
+        "/etc/argo_vmess.conf /etc/sing-box /etc/rr-nexus",
+        "/var/lib/rr-nexus",
+        "/etc/systemd/system/sing-box.service",
+        "/etc/systemd/system/rr-nexus.service",
+        "/var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme",
+        "/etc/systemd/system/rr-nexus-ip-acme.service",
+        "/etc/systemd/system/rr-nexus-ip-acme.timer",
+        "/usr/local/lib/rr-vps/nexus-ip-cert-gate",
+        "rr_audit_http_routes_absent || failed=true",
+        "for unit in sing-box.service rr-nexus.service",
+        'for port in "$panel_port" "$node_port"',
+        'if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
+        'elif grep -q . <<<"$port_state"; then',
+        'rm -rf -- /root/rr-audit-ip-candidate || failed=true',
+        '[ "$failed" = false ]',
+    ):
+        require_fragment(cleanup, fragment, "public-IP failure cleanup")
+    assert ">>/root/rr-audit-ip-acme.log 2>&1 || true" not in cleanup
+    generation_gate = cleanup.index(
+        "if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ]"
+    )
+    generation_capture_call = cleanup.index(
+        "rr_audit_capture_nginx_generation || failed=true", generation_gate
+    )
+    shape_check = cleanup.index(
+        "if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ]",
+        generation_capture_call,
+    )
+    uninstall = cleanup.index("elif ! bash -c '", shape_check)
+    residue_proof = cleanup.index("for residue in", uninstall)
+    residue_end = cleanup.index("; do", residue_proof)
+    residue_tokens = cleanup[residue_proof:residue_end].replace("\\\n", " ").split()
+    for exact_path in (
+        "/usr/local/bin/rr",
+        "/usr/local/lib/rr",
+        "/usr/local/bin/sing-box",
+        "/etc/argo_vmess.conf",
+        "/etc/sing-box",
+        "/etc/rr-nexus",
+        "/var/lib/rr-nexus",
+        "/etc/systemd/system/sing-box.service",
+        "/etc/systemd/system/rr-nexus.service",
+    ):
+        assert residue_tokens.count(exact_path) == 1
+    route_definition = cleanup.index("rr_audit_http_routes_absent() {")
+    route_definition_end = cleanup.index(
+        "if [ -e /usr/local/bin/rr ]", route_definition
+    )
+    route_definition_body = cleanup[route_definition:route_definition_end]
+    route_loop = route_definition_body.index("for path in")
+    route_loop_end = route_definition_body.index("; do", route_loop)
+    route_tokens = route_definition_body[route_loop:route_loop_end].replace(
+        "\\\n", " "
+    ).split()
+    for exact_path in (
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/rr-nexus.conf.port",
+        "/etc/nginx/sites-available/rr-nexus-ip.conf",
+        "/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf",
+        "/etc/nginx/sites-enabled/rr-nexus.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-port.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf",
+    ):
+        assert route_tokens.count(exact_path) == 1
+    route_proof = cleanup.index(
+        "rr_audit_http_routes_absent || failed=true", residue_end
+    )
+    generation_retirement = cleanup.index(
+        "rr_audit_prove_nginx_generation_retired || failed=true", route_proof
+    )
+    unit_proof = cleanup.index(
+        "for unit in sing-box.service rr-nexus.service",
+        generation_retirement,
+    )
+    unit_end = cleanup.index("; do", unit_proof)
+    unit_tokens = cleanup[unit_proof:unit_end].replace("\\\n", " ").split()
+    for exact_unit in (
+        "sing-box.service",
+        "rr-nexus.service",
+        "rr-nexus-ip-acme.service",
+        "rr-nexus-ip-acme.timer",
+    ):
+        assert unit_tokens.count(exact_unit) == 1
+    port_loop = cleanup.index('for port in "$panel_port" "$node_port"', unit_proof)
+    port_end = cleanup.index("; do", port_loop)
+    port_tokens = cleanup[port_loop:port_end].split()
+    for exact_port in ('"$panel_port"', '"$node_port"'):
+        assert port_tokens.count(exact_port) == 1
+    assert "80" not in port_tokens
+    port_query = cleanup.index(
+        'if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
+        port_loop,
+    )
+    port_listener = cleanup.index(
+        'elif grep -q . <<<"$port_state"; then', port_query
+    )
+    candidate_remove = cleanup.index(
+        "rm -rf -- /root/rr-audit-ip-candidate", port_listener
+    )
+    final_cleanup_gate = cleanup.rindex('[ "$failed" = false ]')
+    assert (
+        generation_gate < generation_capture_call < shape_check < uninstall
+        < residue_proof < route_proof < generation_retirement < unit_proof
+        < port_query < port_listener < candidate_remove < final_cleanup_gate
+    )
+    finish_start = body.index("finish_ip_audit() {", cleanup_end)
+    finish_end = body.index("trap finish_ip_audit EXIT", finish_start)
+    finish = body[finish_start:finish_end]
+    for fragment in (
+        "if cleanup_b; then",
+        "cleanup_status=$?",
+        "IP ACME audit cleanup failed; inspect the root-only VPS log and residual services.",
+        'exit "$cleanup_status"',
+    ):
+        require_fragment(finish, fragment, "public-IP cleanup status")
     required = (
         'set +x',
         'python3 - "$RR_IP_ACME_EMAIL" "$RR_B_PUBLIC_IPV4"',
@@ -207,6 +412,10 @@ def assert_contract(candidate: dict) -> None:
         'ipv6_raw != str(ipv6)',
         'RR_B_PUBLIC_IPV4 is not a global IPv4 address',
         'RR_B_PUBLIC_IPV6 is not a global IPv6 address',
+        'route_probe_name="rr-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+        'route_probe_value=$(openssl rand -hex 32)',
+        '[[ "$route_probe_name" =~ ^rr-audit-[0-9]+-[0-9]+$ ]]',
+        '[[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]',
         'StrictHostKeyChecking=yes',
         'UserKnownHostsFile="$b_known_hosts"',
         'UserKnownHostsFile="$c_known_hosts"',
@@ -230,6 +439,10 @@ def assert_contract(candidate: dict) -> None:
         'assert_unit_state rr-nexus-ip-acme.timer loaded:active:enabled',
         'systemctl start rr-nexus-ip-acme.service',
         'test "$before" = "$after"',
+        '/var/www/rr-nexus-ip-acme/.well-known/acme-challenge/${route_probe_name}',
+        'chmod 644 "$route_probe_path"',
+        'test "$(stat -c \'%u:%g:%a:%h\' -- "$route_probe_path")" = 0:0:644:1',
+        'test "$probe_body" = "$route_probe_value"',
         'nc -4 -z -w 10 "$RR_B_PUBLIC_IPV4" 80',
         '-verify_ip "$RR_B_PUBLIC_IPV4" -verify_return_error',
         'curl -fsS --noproxy \'*\' --connect-timeout 10 --max-time 30 "$ipv4_url"',
@@ -254,9 +467,14 @@ def assert_contract(candidate: dict) -> None:
         'test ! -L /usr/local/bin/rr',
         'test ! -L /usr/local/lib/rr',
         'cleanup_required=false',
-        'IP ACME audit HTTP challenge port remained reachable after uninstall.',
         'IPv6 panel remained reachable after IP ACME uninstall.',
-        'IPv6 challenge port remained reachable after IP ACME uninstall.',
+        'old_nginx_master=$(systemctl show -p MainPID --value nginx.service)',
+        'old_nginx_workers+=("${worker_pid}:${worker_start}")',
+        'old_nginx_workers_retired() {',
+        '[ "$current_start" != "$expected_start" ] || return 1',
+        'test "$old_workers_gone" = true',
+        'new_nginx_master=$(systemctl show -p MainPID --value nginx.service)',
+        'test "$new_worker_count" -ge 1',
     )
     for fragment in required:
         require_fragment(body, fragment, "public-ip-acme job")
@@ -276,6 +494,59 @@ def assert_contract(candidate: dict) -> None:
     assert 'systemctl is-enabled' not in body
     assert body.count('-verify_ip "$address" -verify_return_error') == 1
     assert body.count('grep -q \'^vless://\'') >= 4
+    assert body.count('test "$probe_body" = "$route_probe_value"') == 1
+    assert body.count('[[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]') == 2
+    residue_guard = 'if [ -e "$path" ] || [ -L "$path" ]; then'
+    assert body.count(residue_guard) == 2
+    assert 'test ! -e "$path" && test ! -L "$path"' not in body
+    final_start = body.index("bash -s <<'REMOTE_FINAL'")
+    final_end = body.index("\nREMOTE_FINAL", final_start)
+    final_cleanup = body[final_start:final_end]
+    assert "assert_rr_http_routes_absent()" in final_cleanup
+    assert final_cleanup.count("\nassert_rr_http_routes_absent\n") == 2
+    route_start = final_cleanup.index("assert_rr_http_routes_absent() {")
+    route_end = final_cleanup.index(
+        "/usr/local/bin/rr --nexus-ip-acme-uninstall", route_start
+    )
+    final_route_helper = final_cleanup[route_start:route_end]
+    final_route_loop = final_route_helper.index("for path in")
+    final_route_loop_end = final_route_helper.index("; do", final_route_loop)
+    final_route_tokens = final_route_helper[
+        final_route_loop:final_route_loop_end
+    ].replace("\\\n", " ").split()
+    assert final_route_helper.count(
+        '[ ! -e "$path" ] && [ ! -L "$path" ] || return 1'
+    ) == 1
+    for exact_path in (
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/rr-nexus.conf.port",
+        "/etc/nginx/sites-available/rr-nexus-ip.conf",
+        "/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf",
+        "/etc/nginx/sites-enabled/rr-nexus.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-port.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf",
+    ):
+        assert final_route_tokens.count(exact_path) == 1
+    worker_capture = final_cleanup.index(
+        "old_nginx_master=$(systemctl show -p MainPID --value nginx.service)"
+    )
+    ip_uninstall = final_cleanup.index(
+        "/usr/local/bin/rr --nexus-ip-acme-uninstall", worker_capture
+    )
+    full_uninstall = final_cleanup.index(
+        "rr_run_with_update_locks direct 180 uninstall_all_locked", ip_uninstall
+    )
+    worker_retirement = final_cleanup.index("old_workers_gone=false", full_uninstall)
+    new_generation = final_cleanup.index(
+        "new_nginx_master=$(systemctl show -p MainPID --value nginx.service)",
+        worker_retirement,
+    )
+    assert worker_capture < ip_uninstall < full_uninstall
+    assert full_uninstall < worker_retirement < new_generation
+    post_uninstall = body[body.index("cleanup_required=false", final_end):]
+    assert 'nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" 80' not in post_uninstall
+    assert "rr-audit-closed" not in post_uninstall
     for forbidden in (
         "set -x",
         'echo "$RR_IP_ACME_EMAIL"',
@@ -373,6 +644,43 @@ def mutated_transaction(old: str, new: str, occurrence: int = 1) -> dict:
     return candidate
 
 
+def mutated_ip_cleanup(old: str, new: str) -> dict:
+    candidate = deepcopy(workflow)
+    step = next(
+        item for item in candidate["jobs"]["public-ip-acme"]["steps"]
+        if item.get("name") == (
+            "Issue and externally verify independent IPv4 and IPv6 certificates"
+        )
+    )
+    body = step["run"]
+    start = body.index("cleanup_b() {")
+    end = body.index("finish_ip_audit() {", start)
+    cleanup = body[start:end]
+    cleanup = cleanup.replace(old, new, 1)
+    step["run"] = body[:start] + cleanup + body[end:]
+    return candidate
+
+
+def mutated_ip_body(old: str, new: str, occurrence: int = 1) -> dict:
+    candidate = deepcopy(workflow)
+    step = next(
+        item for item in candidate["jobs"]["public-ip-acme"]["steps"]
+        if item.get("name") == (
+            "Issue and externally verify independent IPv4 and IPv6 certificates"
+        )
+    )
+    step["run"] = replace_nth(step["run"], old, new, occurrence)
+    return candidate
+
+
+expect_contract_rejected(
+    mutated_transaction("rr_firewall_lock_acquire || return 1", ":", 1),
+    "fixture firewall-lock acquire",
+)
+expect_contract_rejected(
+    mutated_transaction("rr_firewall_lock_release || failed=true", ":", 1),
+    "fixture firewall-lock release",
+)
 expect_contract_rejected(
     mutated_transaction("rr_firewall_lock_acquire || return 1", ":", 2),
     "UFW firewall-lock acquire",
@@ -383,12 +691,14 @@ expect_contract_rejected(
 )
 expect_contract_rejected(
     mutated_transaction(
-        "if rr_ufw_installed; then\n    failed=true\n  fi\n"
-        "  rr_firewall_lock_release",
-        "if false; then\n    failed=true\n  fi\n"
-        "  rr_firewall_lock_release",
+        "if rr_ufw_installed; then\n    failed=true\n  fi",
+        "if false; then\n    failed=true\n  fi",
     ),
     "UFW final absence proof",
+)
+expect_contract_rejected(
+    mutated_transaction("rr_audit_persist_fixture_cleanup optional", ":", 1),
+    "post-UFW persistence",
 )
 expect_contract_rejected(
     mutated_transaction("rr_audit_cleanup_cross_fixture optional", ":", 1),
@@ -402,6 +712,115 @@ expect_contract_rejected(
     mutated_transaction("--dport 65431", "--dport 65430", 1),
     "exact firewall fixture port",
 )
+expect_contract_rejected(
+    mutated_transaction(
+        'install_hop_rules HY2 "$hop_main_port" "$hop_spec"', ":", 1
+    ),
+    "real-host product hop install",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup('[ "$failed" = false ]', ":"),
+    "public-IP cleanup final gate",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup("rr_route_evidence=true", "rr_route_evidence=false"),
+    "public-IP cleanup Nginx route evidence",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        "rr_audit_capture_nginx_generation || failed=true",
+        ":",
+    ),
+    "public-IP cleanup Nginx generation capture",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        "rr_audit_prove_nginx_generation_retired || failed=true",
+        ":",
+    ),
+    "public-IP cleanup Nginx generation retirement",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup("elif ! bash -c '", "elif bash -c '"),
+    "public-IP cleanup uninstall status",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        'if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
+        'if port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
+    ),
+    "public-IP cleanup port query failure",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup("/usr/local/bin/sing-box", "/usr/local/bin/ignored"),
+    "public-IP cleanup core residue",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/ignored.conf",
+    ),
+    "public-IP cleanup owned HTTP routes",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'if [ -e "$path" ] || [ -L "$path" ]; then',
+        "if false; then",
+        1,
+    ),
+    "public-IP IPv4 cleanup residue fail-hard proof",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'if [ -e "$path" ] || [ -L "$path" ]; then',
+        "if false; then",
+        2,
+    ),
+    "public-IP final cleanup residue fail-hard proof",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        '[ ! -e "$path" ] && [ ! -L "$path" ] || return 1',
+        '[ ! -e "$path" ] && [ ! -L "$path" ]',
+        2,
+    ),
+    "public-IP final owned-route fail-hard proof",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'test "$old_workers_gone" = true',
+        ":",
+    ),
+    "public-IP final old Nginx generation retirement",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'test "$new_worker_count" -ge 1',
+        ":",
+    ),
+    "public-IP final new Nginx generation proof",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup("sing-box.service rr-nexus.service", "rr-nexus.service"),
+    "public-IP cleanup core units",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        'for port in "$panel_port" "$node_port"; do',
+        'for port in "$panel_port"; do',
+    ),
+    "public-IP cleanup node listener",
+)
+
+mutation = deepcopy(workflow)
+ssh_step = next(
+    step for step in mutation["jobs"]["debian-full"]["steps"]
+    if "-o ServerAliveCountMax=6" in step.get("run", "")
+)
+ssh_step["run"] = ssh_step["run"].replace(
+    "-o ServerAliveCountMax=6", "-o ServerAliveCountMax=60", 1
+)
+expect_contract_rejected(mutation, "SSH keepalive retry budget")
 
 mutation = deepcopy(workflow)
 mutation["jobs"]["public-ip-acme"]["if"] = (

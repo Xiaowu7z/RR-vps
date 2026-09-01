@@ -1030,7 +1030,13 @@ rollback_function=$(awk '
     capture { print }
     capture && /^}$/ { exit }
 ' scripts/install-core.sh)
+update_failure_diag_function=$(awk '
+    /^rr_emit_update_failure_diag\(\) \{/ { capture = 1 }
+    capture { print }
+    capture && /^}$/ { exit }
+' scripts/install-core.sh)
 (
+    eval "$update_failure_diag_function"
     eval "$rollback_function"
     rollback_root=$(mktemp -d)
     RR_LIB_DIR="$rollback_root/live-runtime"

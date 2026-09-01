@@ -43,6 +43,8 @@ printf '%s\n' '[1/13] cleanup preserves a committed transaction even if the acti
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_phase)"
     # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_emit_update_failure_diag)"
+    # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_reconcile_committed_writer_state)"
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_cleanup)"
@@ -102,6 +104,8 @@ printf '%s\n' '[2/13] direct rollback also refuses a trusted committed phase'
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_dir_is_strict)"
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_read_trusted_phase)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_emit_update_failure_diag)"
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_rollback)"
     RR_TX_ROOT="$TEST_ROOT/committed-direct/update"
@@ -167,6 +171,8 @@ run_migrating_rollback() (
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_republish_active_pointer_for_retry)"
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_clear_active_transaction_pointer)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_emit_update_failure_diag)"
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_rollback)"
 
@@ -492,19 +498,83 @@ printf '%s\n' '[7/13] managed writer recovery clears StartLimitHit only after id
     ! grep -Fxq restart "$operation_log" ||
         fail 'inactive managed writer unexpectedly restarted'
 )
-for checkpoint in phase-switching old-runtime-move runtime-install \
+for checkpoint in pre-snapshot phase-switching old-runtime-move runtime-install \
     phase-runtime-swapped launcher-install quarantine-suspend phase-migrating \
     ip-acme-pre post-update writer-verify durability-sync phase-commit; do
     grep -Fq "RR_UPDATE_CHECKPOINT=$checkpoint" \
         "$REPO_ROOT/scripts/install-core.sh" ||
         fail "installer omitted fixed update checkpoint $checkpoint"
 done
-grep -Fq 'DIAG update_failure_gate=${RR_UPDATE_CHECKPOINT} rollback_phase=${rollback_phase}' \
+grep -Fq 'rr_emit_update_failure_diag "$rollback_phase"' \
     "$REPO_ROOT/scripts/install-core.sh" ||
     fail 'installer rollback omitted the fixed failure-gate diagnostic'
+grep -Fq 'DIAG update_failure_gate=${checkpoint} rollback_phase=${rollback_phase}' \
+    "$REPO_ROOT/scripts/install-core.sh" ||
+    fail 'installer failure diagnostic omitted its fixed allowlisted shape'
 grep -Fq 'DIAG rollback_writer_gate=${writer_failure_gate}' \
     "$REPO_ROOT/scripts/install-core.sh" ||
     fail 'installer rollback omitted the fixed writer-gate diagnostic'
+
+(
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_emit_update_failure_diag)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_cleanup)"
+    diag_log="$TEST_ROOT/pre-switch-diag.log"
+    rr_error() { printf '[RR-vps] %s\n' "$*" >> "$diag_log"; }
+    TRANSACTION_ACTIVE=false
+    ROLLBACK_FAILED=false
+    KEEP_TRANSACTION=false
+    RR_UPDATE_WRITERS_FROZEN=false
+    RR_UPDATE_MAINTENANCE_ACTIVE=false
+    RR_HEALTH_MONITOR_FROZEN=false
+    RR_UPDATE_DIAG_ARMED=true
+    RR_UPDATE_DIAG_EMITTED=false
+    RR_UPDATE_CHECKPOINT=pre-snapshot
+    TX_DIR=""
+    BACKUP_DIR=""
+    STAGE_ROOT=""
+    NEW_RUNTIME=""
+    NEW_LAUNCHER=""
+    OLD_RUNTIME=""
+
+    set +e
+    rr_cleanup 73
+    cleanup_status=$?
+    set -e
+    [ "$cleanup_status" -eq 73 ] ||
+        fail 'pre-snapshot diagnostic changed the original failure status'
+    [ "$(cat "$diag_log")" = \
+      '[RR-vps] DIAG update_failure_gate=pre-snapshot rollback_phase=unknown' ] ||
+        fail 'pre-snapshot failure omitted its fixed unknown-phase diagnostic'
+
+    prepared_tx="$TEST_ROOT/pre-switch-prepared/transactions/tx"
+    mkdir -p "$prepared_tx"
+    TX_DIR="$prepared_tx"
+    BACKUP_DIR="$prepared_tx/backup"
+    KEEP_TRANSACTION=true
+    RR_UPDATE_DIAG_EMITTED=false
+    rr_read_trusted_phase() { printf '%s\n' prepared; }
+    : > "$diag_log"
+    set +e
+    rr_cleanup 74
+    cleanup_status=$?
+    set -e
+    [ "$cleanup_status" -eq 74 ] ||
+        fail 'prepared diagnostic changed the original failure status'
+    [ "$(cat "$diag_log")" = \
+      '[RR-vps] DIAG update_failure_gate=pre-snapshot rollback_phase=prepared' ] ||
+        fail 'prepared pre-switch failure omitted its trusted phase diagnostic'
+
+    RR_UPDATE_DIAG_EMITTED=false
+    RR_UPDATE_CHECKPOINT=$'bad\nDIAG injected'
+    : > "$diag_log"
+    rr_emit_update_failure_diag $'bad\nphase'
+    rr_emit_update_failure_diag prepared
+    [ "$(cat "$diag_log")" = \
+      '[RR-vps] DIAG update_failure_gate=unknown rollback_phase=unknown' ] ||
+        fail 'failure diagnostic accepted injection or emitted more than once'
+)
 
 printf '%s\n' '[8/13] writer restore query failure retains maintenance and active evidence'
 run_migrating_rollback writer-restore-query-failure false true false
