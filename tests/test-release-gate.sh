@@ -112,6 +112,73 @@ def firewall_tokens_are_ordered(body, tokens):
     return True
 
 
+# systemctl renders the empty default of its `(bas)` set properties as the
+# literal `~`.  Every effective-identity gate must preserve that exact
+# fail-closed contract instead of treating the value as an empty string.
+system_marker_view = function_slice(
+    system,
+    "rr_firewall_effective_root_marker_view_is_safe() {",
+    "\nrr_firewall_effective_marker_view_is_safe() {",
+)[2]
+assert '[ "$system_call_filter" = \'~\' ] || return 1' in system_marker_view
+
+certbot_runtime = function_slice(
+    config,
+    "rr_certbot_renewal_runtime_is_ready() {",
+    "\nrr_enable_certbot_renewal_runtime() {",
+)[2]
+for exact_default in (
+    '[ "$restrict_address_families" = \'~\' ] || return 1',
+    '[ "$restrict_network_interfaces" = \'~\' ] && \\\n',
+    '[ "$restrict_filesystems" = \'~\' ] || return 1',
+    '[ "$system_call_filter" = \'~\' ] || return 1',
+):
+    assert exact_default in certbot_runtime
+
+singbox_current = function_slice(
+    singbox,
+    "rr_singbox_service_guards_are_effective() {",
+    "\nrr_singbox_effective_control_hooks_are_empty() {",
+)[2]
+singbox_legacy = function_slice(
+    singbox,
+    "rr_singbox_legacy_service_is_owned() {",
+    "\nrr_singbox_service_is_owned_or_absent() {",
+)[2]
+health_namespace = function_slice(
+    singbox,
+    "rr_health_effective_namespace_is_exact() {",
+    "\nrr_health_effective_conditions_are_exact() {",
+)[2]
+for effective_gate in (singbox_current, singbox_legacy, health_namespace):
+    assert '--property=SystemCallFilter --value' in effective_gate
+    assert '[ "$value" = \'~\' ] || return 1' in effective_gate
+
+restore_marker_view = function_slice(
+    resilience,
+    "rr_restore_effective_marker_view_is_safe() {",
+    "\nrr_restore_effective_conditions_are_managed() {",
+)[2]
+assert '--property=SystemCallFilter --value' in restore_marker_view
+assert '[ "$value" = \'~\' ] || return 1' in restore_marker_view
+
+cloudflared_identity = function_slice(
+    protocols,
+    "rr_cloudflared_effective_identity_is_exact() {",
+    "\nrr_cloudflared_effective_service_is_absent() {",
+)[2]
+assert 'rr_cloudflared_show SystemCallFilter' in cloudflared_identity
+assert '[ "$value" = \'~\' ] || return 1' in cloudflared_identity
+
+update_recovery_identity = function_slice(
+    installer,
+    "rr_update_recovery_effective_identity_matches() {",
+    "\nrr_update_recovery_effective_identity_is_exact() {",
+)[2]
+assert '--property=SystemCallFilter --value' in update_recovery_identity
+assert '[ "$value" = \'~\' ] || return 1' in update_recovery_identity
+
+
 def firewall_lock_contract(system_candidate, resilience_candidate):
     try:
         directory_safe = firewall_function_slice(
@@ -8192,6 +8259,62 @@ lock_timeout = b_job.index(
 assert quarantine_final < lock_wait < lock_probe < lock_busy_retry
 assert lock_busy_retry < lock_timeout < candidate_cleanup_stage
 assert "B pre-clean update lock probe failed safely" in b_job[lock_probe:lock_timeout]
+for fragment in (
+    "recovery_helper_is_known_for_reset() {",
+    "recovery_unit_is_known_for_reset() {",
+    "recovery_dropin_dir_is_safe_for_reset() {",
+    "reset_recovery_runtime_for_v710_fixture() {",
+    "assert_pure_v710_recovery_runtime() {",
+    "/etc/systemd/system/rr-update-recovery.service.d",
+    "/usr/local/sbin/rr-update-recover",
+    "/usr/local/sbin/rr-update-external-state",
+    "2243e4b3c9199a100b0725cbec5b333a1897fe9367b0c222e8536da26531b9ec",
+    "dfc878951a4bb9d8b43523b767314ebc8254d4ad64b3a606b569255190916e4a",
+    "95c317ad865e0ac9b77454a6948bea25783ccc19aa52a25134386ee396362412",
+):
+    assert fragment in b_job
+recovery_reset_start = b_job.index(
+    "          recovery_dropin_dir_is_safe_for_reset() {"
+)
+recovery_reset_end = b_job.index(
+    "          assert_pure_v710_recovery_runtime() {", recovery_reset_start
+)
+recovery_reset_contract = b_job[recovery_reset_start:recovery_reset_end]
+assert 'find "$target" -mindepth 1 -maxdepth 1 -printf x -quit' in \
+    recovery_reset_contract
+assert '[ -z "$entry" ]' in recovery_reset_contract
+assert 'rmdir -- "$dropin_dir" || return 1' in recovery_reset_contract
+assert 'rm -rf -- "$dropin_dir"' not in recovery_reset_contract
+recovery_reset_call = b_job.index(
+    '          reset_recovery_runtime_for_v710_fixture "$cleanup_runtime"',
+    lock_timeout,
+)
+assert lock_timeout < recovery_reset_call < candidate_cleanup_stage
+assert b_job.count("          assert_pure_v710_recovery_runtime\n") == 2
+old_core_install = b_job.index(
+    '            bash "$old/install-core.sh" --upgrade >/root/rr-audit-old-core.log'
+)
+first_pure_v710 = b_job.index(
+    "          assert_pure_v710_recovery_runtime\n", old_core_install
+)
+first_candidate_upgrade = b_job.index(
+    "          install_candidate >/root/rr-audit-upgrade.log", first_pure_v710
+)
+second_pure_v710 = b_job.index(
+    "          assert_pure_v710_recovery_runtime\n", first_pure_v710 + 1
+)
+assert old_core_install < first_pure_v710 < second_pure_v710 < first_candidate_upgrade
+pure_v710_start = b_job.index("          assert_pure_v710_recovery_runtime() {")
+pure_v710_end = b_job.index("          quarantine_fully_absent() {", pure_v710_start)
+pure_v710_contract = b_job[pure_v710_start:pure_v710_end]
+for fragment in (
+    "[ ! -e /usr/local/sbin/rr-update-external-state ]",
+    "loaded:inactive:enabled",
+    '[ "$unit_umask" = 0022 ]',
+    "/var/lib/rr-update/transactions/*",
+    '[ "$(cat "$active_tx/phase")" = committed ]',
+):
+    assert fragment in pure_v710_contract
 assert b_job.count("source /usr/local/sbin/rr-update-recover") == 3
 assert b_job.count("rr_quarantine_firewall_inventory_is_exact 18081") == 2
 legacy_assert_start = b_job.index("          assert_legacy_quarantine() {")

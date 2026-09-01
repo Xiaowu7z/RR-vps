@@ -2391,12 +2391,16 @@ rr_certbot_renewal_runtime_is_ready() {
     [ -z "${unit_asserts//[[:space:]]/}" ] || return 1
     for next_value in "$read_only_paths" "$inaccessible_paths" "$bind_paths" \
         "$bind_read_only_paths" "$temporary_filesystems" "$no_exec_paths" \
-        "$network_namespace_path" "$restrict_address_families" \
-        "$restrict_network_interfaces" "$restrict_filesystems" \
-        "$system_call_filter" "$mount_images" "$extension_images" \
+        "$network_namespace_path" "$mount_images" "$extension_images" \
         "$extension_directories" "$joins_namespace_of" "$ip_address_deny"; do
         [ -z "${next_value//[[:space:]]/}" ] || return 1
     done
+    [ "$restrict_address_families" = '~' ] || return 1
+    if (( systemd_version >= 250 )); then
+        [ "$restrict_network_interfaces" = '~' ] && \
+            [ "$restrict_filesystems" = '~' ] || return 1
+    fi
+    [ "$system_call_filter" = '~' ] || return 1
     python3 - "$exec_start" "$certbot_path" <<'PY' || return 1
 import re
 import sys

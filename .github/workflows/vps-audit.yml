@@ -524,6 +524,184 @@ jobs:
             fi
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
+          recovery_helper_is_known_for_reset() {
+            local target="$1" candidate_source="$2" allowed_legacy_digest="$3"
+            local canonical="" parent="" parent_mode="" digest=""
+            if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+              return 0
+            fi
+            [ -f "$target" ] && [ ! -L "$target" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+              0:0:755:1 ] || return 1
+            canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+            [ "$canonical" = "$target" ] || return 1
+            parent=$(dirname -- "$target") || return 1
+            [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+            [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+            canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+            [ "$canonical" = "$parent" ] || return 1
+            parent_mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
+            [[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] && \
+              [ $((8#$parent_mode & 8#022)) -eq 0 ] || return 1
+            cmp -s -- "$target" "$candidate_source" && return 0
+            [ -n "$allowed_legacy_digest" ] || return 1
+            digest=$(sha256sum "$target" | awk '{print $1}') || return 1
+            [ "$digest" = "$allowed_legacy_digest" ]
+          }
+          recovery_unit_is_known_for_reset() {
+            local target=/etc/systemd/system/rr-update-recovery.service
+            local canonical="" parent="" parent_mode="" metadata="" digest=""
+            if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+              return 0
+            fi
+            [ -f "$target" ] && [ ! -L "$target" ] || return 1
+            metadata=$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null) || return 1
+            digest=$(sha256sum "$target" | awk '{print $1}') || return 1
+            case "$digest:$metadata" in
+              deb555b957d0071e6d0dbff1f43379cec6b76f9602ec0bfd739aa1c4eb11eb1b:0:0:644:1|\
+              95c317ad865e0ac9b77454a6948bea25783ccc19aa52a25134386ee396362412:0:0:600:1|\
+              95c317ad865e0ac9b77454a6948bea25783ccc19aa52a25134386ee396362412:0:0:640:1|\
+              95c317ad865e0ac9b77454a6948bea25783ccc19aa52a25134386ee396362412:0:0:644:1) ;;
+              *) return 1 ;;
+            esac
+            canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+            [ "$canonical" = "$target" ] || return 1
+            parent=$(dirname -- "$target") || return 1
+            [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+            [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+            canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+            [ "$canonical" = "$parent" ] || return 1
+            parent_mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
+            [[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] && \
+              [ $((8#$parent_mode & 8#022)) -eq 0 ]
+          }
+          recovery_dropin_dir_is_safe_for_reset() {
+            local target=/etc/systemd/system/rr-update-recovery.service.d
+            local canonical="" parent="" mode="" entry=""
+            if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+              return 0
+            fi
+            [ -d "$target" ] && [ ! -L "$target" ] || return 1
+            mountpoint -q "$target" && return 1
+            [ "$(stat -c '%u:%g' -- "$target" 2>/dev/null)" = 0:0 ] || return 1
+            canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+            [ "$canonical" = "$target" ] || return 1
+            mode=$(stat -c %a -- "$target" 2>/dev/null) || return 1
+            [[ "$mode" =~ ^[0-7]{3,4}$ ]] && \
+              [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+            parent=$(dirname -- "$target") || return 1
+            [ "$(readlink -f -- "$parent" 2>/dev/null)" = "$parent" ] && \
+              [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || \
+              return 1
+            entry=$(find "$target" -mindepth 1 -maxdepth 1 -printf x -quit \
+              2>/dev/null) || return 1
+            [ -z "$entry" ]
+          }
+          reset_recovery_runtime_for_v710_fixture() {
+            local cleanup_root="$1" unit=rr-update-recovery.service
+            local unit_file=/etc/systemd/system/rr-update-recovery.service
+            local dropin_dir="${unit_file}.d" load_state="" active_state=""
+            local fragment="" dropins="" dropin=""
+            recovery_helper_is_known_for_reset \
+              /usr/local/sbin/rr-update-recover \
+              "$cleanup_root/scripts/update-recover.sh" \
+              2243e4b3c9199a100b0725cbec5b333a1897fe9367b0c222e8536da26531b9ec || \
+              return 1
+            recovery_helper_is_known_for_reset \
+              /usr/local/sbin/rr-update-external-state \
+              "$cleanup_root/scripts/update-external-state.py" \
+              dfc878951a4bb9d8b43523b767314ebc8254d4ad64b3a606b569255190916e4a || \
+              return 1
+            recovery_unit_is_known_for_reset || return 1
+            recovery_dropin_dir_is_safe_for_reset || return 1
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || \
+              return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || \
+              return 1
+            fragment=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null) || \
+              return 1
+            dropins=$(systemctl show -p DropInPaths --value "$unit" 2>/dev/null) || \
+              return 1
+            case "$active_state" in inactive|failed) ;; *) return 1 ;; esac
+            if [ "$load_state" = loaded ]; then
+              [ "$fragment" = "$unit_file" ] || return 1
+              for dropin in $dropins; do
+                case "$dropin" in "$dropin_dir"/*) ;; *) return 1 ;; esac
+              done
+            else
+              [ "$load_state" = not-found ] && \
+                [ -z "${fragment//[[:space:]]/}" ] && \
+                [ -z "${dropins//[[:space:]]/}" ] || return 1
+            fi
+            systemctl disable "$unit" >/dev/null 2>&1 || true
+            rm -f -- "$unit_file" \
+              /usr/local/sbin/rr-update-recover \
+              /usr/local/sbin/rr-update-external-state
+            if [ -d "$dropin_dir" ]; then
+              rmdir -- "$dropin_dir" || return 1
+            fi
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            for target in "$unit_file" "$dropin_dir" \
+              /usr/local/sbin/rr-update-recover \
+              /usr/local/sbin/rr-update-external-state \
+              /var/lib/rr-update/active; do
+              [ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+            done
+            assert_unit_state "$unit" not-found:inactive:not-found
+          }
+          assert_pure_v710_recovery_runtime() {
+            local unit=rr-update-recovery.service
+            local unit_file=/etc/systemd/system/rr-update-recovery.service
+            local active_file=/var/lib/rr-update/active active_tx="" canonical=""
+            local recovery_sha="" unit_sha="" fragment="" dropins=""
+            local environment="" unit_umask="" exec_start=""
+            [ -f /usr/local/sbin/rr-update-recover ] && \
+              [ ! -L /usr/local/sbin/rr-update-recover ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' /usr/local/sbin/rr-update-recover)" = \
+              0:0:755:1 ] || return 1
+            recovery_sha=$(sha256sum /usr/local/sbin/rr-update-recover | \
+              awk '{print $1}') || return 1
+            [ "$recovery_sha" = \
+              2243e4b3c9199a100b0725cbec5b333a1897fe9367b0c222e8536da26531b9ec ] || \
+              return 1
+            [ ! -e /usr/local/sbin/rr-update-external-state ] && \
+              [ ! -L /usr/local/sbin/rr-update-external-state ] || return 1
+            [ -f "$unit_file" ] && [ ! -L "$unit_file" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$unit_file")" = 0:0:600:1 ] || return 1
+            unit_sha=$(sha256sum "$unit_file" | awk '{print $1}') || return 1
+            [ "$unit_sha" = \
+              95c317ad865e0ac9b77454a6948bea25783ccc19aa52a25134386ee396362412 ] || \
+              return 1
+            [ ! -e "${unit_file}.d" ] && [ ! -L "${unit_file}.d" ] || return 1
+            assert_unit_state "$unit" loaded:inactive:enabled || return 1
+            fragment=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null) || \
+              return 1
+            dropins=$(systemctl show -p DropInPaths --value "$unit" 2>/dev/null) || \
+              return 1
+            environment=$(systemctl show -p Environment --value "$unit" 2>/dev/null) || \
+              return 1
+            unit_umask=$(systemctl show -p UMask --value "$unit" 2>/dev/null) || return 1
+            exec_start=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null) || \
+              return 1
+            [ "$fragment" = "$unit_file" ] && \
+              [ -z "${dropins//[[:space:]]/}" ] && \
+              [ -z "${environment//[[:space:]]/}" ] && \
+              [ "$unit_umask" = 0022 ] || return 1
+            [[ "$exec_start" = *'path=/usr/local/sbin/rr-update-recover'* ]] && \
+              [[ "$exec_start" = *'argv[]=/usr/local/sbin/rr-update-recover recover'* ]] && \
+              [[ "$exec_start" = *'ignore_errors=no'* ]] || return 1
+            [ -f "$active_file" ] && [ ! -L "$active_file" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$active_file")" = 0:0:600:1 ] || return 1
+            mapfile -t active_lines < "$active_file"
+            [ "${#active_lines[@]}" -eq 1 ] || return 1
+            active_tx="${active_lines[0]}"
+            case "$active_tx" in /var/lib/rr-update/transactions/*) ;; *) return 1 ;; esac
+            [ -d "$active_tx" ] && [ ! -L "$active_tx" ] || return 1
+            canonical=$(readlink -f -- "$active_tx" 2>/dev/null) || return 1
+            [ "$canonical" = "$active_tx" ] || return 1
+            [ "$(stat -c '%u:%g:%a' "$active_tx")" = 0:0:700 ] || return 1
+            [ "$(cat "$active_tx/phase")" = committed ]
+          }
           quarantine_fully_absent() {
             local artifact="" backend="" rules=""
             for artifact in \
@@ -711,6 +889,7 @@ jobs:
           test ! -e /run/rr-vps/update-maintenance
           test ! -L /run/rr-vps/update-maintenance
           test "$(systemctl show -p LoadState --value rr-nexus.service 2>/dev/null)" = not-found
+          reset_recovery_runtime_for_v710_fixture "$cleanup_runtime"
           unset stale_subscription_pids
           rm -rf "$cleanup_runtime"
           printf 'preclean-complete\n' > /root/rr-audit-stage
@@ -734,6 +913,7 @@ jobs:
           RR_BUNDLE_FILE="$old/rr-bundle.tar.gz" RR_GUARD_FILE="$old/update-guard.sh" \
             bash "$old/install-core.sh" --upgrade >/root/rr-audit-old-core.log 2>&1
           /usr/local/bin/rr --version | grep -F 'RR-vps 7.1.0' >/dev/null
+          assert_pure_v710_recovery_runtime
 
           bash -c '
               set -eo pipefail
@@ -1032,6 +1212,7 @@ jobs:
             assert_product_quarantine_firewall
           }
 
+          assert_pure_v710_recovery_runtime
           install_candidate >/root/rr-audit-upgrade.log 2>&1
           assert_candidate_runtime
           printf 'first-upgrade-complete\n' > /root/rr-audit-stage

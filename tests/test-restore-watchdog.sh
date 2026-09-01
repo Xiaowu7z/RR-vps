@@ -38,11 +38,14 @@ rr_test_restore_marker_view_systemctl() {
                 *) printf '%s\n' no ;;
             esac
             ;;
+        SystemCallFilter)
+            printf '%s\n' "${RR_TEST_RESTORE_SYSTEM_CALL_FILTER:-~}"
+            ;;
         User|Group|RootDirectory|RootImage|MountImages|ExtensionImages|\
         ExtensionDirectories|TemporaryFileSystem|BindPaths|BindReadOnlyPaths|\
         InaccessiblePaths|JoinsNamespaceOf|ReadOnlyPaths|ReadWritePaths|\
         EnvironmentFiles|PassEnvironment|UnsetEnvironment|PAMName|\
-        SystemCallFilter|Environment|Conditions|Asserts)
+        Environment|Conditions|Asserts)
             printf '\n'
             ;;
         *) return 1 ;;
@@ -498,6 +501,12 @@ printf '%s\n' '[5/9] recovery and watchdog units install bounded gates'
         echo 'Restore and firewall effective gate sets did not coexist.' >&2
         exit 1
     }
+    RR_TEST_RESTORE_SYSTEM_CALL_FILTER='~@privileged'
+    if rr_restore_effective_gate_is_exact sing-box.service; then
+        echo 'Restore gate accepted a non-default system-call filter.' >&2
+        exit 1
+    fi
+    RR_TEST_RESTORE_SYSTEM_CALL_FILTER='~'
     ignore_restore_condition=true
     if rr_restore_effective_gate_is_exact sing-box.service; then
         echo 'Combined gate proof accepted an ignored -/usr/local/bin/rr --restore-service-gate condition.' >&2

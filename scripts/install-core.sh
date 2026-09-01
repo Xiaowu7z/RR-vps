@@ -2461,6 +2461,27 @@ WantedBy=multi-user.target
 EOF
 }
 
+rr_render_legacy_v710_update_recovery_unit() {
+    # v7.1.0 wrote this file under the installer's inherited umask, so a
+    # production unit can legitimately be 0600, 0640 or 0644.  Keep the
+    # historical bytes here instead of admitting an arbitrary older unit.
+    cat <<'EOF'
+[Unit]
+Description=RR-vps interrupted update recovery
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target
+ConditionPathExists=/var/lib/rr-update/active
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rr-update-recover recover
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 rr_update_recovery_unit_file_is_exact() {
     local target="$RR_UPDATE_RECOVERY_UNIT_FILE" canonical="" parent="" mode=""
     [ -f "$target" ] && [ ! -L "$target" ] && \
@@ -2476,6 +2497,28 @@ rr_update_recovery_unit_file_is_exact() {
     mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ $((8#$mode & 8#022)) -eq 0 ] || return 1
     cmp -s -- "$target" <(rr_render_update_recovery_unit)
+}
+
+rr_legacy_v710_update_recovery_unit_file_is_exact() {
+    local target="$RR_UPDATE_RECOVERY_UNIT_FILE" canonical="" parent="" mode=""
+    local metadata=""
+    [[ "$target" = /* ]] || return 1
+    [ -f "$target" ] && [ ! -L "$target" ] || return 1
+    metadata=$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null) || return 1
+    case "$metadata" in
+        0:0:600:1|0:0:640:1|0:0:644:1) ;;
+        *) return 1 ;;
+    esac
+    canonical=$(readlink -f -- "$target" 2>/dev/null) || return 1
+    [ "$canonical" = "$target" ] || return 1
+    parent=$(dirname -- "$target") || return 1
+    [ -d "$parent" ] && [ ! -L "$parent" ] && \
+        [ "$(stat -c '%u:%g' -- "$parent" 2>/dev/null)" = 0:0 ] || return 1
+    canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+    [ "$canonical" = "$parent" ] || return 1
+    mode=$(stat -c %a -- "$parent" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    cmp -s -- "$target" <(rr_render_legacy_v710_update_recovery_unit)
 }
 
 rr_recovery_helper_file_is_safe() {
@@ -2501,7 +2544,13 @@ rr_recovery_helper_source_is_safe() {
     canonical=$(readlink -f -- "$source" 2>/dev/null) || return 1
     [ "$canonical" = "$source" ] || return 1
     metadata=$(stat -c '%u:%g:%a:%h' -- "$source" 2>/dev/null) || return 1
-    case "$metadata" in 0:0:755:1|0:0:644:1) ;; *) return 1 ;; esac
+    # tar --no-same-permissions applies the caller's umask.  The release
+    # archive is already digest- and member-validated, so under umask 077 its
+    # regular helper sources safely arrive as 0600/0700 rather than 0644/0755.
+    case "$metadata" in
+        0:0:755:1|0:0:700:1|0:0:644:1|0:0:600:1) ;;
+        *) return 1 ;;
+    esac
 }
 
 rr_recovery_helper_is_owned_or_absent() {
@@ -2524,33 +2573,9 @@ rr_recovery_helper_is_exact() {
         cmp -s -- "$target" "$candidate"
 }
 
-rr_update_recovery_effective_identity_is_exact() {
-    local load_state="" fragment="" dropins="" exec_start=""
-    local exec_start_pre="" exec_reload="" exec_condition=""
-    local user="" group="" working_directory="" dynamic_user=""
-    local private_users="" private_mounts="" root_directory="" root_image=""
-    local environment="" service_type="" remain_after_exit=""
-    local version_line="" systemd_version="" root_ephemeral=no
-    local property="" value="" protect_home="" protect_system=""
-    local -a empty_properties=(
-        RootDirectory RootImage MountImages ExtensionImages
-        ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths
-        InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths
-        EnvironmentFiles PassEnvironment UnsetEnvironment PAMName
-        SystemCallFilter
-    )
-    rr_update_recovery_unit_file_is_exact || return 1
-    load_state=$(systemctl show --property=LoadState --value \
-        rr-update-recovery.service 2>/dev/null) || return 1
-    fragment=$(systemctl show --property=FragmentPath --value \
-        rr-update-recovery.service 2>/dev/null) || return 1
-    dropins=$(systemctl show --property=DropInPaths --value \
-        rr-update-recovery.service 2>/dev/null) || return 1
-    [ "$load_state" = loaded ] && [ "$fragment" = "$RR_UPDATE_RECOVERY_UNIT_FILE" ] && \
-        [ -z "${dropins//[[:space:]]/}" ] || return 1
-    exec_start=$(systemctl show --property=ExecStart --value \
-        rr-update-recovery.service 2>/dev/null) || return 1
-    python3 - "$exec_start" <<'PY' || return 1
+rr_update_recovery_exec_start_is_exact() {
+    local exec_start="$1"
+    python3 - "$exec_start" <<'PY'
 import re
 import sys
 
@@ -2583,13 +2608,52 @@ if (
 ):
     raise SystemExit(1)
 PY
+}
+
+rr_update_recovery_effective_identity_matches() {
+    local unit_file_validator="$1" expected_environment="$2" expected_umask="$3"
+    local load_state="" fragment="" dropins="" exec_start=""
+    local exec_start_pre="" exec_start_post="" exec_stop="" exec_stop_post=""
+    local exec_reload="" exec_condition=""
+    local user="" group="" working_directory="" dynamic_user=""
+    local private_users="" private_mounts="" root_directory="" root_image=""
+    local environment="" unit_umask="" service_type="" remain_after_exit=""
+    local version_line="" systemd_version="" root_ephemeral=no
+    local property="" value="" protect_home="" protect_system=""
+    local -a empty_properties=(
+        RootDirectory RootImage MountImages ExtensionImages
+        ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths
+        InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths
+        EnvironmentFiles PassEnvironment UnsetEnvironment PAMName
+    )
+    "$unit_file_validator" || return 1
+    load_state=$(systemctl show --property=LoadState --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    fragment=$(systemctl show --property=FragmentPath --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    dropins=$(systemctl show --property=DropInPaths --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$load_state" = loaded ] && [ "$fragment" = "$RR_UPDATE_RECOVERY_UNIT_FILE" ] && \
+        [ -z "${dropins//[[:space:]]/}" ] || return 1
+    exec_start=$(systemctl show --property=ExecStart --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    rr_update_recovery_exec_start_is_exact "$exec_start" || return 1
     exec_start_pre=$(systemctl show --property=ExecStartPre --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    exec_start_post=$(systemctl show --property=ExecStartPost --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    exec_stop=$(systemctl show --property=ExecStop --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    exec_stop_post=$(systemctl show --property=ExecStopPost --value \
         rr-update-recovery.service 2>/dev/null) || return 1
     exec_reload=$(systemctl show --property=ExecReload --value \
         rr-update-recovery.service 2>/dev/null) || return 1
     exec_condition=$(systemctl show --property=ExecCondition --value \
         rr-update-recovery.service 2>/dev/null) || return 1
     [ -z "${exec_start_pre//[[:space:]]/}" ] && \
+        [ -z "${exec_start_post//[[:space:]]/}" ] && \
+        [ -z "${exec_stop//[[:space:]]/}" ] && \
+        [ -z "${exec_stop_post//[[:space:]]/}" ] && \
         [ -z "${exec_reload//[[:space:]]/}" ] && \
         [ -z "${exec_condition//[[:space:]]/}" ] || return 1
     user=$(systemctl show --property=User --value rr-update-recovery.service \
@@ -2614,6 +2678,9 @@ PY
             rr-update-recovery.service 2>/dev/null) || return 1
         [ -z "$value" ] || return 1
     done
+    value=$(systemctl show --property=SystemCallFilter --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$value" = '~' ] || return 1
     version_line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
     [[ "$version_line" =~ ^systemd[[:space:]]+([0-9]+)([[:space:]]|$) ]] || \
         return 1
@@ -2631,7 +2698,10 @@ PY
     [ "$protect_system" = no ] || return 1
     environment=$(systemctl show --property=Environment --value \
         rr-update-recovery.service 2>/dev/null) || return 1
-    [ "$environment" = RR_UPDATE_RECOVERY_SERVICE=1 ] || return 1
+    [ "$environment" = "$expected_environment" ] || return 1
+    unit_umask=$(systemctl show --property=UMask --value \
+        rr-update-recovery.service 2>/dev/null) || return 1
+    [ "$unit_umask" = "$expected_umask" ] || return 1
     service_type=$(systemctl show --property=Type --value \
         rr-update-recovery.service 2>/dev/null) || return 1
     remain_after_exit=$(systemctl show --property=RemainAfterExit --value \
@@ -2639,12 +2709,23 @@ PY
     [ "$service_type" = oneshot ] && [ "$remain_after_exit" = no ]
 }
 
+rr_update_recovery_effective_identity_is_exact() {
+    rr_update_recovery_effective_identity_matches \
+        rr_update_recovery_unit_file_is_exact RR_UPDATE_RECOVERY_SERVICE=1 0077
+}
+
+rr_legacy_v710_update_recovery_effective_identity_is_exact() {
+    rr_update_recovery_effective_identity_matches \
+        rr_legacy_v710_update_recovery_unit_file_is_exact "" 0022
+}
+
 rr_update_recovery_unit_is_owned_or_absent() {
     local dropin_dir="${RR_UPDATE_RECOVERY_UNIT_FILE}.d" load_state=""
     local fragment="" dropins=""
     if [ -e "$RR_UPDATE_RECOVERY_UNIT_FILE" ] || \
        [ -L "$RR_UPDATE_RECOVERY_UNIT_FILE" ]; then
-        rr_update_recovery_effective_identity_is_exact
+        rr_update_recovery_effective_identity_is_exact || \
+            rr_legacy_v710_update_recovery_effective_identity_is_exact
         return
     fi
     if [ -e "$dropin_dir" ] || [ -L "$dropin_dir" ]; then
@@ -2803,7 +2884,10 @@ rr_snapshot_runtime() {
     # Resolve a prior durable transaction first.  The new transaction records
     # every writer state and publishes its active pointer before stopping even
     # the health timer, so SIGKILL never leaves an untracked frozen writer.
-    rr_prepare_recovery_runtime || return 1
+    rr_prepare_recovery_runtime || {
+        rr_error "更新前快照失败：recovery-runtime 阶段未能建立受信任恢复环境。"
+        return 1
+    }
     rr_discard_previous_transaction || return 1
     rr_prune_stale_transactions || return 1
     if declare -F rr_capture_update_writer_state >/dev/null; then
@@ -3225,7 +3309,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "e8101e848baf368c464b2f61a1e95378780bcde0ee5f8d016515d7bc41f81f8d" ] && \
+        if [ "$actual" = "59ff88caf9c11b74394b8828c7c50f3d0934861a38d6d07cb7fd390eca306157" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \

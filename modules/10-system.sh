@@ -958,9 +958,10 @@ rr_firewall_effective_root_marker_view_is_safe() {
         "$temporary_filesystems" "$bind_paths" "$bind_read_only_paths" \
         "$inaccessible_paths" "$joins_namespace_of" "$read_only_paths" \
         "$read_write_paths" "$environment" "$environment_files" \
-        "$pass_environment" "$pam_name" "$system_call_filter"; do
+        "$pass_environment" "$pam_name"; do
         [ -z "$value" ] || return 1
     done
+    [ "$system_call_filter" = '~' ] || return 1
     [ "$root_ephemeral" = no ] || return 1
     # ProtectSystem only changes write access; all supported values retain the
     # same readable path/inode view needed by `test -e/-L`.
