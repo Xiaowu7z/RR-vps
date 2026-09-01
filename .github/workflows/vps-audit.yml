@@ -1263,7 +1263,8 @@ jobs:
                 exit 1
                 ;;
             esac
-            reconnect_opts=("${ssh_opts[@]}" -o ConnectTimeout=5 -o ConnectionAttempts=1)
+            reconnect_opts=(-o ConnectTimeout=5 -o ConnectionAttempts=1 \
+              "${ssh_opts[@]}")
             postboot_id=""
             for reconnect_attempt in $(seq 1 36); do
               sleep 3
@@ -1394,9 +1395,17 @@ jobs:
               [ "$release_failed" = false ] || state=error
               printf '%s\n' "$state"
             }
-            rr_firewall_fail_closed_quarantine_active || exit 4
-            rr_uninstall_firewall_quarantine_artifacts_are_owned || exit 4
-            rr_audit_quarantine_supervisor_is_settled || exit 4
+            supervisor_settled=false
+            for settle_attempt in $(seq 1 20); do
+              rr_firewall_fail_closed_quarantine_active || exit 4
+              rr_uninstall_firewall_quarantine_artifacts_are_owned || exit 4
+              if rr_audit_quarantine_supervisor_is_settled; then
+                supervisor_settled=true
+                break
+              fi
+              sleep 1
+            done
+            [ "$supervisor_settled" = true ] || exit 4
             rr_update_recovery_unit_is_owned || exit 4
             recovery_load=$(systemctl show rr-update-recovery.service \
               --property=LoadState --value 2>/dev/null) || exit 4
