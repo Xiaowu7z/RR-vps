@@ -1314,6 +1314,7 @@ jobs:
           reboot_cleared_gate=not-invoked
           reboot_old_ambiguity=not-invoked
           reboot_current_ambiguity=not-invoked
+          supervisor_release=not-invoked
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1434,6 +1435,7 @@ jobs:
             if [ "$remediation_failed" = false ] && \
                rr_audit_product_evidence_present; then
               rr_audit_original_stop_nodes_definition=""
+              rr_audit_original_deactivate_definition=""
               if [ "$reboot_cleared_owned" = true ]; then
                 rr_audit_original_stop_nodes_definition=$(declare -f \
                   rr_firewall_stop_nodes_on_indeterminate_commit) || \
@@ -1456,6 +1458,31 @@ jobs:
                     rr_audit_original_stop_nodes_on_indeterminate_commit
                   }
                 fi
+                if [ "$remediation_failed" = false ]; then
+                  rr_audit_original_deactivate_definition=$(declare -f \
+                    rr_firewall_deactivate_quarantine_retry) || \
+                    remediation_failed=true
+                fi
+                if [ "$remediation_failed" = false ]; then
+                  rr_audit_renamed_deactivate_definition=${rr_audit_original_deactivate_definition/#rr_firewall_deactivate_quarantine_retry/rr_audit_original_deactivate_quarantine_retry}
+                  eval "$rr_audit_renamed_deactivate_definition" || \
+                    remediation_failed=true
+                fi
+                if [ "$remediation_failed" = false ]; then
+                  rr_audit_deactivate_gate_once=true
+                  rr_firewall_deactivate_quarantine_retry() {
+                    if [ "$rr_audit_deactivate_gate_once" = true ]; then
+                      rr_audit_deactivate_gate_once=false
+                      if rr_audit_reboot_cleared_quarantine_is_owned && \
+                         rr_audit_quarantine_supervisor_is_quiescent; then
+                        supervisor_release=quiescent-owned
+                        return 0
+                      fi
+                      supervisor_release=fallback
+                    fi
+                    rr_audit_original_deactivate_quarantine_retry
+                  }
+                fi
               fi
               exec 9>"$trace"
               PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
@@ -1474,6 +1501,12 @@ jobs:
                 eval "$rr_audit_original_stop_nodes_definition" || \
                   raw_uninstall_rc=2
                 unset -f rr_audit_original_stop_nodes_on_indeterminate_commit \
+                  2>/dev/null || true
+              fi
+              if [ -n "$rr_audit_original_deactivate_definition" ]; then
+                eval "$rr_audit_original_deactivate_definition" || \
+                  raw_uninstall_rc=2
+                unset -f rr_audit_original_deactivate_quarantine_retry \
                   2>/dev/null || true
               fi
               chmod 600 "$trace" "$product_log"
@@ -1547,6 +1580,8 @@ jobs:
             "$diag_nonce" "$role" "$reboot_old_ambiguity"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_current_ambiguity=%s\n' \
             "$diag_nonce" "$role" "$reboot_current_ambiguity"
+          printf 'SAFE_DIAG nonce=%s role=%s supervisor_release=%s\n' \
+            "$diag_nonce" "$role" "$supervisor_release"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
@@ -1638,6 +1673,7 @@ jobs:
                [[ "$payload" =~ ^reboot_cleared_gate=(not-invoked|role-rejected|tempdir-failed|tempdir-meta-failed|config-load-failed|lock-failed|quarantine-inactive|quarantine-load-failed|kind-invalid|evidence-untrusted|artifacts-unowned|supervisor-unsettled|persistence-present|old-managed-absent|old-managed-error|old-ambiguous|old-ambiguity-error|current-capture-failed|current-verify-failed|current-managed-present|current-managed-error|current-ambiguous|current-ambiguity-error|current-specific-ambiguous|current-specific-error|release-failed|tempdir-cleanup-failed|owned)$ ]] ||
                [[ "$payload" =~ ^reboot_old_ambiguity=(not-invoked|observed|absent)$ ]] ||
                [[ "$payload" =~ ^reboot_current_ambiguity=(not-invoked|absent|broad-only|specific|error)$ ]] ||
+               [[ "$payload" =~ ^supervisor_release=(not-invoked|quiescent-owned|fallback)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
