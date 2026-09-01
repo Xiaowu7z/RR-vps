@@ -131,20 +131,22 @@ with tempfile.TemporaryDirectory() as directory:
         *,
         mode: str = "public",
         sub_port: int = 0,
+        public_port: int = 8443,
+        ssh_host: str = "9.9.9.9",
     ) -> rr_nexus.NexusConfig:
         payload = {
             "mode": mode,
             "listen": "127.0.0.1",
             "port": 7900,
-            "public_port": 8443,
+            "public_port": public_port,
             "domain": domain,
             "database": str(root / "nexus.db"),
             "subscription_root": str(subscription_root),
             "published_subscription_root": str(published_root),
             "stats_port": 39091,
-            # The public identity must come from domain, never this mutable SSH
-            # convenience address.
-            "ssh_host": "9.9.9.9",
+            # Modern public identities come from domain.  ssh_host remains
+            # only for the legacy domain="ip" compatibility sentinel.
+            "ssh_host": ssh_host,
             "sub_port": sub_port,
             "subscription_access_mode": "local",
             "subscription_domain": "",
@@ -166,6 +168,7 @@ with tempfile.TemporaryDirectory() as directory:
     # The short-lived IP profile is checked at six hours, never at the
     # seven-day DNS threshold which would reject every 160-hour IP certificate.
     config = activate(IPV4)
+    assert config.access_url == f"https://{IPV4}:8443"
     calls.clear()
     assert rr_nexus.remote_cert_check(config) == (True, "")
     checkend = next(argv for argv in calls if "-checkend" in argv)
@@ -195,6 +198,30 @@ with tempfile.TemporaryDirectory() as directory:
     assert primary == expected_base + "/txt", primary
     assert len(urls) == 9
     assert config.access_url == f"https://[{IPV6}]:8443"
+
+    # The server is the single authority for panel URL serialization: default
+    # HTTPS omits :443, while local mode uses the chosen tunnel-facing port.
+    assert activate(IPV4, public_port=443).access_url == f"https://{IPV4}"
+    assert activate(IPV6, public_port=443).access_url == f"https://[{IPV6}]"
+    assert activate(
+        "panel.example.com", "certbot-domain", public_port=443
+    ).access_url == "https://panel.example.com"
+    assert activate(
+        "panel.example.com", "certbot-domain", public_port=18443
+    ).access_url == "https://panel.example.com:18443"
+    assert activate(
+        "ip", "certbot-ip", public_port=18443, ssh_host=IPV4
+    ).access_url == f"https://{IPV4}:18443"
+    assert activate(
+        "ip", "certbot-ip", public_port=18443, ssh_host=IPV6
+    ).access_url == f"https://[{IPV6}]:18443"
+    assert activate(
+        "", "none", mode="local", public_port=24888
+    ).access_url == "http://127.0.0.1:24888"
+
+    # Restore the trusted IPv6 fixture used by QR and remote-key assertions.
+    config = activate(IPV6)
+    primary, urls = handler._device_subscription_urls(device)
 
     # All nine QR selections and the authenticated remote raw compatibility
     # path rebuild/whitelist the same trusted URLs server-side.

@@ -376,6 +376,7 @@ def test_session_transport_isolation() -> None:
             subscription_root=root / "subscriptions",
             published_subscription_root=root / "published",
             stats_port=39091, ssh_host="127.0.0.1", secure_cookie=False,
+            public_port=18443,
         )
         state = rr_nexus.NexusState(config)
         password = "local tunnel password"
@@ -444,6 +445,8 @@ def test_session_transport_isolation() -> None:
                 headers={"Authorization": f"Bearer {legacy_token}"},
             )
             assert status == 200 and not legacy_session["authenticated"]
+            assert "public_port" not in legacy_session
+            assert "access_url" not in legacy_session
 
             status, headers, login = request_json(
                 opener,
@@ -480,6 +483,9 @@ def test_session_transport_isolation() -> None:
                 opener, panel_url + "/api/session", headers=bearer
             )
             assert status == 200 and session["authenticated"]
+            assert session["port"] == 7900
+            assert session["public_port"] == 18443
+            assert session["access_url"] == "http://127.0.0.1:18443"
             csrf = str(session["csrf"])
             status, _, remote_servers = request_json(
                 opener, panel_url + "/api/remote-servers", headers=bearer
@@ -595,7 +601,8 @@ def test_session_transport_isolation() -> None:
             state.config = replace(
                 config,
                 mode="public",
-                domain="panel.example.com",
+                domain="2606:4700:4700::1111",
+                public_port=8443,
                 secure_cookie=True,
             )
             status, headers, public_login = request_json(
@@ -640,6 +647,9 @@ def test_session_transport_isolation() -> None:
                 headers=public_bearer,
             )
             assert status == 200 and session["authenticated"]
+            assert session["port"] == 7900
+            assert session["public_port"] == 8443
+            assert session["access_url"] == "https://[2606:4700:4700::1111]:8443"
             status, _, remote_servers = request_json(
                 opener,
                 panel_url + "/api/remote-servers",
@@ -677,6 +687,17 @@ def test_session_transport_isolation() -> None:
             assert "function completeSecurityChange(message)" in app_source
             assert '$$("dialog[open]").forEach(dialog => dialog.close())' in app_source
             assert "linksDialogGeneration" in app_source
+            assert "session.public_port || session.port || 7900" in app_source
+            assert 'String(session.access_url || "")' in app_source
+            assert "-L ${state.publicPort}:127.0.0.1:${state.backendPort}" in app_source
+            assert 'const publicUrl = state.mode === "public" && state.accessUrl' in app_source
+            assert 'publicUrl = `https://${state.domain}`' not in app_source
+            assert '$("#public-guide").classList.toggle("hidden", !isPublic)' in app_source
+            assert '$("#public-guide").classList.remove("hidden")' not in app_source
+            assert app_source.count('$("#subscription-empty").classList.toggle') == 2
+            index_source = (ROOT / "nexus/static/index.html").read_text(encoding="utf-8")
+            assert "当前没有可用的个人订阅地址。" in index_source
+            assert "当前没有可用的可信 HTTPS 个人订阅地址。" not in index_source
             admin_source = (ROOT / "nexus/static/admin.js").read_text(encoding="utf-8")
             assert 'releaseAuthenticatedImage($("#totp-qr"))' in admin_source
             assert "totpSetupGeneration" in admin_source

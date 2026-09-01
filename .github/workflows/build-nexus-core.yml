@@ -16,6 +16,11 @@ on:
         description: Full main commit SHA that already passed CI
         required: true
         type: string
+      bootstrap_legacy_latest:
+        description: One-time v7.2 migration using the pinned legacy Core Latest
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "17 3 * * *"
 
@@ -125,6 +130,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          BOOTSTRAP_LEGACY_LATEST: ${{ inputs.bootstrap_legacy_latest }}
         run: |
           set -euo pipefail
 
@@ -157,22 +163,126 @@ jobs:
             fi
           }
 
+          pinned_legacy_latest_bootstrap_allowed() {
+            local latest_json="$1" target_tag="" legacy_ref="" releases="" refs=""
+            target_tag="${TAG:-${release_tag:-}}"
+            [ "$GITHUB_REPOSITORY" = Xiaowu7z/RR-vps ] &&
+              [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] &&
+              [ "${BOOTSTRAP_LEGACY_LATEST:-false}" = true ] &&
+              [ "$RR_NEXUS_CORE_VERSION" = 1.14.0 ] &&
+              [ "$RR_NEXUS_CORE_TAG" = v1.14.0 ] &&
+              [ "$target_tag" = rr-nexus-core-v1.14.0-r1 ] || return 1
+            jq -e '
+              .id == 377802786 and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786" and
+              .assets_url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets" and
+              .upload_url == "https://uploads.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets{?name,label}" and
+              .html_url == "https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.19" and
+              .tag_name == "rr-nexus-core-v1.13.19" and
+              .target_commitish == "ad69c42e6c6f468b6c643da06e7a461de7d773f3" and
+              .name == "RR Nexus traffic core · sing-box 1.13.19" and
+              .draft == false and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              .created_at == "2026-08-27T12:25:26Z" and
+              .published_at == "2026-08-27T12:26:19Z" and
+              .body == "Built from the official SagerNet/sing-box v1.13.19 source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand." and
+              ([.assets[] | {
+                id, name, state, size, digest, url, browser_download_url,
+                uploader: .uploader.login
+              }] | sort_by(.id)) == ([
+                {id:532275339,name:"BUILD_INFO",state:"uploaded",size:185,
+                 digest:"sha256:bd5aaf67c5f45f4ce9a6065ddb5dc12cd08c50b502fdea39a9c67d5ac68bd96c",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275339",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/BUILD_INFO",
+                 uploader:"github-actions[bot]"},
+                {id:532275341,name:"rr-sing-box-1.13.19-linux-amd64.tar.gz",state:"uploaded",size:20610257,
+                 digest:"sha256:9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275341",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-amd64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275350,name:"rr-sing-box-1.13.19-linux-arm64.tar.gz",state:"uploaded",size:18978144,
+                 digest:"sha256:28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275350",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-arm64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275351,name:"SHA256SUMS",state:"uploaded",size:210,
+                 digest:"sha256:81a4d7114411705ae2af7c7b5e0bbf2c316a630558d2250a757cf6654760151b",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275351",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/SHA256SUMS",
+                 uploader:"github-actions[bot]"}
+              ] | sort_by(.id))
+            ' <<<"$latest_json" >/dev/null || return 1
+            legacy_ref=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/rr-nexus-core-v1.13.19") ||
+              return 1
+            jq -e '
+              .ref == "refs/tags/rr-nexus-core-v1.13.19" and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/git/refs/tags/rr-nexus-core-v1.13.19" and
+              .object.type == "commit" and
+              .object.sha == "ad69c42e6c6f468b6c643da06e7a461de7d773f3"
+            ' <<<"$legacy_ref" >/dev/null || return 1
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -e --argjson pinned "$latest_json" '
+              def material:
+                {
+                  id, url, assets_url, upload_url, html_url, tag_name,
+                  target_commitish, name, draft, prerelease, immutable,
+                  author: .author.login, created_at, published_at, body,
+                  assets: ([.assets[] | {
+                    id, name, state, size, digest, url, browser_download_url,
+                    uploader: .uploader.login
+                  }] | sort_by(.id))
+                };
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.tag_name | type) == "string" and
+                  (.tag_name as $tag |
+                    if ($tag | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($tag | capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)) and
+                ([$inventory[] | select((material) == ($pinned | material))] |
+                  length) == 1)
+            ' <<<"$releases" >/dev/null || return 1
+            refs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v") || return 1
+            jq -e '
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.ref | type) == "string" and
+                  (.ref as $ref |
+                    if ($ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($ref | capture("^refs/tags/v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)))
+            ' <<<"$refs" >/dev/null
+          }
+
           assert_product_latest() {
             local max_attempts="${1:-1}" attempt latest_json
             for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
-                jq -e '
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest"); then
+                if jq -e '
                   (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
                   (.target_commitish | test("^[0-9a-f]{40}$")) and
                   .draft == false and .prerelease == false and .immutable == true and
                   ([.assets[].name] | sort) ==
                   (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
                 ' <<<"$latest_json" >/dev/null; then
-                return 0
+                  return 0
+                fi
+                if pinned_legacy_latest_bootstrap_allowed "$latest_json"; then
+                  echo "::warning::Using the one-time pinned v7.2 legacy Latest bootstrap."
+                  return 0
+                fi
               fi
               [ "$attempt" -eq "$max_attempts" ] || sleep 2
             done
-            echo "Repository Latest is not an immutable complete product release." >&2
+            echo "Repository Latest is neither an immutable complete product nor the exact authorized v7.2 bootstrap release." >&2
             return 1
           }
 
@@ -643,6 +753,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          BOOTSTRAP_LEGACY_LATEST: ${{ inputs.bootstrap_legacy_latest }}
           IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
           TAG: ${{ needs.version.outputs.release_tag }}
           VERSION: ${{ needs.version.outputs.version }}
@@ -734,22 +845,127 @@ jobs:
             }
           }
 
+          pinned_legacy_latest_bootstrap_allowed() {
+            local latest_json="$1" target_tag="" legacy_ref="" releases="" refs=""
+            target_tag="${TAG:-${release_tag:-}}"
+            [ "$GITHUB_REPOSITORY" = Xiaowu7z/RR-vps ] &&
+              [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] &&
+              [ "${BOOTSTRAP_LEGACY_LATEST:-false}" = true ] &&
+              [ "$RR_NEXUS_CORE_VERSION" = 1.14.0 ] &&
+              [ "$RR_NEXUS_CORE_TAG" = v1.14.0 ] &&
+              [ "$target_tag" = rr-nexus-core-v1.14.0-r1 ] || return 1
+            jq -e '
+              .id == 377802786 and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786" and
+              .assets_url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets" and
+              .upload_url == "https://uploads.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets{?name,label}" and
+              .html_url == "https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.19" and
+              .tag_name == "rr-nexus-core-v1.13.19" and
+              .target_commitish == "ad69c42e6c6f468b6c643da06e7a461de7d773f3" and
+              .name == "RR Nexus traffic core · sing-box 1.13.19" and
+              .draft == false and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              .created_at == "2026-08-27T12:25:26Z" and
+              .published_at == "2026-08-27T12:26:19Z" and
+              .body == "Built from the official SagerNet/sing-box v1.13.19 source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand." and
+              ([.assets[] | {
+                id, name, state, size, digest, url, browser_download_url,
+                uploader: .uploader.login
+              }] | sort_by(.id)) == ([
+                {id:532275339,name:"BUILD_INFO",state:"uploaded",size:185,
+                 digest:"sha256:bd5aaf67c5f45f4ce9a6065ddb5dc12cd08c50b502fdea39a9c67d5ac68bd96c",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275339",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/BUILD_INFO",
+                 uploader:"github-actions[bot]"},
+                {id:532275341,name:"rr-sing-box-1.13.19-linux-amd64.tar.gz",state:"uploaded",size:20610257,
+                 digest:"sha256:9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275341",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-amd64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275350,name:"rr-sing-box-1.13.19-linux-arm64.tar.gz",state:"uploaded",size:18978144,
+                 digest:"sha256:28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275350",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-arm64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275351,name:"SHA256SUMS",state:"uploaded",size:210,
+                 digest:"sha256:81a4d7114411705ae2af7c7b5e0bbf2c316a630558d2250a757cf6654760151b",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275351",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/SHA256SUMS",
+                 uploader:"github-actions[bot]"}
+              ] | sort_by(.id))
+            ' <<<"$latest_json" >/dev/null || return 1
+            legacy_ref=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/rr-nexus-core-v1.13.19") ||
+              return 1
+            jq -e '
+              .ref == "refs/tags/rr-nexus-core-v1.13.19" and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/git/refs/tags/rr-nexus-core-v1.13.19" and
+              .object.type == "commit" and
+              .object.sha == "ad69c42e6c6f468b6c643da06e7a461de7d773f3"
+            ' <<<"$legacy_ref" >/dev/null || return 1
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -e --argjson pinned "$latest_json" '
+              def material:
+                {
+                  id, url, assets_url, upload_url, html_url, tag_name,
+                  target_commitish, name, draft, prerelease, immutable,
+                  author: .author.login, created_at, published_at, body,
+                  assets: ([.assets[] | {
+                    id, name, state, size, digest, url, browser_download_url,
+                    uploader: .uploader.login
+                  }] | sort_by(.id))
+                };
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.tag_name | type) == "string" and
+                  (.tag_name as $tag |
+                    if ($tag | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($tag | capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)) and
+                ([$inventory[] | select((material) == ($pinned | material))] |
+                  length) == 1)
+            ' <<<"$releases" >/dev/null || return 1
+            refs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v") || return 1
+            jq -e '
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.ref | type) == "string" and
+                  (.ref as $ref |
+                    if ($ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($ref | capture("^refs/tags/v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)))
+            ' <<<"$refs" >/dev/null
+          }
+
+
           assert_product_latest() {
             local max_attempts="${1:-1}" attempt latest_json
             for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
-                jq -e '
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest"); then
+                if jq -e '
                   (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
                   (.target_commitish | test("^[0-9a-f]{40}$")) and
                   .draft == false and .prerelease == false and .immutable == true and
                   ([.assets[].name] | sort) ==
                   (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
                 ' <<<"$latest_json" >/dev/null; then
-                return 0
+                  return 0
+                fi
+                if pinned_legacy_latest_bootstrap_allowed "$latest_json"; then
+                  echo "::warning::Using the one-time pinned v7.2 legacy Latest bootstrap."
+                  return 0
+                fi
               fi
               [ "$attempt" -eq "$max_attempts" ] || sleep 2
             done
-            echo "Repository Latest is not an immutable complete product release." >&2
+            echo "Repository Latest is neither an immutable complete product nor the exact authorized v7.2 bootstrap release." >&2
             return 1
           }
 

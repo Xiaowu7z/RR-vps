@@ -1028,14 +1028,10 @@ class NexusConfig:
     def access_url(self) -> str:
         if self.mode == "local":
             return "http://127.0.0.1:{}".format(self.public_port or self.port)
-        elif not self.domain or self.domain == "ip":
-            return "https://{}:{}".format(
-                _url_host(self.ssh_host), self.public_port or self.port
-            )
-        else:
-            return "https://{}:{}".format(
-                _url_host(self.domain), self.public_port or self.port
-            )
+        host = self.ssh_host if not self.domain or self.domain == "ip" else self.domain
+        port = self.public_port or self.port
+        base = "https://{}".format(_url_host(host))
+        return base if port == 443 else "{}:{}".format(base, port)
     ssh_host: str
     secure_cookie: bool
     traffic_mode: str = "both"
@@ -3332,7 +3328,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(
                     HTTPStatus.OK,
-                    {"authenticated": True, "username": session["username"], "csrf": session["csrf_token"], "mode": STATE.config.mode, "domain": STATE.config.domain, "port": STATE.config.port, "ssh_host": STATE.config.ssh_host},
+                    {
+                        "authenticated": True,
+                        "username": session["username"],
+                        "csrf": session["csrf_token"],
+                        "mode": STATE.config.mode,
+                        "domain": STATE.config.domain,
+                        "port": STATE.config.port,
+                        "public_port": STATE.config.public_port,
+                        "access_url": STATE.config.access_url,
+                        "ssh_host": STATE.config.ssh_host,
+                    },
                     self.legacy_session_cookie_headers(),
                 )
             return

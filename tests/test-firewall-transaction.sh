@@ -3914,12 +3914,24 @@ done
 )
 (
     transaction_root=$(mktemp -d)
-    MOCK_NETFILTER_ROOT="$transaction_root/not-created"
-    trap 'rm -rf "$MOCK_NETFILTER_ROOT" "$transaction_root"' EXIT
+    trap 'rm -rf "$transaction_root"' EXIT
     rollback="$transaction_root/rollback"
+    # Model the OS probe boundary explicitly.  Merely pointing the netfilter
+    # mock root at a missing directory does nothing unless the mock commands
+    # have been installed, and previously let a runner's real iptables become
+    # the authority under test.
+    rr_restore_firewall_ufw_state() {
+        printf -v "$1" '%s' absent
+    }
+    rr_restore_firewall_netfilter_state() {
+        case "$1" in iptables|ip6tables) ;; *) return 1 ;; esac
+        printf -v "$2" '%s' absent
+    }
     if rr_restore_capture_firewall_snapshot "$rollback" >/dev/null 2>&1; then
         fail 'portable snapshot accepted a target with no filter authority'
     fi
+    [ ! -e "$rollback/firewall/complete" ] || \
+        fail 'no-authority snapshot published a complete marker'
 )
 (
     setup_netfilter_mock

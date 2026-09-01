@@ -3637,7 +3637,13 @@ grep -Fq 'v2rayN（Windows）· 全协议' nexus/rr_nexus.py
 grep -Fq 'v2rayNG（安卓）· 全协议' nexus/rr_nexus.py
 grep -Fq 'SFA / SFI / SFM · VMess、Reality、HY2、TUIC、AnyTLS、Naive' nexus/rr_nexus.py
 grep -Fq 'id="rename-dialog"' nexus/static/index.html
-grep -Fq '/app.js?v=26' nexus/static/index.html
+grep -Fq 'id="subscription-empty"' nexus/static/index.html
+grep -Fq '当前没有可用的个人订阅地址。' nexus/static/index.html
+! grep -Fq '当前没有可用的可信 HTTPS 个人订阅地址。' nexus/static/index.html
+grep -Fq '公网 IP 模式还必须确保 TCP/80 可从公网访问' nexus/static/index.html
+grep -Fq '$("#public-guide").classList.toggle("hidden", !isPublic)' nexus/static/app.js
+! grep -Fq '$("#public-guide").classList.remove("hidden")' nexus/static/app.js
+grep -Fq '/app.js?v=27' nexus/static/index.html
 grep -Fq '/admin.js?v=4' nexus/static/index.html
 if grep -Fq '?raw=' nexus/static/app.js || \
    grep -Fq 'qr_query["raw"]' nexus/rr_nexus.py; then
@@ -3754,8 +3760,12 @@ fi
 grep -Fq '$run.head_branch == "main" and $run.event == "push"' .github/workflows/build-nexus-core.yml
 grep -Fq '.draft == false and .prerelease == false' .github/workflows/build-nexus-core.yml
 grep -Fq 'SOURCE_COMMIT=${SOURCE_SHA}' .github/workflows/build-nexus-core.yml
-if grep -Fq 'Latest release, refreshed' .github/workflows/build-nexus-core.yml; then
-    echo "Versioned Nexus core is still advertised as the repository latest release." >&2
+grep -Fq 'This immutable auxiliary release is consumed only by its versioned tag and never owns repository Latest.' \
+    .github/workflows/build-nexus-core.yml
+legacy_latest_claims=$(grep -Fc 'Latest release, refreshed' \
+    .github/workflows/build-nexus-core.yml || true)
+if [ "$legacy_latest_claims" -ne 2 ]; then
+    echo "Unexpected repository-Latest advertising outside the two exact legacy bootstrap pins." >&2
     exit 1
 fi
 if grep -Eq 'gh release (upload|edit|delete-asset).*\brr-nexus-core|--clobber' \
