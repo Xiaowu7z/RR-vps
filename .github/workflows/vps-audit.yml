@@ -1,4 +1,4 @@
-name: Temporary safe VPS pre-clean diagnostic
+name: Temporary safe VPS pre-clean remediation
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   diagnose:
-    name: Safe diagnostic · ${{ matrix.role }}
+    name: Safe remediation · ${{ matrix.role }}
     if: >-
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/audit/fix-v720-ip-acme-final'
@@ -44,20 +44,32 @@ jobs:
           python3 scripts/rebuild-bundle.py --check
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass
-      - name: Collect fixed-enum pre-clean evidence
+      - name: Remediate and report fixed-enum pre-clean state
         shell: bash
         env:
-          TARGET_HOST: ${{ matrix.role == 'A' && secrets.RR_A_HOST || (matrix.role == 'B' && secrets.RR_B_HOST || secrets.RR_C_HOST) }}
-          TARGET_PASS: ${{ matrix.role == 'A' && secrets.RR_A_PASS || (matrix.role == 'B' && secrets.RR_B_PASS || secrets.RR_C_PASS) }}
+          RR_A_HOST_VALUE: ${{ secrets.RR_A_HOST }}
+          RR_A_PASS_VALUE: ${{ secrets.RR_A_PASS }}
+          RR_B_HOST_VALUE: ${{ secrets.RR_B_HOST }}
+          RR_B_PASS_VALUE: ${{ secrets.RR_B_PASS }}
+          RR_C_HOST_VALUE: ${{ secrets.RR_C_HOST }}
+          RR_C_PASS_VALUE: ${{ secrets.RR_C_PASS }}
           TARGET_HOST_KEY: ${{ matrix.host_key }}
           TARGET_ROLE: ${{ matrix.role }}
         run: |
           set -euo pipefail
           set +x
-          export SSHPASS="$TARGET_PASS"
-          host="$TARGET_HOST"
           [[ "$TARGET_ROLE" =~ ^[ABC]$ ]]
+          case "$TARGET_ROLE" in
+            A) host="$RR_A_HOST_VALUE"; target_pass="$RR_A_PASS_VALUE" ;;
+            B) host="$RR_B_HOST_VALUE"; target_pass="$RR_B_PASS_VALUE" ;;
+            C) host="$RR_C_HOST_VALUE"; target_pass="$RR_C_PASS_VALUE" ;;
+          esac
+          unset RR_A_HOST_VALUE RR_A_PASS_VALUE RR_B_HOST_VALUE \
+            RR_B_PASS_VALUE RR_C_HOST_VALUE RR_C_PASS_VALUE
           test -n "$host"
+          test -n "$target_pass"
+          export SSHPASS="$target_pass"
+          unset target_pass
           [[ "$host" != *$'\n'* ]]
           [[ "$host" != *$'\r'* ]]
           [[ "$TARGET_HOST_KEY" != *$'\n'* ]]
@@ -146,6 +158,7 @@ jobs:
           runtime="$stage/runtime"
           trace="$stage/trace.log"
           product_log="$stage/product.log"
+          recovery_log="$stage/recovery.log"
           install -d -m 700 "$runtime" || exit 3
           test "$(sha256sum "$stage/rr-bundle.tar.gz" | awk '{print $1}')" = \
             "$expected_bundle_sha" || exit 3
@@ -228,43 +241,405 @@ jobs:
             printf 'SAFE_DIAG nonce=%s role=%s backend=%s state=%s\n' \
               "$diag_nonce" "$role" "$backend" "$backend_state"
           done
-          callback_marker="$stage/callback-entered"
-          diag_uninstall_callback() {
-            : > "$callback_marker"
-            chmod 600 "$callback_marker"
-            uninstall_all_locked
+          rr_audit_path_absent() {
+            [ ! -e "$1" ] && [ ! -L "$1" ]
           }
-          exec 9>"$trace"
-          PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
-          (
-            BASH_XTRACEFD=9
-            set -x
-            rr_run_with_update_locks direct 120 diag_uninstall_callback
-          ) >"$product_log" 2>&1
-          raw_uninstall_rc=$?
-          exec 9>&-
-          chmod 600 "$trace" "$product_log"
-          if [ -f "$callback_marker" ]; then callback_entered=yes; else callback_entered=no; fi
+          rr_audit_unit_absent() {
+            local unit="$1" load="" active="" enabled=""
+            load=$(systemctl show "$unit" --property=LoadState --value 2>/dev/null) || return 1
+            active=$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null) || return 1
+            enabled=$(systemctl show "$unit" --property=UnitFileState --value 2>/dev/null) || return 1
+            [ "$load" = not-found ] && [ "$active" = inactive ] && \
+              { [ -z "$enabled" ] || [ "$enabled" = not-found ]; }
+          }
+          rr_audit_cloudflared_process_present() {
+            pgrep -x cloudflared >/dev/null 2>&1
+          }
+          rr_audit_product_evidence_present() {
+            local target=""
+            for target in \
+              /usr/local/bin/rr /usr/local/lib/rr /etc/argo_vmess.conf \
+              /usr/local/bin/sing-box /usr/local/bin/auto_update_sub.py \
+              /etc/sing-box /etc/rr-nexus /etc/rr-naive /etc/rr-update \
+              /etc/rr-cloudflared /var/lib/rr-nexus /var/lib/rr-update \
+              /var/lib/rr-backup \
+              /usr/local/sbin/rr-update-recover \
+              /usr/local/sbin/rr-update-external-state \
+              /etc/systemd/system/rr-update-recovery.service \
+              /etc/systemd/system/rr-update-recovery.service.d \
+              /etc/systemd/system/rr-restore-recovery.service \
+              /etc/systemd/system/rr-restore-watchdog.service \
+              /etc/systemd/system/rr-subscription-quarantine.service \
+              /etc/systemd/system/rr-nexus.service \
+              /etc/systemd/system/rr-subscription.service \
+              /etc/systemd/system/sing-box.service \
+              /etc/systemd/system/rr-nexus-ip-acme.service \
+              /etc/systemd/system/rr-nexus-ip-acme.timer \
+              /etc/systemd/system/argo-rr-health.timer \
+              /etc/systemd/system/argo-rr-health.service \
+              /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+              /usr/local/lib/rr-vps/lego \
+              /usr/local/lib/rr-vps/lego.install; do
+              rr_audit_path_absent "$target" || return 0
+            done
+            return 1
+          }
+          rr_audit_remove_v710_orphan_maintenance() {
+            local marker=/run/rr-vps/update-maintenance parent=/run/rr-vps
+            local target="" canonical="" marker_value="" last_byte=""
+            local -a marker_lines=()
+            rr_audit_product_evidence_present && return 1
+            rr_audit_path_absent /var/lib/rr-backup/active || return 1
+            for target in subscription_server_running managed_singbox_running; do
+              declare -F "$target" >/dev/null 2>&1 || return 1
+              "$target" && return 1
+            done
+            rr_audit_cloudflared_process_present && return 1
+            for target in rr-update-recovery.service rr-restore-recovery.service \
+              rr-restore-watchdog.service rr-subscription-quarantine.service \
+              rr-nexus.service rr-subscription.service sing-box.service \
+              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+              argo-rr-health.timer \
+              argo-rr-health.service; do
+              rr_audit_unit_absent "$target" || return 1
+            done
+            [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+            command -v mountpoint >/dev/null 2>&1 || return 1
+            mountpoint -q -- "$parent" && return 1
+            canonical=$(readlink -e -- "$parent" 2>/dev/null) || return 1
+            [ "$canonical" = "$parent" ] || return 1
+            [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+            [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || return 1
+            mapfile -t marker_lines < "$marker"
+            [ "${#marker_lines[@]}" -eq 1 ] || return 1
+            [[ "${marker_lines[0]}" =~ ^/var/lib/rr-update/transactions/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]] || return 1
+            marker_value="${marker_lines[0]}"
+            [ "$(stat -c %s -- "$marker" 2>/dev/null)" -eq \
+              "$(( ${#marker_value} + 1 ))" ] || return 1
+            last_byte=$(tail -c 1 -- "$marker" 2>/dev/null | \
+              od -An -tx1 | tr -d ' \n') || return 1
+            [ "$last_byte" = 0a ] || return 1
+            rr_audit_path_absent "$marker_value" || return 1
+            sync -f "$marker" || return 1
+            sync -f "$parent" || return 1
+            [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || return 1
+            mapfile -t marker_lines < "$marker"
+            [ "${#marker_lines[@]}" -eq 1 ] || return 1
+            [ "${marker_lines[0]}" = "$marker_value" ] || return 1
+            [ "$(stat -c %s -- "$marker" 2>/dev/null)" -eq \
+              "$(( ${#marker_value} + 1 ))" ] || return 1
+            last_byte=$(tail -c 1 -- "$marker" 2>/dev/null | \
+              od -An -tx1 | tr -d ' \n') || return 1
+            [ "$last_byte" = 0a ] || return 1
+            rr_audit_path_absent "$marker_value" || return 1
+            rm -f -- "$marker" || return 1
+            sync -f "$parent" || return 1
+            rr_audit_path_absent "$marker"
+          }
+          rr_audit_repair_known_mismatched_current_hook() {
+            local directory=/etc/letsencrypt/renewal-hooks/deploy
+            local hook="$directory/rr-certificates.sh" hook_hash="" temporary=""
+            local source="${RR_RUNTIME_DIR:-/usr/local/lib/rr}/scripts/naive-cert-hook.sh"
+            rr_uninstall_certificate_hook_directory_is_safe || return 1
+            [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ] || return 1
+            rr_uninstall_runtime_certificate_hook_source_is_owned || return 1
+            [ -f "$hook" ] && [ ! -L "$hook" ] && [ -s "$hook" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$hook" 2>/dev/null)" = 0:0:700:1 ] || return 1
+            bash -n "$hook" >/dev/null 2>&1 || return 1
+            hook_hash=$(sha256sum -- "$hook" 2>/dev/null | awk '{print $1}') || return 1
+            case "$hook_hash" in
+              f908141e58c8f9abce04c6190072ef878dac768bbd8ba8b100f561847ce7c7ff|\
+              8ac94f81afc303961f4db4f5a3fb2112546b1a1f518f1aca5d0c5cc8eac86201|\
+              2c1a37523913e0c5f50ffc20348b257f7fc8bac5c6204bc158bf44baa05fd86d|\
+              61540febb8728180eb585d7788eedd63d742603652ed520d7c6fec2ef64cfc04) ;;
+              *) return 1 ;;
+            esac
+            [ "$hook_hash" != "$RR_UNINSTALL_CERT_HOOK_SOURCE_SHA256" ] || return 1
+            temporary=$(mktemp "$directory/.rr-certificates.audit.XXXXXX") || return 1
+            if ! install -o 0 -g 0 -m 700 -- "$source" "$temporary" ||
+               ! sync -f "$temporary"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            if ! sync -f "$hook" || ! sync -f "$directory" ||
+               [ "$(stat -c '%u:%g:%a:%h' -- "$hook" 2>/dev/null)" != 0:0:700:1 ] ||
+               ! bash -n "$hook" >/dev/null 2>&1 ||
+               [ "$(sha256sum -- "$hook" 2>/dev/null | awk '{print $1}')" != "$hook_hash" ] ||
+               ! rr_uninstall_runtime_certificate_hook_source_is_owned ||
+               [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:700:1 ] ||
+               ! cmp -s -- "$temporary" "$source"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            if ! mv -fT -- "$temporary" "$hook" || ! sync -f "$directory"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            rr_uninstall_current_certificate_hook_is_owned
+          }
+          rr_audit_repair_firewall_without_update_fds() {
+            load_config_with_defaults >>"$recovery_log" 2>&1 &&
+              rr_firewall_repair_fail_closed_quarantine \
+                >>"$recovery_log" 2>&1 &&
+              ! rr_firewall_fail_closed_quarantine_active
+          }
+          rr_audit_publish_legacy_update_bridge() {
+            local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" parent="" canonical=""
+            local temporary="" marker_state=0
+            if rr_legacy_update_bridge_required; then
+              marker_state=0
+            else
+              marker_state=$?
+            fi
+            if [ "$marker_state" -eq 0 ]; then
+              return 0
+            elif [ "$marker_state" -ne 1 ]; then
+              return 1
+            fi
+            parent=$(dirname -- "$marker") || return 1
+            [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+            canonical=$(readlink -f -- "$parent" 2>/dev/null) || return 1
+            [ "$canonical" = "$parent" ] || return 1
+            [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || return 1
+            temporary=$(mktemp "$parent/.legacy-update-bridge.audit.XXXXXX") || return 1
+            if ! printf '%s\n' "$RR_LEGACY_UPDATE_BRIDGE_VALUE" > "$temporary" ||
+               ! chmod 600 -- "$temporary" ||
+               [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != 0:0:600:1 ] ||
+               ! sync -f "$temporary" || ! mv -fT -- "$temporary" "$marker" ||
+               ! sync -f "$parent"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            rr_legacy_update_bridge_required
+          }
+          audit_legacy_lock_fd=""
+          rr_audit_acquire_unbridged_legacy_lock() {
+            local state=0
+            if rr_legacy_update_bridge_required; then
+              return 0
+            else
+              state=$?
+            fi
+            [ "$state" -eq 1 ] || return 76
+            rr_legacy_update_lock_parent_is_safe \
+              "$RR_LEGACY_UPDATE_LOCK_FILE" || return 76
+            if [ ! -e "$RR_LEGACY_UPDATE_LOCK_FILE" ] &&
+               [ ! -L "$RR_LEGACY_UPDATE_LOCK_FILE" ]; then
+              (umask 077; set -o noclobber; : > "$RR_LEGACY_UPDATE_LOCK_FILE") \
+                2>/dev/null || true
+            fi
+            rr_legacy_update_lock_path_is_safe \
+              "$RR_LEGACY_UPDATE_LOCK_FILE" || return 76
+            exec {audit_legacy_lock_fd}<"$RR_LEGACY_UPDATE_LOCK_FILE" || {
+              audit_legacy_lock_fd=""
+              return 76
+            }
+            if ! rr_legacy_update_lock_fd_is_safe \
+                   "$RR_LEGACY_UPDATE_LOCK_FILE" "$audit_legacy_lock_fd"; then
+              exec {audit_legacy_lock_fd}>&-
+              audit_legacy_lock_fd=""
+              return 76
+            fi
+            if ! flock -w 120 "$audit_legacy_lock_fd"; then
+              exec {audit_legacy_lock_fd}>&-
+              audit_legacy_lock_fd=""
+              return 75
+            fi
+            if ! rr_legacy_update_lock_fd_is_safe \
+                   "$RR_LEGACY_UPDATE_LOCK_FILE" "$audit_legacy_lock_fd"; then
+              exec {audit_legacy_lock_fd}>&-
+              audit_legacy_lock_fd=""
+              return 76
+            fi
+            if ! rr_audit_publish_legacy_update_bridge; then
+              exec {audit_legacy_lock_fd}>&-
+              audit_legacy_lock_fd=""
+              return 76
+            fi
+          }
+          rr_audit_release_extra_legacy_lock() {
+            if [[ "$audit_legacy_lock_fd" =~ ^[0-9]+$ ]]; then
+              exec {audit_legacy_lock_fd}>&-
+            fi
+            audit_legacy_lock_fd=""
+          }
+          rr_audit_postclean_residue_present() {
+            local target=""
+            rr_audit_product_evidence_present && return 0
+            for target in \
+              /run/rr-vps/update-maintenance \
+              /run/rr-vps/restore-live \
+              /var/lib/rr-backup/active \
+              /var/lib/rr-vps/firewall-quarantine \
+              /var/lib/rr-vps/firewall-evidence \
+              /var/lib/rr-update/subscription-quarantine \
+              /run/rr-subscription-quarantine.ready \
+              /var/lib/rr-quarantine/guard-state \
+              /usr/local/libexec/rr-vps/subscription-quarantine-guard \
+              /var/www/rr-nexus-ip-acme \
+              /etc/letsencrypt/renewal-hooks/deploy/rr-certificates.sh \
+              /etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh; do
+              rr_audit_path_absent "$target" || return 0
+            done
+            for target in rr-update-recovery.service rr-restore-recovery.service \
+              rr-restore-watchdog.service rr-subscription-quarantine.service \
+              rr-nexus.service rr-subscription.service sing-box.service \
+              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+              argo-rr-health.timer \
+              argo-rr-health.service rr-firewall-quarantine-guard.service \
+              rr-firewall-quarantine-guard.path \
+              rr-firewall-quarantine-guard.timer; do
+              rr_audit_unit_absent "$target" || return 0
+            done
+            subscription_server_running && return 0
+            managed_singbox_running && return 0
+            rr_audit_cloudflared_process_present && return 0
+            return 1
+          }
+          callback_marker="$stage/callback-entered"
+          : > "$trace"
+          : > "$product_log"
+          : > "$recovery_log"
+          chmod 600 "$trace" "$product_log" "$recovery_log"
+          remediation_failed=false
+          firewall_repair=not-run
+          hook_remediation=not-run
+          orphan_state=not-run
+          uninstall_state=not-run
+          residue_state=unknown
+          raw_uninstall_rc=0
+          rr_audit_locked_remediation() {
+            local legacy_lock_state=0
+            : > "$callback_marker"
+            chmod 600 "$callback_marker" || {
+              remediation_failed=true
+              return 0
+            }
+            rr_audit_acquire_unbridged_legacy_lock
+            legacy_lock_state=$?
+            if [ "$legacy_lock_state" -ne 0 ]; then
+              remediation_failed=true
+              case "$legacy_lock_state" in
+                75) uninstall_state=lock-busy ;;
+                *) uninstall_state=lock-unsafe ;;
+              esac
+            fi
+            if [ "$remediation_failed" = false ]; then
+              firewall_repair=not-needed
+              if rr_firewall_fail_closed_quarantine_active; then
+                if rr_run_without_inherited_update_lock_fds \
+                     rr_audit_repair_firewall_without_update_fds; then
+                  firewall_repair=success
+                else
+                  firewall_repair=failed
+                  remediation_failed=true
+                fi
+              fi
+            fi
+            hook_remediation=not-present
+            current_hook=/etc/letsencrypt/renewal-hooks/deploy/rr-certificates.sh
+            if ! rr_audit_path_absent "$current_hook"; then
+              if [ "$remediation_failed" = true ]; then
+                hook_remediation=not-run
+              elif rr_uninstall_current_certificate_hook_is_owned; then
+                hook_remediation=matched
+              elif rr_audit_repair_known_mismatched_current_hook; then
+                hook_remediation=repaired-known
+              else
+                hook_remediation=rejected
+                remediation_failed=true
+              fi
+            fi
+            orphan_state=not-applicable
+            if [ "$role" = B ]; then
+              if rr_audit_path_absent /run/rr-vps/update-maintenance; then
+                orphan_state=not-present
+              elif [ "$remediation_failed" = true ]; then
+                orphan_state=not-run
+              elif rr_audit_remove_v710_orphan_maintenance; then
+                orphan_state=removed
+              else
+                orphan_state=rejected
+                remediation_failed=true
+              fi
+            fi
+            if [ "$remediation_failed" = false ] && \
+               rr_audit_product_evidence_present; then
+              exec 9>"$trace"
+              PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
+              BASH_XTRACEFD=9
+              set -x
+              uninstall_all_locked >"$product_log" 2>&1
+              raw_uninstall_rc=$?
+              set +x
+              unset BASH_XTRACEFD
+              exec 9>&-
+              chmod 600 "$trace" "$product_log"
+              case "$raw_uninstall_rc" in
+                0) uninstall_state=success ;;
+                1) uninstall_state=callback-rc1 ;;
+                2) uninstall_state=callback-rc2 ;;
+                3) uninstall_state=callback-rc3 ;;
+                *) uninstall_state=callback-other ;;
+              esac
+              [ "$uninstall_state" = success ] || remediation_failed=true
+            elif [ "$remediation_failed" = true ]; then
+              case "$uninstall_state" in
+                lock-busy|lock-unsafe) ;;
+                *) uninstall_state=not-run ;;
+              esac
+            elif rr_audit_product_evidence_present; then
+              uninstall_state=not-run
+            else
+              uninstall_state=not-needed
+            fi
+            residue_state=absent
+            if rr_audit_postclean_residue_present; then
+              residue_state=present
+              remediation_failed=true
+            fi
+            rr_audit_release_extra_legacy_lock || remediation_failed=true
+            return 0
+          }
+          callback_entered=no
+          rr_run_with_update_locks direct 120 rr_audit_locked_remediation
+          lock_run_rc=$?
+          if [ -f "$callback_marker" ]; then callback_entered=yes; fi
+          if [ "$callback_entered" = no ]; then
+            remediation_failed=true
+            firewall_repair=not-run
+            hook_remediation=not-run
+            if [ "$role" = B ]; then orphan_state=not-run; else orphan_state=not-applicable; fi
+            case "$lock_run_rc" in
+              75) uninstall_state=lock-busy ;;
+              76) uninstall_state=lock-unsafe ;;
+              *) uninstall_state=wrapper-other ;;
+            esac
+            if rr_audit_postclean_residue_present; then
+              residue_state=present
+            else
+              residue_state=absent
+            fi
+          elif [ "$lock_run_rc" -ne 0 ]; then
+            remediation_failed=true
+            uninstall_state=wrapper-other
+          fi
+          chmod 600 "$recovery_log" 2>/dev/null || true
+          printf 'SAFE_DIAG nonce=%s role=%s firewall_repair=%s\n' \
+            "$diag_nonce" "$role" "$firewall_repair"
+          printf 'SAFE_DIAG nonce=%s role=%s hook_remediation=%s\n' \
+            "$diag_nonce" "$role" "$hook_remediation"
+          printf 'SAFE_DIAG nonce=%s role=%s orphan_maintenance=%s\n' \
+            "$diag_nonce" "$role" "$orphan_state"
           printf 'SAFE_DIAG nonce=%s role=%s callback_entered=%s\n' \
             "$diag_nonce" "$role" "$callback_entered"
-          if [ "$raw_uninstall_rc" -eq 0 ]; then
-            uninstall_state=success
-          elif [ "$raw_uninstall_rc" -eq 75 ]; then
-            uninstall_state=lock-busy
-          elif [ "$raw_uninstall_rc" -eq 76 ]; then
-            uninstall_state=lock-unsafe
-          elif [ "$callback_entered" = no ]; then
-            uninstall_state=wrapper-other
-          else
-            case "$raw_uninstall_rc" in
-              1) uninstall_state=callback-rc1 ;;
-              2) uninstall_state=callback-rc2 ;;
-              3) uninstall_state=callback-rc3 ;;
-              *) uninstall_state=callback-other ;;
-            esac
-          fi
           printf 'SAFE_DIAG nonce=%s role=%s uninstall=%s\n' \
             "$diag_nonce" "$role" "$uninstall_state"
+          printf 'SAFE_DIAG nonce=%s role=%s residue=%s\n' \
+            "$diag_nonce" "$role" "$residue_state"
           safe_traces=()
           while IFS= read -r trace_line; do
             if [[ "$trace_line" =~ ^\+*RRX\|${diag_nonce}\|([A-Za-z0-9._-]+):([0-9]+):([A-Za-z0-9_+-]+)\| ]]; then
@@ -284,6 +659,8 @@ jobs:
           safe_object_state config_after /etc/argo_vmess.conf
           safe_object_state active_tx_after /var/lib/rr-update/active
           safe_object_state maintenance_after /run/rr-vps/update-maintenance
+          final_rc=0
+          [ "$remediation_failed" = false ] || final_rc=6
           cleanup_state=retry
           if rm -rf -- "$stage"; then
             cleanup_state=success
@@ -292,7 +669,7 @@ jobs:
           printf 'SAFE_DIAG nonce=%s role=%s cleanup=%s\n' \
             "$diag_nonce" "$role" "$cleanup_state"
           [ "$cleanup_state" = success ] || exit 5
-          exit 0
+          exit "$final_rc"
           REMOTE
           remote_rc=$?
           set -e
@@ -308,11 +685,15 @@ jobs:
                [[ "$payload" =~ ^ufw=(absent|installed)\ persistence=(absent|present)$ ]] ||
                [[ "$payload" =~ ^lock_probe=(available|busy|unsafe|other)$ ]] ||
                [[ "$payload" =~ ^backend=(iptables|ip6tables)\ state=(missing|ready|error)$ ]] ||
+               [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|failed)$ ]] ||
+               [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
+               [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^callback_entered=(yes|no)$ ]] ||
+               [[ "$payload" =~ ^residue=(absent|present)$ ]] ||
                [[ "$payload" =~ ^trace=[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9_+-]+$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
               safe_line_count=$((safe_line_count + 1))
-            elif [[ "$payload" =~ ^uninstall=(success|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
+            elif [[ "$payload" =~ ^uninstall=(success|not-needed|not-run|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
               safe_line_count=$((safe_line_count + 1))
               seen_uninstall=1
