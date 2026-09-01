@@ -68,6 +68,7 @@ RR_RESTORE_ACTIVE="${RR_RESTORE_ACTIVE:-/var/lib/rr-backup/active}"
 RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-maintenance}"
 RR_COMMITTED_SETTLED_NAME="committed-settled"
 RR_COMMITTED_SETTLED_VALUE="rr-update-committed-settled-v1"
+RR_UPDATE_CHECKPOINT="pre-snapshot"
 
 rr_error() {
     echo "[RR-vps] $*" >&2
@@ -1498,6 +1499,14 @@ rr_restore_unit_state() {
     fi
     if [ -f "$active_marker" ]; then
         [ "$load_state" = loaded ] || return 1
+        case "$unit" in
+            sing-box|sing-box.service|rr-nexus|rr-nexus.service)
+                # Candidate start failures can leave systemd's rate-limit latch
+                # set.  Clear it only after the exact managed-service identity,
+                # load state and requested enable state have all been proved.
+                systemctl reset-failed "$unit" >/dev/null 2>&1 || return 1
+                ;;
+        esac
         systemctl restart "$unit" >/dev/null 2>&1 || return 1
         rr_wait_unit_state "$unit" active
     else
@@ -1572,48 +1581,88 @@ rr_restart_health_service_bounded() {
 
 rr_restore_update_writer_state() {
     local backup="${1:-$BACKUP_DIR}" subscription_policy="${2:-normal}" failed=false
-    local resume_subscription=false
+    local resume_subscription=false writer_failure_gate=""
     if [ -f "$backup/singbox_was_running" ] || \
        [ -f "$backup/singbox_was_enabled" ]; then
-        rr_installer_managed_service_start_is_safe sing-box || return 1
+        rr_installer_managed_service_start_is_safe sing-box || {
+            rr_error "DIAG rollback_writer_gate=singbox-identity"
+            return 1
+        }
     fi
     if [ -f "$backup/nexus_was_running" ] || \
        [ -f "$backup/nexus_was_enabled" ]; then
-        rr_installer_managed_service_start_is_safe rr-nexus || return 1
+        rr_installer_managed_service_start_is_safe rr-nexus || {
+            rr_error "DIAG rollback_writer_gate=nexus-identity"
+            return 1
+        }
     fi
     if [ "$subscription_policy" = normal ] && [ -f "$backup/subscription_was_running" ]; then
         resume_subscription=true
     else
-        rr_stop_subscription_servers || failed=true
-        rr_subscription_running && failed=true
+        rr_stop_subscription_servers || {
+            writer_failure_gate=subscription-freeze
+            failed=true
+        }
+        if rr_subscription_running; then
+            [ -n "$writer_failure_gate" ] || writer_failure_gate=subscription-freeze
+            failed=true
+        fi
     fi
     rr_restore_unit_state sing-box "$backup/singbox_was_running" \
-        "$backup/singbox_was_enabled" || failed=true
+        "$backup/singbox_was_enabled" || {
+            [ -n "$writer_failure_gate" ] || writer_failure_gate=singbox-restore
+            failed=true
+        }
     # Restore the certificate writer before Nexus can serve public-IP
     # subscriptions.  Its timer/service were deliberately disarmed first.
-    rr_restore_ip_acme_update_writer_state "$backup" || failed=true
+    rr_restore_ip_acme_update_writer_state "$backup" || {
+        [ -n "$writer_failure_gate" ] || writer_failure_gate=ip-acme-restore
+        failed=true
+    }
     rr_restore_unit_state rr-nexus "$backup/nexus_was_running" \
-        "$backup/nexus_was_enabled" || failed=true
+        "$backup/nexus_was_enabled" || {
+            [ -n "$writer_failure_gate" ] || writer_failure_gate=nexus-restore
+            failed=true
+        }
     if [ "$subscription_policy" = normal ]; then
         rr_restore_unit_state argo-rr-health.timer "$backup/health_timer_was_running" \
-            "$backup/health_timer_was_enabled" || failed=true
+            "$backup/health_timer_was_enabled" || {
+                [ -n "$writer_failure_gate" ] || writer_failure_gate=health-timer-restore
+                failed=true
+            }
         if [ -f "$backup/health_service_was_running" ]; then
-            rr_restart_health_service_bounded || failed=true
+            rr_restart_health_service_bounded || {
+                [ -n "$writer_failure_gate" ] || writer_failure_gate=health-service-restart
+                failed=true
+            }
         fi
     else
         # A degraded/quarantined rollback must never revive the legacy health
         # writer.  Reuse the fail-closed postcondition verifier after the old
         # unit files have been restored.
-        rr_quiesce_health_monitor_for_rollback || failed=true
+        rr_quiesce_health_monitor_for_rollback || {
+            [ -n "$writer_failure_gate" ] || writer_failure_gate=health-quiesce
+            failed=true
+        }
     fi
     if [ "$resume_subscription" = true ]; then
         if [ "$failed" = false ]; then
-            rr_resume_subscription_bounded || failed=true
+            rr_resume_subscription_bounded || {
+                writer_failure_gate=subscription-resume
+                failed=true
+            }
         else
             rr_stop_subscription_servers >/dev/null 2>&1 || true
         fi
     fi
     if [ "$failed" != false ]; then
+        case "$writer_failure_gate" in
+            subscription-freeze|singbox-restore|ip-acme-restore|nexus-restore|\
+            health-timer-restore|health-service-restart|health-quiesce|\
+            subscription-resume) ;;
+            *) writer_failure_gate=unknown ;;
+        esac
+        rr_error "DIAG rollback_writer_gate=${writer_failure_gate}"
         rr_stop_subscription_servers >/dev/null 2>&1 || true
         rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
         return 1
@@ -3011,6 +3060,14 @@ rr_rollback() {
             return 1
             ;;
     esac
+    case "${RR_UPDATE_CHECKPOINT:-unknown}" in
+        pre-snapshot|phase-switching|old-runtime-move|runtime-install|\
+        phase-runtime-swapped|launcher-install|quarantine-suspend|\
+        phase-migrating|ip-acme-pre|post-update|writer-verify|\
+        durability-sync|phase-commit) ;;
+        *) RR_UPDATE_CHECKPOINT=unknown ;;
+    esac
+    rr_error "DIAG update_failure_gate=${RR_UPDATE_CHECKPOINT} rollback_phase=${rollback_phase}"
     if ! rr_quiesce_health_monitor_for_rollback; then
         TRANSACTION_ACTIVE=false
         ROLLBACK_FAILED=true
@@ -3309,7 +3366,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "59ff88caf9c11b74394b8828c7c50f3d0934861a38d6d07cb7fd390eca306157" ] && \
+        if [ "$actual" = "2353fd75c28744f72b2e3bd40dd48a40076fa31a67e082b96d312e0043f58229" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \
@@ -3466,9 +3523,11 @@ rr_install_release() {
     install -m 755 "$PAYLOAD_DIR/rr" "$NEW_LAUNCHER" || return 1
 
     TRANSACTION_ACTIVE=true
+    RR_UPDATE_CHECKPOINT=phase-switching
     rr_write_phase switching || return 1
     if [ -e "$RR_LIB_DIR" ]; then
         OLD_RUNTIME="$TX_DIR/old-runtime"
+        RR_UPDATE_CHECKPOINT=old-runtime-move
         if ! mv "$RR_LIB_DIR" "$OLD_RUNTIME"; then
             TRANSACTION_ACTIVE=false
             return 1
@@ -3476,10 +3535,13 @@ rr_install_release() {
         rr_test_fault old_runtime_moved || return 1
     fi
     RUNTIME_REPLACED=true
+    RR_UPDATE_CHECKPOINT=runtime-install
     mv "$NEW_RUNTIME" "$RR_LIB_DIR" || return 1
     NEW_RUNTIME=""
+    RR_UPDATE_CHECKPOINT=phase-runtime-swapped
     rr_write_phase runtime_swapped || return 1
     rr_test_fault runtime_swapped || return 1
+    RR_UPDATE_CHECKPOINT=launcher-install
     mv "$NEW_LAUNCHER" "$RR_LAUNCHER" || return 1
     NEW_LAUNCHER=""
 
@@ -3488,19 +3550,23 @@ rr_install_release() {
     # keep the marker/firewall until the safe candidate has fully migrated so
     # a crash still causes boot recovery to re-apply the quarantine.
     if rr_version_ge "$release_version" "$RR_SUBSCRIPTION_SAFE_VERSION"; then
+        RR_UPDATE_CHECKPOINT=quarantine-suspend
         rr_run_with_delegated_update_lock \
             "$RR_RECOVERY_HELPER" suspend-quarantine || return 1
     fi
 
+    RR_UPDATE_CHECKPOINT=phase-migrating
     rr_write_phase migrating || return 1
     # The snapshot froze the short-lived certificate timer before copying its
     # account/store.  Re-arm exactly its pre-update state before Nexus
     # reconciliation; a failed unit/state proof is a normal rollback trigger.
+    RR_UPDATE_CHECKPOINT=ip-acme-pre
     if ! rr_restore_ip_acme_update_writer_state "$BACKUP_DIR"; then
         rr_error "候选版本无法恢复升级前的 IP 证书续签状态，正在回滚。"
         rr_rollback
         return 1
     fi
+    RR_UPDATE_CHECKPOINT=post-update
     if ! RR_UPDATE_TRANSACTION=1 \
         RR_UPDATE_SINGBOX_WAS_RUNNING="$([ -f "$BACKUP_DIR/singbox_was_running" ] && printf true || printf false)" \
         RR_UPDATE_NEXUS_WAS_RUNNING="$([ -f "$BACKUP_DIR/nexus_was_running" ] && printf true || printf false)" \
@@ -3511,6 +3577,7 @@ rr_install_release() {
         rr_rollback
         return 1
     fi
+    RR_UPDATE_CHECKPOINT=writer-verify
     if [ ! -f "$BACKUP_DIR/runtime_did_not_exist" ] && \
        ! rr_verify_update_writer_state "$BACKUP_DIR"; then
         rr_error "候选版本未恢复升级前的服务启用/运行状态，正在回滚。"
@@ -3523,7 +3590,9 @@ rr_install_release() {
     # safe candidate durable before attempting quarantine retirement. A later
     # cleanup failure must retain the candidate/evidence, never resurrect the
     # vulnerable runtime that the barrier was protecting.
+    RR_UPDATE_CHECKPOINT=durability-sync
     rr_sync_host_state_before_terminal || return 1
+    RR_UPDATE_CHECKPOINT=phase-commit
     if ! rr_write_phase committed; then
         rr_rollback
         return 1

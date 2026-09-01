@@ -2277,6 +2277,7 @@ nexus_systemctl_start_checked() {
 
 nexus_systemctl_restart_checked() {
     nexus_service_start_preflight || return 1
+    systemctl reset-failed rr-nexus >/dev/null 2>&1 || return 1
     systemctl restart rr-nexus "$@"
 }
 

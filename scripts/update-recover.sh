@@ -2494,6 +2494,14 @@ rr_restore_unit_state() {
         case "$unit_file_state" in disabled|static|masked|not-found) ;; *) return 1 ;; esac
     fi
     if [ -f "$active_marker" ]; then
+        case "$unit" in
+            sing-box|sing-box.service|rr-nexus|rr-nexus.service)
+                # The exact current/legacy service identity and requested unit
+                # state were proved above; clear only that owned unit's
+                # StartLimitHit latch before restoring it to active.
+                systemctl reset-failed "$unit" >/dev/null 2>&1 || return 1
+                ;;
+        esac
         systemctl restart "$unit" >/dev/null 2>&1 || return 1
         rr_wait_unit_state "$unit" active
     else
@@ -2760,12 +2768,20 @@ rr_restore_recorded_writer_state() {
             systemctl stop --no-block argo-rr-health.timer >/dev/null 2>&1 || true
         fi
         if [ -f "$backup/singbox_was_running" ]; then
-            systemctl restart --no-block sing-box >/dev/null 2>&1 || failed=true
+            if ! systemctl reset-failed sing-box >/dev/null 2>&1; then
+                failed=true
+            elif ! systemctl restart --no-block sing-box >/dev/null 2>&1; then
+                failed=true
+            fi
         else
             systemctl stop --no-block sing-box >/dev/null 2>&1 || true
         fi
         if [ -f "$backup/nexus_was_running" ]; then
-            systemctl restart --no-block rr-nexus >/dev/null 2>&1 || failed=true
+            if ! systemctl reset-failed rr-nexus >/dev/null 2>&1; then
+                failed=true
+            elif ! systemctl restart --no-block rr-nexus >/dev/null 2>&1; then
+                failed=true
+            fi
         else
             systemctl stop --no-block rr-nexus >/dev/null 2>&1 || true
         fi
