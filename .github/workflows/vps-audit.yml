@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vps-release-audit
+  group: temporary-safe-vps-preclean-diagnostic
   cancel-in-progress: false
 
 jobs:
@@ -133,16 +133,6 @@ jobs:
               "root@$host:$stage/rr-bundle.tar.gz" >"$runner_log" 2>&1; then
             printf 'SAFE_DIAG role=%s runner=upload-error\n' "$TARGET_ROLE" >&2
             exit 1
-          fi
-          preboot_id=""
-          if [ "$TARGET_ROLE" != B ]; then
-            if ! preboot_id=$(sshpass -e ssh "${ssh_opts[@]}" "root@$host" \
-                'cat /proc/sys/kernel/random/boot_id' 2>/dev/null) ||
-               [[ ! "$preboot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
-              printf 'SAFE_DIAG role=%s runner=preboot-id-error\n' \
-                "$TARGET_ROLE" >&2
-              exit 1
-            fi
           fi
           set +e
           sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
@@ -687,6 +677,286 @@ jobs:
                 >>"$recovery_log" 2>&1 &&
               ! rr_firewall_fail_closed_quarantine_active
           }
+          rr_audit_policy_guard_path_is_exact() {
+            local target="$1" expected_links="$2"
+            local -a lines=()
+            [ -f "$target" ] && [ ! -L "$target" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$target" 2>/dev/null)" = \
+              "0:0:755:${expected_links}" ] || return 1
+            mapfile -t lines < "$target" || return 1
+            [ "${#lines[@]}" -eq 2 ] && [ "${lines[0]}" = '#!/bin/sh' ] && \
+              [ "${lines[1]}" = 'exit 101' ]
+          }
+          rr_audit_package_is_installed() {
+            [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = \
+              installed ]
+          }
+          rr_audit_netfilter_service_is_absent() {
+            local load_state="" active_state="" file_state=""
+            load_state=$(systemctl show -p LoadState --value \
+              netfilter-persistent.service 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value \
+              netfilter-persistent.service 2>/dev/null) || return 1
+            file_state=$(systemctl show -p UnitFileState --value \
+              netfilter-persistent.service 2>/dev/null) || return 1
+            [ "$load_state:$active_state" = not-found:inactive ] && \
+              { [ -z "$file_state" ] || [ "$file_state" = not-found ]; }
+          }
+          rr_audit_ufw_without_raw_persistence_is_exact() {
+            local path="" metadata="" canonical="" parent_mode=""
+            rr_audit_package_is_installed ufw || return 1
+            [ -x /usr/sbin/ufw ] && [ ! -L /usr/sbin/ufw ] || return 1
+            ! rr_audit_package_is_installed netfilter-persistent || return 1
+            ! rr_audit_package_is_installed iptables-persistent || return 1
+            rr_audit_path_absent /usr/sbin/netfilter-persistent || return 1
+            rr_audit_path_absent /etc/init.d/iptables || return 1
+            for path in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+              rr_audit_path_absent "$path" && continue
+              [ -d /etc/iptables ] && [ ! -L /etc/iptables ] || return 1
+              canonical=$(readlink -f -- /etc/iptables 2>/dev/null) || return 1
+              [ "$canonical" = /etc/iptables ] || return 1
+              [ "$(stat -c '%u:%g' -- /etc/iptables 2>/dev/null)" = 0:0 ] || \
+                return 1
+              parent_mode=$(stat -c %a -- /etc/iptables 2>/dev/null) || return 1
+              [[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] && \
+                [ $((8#$parent_mode & 8#022)) -eq 0 ] || return 1
+              [ -f "$path" ] && [ ! -L "$path" ] || return 1
+              canonical=$(readlink -f -- "$path" 2>/dev/null) || return 1
+              [ "$canonical" = "$path" ] || return 1
+              metadata=$(stat -c '%u:%g:%h:%a:%s' -- "$path" 2>/dev/null) || \
+                return 1
+              [[ "$metadata" =~ ^0:0:1:[0-7]{3,4}:[0-9]+$ ]] || return 1
+              [ "${metadata##*:}" -le 10485760 ] || return 1
+              parent_mode=${metadata%:*}
+              parent_mode=${parent_mode##*:}
+              [ $((8#$parent_mode & 8#022)) -eq 0 ] || return 1
+              ! grep -Fq -e argo-rr-managed \
+                -e 'rr-vps unsafe rollback subscription quarantine' \
+                -- "$path" || return 1
+            done
+            rr_audit_netfilter_service_is_absent
+          }
+          rr_audit_c_ufw_package_baseline_is_exact() {
+            rr_audit_ufw_without_raw_persistence_is_exact && \
+              rr_audit_path_absent /etc/iptables/rules.v4 && \
+              rr_audit_path_absent /etc/iptables/rules.v6
+          }
+          rr_audit_remove_owned_policy_guard_residue() {
+            local policy=/usr/sbin/policy-rc.d candidate=""
+            local policy_identity="" candidate_identity=""
+            local -a candidates=()
+            shopt -s nullglob
+            candidates=(/usr/sbin/.rr-policy-rc.d.*)
+            shopt -u nullglob
+            if ! rr_audit_path_absent "$policy"; then
+              if rr_audit_policy_guard_path_is_exact "$policy" 2; then
+                [ "${#candidates[@]}" -eq 1 ] || return 1
+                candidate="${candidates[0]}"
+                rr_audit_policy_guard_path_is_exact "$candidate" 2 || return 1
+                policy_identity=$(stat -c '%d:%i' -- "$policy" 2>/dev/null) || \
+                  return 1
+                candidate_identity=$(stat -c '%d:%i' -- "$candidate" \
+                  2>/dev/null) || return 1
+                [ "$policy_identity" = "$candidate_identity" ] || return 1
+                unlink -- "$candidate" || return 1
+                sync -f /usr/sbin || return 1
+                candidates=()
+              fi
+              rr_audit_policy_guard_path_is_exact "$policy" 1 || return 1
+              unlink -- "$policy" || return 1
+            fi
+            for candidate in "${candidates[@]}"; do
+              rr_audit_policy_guard_path_is_exact "$candidate" 1 || return 1
+              unlink -- "$candidate" || return 1
+            done
+            sync -f /usr/sbin || return 1
+            rr_audit_path_absent "$policy"
+          }
+          rr_audit_restore_ufw_package_baseline() {
+            local policy=/usr/sbin/policy-rc.d temporary=""
+            local operation_status=0 cleanup_status=0 canonical="" parent_mode=""
+            local policy_identity="" temporary_identity="" path="" metadata=""
+            local -a introduced_rules=(/etc/iptables/rules.v4 /etc/iptables/rules.v6)
+            case "$role" in
+              A)
+                rr_audit_ufw_without_raw_persistence_is_exact
+                return $?
+                ;;
+              C) ;;
+              *) return 1 ;;
+            esac
+            command -v apt-get >/dev/null 2>&1 || return 1
+            command -v dpkg-query >/dev/null 2>&1 || return 1
+            command -v systemctl >/dev/null 2>&1 || return 1
+            rr_audit_c_ufw_package_baseline_is_exact && return 0
+            [ -d /usr/sbin ] && [ ! -L /usr/sbin ] || return 1
+            [ "$(stat -c '%u:%g' -- /usr/sbin 2>/dev/null)" = 0:0 ] || return 1
+            canonical=$(readlink -f -- /usr/sbin 2>/dev/null) || return 1
+            [ "$canonical" = /usr/sbin ] || return 1
+            parent_mode=$(stat -c %a -- /usr/sbin 2>/dev/null) || return 1
+            [[ "$parent_mode" =~ ^[0-7]{3,4}$ ]] && \
+              [ $((8#$parent_mode & 8#022)) -eq 0 ] || return 1
+            rr_audit_remove_owned_policy_guard_residue || return 1
+            for path in "${introduced_rules[@]}"; do
+              rr_audit_path_absent "$path" && continue
+              [ -f "$path" ] && [ ! -L "$path" ] || return 1
+              metadata=$(stat -c '%u:%g:%h:%a:%s' -- "$path" 2>/dev/null) || \
+                return 1
+              [[ "$metadata" =~ ^0:0:1:[0-7]{3,4}:[0-9]+$ ]] || return 1
+              [ "${metadata##*:}" -le 10485760 ] || return 1
+            done
+            temporary=$(mktemp /usr/sbin/.rr-policy-rc.d.XXXXXX) || return 1
+            if ! printf '%s\n' '#!/bin/sh' 'exit 101' > "$temporary" || \
+               ! chown 0:0 -- "$temporary" || ! chmod 755 -- "$temporary" || \
+               [ "$(stat -c '%u:%g:%a:%h' -- "$temporary" 2>/dev/null)" != \
+                 0:0:755:1 ] || ! sync -f "$temporary" || \
+               ! ln -- "$temporary" "$policy"; then
+              rm -f -- "$temporary"
+              return 1
+            fi
+            unlink -- "$temporary" || operation_status=1
+            sync -f /usr/sbin || operation_status=1
+            rr_audit_policy_guard_path_is_exact "$policy" 1 || operation_status=1
+            if [ "$operation_status" -eq 0 ]; then
+              systemctl stop netfilter-persistent.service \
+                >>"$recovery_log" 2>&1 || true
+              systemctl is-active --quiet netfilter-persistent.service && \
+                operation_status=1
+            fi
+            if [ "$operation_status" -eq 0 ]; then
+              DEBIAN_FRONTEND=noninteractive \
+                apt-get -o DPkg::Lock::Timeout=120 update \
+                  >>"$recovery_log" 2>&1 || operation_status=1
+            fi
+            if [ "$operation_status" -eq 0 ]; then
+              DEBIAN_FRONTEND=noninteractive \
+                apt-get -o DPkg::Lock::Timeout=120 \
+                  -o Dpkg::Options::=--force-confold install -y \
+                  --no-install-recommends ufw \
+                  netfilter-persistent- iptables-persistent- \
+                  >>"$recovery_log" 2>&1 || operation_status=1
+            fi
+            if [ "$operation_status" -eq 0 ]; then
+              for path in "${introduced_rules[@]}"; do
+                rr_audit_path_absent "$path" || unlink -- "$path" || \
+                  operation_status=1
+              done
+            fi
+            systemctl daemon-reload >>"$recovery_log" 2>&1 || operation_status=1
+            if ! rr_audit_path_absent "$temporary"; then
+              policy_identity=$(stat -c '%d:%i' -- "$policy" 2>/dev/null) || \
+                cleanup_status=1
+              temporary_identity=$(stat -c '%d:%i' -- "$temporary" 2>/dev/null) || \
+                cleanup_status=1
+              if [ "$cleanup_status" -eq 0 ] && \
+                 [ "$policy_identity" = "$temporary_identity" ] && \
+                 rr_audit_policy_guard_path_is_exact "$policy" 2 && \
+                 rr_audit_policy_guard_path_is_exact "$temporary" 2; then
+                unlink -- "$temporary" || cleanup_status=1
+                sync -f /usr/sbin || cleanup_status=1
+              else
+                cleanup_status=1
+              fi
+            fi
+            if rr_audit_policy_guard_path_is_exact "$policy" 1; then
+              unlink -- "$policy" || cleanup_status=1
+              sync -f /usr/sbin || cleanup_status=1
+            else
+              cleanup_status=1
+            fi
+            rr_audit_path_absent "$temporary" || cleanup_status=1
+            rr_audit_path_absent "$policy" || cleanup_status=1
+            [ "$operation_status" -eq 0 ] && [ "$cleanup_status" -eq 0 ] || \
+              return 1
+            rr_audit_c_ufw_package_baseline_is_exact
+          }
+          RR_AUDIT_ORIGINAL_PATH=""
+          RR_AUDIT_PERSISTENCE_BRIDGE=""
+          rr_audit_prepare_no_raw_persistence_bridge() {
+            local directory="$stage/persistence-bridge"
+            local bridge="$directory/netfilter-persistent"
+            rr_audit_ufw_without_raw_persistence_is_exact || return 1
+            rr_audit_path_absent "$directory" || return 1
+            install -d -o 0 -g 0 -m 700 -- "$directory" || return 1
+            if ! printf '%s\n' \
+                '#!/bin/bash' \
+                'set -euo pipefail' \
+                '[ "$#" -eq 1 ] && [ "$1" = save ]' \
+                '[ "$(dpkg-query -W -f='"'"'${db:Status-Status}'"'"' ufw 2>/dev/null)" = installed ]' \
+                '[ "$(dpkg-query -W -f='"'"'${db:Status-Status}'"'"' netfilter-persistent 2>/dev/null || true)" != installed ]' \
+                '[ "$(dpkg-query -W -f='"'"'${db:Status-Status}'"'"' iptables-persistent 2>/dev/null || true)" != installed ]' \
+                '[ -x /usr/sbin/ufw ] && [ ! -L /usr/sbin/ufw ]' \
+                'for path in /usr/sbin/netfilter-persistent /etc/init.d/iptables; do' \
+                '  [ ! -e "$path" ] && [ ! -L "$path" ]' \
+                'done' \
+                'for path in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do' \
+                '  if [ -e "$path" ] || [ -L "$path" ]; then' \
+                '    [ -d /etc/iptables ] && [ ! -L /etc/iptables ]' \
+                '    [ "$(readlink -f -- /etc/iptables)" = /etc/iptables ]' \
+                '    [ "$(stat -c '"'"'%u:%g'"'"' -- /etc/iptables)" = 0:0 ]' \
+                '    mode=$(stat -c %a -- /etc/iptables)' \
+                '    [[ "$mode" =~ ^[0-7]{3,4}$ ]]' \
+                '    [ $((8#$mode & 8#022)) -eq 0 ]' \
+                '    [ -f "$path" ] && [ ! -L "$path" ]' \
+                '    [ "$(readlink -f -- "$path")" = "$path" ]' \
+                '    meta=$(stat -c '"'"'%u:%g:%h:%a:%s'"'"' -- "$path")' \
+                '    [[ "$meta" =~ ^0:0:1:[0-7]{3,4}:[0-9]+$ ]]' \
+                '    size=${meta##*:}; [ "$size" -le 10485760 ]' \
+                '    mode=${meta%:*}; mode=${mode##*:}' \
+                '    [ $((8#$mode & 8#022)) -eq 0 ]' \
+                '    ! grep -Fq -e argo-rr-managed -e '"'"'rr-vps unsafe rollback subscription quarantine'"'"' -- "$path"' \
+                '  fi' \
+                'done' \
+                'load=$(systemctl show -p LoadState --value netfilter-persistent.service)' \
+                'active=$(systemctl show -p ActiveState --value netfilter-persistent.service)' \
+                'file=$(systemctl show -p UnitFileState --value netfilter-persistent.service)' \
+                '[ "$load:$active" = not-found:inactive ]' \
+                '{ [ -z "$file" ] || [ "$file" = not-found ]; }' \
+                'sync -f /etc/ufw' \
+                > "$bridge"; then
+              rm -rf -- "$directory"
+              return 1
+            fi
+            if ! chown 0:0 -- "$bridge" || ! chmod 700 -- "$bridge" || \
+               [ "$(stat -c '%u:%g:%a:%h' -- "$bridge" 2>/dev/null)" != \
+                 0:0:700:1 ] || ! sync -f "$bridge" || ! sync -f "$directory" || \
+               ! bash -n "$bridge"; then
+              rm -rf -- "$directory"
+              return 1
+            fi
+            RR_AUDIT_ORIGINAL_PATH="$PATH"
+            RR_AUDIT_PERSISTENCE_BRIDGE="$bridge"
+            PATH="$directory:$PATH"
+            export PATH
+            if [ "$(command -v netfilter-persistent 2>/dev/null)" = "$bridge" ] && \
+               rr_firewall_persistence_backend_available; then
+              return 0
+            fi
+            PATH="$RR_AUDIT_ORIGINAL_PATH"
+            export PATH
+            RR_AUDIT_ORIGINAL_PATH=""
+            RR_AUDIT_PERSISTENCE_BRIDGE=""
+            rm -rf -- "$directory"
+            return 1
+          }
+          rr_audit_remove_no_raw_persistence_bridge() {
+            local directory="$stage/persistence-bridge"
+            local bridge="$directory/netfilter-persistent"
+            [ -n "$RR_AUDIT_ORIGINAL_PATH" ] && \
+              [ "$RR_AUDIT_PERSISTENCE_BRIDGE" = "$bridge" ] || return 1
+            [ "$(command -v netfilter-persistent 2>/dev/null)" = "$bridge" ] || \
+              return 1
+            [ "$(stat -c '%u:%g:%a:%h' -- "$bridge" 2>/dev/null)" = \
+              0:0:700:1 ] || return 1
+            PATH="$RR_AUDIT_ORIGINAL_PATH"
+            export PATH
+            RR_AUDIT_ORIGINAL_PATH=""
+            RR_AUDIT_PERSISTENCE_BRIDGE=""
+            rm -rf -- "$directory" || return 1
+            sync -f "$stage" || return 1
+            rr_audit_path_absent "$directory" && \
+              rr_audit_ufw_without_raw_persistence_is_exact
+          }
           rr_audit_live_managed_raw_state() {
             local snapshot="" state=error raw_status=0 release_failed=false
             snapshot=$(mktemp -d "$stage/live-firewall.XXXXXX") || {
@@ -720,94 +990,6 @@ jobs:
             rm -rf -- "$snapshot" || state=error
             [ "$release_failed" = false ] || state=error
             printf '%s\n' "$state"
-          }
-          rr_audit_quarantine_supervisor_is_settled() {
-            local load_state="" active_state="" file_state="" unit=""
-            rr_firewall_quarantine_supervisor_effective || return 1
-            for unit in service path timer; do
-              load_state=$(systemctl show \
-                "rr-firewall-quarantine-guard.$unit" \
-                --property=LoadState --value 2>/dev/null) || return 1
-              active_state=$(systemctl show \
-                "rr-firewall-quarantine-guard.$unit" \
-                --property=ActiveState --value 2>/dev/null) || return 1
-              file_state=$(systemctl show \
-                "rr-firewall-quarantine-guard.$unit" \
-                --property=UnitFileState --value 2>/dev/null) || return 1
-              case "$unit:$load_state:$active_state:$file_state" in
-                service:loaded:inactive:static|\
-                path:loaded:active:enabled|\
-                timer:loaded:inactive:disabled) ;;
-                *) return 1 ;;
-              esac
-            done
-          }
-          rr_audit_prepare_ephemeral_firewall_reboot() {
-            local load_state="" active_state="" file_state=""
-            local unit=""
-            case "$role" in A|C) ;; *) return 1 ;; esac
-            dpkg-query -W -f='${db:Status-Abbrev}' ufw 2>/dev/null | \
-              grep -q '^ii' || return 1
-            ! rr_firewall_persistence_backend_available || return 1
-            rr_firewall_fail_closed_quarantine_active || return 1
-            rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
-            rr_audit_quarantine_supervisor_is_settled || return 1
-            rr_audit_path_absent /var/lib/rr-backup/active || return 1
-            rr_audit_path_absent /run/rr-vps/restore-live || return 1
-            for unit in rr-restore-recovery.service rr-restore-watchdog.service \
-              rr-nexus.service rr-subscription.service sing-box.service \
-              argo-rr-health.service argo-rr-health.timer \
-              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
-              cloudflared.service; do
-              rr_audit_unit_absent "$unit" || return 1
-            done
-            rr_update_recovery_unit_is_owned || return 1
-            load_state=$(systemctl show rr-update-recovery.service \
-              --property=LoadState --value 2>/dev/null) || return 1
-            active_state=$(systemctl show rr-update-recovery.service \
-              --property=ActiveState --value 2>/dev/null) || return 1
-            file_state=$(systemctl show rr-update-recovery.service \
-              --property=UnitFileState --value 2>/dev/null) || return 1
-            [ "$load_state:$active_state:$file_state" = loaded:inactive:enabled ] || \
-              return 1
-            [ "$(rr_audit_callable_state subscription_server_running)" = absent ] || \
-              return 1
-            [ "$(rr_audit_callable_state managed_singbox_running)" = absent ] || \
-              return 1
-            [ "$(rr_audit_cloudflared_state)" = absent ] || return 1
-            systemctl disable --now rr-update-recovery.service \
-              >>"$recovery_log" 2>&1 || return 1
-            rr_update_recovery_unit_is_owned || return 1
-            load_state=$(systemctl show rr-update-recovery.service \
-              --property=LoadState --value 2>/dev/null) || return 1
-            active_state=$(systemctl show rr-update-recovery.service \
-              --property=ActiveState --value 2>/dev/null) || return 1
-            file_state=$(systemctl show rr-update-recovery.service \
-              --property=UnitFileState --value 2>/dev/null) || return 1
-            [ "$load_state:$active_state:$file_state" = loaded:inactive:disabled ] || \
-              return 1
-            rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
-            rr_firewall_fail_closed_quarantine_active || return 1
-            rr_audit_quarantine_supervisor_is_settled || return 1
-            rr_audit_path_absent /var/lib/rr-backup/active || return 1
-            rr_audit_path_absent /run/rr-vps/restore-live || return 1
-            for unit in rr-restore-recovery.service rr-restore-watchdog.service \
-              rr-nexus.service rr-subscription.service sing-box.service \
-              argo-rr-health.service argo-rr-health.timer \
-              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
-              cloudflared.service; do
-              rr_audit_unit_absent "$unit" || return 1
-            done
-            [ "$(rr_audit_callable_state subscription_server_running)" = absent ] || \
-              return 1
-            [ "$(rr_audit_callable_state managed_singbox_running)" = absent ] || \
-              return 1
-            [ "$(rr_audit_cloudflared_state)" = absent ] || return 1
-            sync -f /etc/systemd/system/rr-update-recovery.service || return 1
-            sync -f /etc/systemd/system || return 1
-            sync -f /var/lib/rr-update/active || return 1
-            sync -f /var/lib/rr-vps/firewall-quarantine || return 1
-            sync -f /var/lib/rr-vps || return 1
           }
           rr_audit_publish_legacy_update_bridge() {
             local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" parent="" canonical=""
@@ -946,10 +1128,9 @@ jobs:
           : > "$recovery_log"
           chmod 600 "$trace" "$product_log" "$recovery_log"
           remediation_failed=false
+          persistence_remediation=not-needed
           firewall_repair=not-run
           live_raw=not-probed
-          reboot_state=not-needed
-          reboot_required=false
           external_helper_cleanup=not-applicable
           hook_remediation=not-run
           orphan_state=not-run
@@ -958,6 +1139,7 @@ jobs:
           raw_uninstall_rc=0
           rr_audit_locked_remediation() {
             local legacy_lock_state=0
+            local bridge_active=false
             : > "$callback_marker"
             chmod 600 "$callback_marker" || {
               remediation_failed=true
@@ -976,20 +1158,27 @@ jobs:
               firewall_repair=not-needed
               if rr_firewall_fail_closed_quarantine_active; then
                 locked_quarantine_probe=$(rr_audit_classify_quarantine)
-                if [ "$locked_quarantine_probe" = raw-no-persistence ]; then
+                if { [ "$role" = A ] || [ "$role" = C ]; } && \
+                   { [ "$locked_quarantine_probe" = raw-no-persistence ] || \
+                     [ "$locked_quarantine_probe" = ready-raw ]; }; then
                   live_raw=$(rr_audit_live_managed_raw_state)
                   if [ "$live_raw" = absent ] && \
                      rr_uninstall_firewall_quarantine_artifacts_are_owned; then
                     firewall_repair=deferred-owned
                   elif [ "$live_raw" = present ] && \
-                       rr_audit_prepare_ephemeral_firewall_reboot; then
-                    firewall_repair=reboot-required
-                    reboot_state=prepared
-                    reboot_required=true
-                    remediation_failed=true
+                       rr_uninstall_firewall_quarantine_artifacts_are_owned; then
+                    if rr_audit_restore_ufw_package_baseline && \
+                       rr_audit_prepare_no_raw_persistence_bridge; then
+                      persistence_remediation=bridged
+                      firewall_repair=deferred-owned
+                      bridge_active=true
+                    else
+                      persistence_remediation=failed
+                      firewall_repair=failed
+                      remediation_failed=true
+                    fi
                   else
                     firewall_repair=failed
-                    if [ "$live_raw" = present ]; then reboot_state=rejected; fi
                     remediation_failed=true
                   fi
                 elif rr_run_without_inherited_update_lock_fds \
@@ -1071,6 +1260,13 @@ jobs:
             else
               uninstall_state=not-needed
             fi
+            if [ "$bridge_active" = true ]; then
+              if ! rr_audit_remove_no_raw_persistence_bridge; then
+                persistence_remediation=failed
+                remediation_failed=true
+              fi
+              bridge_active=false
+            fi
             residue_state=absent
             if rr_audit_postclean_residue_present; then
               residue_state=present
@@ -1080,15 +1276,14 @@ jobs:
             return 0
           }
           callback_entered=no
-          rr_run_with_update_locks direct 120 rr_audit_locked_remediation
+          rr_run_with_update_locks direct 240 rr_audit_locked_remediation
           lock_run_rc=$?
           if [ -f "$callback_marker" ]; then callback_entered=yes; fi
           if [ "$callback_entered" = no ]; then
             remediation_failed=true
+            persistence_remediation=not-run
             firewall_repair=not-run
             live_raw=not-probed
-            reboot_state=not-needed
-            reboot_required=false
             if [ "$role" = B ]; then
               external_helper_cleanup=not-run
             else
@@ -1111,12 +1306,12 @@ jobs:
             uninstall_state=wrapper-other
           fi
           chmod 600 "$recovery_log" 2>/dev/null || true
+          printf 'SAFE_DIAG nonce=%s role=%s persistence_remediation=%s\n' \
+            "$diag_nonce" "$role" "$persistence_remediation"
           printf 'SAFE_DIAG nonce=%s role=%s firewall_repair=%s\n' \
             "$diag_nonce" "$role" "$firewall_repair"
           printf 'SAFE_DIAG nonce=%s role=%s live_raw=%s\n' \
             "$diag_nonce" "$role" "$live_raw"
-          printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
-            "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s external_helper_cleanup=%s\n' \
             "$diag_nonce" "$role" "$external_helper_cleanup"
           printf 'SAFE_DIAG nonce=%s role=%s hook_remediation=%s\n' \
@@ -1160,18 +1355,12 @@ jobs:
           final_rc=0
           [ "$remediation_failed" = false ] || final_rc=6
           cleanup_state=retry
-          if [ "$reboot_required" = true ]; then
-            cleanup_state=deferred
-            trap - EXIT
-          elif rm -rf -- "$stage"; then
+          if rm -rf -- "$stage"; then
             cleanup_state=success
             trap - EXIT
           fi
           printf 'SAFE_DIAG nonce=%s role=%s cleanup=%s\n' \
             "$diag_nonce" "$role" "$cleanup_state"
-          if [ "$reboot_required" = true ]; then
-            exit 7
-          fi
           [ "$cleanup_state" = success ] || exit 5
           exit "$final_rc"
           REMOTE
@@ -1180,8 +1369,6 @@ jobs:
           safe_line_count=0
           seen_uninstall=0
           seen_cleanup=0
-          seen_cleanup_deferred=0
-          seen_reboot_prepared=0
           safe_prefix="SAFE_DIAG nonce=${diag_nonce} role=${TARGET_ROLE} "
           while IFS= read -r line; do
             [[ "$line" == "$safe_prefix"* ]] || continue
@@ -1195,9 +1382,9 @@ jobs:
                [[ "$payload" =~ ^orphan_probe=(not-applicable|not-present|evidence-(launcher|runtime|config|singbox-bin|subscription-bin|singbox-config|nexus-config|naive-config|update-config|cloudflared-config|nexus-state|update-state|backup-state|recovery-helper|external-helper|recovery-unit|recovery-dropin|restore-unit|watchdog-unit|quarantine-unit|nexus-unit|subscription-unit|singbox-unit|ip-acme-service|ip-acme-timer|health-timer|health-service|ip-acme-site|ip-acme-enabled|lego|lego-install)|restore-active|helper-missing|process-(subscription_server_running|managed_singbox_running|cloudflared)|unit-state|parent-type|parent-mount-check|parent-mount|parent-canonical|parent-meta|marker-type|marker-meta|marker-read|marker-lines|marker-format|marker-size|marker-newline|target-present|eligible)$ ]] ||
                [[ "$payload" =~ ^update_root=(not-applicable|absent|empty|transactions-empty|other|unsafe)$ ]] ||
                [[ "$payload" =~ ^quarantine_probe=(not-present|load-failed|kind-invalid|evidence-invalid|raw-no-persistence|raw-error|ambiguous|ambiguous-error|ready-raw|ready-no-raw)$ ]] ||
-               [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
+               [[ "$payload" =~ ^persistence_remediation=(not-needed|not-run|bridged|failed)$ ]] ||
+               [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
-               [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^external_helper_cleanup=(not-applicable|not-present|not-run|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
                [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
@@ -1206,265 +1393,22 @@ jobs:
                [[ "$payload" =~ ^trace=[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9_+-]+$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
               safe_line_count=$((safe_line_count + 1))
-              if [ "$payload" = reboot=prepared ]; then
-                seen_reboot_prepared=1
-              fi
             elif [[ "$payload" =~ ^uninstall=(success|not-needed|not-run|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
               safe_line_count=$((safe_line_count + 1))
               seen_uninstall=1
-            elif [[ "$payload" =~ ^cleanup=(success|deferred|retry)$ ]]; then
+            elif [[ "$payload" =~ ^cleanup=(success|retry)$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
               safe_line_count=$((safe_line_count + 1))
               if [ "${BASH_REMATCH[1]}" = success ]; then
                 seen_cleanup=1
-              elif [ "${BASH_REMATCH[1]}" = deferred ]; then
-                seen_cleanup_deferred=1
               fi
             fi
           done < "$runner_log"
-          if [ "$safe_line_count" -eq 0 ] || [ "$seen_uninstall" -ne 1 ]; then
+          if [ "$remote_rc" -ne 0 ] || [ "$safe_line_count" -eq 0 ] || \
+             [ "$seen_uninstall" -ne 1 ] || [ "$seen_cleanup" -ne 1 ]; then
             printf 'SAFE_DIAG role=%s runner=remote-error-raw-suppressed\n' \
               "$TARGET_ROLE" >&2
             exit 1
           fi
-          if [ "$remote_rc" -eq 0 ] && [ "$seen_cleanup" -eq 1 ] && \
-             [ "$seen_reboot_prepared" -eq 0 ]; then
-            validated_stage=""
-          elif [ "$remote_rc" -eq 7 ] && [ "$TARGET_ROLE" != B ] && \
-               [ "$seen_reboot_prepared" -eq 1 ] && \
-               [ "$seen_cleanup_deferred" -eq 1 ] && \
-               [ "$seen_cleanup" -eq 0 ]; then
-            :
-          else
-            printf 'SAFE_DIAG role=%s runner=remote-error-raw-suppressed\n' \
-              "$TARGET_ROLE" >&2
-            exit 1
-          fi
-          if [ "$seen_reboot_prepared" -eq 1 ]; then
-            set +e
-            sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
-              "$preboot_id" >/dev/null 2>/dev/null <<'REBOOT_REMOTE'
-            set -euo pipefail
-            expected_boot_id="$1"
-            [[ "$expected_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
-            current_boot_id=$(cat /proc/sys/kernel/random/boot_id)
-            [ "$current_boot_id" = "$expected_boot_id" ]
-            sync
-            systemctl reboot --no-block
-          REBOOT_REMOTE
-            reboot_command_rc=$?
-            set -e
-            case "$reboot_command_rc" in
-              0|255) ;;
-              *)
-                printf 'SAFE_DIAG role=%s runner=reboot-command-error\n' \
-                  "$TARGET_ROLE" >&2
-                exit 1
-                ;;
-            esac
-            reconnect_opts=(-o ConnectTimeout=5 -o ConnectionAttempts=1 \
-              "${ssh_opts[@]}")
-            postboot_id=""
-            for reconnect_attempt in $(seq 1 36); do
-              sleep 3
-              set +e
-              candidate_boot_id=$(sshpass -e ssh "${reconnect_opts[@]}" \
-                "root@$host" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null)
-              reconnect_rc=$?
-              set -e
-              if [ "$reconnect_rc" -eq 0 ] && \
-                 [[ "$candidate_boot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] && \
-                 [ "$candidate_boot_id" != "$preboot_id" ]; then
-                postboot_id="$candidate_boot_id"
-                break
-              fi
-            done
-            if [ -z "$postboot_id" ]; then
-              printf 'SAFE_DIAG role=%s runner=reboot-not-observed\n' \
-                "$TARGET_ROLE" >&2
-              exit 1
-            fi
-            set +e
-            sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
-              "$TARGET_ROLE" "$stage" "$bundle_sha" "$diag_nonce" \
-              "$preboot_id" "$postboot_id" >"$runner_log" 2>&1 <<'POSTBOOT_REMOTE'
-            set -uo pipefail
-            umask 077
-            export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-            role="$1"
-            stage="$2"
-            expected_bundle_sha="$3"
-            diag_nonce="$4"
-            preboot_id="$5"
-            expected_postboot_id="$6"
-            [[ "$role" =~ ^[AC]$ ]] || exit 2
-            [[ "$stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]] || exit 2
-            [[ "$diag_nonce" =~ ^[0-9a-f]{32}$ ]] || exit 2
-            [[ "$preboot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 2
-            [[ "$expected_postboot_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 2
-            current_boot_id=$(cat /proc/sys/kernel/random/boot_id) || exit 2
-            [ "$current_boot_id" = "$expected_postboot_id" ] && \
-              [ "$current_boot_id" != "$preboot_id" ] || exit 2
-            [ -d "$stage" ] && [ ! -L "$stage" ] || exit 3
-            [ "$(readlink -f -- "$stage" 2>/dev/null)" = "$stage" ] || exit 3
-            [ "$(stat -c '%u:%g:%a' -- "$stage" 2>/dev/null)" = 0:0:700 ] || \
-              exit 3
-            [ -f "$stage/rr-bundle.tar.gz" ] && \
-              [ ! -L "$stage/rr-bundle.tar.gz" ] || exit 3
-            [ "$(sha256sum "$stage/rr-bundle.tar.gz" | awk '{print $1}')" = \
-              "$expected_bundle_sha" ] || exit 3
-            runtime="$stage/runtime"
-            postboot_log="$stage/postboot.log"
-            rm -rf -- "$runtime" || exit 3
-            install -d -m 700 "$runtime" || exit 3
-            tar --no-same-owner --no-same-permissions -xzf \
-              "$stage/rr-bundle.tar.gz" -C "$runtime" --strip-components=1 || \
-              exit 3
-            for module_file in "$runtime"/modules/*.sh; do
-              source "$module_file" || exit 3
-            done
-            : > "$postboot_log"
-            chmod 600 "$postboot_log" || exit 3
-            rr_audit_path_absent() {
-              [ ! -e "$1" ] && [ ! -L "$1" ]
-            }
-            rr_audit_unit_absent() {
-              local unit="$1" load="" active="" enabled=""
-              load=$(systemctl show "$unit" --property=LoadState \
-                --value 2>/dev/null) || return 1
-              active=$(systemctl show "$unit" --property=ActiveState \
-                --value 2>/dev/null) || return 1
-              enabled=$(systemctl show "$unit" --property=UnitFileState \
-                --value 2>/dev/null) || return 1
-              [ "$load" = not-found ] && [ "$active" = inactive ] && \
-                { [ -z "$enabled" ] || [ "$enabled" = not-found ]; }
-            }
-            rr_audit_quarantine_supervisor_is_settled() {
-              local load_state="" active_state="" file_state="" unit=""
-              rr_firewall_quarantine_supervisor_effective || return 1
-              for unit in service path timer; do
-                load_state=$(systemctl show \
-                  "rr-firewall-quarantine-guard.$unit" \
-                  --property=LoadState --value 2>/dev/null) || return 1
-                active_state=$(systemctl show \
-                  "rr-firewall-quarantine-guard.$unit" \
-                  --property=ActiveState --value 2>/dev/null) || return 1
-                file_state=$(systemctl show \
-                  "rr-firewall-quarantine-guard.$unit" \
-                  --property=UnitFileState --value 2>/dev/null) || return 1
-                case "$unit:$load_state:$active_state:$file_state" in
-                  service:loaded:inactive:static|\
-                  path:loaded:active:enabled|\
-                  timer:loaded:inactive:disabled) ;;
-                  *) return 1 ;;
-                esac
-              done
-            }
-            rr_audit_live_managed_raw_state() {
-              local snapshot="" state=error raw_status=0 release_failed=false
-              snapshot=$(mktemp -d "$stage/postboot-firewall.XXXXXX") || {
-                printf '%s\n' error
-                return 0
-              }
-              chmod 700 "$snapshot" || {
-                rm -rf -- "$snapshot"
-                printf '%s\n' error
-                return 0
-              }
-              if ! load_config_with_defaults >>"$postboot_log" 2>&1 || \
-                 ! rr_firewall_lock_acquire; then
-                rm -rf -- "$snapshot"
-                printf '%s\n' error
-                return 0
-              fi
-              if ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
-                     >>"$postboot_log" 2>&1 || \
-                 ! rr_restore_verify_firewall_pre_mutation_snapshot "$snapshot" \
-                     >>"$postboot_log" 2>&1; then
-                state=error
-              elif rr_restore_firewall_snapshot_has_managed_raw_rules \
-                     "$snapshot/firewall" >>"$postboot_log" 2>&1; then
-                state=present
-              else
-                raw_status=$?
-                if [ "$raw_status" -eq 1 ]; then state=absent; else state=error; fi
-              fi
-              rr_firewall_lock_release || release_failed=true
-              rm -rf -- "$snapshot" || state=error
-              [ "$release_failed" = false ] || state=error
-              printf '%s\n' "$state"
-            }
-            supervisor_settled=false
-            for settle_attempt in $(seq 1 20); do
-              rr_firewall_fail_closed_quarantine_active || exit 4
-              rr_uninstall_firewall_quarantine_artifacts_are_owned || exit 4
-              if rr_audit_quarantine_supervisor_is_settled; then
-                supervisor_settled=true
-                break
-              fi
-              sleep 1
-            done
-            [ "$supervisor_settled" = true ] || exit 4
-            rr_update_recovery_unit_is_owned || exit 4
-            recovery_load=$(systemctl show rr-update-recovery.service \
-              --property=LoadState --value 2>/dev/null) || exit 4
-            recovery_active=$(systemctl show rr-update-recovery.service \
-              --property=ActiveState --value 2>/dev/null) || exit 4
-            recovery_enabled=$(systemctl show rr-update-recovery.service \
-              --property=UnitFileState --value 2>/dev/null) || exit 4
-            [ "$recovery_load:$recovery_active:$recovery_enabled" = \
-              loaded:inactive:disabled ] || exit 4
-            rr_audit_path_absent /var/lib/rr-backup/active || exit 4
-            rr_audit_path_absent /run/rr-vps/restore-live || exit 4
-            for unit in rr-restore-recovery.service rr-restore-watchdog.service \
-              rr-subscription-quarantine.service rr-nexus.service \
-              rr-subscription.service sing-box.service argo-rr-health.service \
-              argo-rr-health.timer rr-nexus-ip-acme.service \
-              rr-nexus-ip-acme.timer cloudflared.service; do
-              rr_audit_unit_absent "$unit" || exit 4
-            done
-            declare -F subscription_server_running >/dev/null 2>&1 || exit 4
-            declare -F managed_singbox_running >/dev/null 2>&1 || exit 4
-            subscription_server_running >/dev/null 2>&1 && exit 4
-            managed_singbox_running >/dev/null 2>&1 && exit 4
-            pgrep -x cloudflared >/dev/null 2>&1 && exit 4
-            postboot_live_raw=$(rr_audit_live_managed_raw_state)
-            case "$postboot_live_raw" in absent|present|error) ;; *) exit 4 ;; esac
-            printf 'SAFE_DIAG nonce=%s role=%s postboot_live_raw=%s\n' \
-              "$diag_nonce" "$role" "$postboot_live_raw"
-            [ "$postboot_live_raw" = absent ] || exit 4
-            rm -rf -- "$stage" || exit 5
-            sync -f /root || exit 5
-            printf 'SAFE_DIAG nonce=%s role=%s reboot_postflight=verified\n' \
-              "$diag_nonce" "$role"
-            printf 'SAFE_DIAG nonce=%s role=%s cleanup=success\n' \
-              "$diag_nonce" "$role"
-          POSTBOOT_REMOTE
-            postboot_rc=$?
-            set -e
-            postboot_raw=""
-            postboot_verified=0
-            postboot_cleanup=0
-            while IFS= read -r line; do
-              [[ "$line" == "$safe_prefix"* ]] || continue
-              payload="${line#"$safe_prefix"}"
-              if [[ "$payload" =~ ^postboot_live_raw=(absent|present|error)$ ]]; then
-                postboot_raw="${BASH_REMATCH[1]}"
-                printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
-              elif [ "$payload" = reboot_postflight=verified ]; then
-                postboot_verified=1
-                printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
-              elif [ "$payload" = cleanup=success ]; then
-                postboot_cleanup=1
-                printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
-              fi
-            done < "$runner_log"
-            if [ "$postboot_rc" -ne 0 ] || [ "$postboot_raw" != absent ] || \
-               [ "$postboot_verified" -ne 1 ] || [ "$postboot_cleanup" -ne 1 ]; then
-              printf 'SAFE_DIAG role=%s runner=postboot-error-raw-suppressed\n' \
-                "$TARGET_ROLE" >&2
-              exit 1
-            fi
-            validated_stage=""
-          fi
+          validated_stage=""
