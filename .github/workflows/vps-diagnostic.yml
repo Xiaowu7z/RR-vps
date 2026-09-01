@@ -187,7 +187,7 @@ jobs:
           command("sing-box-version", ["/usr/local/bin/sing-box", "version"])
           for unit in ("rr-nexus.service", "sing-box.service", "nginx.service", "rr-update-recovery.service"):
               command("unit-" + unit, ["systemctl", "is-active", unit])
-          for prop in ("LoadState", "FragmentPath", "DropInPaths", "UnitFileState"):
+          for prop in ("LoadState", "FragmentPath", "DropInPaths", "UnitFileState", "UMask"):
               command(
                   "recovery-" + prop,
                   ["systemctl", "show", "--property=" + prop, "--value", "rr-update-recovery.service"],
