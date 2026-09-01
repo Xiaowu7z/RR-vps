@@ -70,6 +70,12 @@ command=${1:-}
 shift
 
 case "$command" in
+    --version)
+        # Exercise the modern-property branch of the production effective-unit
+        # validator on every matrix image.  The container has no systemd bus,
+        # so this value belongs to the shim rather than the host binary.
+        printf '%s\n' 'systemd 255 (255.0)'
+        ;;
     daemon-reload|reset-failed)
         exit 0
         ;;
@@ -124,6 +130,39 @@ case "$command" in
             FragmentPath) printf '%s\n' "$fragment" ;;
             DropInPaths) printf '\n' ;;
             MainPID) printf '0\n' ;;
+            ExecStart)
+                if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
+                    printf '%s\n' '{ path=/usr/local/sbin/rr-update-recover ; argv[]=/usr/local/sbin/rr-update-recover recover ; ignore_errors=no ; }'
+                else
+                    printf '\n'
+                fi
+                ;;
+            Environment)
+                if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
+                    printf '%s\n' 'RR_UPDATE_RECOVERY_SERVICE=1'
+                else
+                    printf '\n'
+                fi
+                ;;
+            Type)
+                if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
+                    printf '%s\n' oneshot
+                else
+                    printf '%s\n' simple
+                fi
+                ;;
+            DynamicUser|PrivateUsers|PrivateMounts|RootEphemeral|ProtectHome|ProtectSystem)
+                printf '%s\n' no
+                ;;
+            RemainAfterExit) printf '%s\n' no ;;
+            User|Group|WorkingDirectory|ExecStartPre|ExecReload|ExecCondition|\
+            RootDirectory|RootImage|MountImages|ExtensionImages|\
+            ExtensionDirectories|TemporaryFileSystem|BindPaths|BindReadOnlyPaths|\
+            InaccessiblePaths|JoinsNamespaceOf|ReadOnlyPaths|ReadWritePaths|\
+            EnvironmentFiles|PassEnvironment|UnsetEnvironment|PAMName|\
+            SystemCallFilter)
+                printf '\n'
+                ;;
             *) exit 1 ;;
         esac
         ;;
@@ -197,6 +236,27 @@ test "$(systemctl show -p UnitFileState --value "$mock_unit")" = disabled
 rm -f -- "$RR_MOCK_SYSTEMD_UNIT_DIR/$mock_unit"
 test "$(systemctl show -p LoadState --value "$mock_unit")" = not-found
 test "$(systemctl show -p UnitFileState --value "$mock_unit")" = not-found
+
+# Load only the installer's declarations and prove that the matrix shim
+# satisfies the same fail-closed effective-unit identity gate used during the
+# first snapshot.  This catches drift whenever that production gate adds a
+# systemd property, before the smoke test reports the less specific backup
+# cancellation error.
+(
+    # shellcheck disable=SC1090
+    source <(awk '/^rr_prepare_recovery_runtime\(\)/ { exit } { print }' \
+        scripts/install-core.sh)
+    RR_UPDATE_SYSTEMD_DIR="$RR_MOCK_SYSTEMD_UNIT_DIR"
+    RR_UPDATE_RECOVERY_UNIT_FILE="${RR_UPDATE_SYSTEMD_DIR}/rr-update-recovery.service"
+    rr_render_update_recovery_unit > "$RR_UPDATE_RECOVERY_UNIT_FILE"
+    chmod 644 "$RR_UPDATE_RECOVERY_UNIT_FILE"
+    rr_update_recovery_effective_identity_is_exact
+    rm -f -- "$RR_UPDATE_RECOVERY_UNIT_FILE"
+)
+if [ "${RR_OS_MATRIX_SYSTEMCTL_SELF_TEST_ONLY:-0}" = 1 ]; then
+    echo "OS matrix systemctl shim self-test passed"
+    exit 0
+fi
 
 # True clean runtime install, then a second in-place hot update.  No node
 # configuration exists in the container, so post-update correctly avoids
