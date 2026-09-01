@@ -533,9 +533,15 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
         capture { print }
         capture && /^}$/ { exit }
     ' "$REPO_ROOT/scripts/install-core.sh")
+    update_failure_diag_function=$(awk '
+        /^rr_emit_update_failure_diag\(\) \{/ { capture = 1 }
+        capture { print }
+        capture && /^}$/ { exit }
+    ' "$REPO_ROOT/scripts/install-core.sh")
     eval "$delegate_close_function"
     eval "$delegate_function"
     eval "$resume_function"
+    eval "$update_failure_diag_function"
     eval "$rollback_function"
     immediate_root="$TEST_ROOT/immediate"
     RR_TX_ROOT="$immediate_root/update"

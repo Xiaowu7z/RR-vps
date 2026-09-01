@@ -273,6 +273,17 @@ def assert_contract(candidate: dict) -> None:
         "failed=false",
         'bash -s -- "$panel_port" "$node_port"',
         "rr_audit_unit_absent()",
+        "rr_audit_http_routes_absent()",
+        "rr_audit_capture_nginx_generation()",
+        "rr_audit_old_nginx_workers_retired()",
+        "rr_audit_prove_nginx_generation_retired()",
+        "rr_route_evidence=false",
+        "rr_route_evidence=true",
+        '[ "$rr_route_evidence" = true ]',
+        "rr_audit_capture_nginx_generation || failed=true",
+        "rr_audit_prove_nginx_generation_retired || failed=true",
+        '[ "$current_start" != "$expected_start" ] || return 1',
+        "systemctl reload nginx.service",
         "elif ! bash -c '",
         "for residue in",
         "/usr/local/bin/rr /usr/local/lib/rr /usr/local/bin/sing-box",
@@ -284,8 +295,9 @@ def assert_contract(candidate: dict) -> None:
         "/etc/systemd/system/rr-nexus-ip-acme.service",
         "/etc/systemd/system/rr-nexus-ip-acme.timer",
         "/usr/local/lib/rr-vps/nexus-ip-cert-gate",
+        "rr_audit_http_routes_absent || failed=true",
         "for unit in sing-box.service rr-nexus.service",
-        'for port in 80 "$panel_port" "$node_port"',
+        'for port in "$panel_port" "$node_port"',
         'if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
         'elif grep -q . <<<"$port_state"; then',
         'rm -rf -- /root/rr-audit-ip-candidate || failed=true',
@@ -293,8 +305,15 @@ def assert_contract(candidate: dict) -> None:
     ):
         require_fragment(cleanup, fragment, "public-IP failure cleanup")
     assert ">>/root/rr-audit-ip-acme.log 2>&1 || true" not in cleanup
-    shape_check = cleanup.index(
+    generation_gate = cleanup.index(
         "if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ]"
+    )
+    generation_capture_call = cleanup.index(
+        "rr_audit_capture_nginx_generation || failed=true", generation_gate
+    )
+    shape_check = cleanup.index(
+        "if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ]",
+        generation_capture_call,
     )
     uninstall = cleanup.index("elif ! bash -c '", shape_check)
     residue_proof = cleanup.index("for residue in", uninstall)
@@ -312,9 +331,36 @@ def assert_contract(candidate: dict) -> None:
         "/etc/systemd/system/rr-nexus.service",
     ):
         assert residue_tokens.count(exact_path) == 1
+    route_definition = cleanup.index("rr_audit_http_routes_absent() {")
+    route_definition_end = cleanup.index(
+        "if [ -e /usr/local/bin/rr ]", route_definition
+    )
+    route_definition_body = cleanup[route_definition:route_definition_end]
+    route_loop = route_definition_body.index("for path in")
+    route_loop_end = route_definition_body.index("; do", route_loop)
+    route_tokens = route_definition_body[route_loop:route_loop_end].replace(
+        "\\\n", " "
+    ).split()
+    for exact_path in (
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/rr-nexus.conf.port",
+        "/etc/nginx/sites-available/rr-nexus-ip.conf",
+        "/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf",
+        "/etc/nginx/sites-enabled/rr-nexus.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-port.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf",
+    ):
+        assert route_tokens.count(exact_path) == 1
+    route_proof = cleanup.index(
+        "rr_audit_http_routes_absent || failed=true", residue_end
+    )
+    generation_retirement = cleanup.index(
+        "rr_audit_prove_nginx_generation_retired || failed=true", route_proof
+    )
     unit_proof = cleanup.index(
         "for unit in sing-box.service rr-nexus.service",
-        residue_proof,
+        generation_retirement,
     )
     unit_end = cleanup.index("; do", unit_proof)
     unit_tokens = cleanup[unit_proof:unit_end].replace("\\\n", " ").split()
@@ -325,11 +371,12 @@ def assert_contract(candidate: dict) -> None:
         "rr-nexus-ip-acme.timer",
     ):
         assert unit_tokens.count(exact_unit) == 1
-    port_loop = cleanup.index('for port in 80 "$panel_port" "$node_port"', unit_proof)
+    port_loop = cleanup.index('for port in "$panel_port" "$node_port"', unit_proof)
     port_end = cleanup.index("; do", port_loop)
     port_tokens = cleanup[port_loop:port_end].split()
-    for exact_port in ("80", '"$panel_port"', '"$node_port"'):
+    for exact_port in ('"$panel_port"', '"$node_port"'):
         assert port_tokens.count(exact_port) == 1
+    assert "80" not in port_tokens
     port_query = cleanup.index(
         'if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then',
         port_loop,
@@ -342,7 +389,8 @@ def assert_contract(candidate: dict) -> None:
     )
     final_cleanup_gate = cleanup.rindex('[ "$failed" = false ]')
     assert (
-        shape_check < uninstall < residue_proof < unit_proof
+        generation_gate < generation_capture_call < shape_check < uninstall
+        < residue_proof < route_proof < generation_retirement < unit_proof
         < port_query < port_listener < candidate_remove < final_cleanup_gate
     )
     finish_start = body.index("finish_ip_audit() {", cleanup_end)
@@ -364,6 +412,10 @@ def assert_contract(candidate: dict) -> None:
         'ipv6_raw != str(ipv6)',
         'RR_B_PUBLIC_IPV4 is not a global IPv4 address',
         'RR_B_PUBLIC_IPV6 is not a global IPv6 address',
+        'route_probe_name="rr-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+        'route_probe_value=$(openssl rand -hex 32)',
+        '[[ "$route_probe_name" =~ ^rr-audit-[0-9]+-[0-9]+$ ]]',
+        '[[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]',
         'StrictHostKeyChecking=yes',
         'UserKnownHostsFile="$b_known_hosts"',
         'UserKnownHostsFile="$c_known_hosts"',
@@ -387,6 +439,10 @@ def assert_contract(candidate: dict) -> None:
         'assert_unit_state rr-nexus-ip-acme.timer loaded:active:enabled',
         'systemctl start rr-nexus-ip-acme.service',
         'test "$before" = "$after"',
+        '/var/www/rr-nexus-ip-acme/.well-known/acme-challenge/${route_probe_name}',
+        'chmod 644 "$route_probe_path"',
+        'test "$(stat -c \'%u:%g:%a:%h\' -- "$route_probe_path")" = 0:0:644:1',
+        'test "$probe_body" = "$route_probe_value"',
         'nc -4 -z -w 10 "$RR_B_PUBLIC_IPV4" 80',
         '-verify_ip "$RR_B_PUBLIC_IPV4" -verify_return_error',
         'curl -fsS --noproxy \'*\' --connect-timeout 10 --max-time 30 "$ipv4_url"',
@@ -411,9 +467,14 @@ def assert_contract(candidate: dict) -> None:
         'test ! -L /usr/local/bin/rr',
         'test ! -L /usr/local/lib/rr',
         'cleanup_required=false',
-        'IP ACME audit HTTP challenge port remained reachable after uninstall.',
         'IPv6 panel remained reachable after IP ACME uninstall.',
-        'IPv6 challenge port remained reachable after IP ACME uninstall.',
+        'old_nginx_master=$(systemctl show -p MainPID --value nginx.service)',
+        'old_nginx_workers+=("${worker_pid}:${worker_start}")',
+        'old_nginx_workers_retired() {',
+        '[ "$current_start" != "$expected_start" ] || return 1',
+        'test "$old_workers_gone" = true',
+        'new_nginx_master=$(systemctl show -p MainPID --value nginx.service)',
+        'test "$new_worker_count" -ge 1',
     )
     for fragment in required:
         require_fragment(body, fragment, "public-ip-acme job")
@@ -433,6 +494,56 @@ def assert_contract(candidate: dict) -> None:
     assert 'systemctl is-enabled' not in body
     assert body.count('-verify_ip "$address" -verify_return_error') == 1
     assert body.count('grep -q \'^vless://\'') >= 4
+    assert body.count('test "$probe_body" = "$route_probe_value"') == 1
+    assert body.count('[[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]') == 2
+    final_start = body.index("bash -s <<'REMOTE_FINAL'")
+    final_end = body.index("\nREMOTE_FINAL", final_start)
+    final_cleanup = body[final_start:final_end]
+    assert "assert_rr_http_routes_absent()" in final_cleanup
+    assert final_cleanup.count("\nassert_rr_http_routes_absent\n") == 2
+    route_start = final_cleanup.index("assert_rr_http_routes_absent() {")
+    route_end = final_cleanup.index(
+        "/usr/local/bin/rr --nexus-ip-acme-uninstall", route_start
+    )
+    final_route_helper = final_cleanup[route_start:route_end]
+    final_route_loop = final_route_helper.index("for path in")
+    final_route_loop_end = final_route_helper.index("; do", final_route_loop)
+    final_route_tokens = final_route_helper[
+        final_route_loop:final_route_loop_end
+    ].replace("\\\n", " ").split()
+    assert final_route_helper.count(
+        '[ ! -e "$path" ] && [ ! -L "$path" ] || return 1'
+    ) == 1
+    for exact_path in (
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/rr-nexus.conf.port",
+        "/etc/nginx/sites-available/rr-nexus-ip.conf",
+        "/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf",
+        "/etc/nginx/sites-enabled/rr-nexus.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-port.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip.conf",
+        "/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf",
+    ):
+        assert final_route_tokens.count(exact_path) == 1
+    worker_capture = final_cleanup.index(
+        "old_nginx_master=$(systemctl show -p MainPID --value nginx.service)"
+    )
+    ip_uninstall = final_cleanup.index(
+        "/usr/local/bin/rr --nexus-ip-acme-uninstall", worker_capture
+    )
+    full_uninstall = final_cleanup.index(
+        "rr_run_with_update_locks direct 180 uninstall_all_locked", ip_uninstall
+    )
+    worker_retirement = final_cleanup.index("old_workers_gone=false", full_uninstall)
+    new_generation = final_cleanup.index(
+        "new_nginx_master=$(systemctl show -p MainPID --value nginx.service)",
+        worker_retirement,
+    )
+    assert worker_capture < ip_uninstall < full_uninstall
+    assert full_uninstall < worker_retirement < new_generation
+    post_uninstall = body[body.index("cleanup_required=false", final_end):]
+    assert 'nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" 80' not in post_uninstall
+    assert "rr-audit-closed" not in post_uninstall
     for forbidden in (
         "set -x",
         'echo "$RR_IP_ACME_EMAIL"',
@@ -547,6 +658,18 @@ def mutated_ip_cleanup(old: str, new: str) -> dict:
     return candidate
 
 
+def mutated_ip_body(old: str, new: str, occurrence: int = 1) -> dict:
+    candidate = deepcopy(workflow)
+    step = next(
+        item for item in candidate["jobs"]["public-ip-acme"]["steps"]
+        if item.get("name") == (
+            "Issue and externally verify independent IPv4 and IPv6 certificates"
+        )
+    )
+    step["run"] = replace_nth(step["run"], old, new, occurrence)
+    return candidate
+
+
 expect_contract_rejected(
     mutated_transaction("rr_firewall_lock_acquire || return 1", ":", 1),
     "fixture firewall-lock acquire",
@@ -597,6 +720,24 @@ expect_contract_rejected(
     "public-IP cleanup final gate",
 )
 expect_contract_rejected(
+    mutated_ip_cleanup("rr_route_evidence=true", "rr_route_evidence=false"),
+    "public-IP cleanup Nginx route evidence",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        "rr_audit_capture_nginx_generation || failed=true",
+        ":",
+    ),
+    "public-IP cleanup Nginx generation capture",
+)
+expect_contract_rejected(
+    mutated_ip_cleanup(
+        "rr_audit_prove_nginx_generation_retired || failed=true",
+        ":",
+    ),
+    "public-IP cleanup Nginx generation retirement",
+)
+expect_contract_rejected(
     mutated_ip_cleanup("elif ! bash -c '", "elif bash -c '"),
     "public-IP cleanup uninstall status",
 )
@@ -612,13 +753,42 @@ expect_contract_rejected(
     "public-IP cleanup core residue",
 )
 expect_contract_rejected(
+    mutated_ip_cleanup(
+        "/etc/nginx/sites-available/rr-nexus.conf",
+        "/etc/nginx/sites-available/ignored.conf",
+    ),
+    "public-IP cleanup owned HTTP routes",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        '[ ! -e "$path" ] && [ ! -L "$path" ] || return 1',
+        '[ ! -e "$path" ] && [ ! -L "$path" ]',
+        2,
+    ),
+    "public-IP final owned-route fail-hard proof",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'test "$old_workers_gone" = true',
+        ":",
+    ),
+    "public-IP final old Nginx generation retirement",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'test "$new_worker_count" -ge 1',
+        ":",
+    ),
+    "public-IP final new Nginx generation proof",
+)
+expect_contract_rejected(
     mutated_ip_cleanup("sing-box.service rr-nexus.service", "rr-nexus.service"),
     "public-IP cleanup core units",
 )
 expect_contract_rejected(
     mutated_ip_cleanup(
-        'for port in 80 "$panel_port" "$node_port"; do',
-        'for port in 80 "$panel_port"; do',
+        'for port in "$panel_port" "$node_port"; do',
+        'for port in "$panel_port"; do',
     ),
     "public-IP cleanup node listener",
 )

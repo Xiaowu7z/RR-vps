@@ -69,9 +69,35 @@ RR_UPDATE_MAINTENANCE_FILE="${RR_UPDATE_MAINTENANCE_FILE:-/run/rr-vps/update-mai
 RR_COMMITTED_SETTLED_NAME="committed-settled"
 RR_COMMITTED_SETTLED_VALUE="rr-update-committed-settled-v1"
 RR_UPDATE_CHECKPOINT="pre-snapshot"
+RR_UPDATE_DIAG_ARMED=false
+RR_UPDATE_DIAG_EMITTED=false
 
 rr_error() {
     echo "[RR-vps] $*" >&2
+}
+
+rr_emit_update_failure_diag() {
+    local checkpoint="${RR_UPDATE_CHECKPOINT:-unknown}"
+    local rollback_phase="${1:-unknown}"
+    [ "${RR_UPDATE_DIAG_ARMED:-false}" = true ] || return 0
+    [ "${RR_UPDATE_DIAG_EMITTED:-false}" != true ] || return 0
+    case "$checkpoint" in
+        pre-snapshot|phase-switching|old-runtime-move|runtime-install|\
+        phase-runtime-swapped|launcher-install|quarantine-suspend|\
+        phase-migrating|ip-acme-pre|post-update|writer-verify|\
+        durability-sync|phase-commit) ;;
+        *) checkpoint=unknown ;;
+    esac
+    case "$rollback_phase" in
+        state_recorded|freezing|snapshotting|prepared|switching|\
+        runtime_swapped|migrating) ;;
+        *) rollback_phase=unknown ;;
+    esac
+    RR_UPDATE_DIAG_EMITTED=true
+    rr_error \
+        "DIAG update_failure_gate=${checkpoint} rollback_phase=${rollback_phase}" \
+        || true
+    return 0
 }
 
 rr_install_release_after_locks() {
@@ -3060,14 +3086,7 @@ rr_rollback() {
             return 1
             ;;
     esac
-    case "${RR_UPDATE_CHECKPOINT:-unknown}" in
-        pre-snapshot|phase-switching|old-runtime-move|runtime-install|\
-        phase-runtime-swapped|launcher-install|quarantine-suspend|\
-        phase-migrating|ip-acme-pre|post-update|writer-verify|\
-        durability-sync|phase-commit) ;;
-        *) RR_UPDATE_CHECKPOINT=unknown ;;
-    esac
-    rr_error "DIAG update_failure_gate=${RR_UPDATE_CHECKPOINT} rollback_phase=${rollback_phase}"
+    rr_emit_update_failure_diag "$rollback_phase"
     if ! rr_quiesce_health_monitor_for_rollback; then
         TRANSACTION_ACTIVE=false
         ROLLBACK_FAILED=true
@@ -3264,7 +3283,13 @@ rr_republish_retryable_update_phase() {
 }
 
 rr_cleanup() {
-    local result="${1:-0}" cleanup_phase="" retry_phase=""
+    local result="${1:-0}" cleanup_phase="" retry_phase="" diag_phase=unknown
+    if [ -n "$TX_DIR" ]; then
+        diag_phase=$(rr_read_trusted_phase "$TX_DIR" 2>/dev/null || printf unknown)
+    fi
+    if [ "$result" -ne 0 ]; then
+        rr_emit_update_failure_diag "$diag_phase"
+    fi
     if [ "$result" -ne 0 ] && [ "$TRANSACTION_ACTIVE" = true ]; then
         if cleanup_phase=$(rr_read_trusted_phase "$TX_DIR"); then
             if [ "$cleanup_phase" = committed ]; then
@@ -3468,6 +3493,9 @@ rr_install_release() {
         fi
     fi
 
+    RR_UPDATE_CHECKPOINT=pre-snapshot
+    RR_UPDATE_DIAG_ARMED=true
+    RR_UPDATE_DIAG_EMITTED=false
     rr_snapshot_runtime || {
         rr_error "无法完整备份当前安装，已取消更新。"
         return 1

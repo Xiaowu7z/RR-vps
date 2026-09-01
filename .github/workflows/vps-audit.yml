@@ -1235,7 +1235,7 @@ jobs:
             [ "$(stat -c '%u:%g:%a:%h' -- "$log" 2>/dev/null)" = \
               0:0:600:1 ] || return 0
             checkpoint_re='(pre-snapshot|phase-switching|old-runtime-move|runtime-install|phase-runtime-swapped|launcher-install|quarantine-suspend|phase-migrating|ip-acme-pre|post-update|writer-verify|durability-sync|phase-commit|unknown)'
-            phase_re='(state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating)'
+            phase_re='(state_recorded|freezing|snapshotting|prepared|switching|runtime_swapped|migrating|unknown)'
             writer_re='(singbox-identity|nexus-identity|subscription-freeze|singbox-restore|ip-acme-restore|nexus-restore|health-timer-restore|health-service-restart|health-quiesce|subscription-resume|unknown)'
             LC_ALL=C grep -aE \
               "^\\[RR-vps\\] DIAG (update_failure_gate=${checkpoint_re} rollback_phase=${phase_re}|rollback_writer_gate=${writer_re})$" \
@@ -5420,6 +5420,8 @@ jobs:
           c_known_hosts="$RUNNER_TEMP/known-hosts-ip-acme-C"
           ipv4_subscription="$RUNNER_TEMP/ip-acme-v4-subscription.txt"
           cleanup_required=true
+          route_probe_name="rr-audit-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          route_probe_value=$(openssl rand -hex 32)
 
           python3 - "$RR_IP_ACME_EMAIL" "$RR_B_PUBLIC_IPV4" \
             "$RR_B_PUBLIC_IPV6" <<'PY'
@@ -5487,6 +5489,117 @@ jobs:
             [ "$load_state:$active_state:$unit_file_state" = \
               not-found:inactive:not-found ]
           }
+          rr_audit_http_routes_absent() {
+            local path=""
+            for path in \
+              /etc/nginx/sites-available/rr-nexus.conf \
+              /etc/nginx/sites-available/rr-nexus.conf.port \
+              /etc/nginx/sites-available/rr-nexus-ip.conf \
+              /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+              /etc/nginx/sites-enabled/rr-nexus.conf \
+              /etc/nginx/sites-enabled/rr-nexus-port.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf; do
+              [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+            done
+          }
+          nginx_generation_captured=false
+          old_nginx_workers=()
+          rr_audit_capture_nginx_generation() {
+            local active_state="" master_pid="" worker_pid="" worker_start=""
+            active_state=$(systemctl show -p ActiveState --value nginx.service \
+              2>/dev/null) || return 1
+            case "$active_state" in
+              inactive) return 0 ;;
+              active) ;;
+              *) return 1 ;;
+            esac
+            command -v pgrep >/dev/null 2>&1 || return 1
+            master_pid=$(systemctl show -p MainPID --value nginx.service \
+              2>/dev/null) || return 1
+            [[ "$master_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+            while IFS= read -r worker_pid; do
+              [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+              worker_start=$(awk '{print $22}' "/proc/${worker_pid}/stat" \
+                2>/dev/null) || return 1
+              [[ "$worker_start" =~ ^[1-9][0-9]*$ ]] || return 1
+              old_nginx_workers+=("${worker_pid}:${worker_start}")
+            done < <(pgrep -P "$master_pid" -x nginx)
+            [ "${#old_nginx_workers[@]}" -ge 1 ] || return 1
+            nginx_generation_captured=true
+          }
+          rr_audit_old_nginx_workers_retired() {
+            local identity="" pid="" expected_start="" current_start=""
+            for identity in "${old_nginx_workers[@]}"; do
+              pid="${identity%%:*}"
+              expected_start="${identity#*:}"
+              if [ ! -e "/proc/${pid}" ]; then
+                continue
+              fi
+              [ -r "/proc/${pid}/stat" ] || return 1
+              current_start=$(awk '{print $22}' "/proc/${pid}/stat") || return 1
+              [[ "$current_start" =~ ^[1-9][0-9]*$ ]] || return 1
+              [ "$current_start" != "$expected_start" ] || return 1
+            done
+          }
+          rr_audit_prove_nginx_generation_retired() {
+            local active_state="" master_pid="" worker_pid="" worker_start=""
+            local old_workers_gone=false worker_wait=0 new_worker_count=0
+            [ "$nginx_generation_captured" = true ] || return 0
+            active_state=$(systemctl show -p ActiveState --value nginx.service \
+              2>/dev/null) || return 1
+            case "$active_state" in
+              active)
+                nginx -t >/dev/null 2>&1 || return 1
+                systemctl reload nginx.service >/dev/null 2>&1 || return 1
+                ;;
+              inactive) ;;
+              *) return 1 ;;
+            esac
+            while [ "$worker_wait" -lt 30 ]; do
+              if rr_audit_old_nginx_workers_retired; then
+                old_workers_gone=true
+                break
+              fi
+              worker_wait=$((worker_wait + 1))
+              [ "$worker_wait" -lt 30 ] && sleep 1
+            done
+            [ "$old_workers_gone" = true ] || return 1
+            active_state=$(systemctl show -p ActiveState --value nginx.service \
+              2>/dev/null) || return 1
+            case "$active_state" in
+              active)
+                master_pid=$(systemctl show -p MainPID --value nginx.service \
+                  2>/dev/null) || return 1
+                [[ "$master_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+                while IFS= read -r worker_pid; do
+                  [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+                  worker_start=$(awk '{print $22}' "/proc/${worker_pid}/stat" \
+                    2>/dev/null) || return 1
+                  [[ "$worker_start" =~ ^[1-9][0-9]*$ ]] || return 1
+                  new_worker_count=$((new_worker_count + 1))
+                done < <(pgrep -P "$master_pid" -x nginx)
+                [ "$new_worker_count" -ge 1 ]
+                ;;
+              inactive)
+                master_pid=$(systemctl show -p MainPID --value nginx.service \
+                  2>/dev/null) || return 1
+                [ "$master_pid" = 0 ]
+                ;;
+              *) return 1 ;;
+            esac
+          }
+          rr_route_evidence=false
+          if rr_audit_http_routes_absent; then
+            :
+          else
+            rr_route_evidence=true
+          fi
+          if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
+             [ -e /usr/local/lib/rr ] || [ -L /usr/local/lib/rr ] || \
+             [ "$rr_route_evidence" = true ]; then
+            rr_audit_capture_nginx_generation || failed=true
+          fi
           if [ -e /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
              [ -e /usr/local/lib/rr ] || [ -L /usr/local/lib/rr ]; then
             if [ ! -x /usr/local/bin/rr ] || [ -L /usr/local/bin/rr ] || \
@@ -5534,10 +5647,6 @@ jobs:
             /var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme \
             /etc/systemd/system/rr-nexus-ip-acme.service \
             /etc/systemd/system/rr-nexus-ip-acme.timer \
-            /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
-            /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
-            /etc/nginx/sites-available/rr-nexus-ip.conf \
-            /etc/nginx/sites-enabled/rr-nexus-ip.conf \
             /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
             /etc/rr-nexus/certs/.ip-cert-pending \
             /usr/local/lib/rr-vps/nexus-ip-cert-gate \
@@ -5546,6 +5655,8 @@ jobs:
               failed=true
             fi
           done
+          rr_audit_http_routes_absent || failed=true
+          rr_audit_prove_nginx_generation_retired || failed=true
           for unit in sing-box.service rr-nexus.service \
             rr-nexus-ip-acme.service rr-nexus-ip-acme.timer; do
             rr_audit_unit_absent "$unit" || failed=true
@@ -5553,7 +5664,7 @@ jobs:
           if ! command -v ss >/dev/null 2>&1; then
             failed=true
           else
-            for port in 80 "$panel_port" "$node_port"; do
+            for port in "$panel_port" "$node_port"; do
               port_state=""
               if ! port_state=$(ss -H -ltn "sport = :${port}" 2>/dev/null); then
                 failed=true
@@ -5798,14 +5909,19 @@ jobs:
           ipv6_url=$(sshpass -e ssh "${ssh_common[@]}" \
             -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
             bash -s -- "$RR_B_PUBLIC_IPV6" "$RR_IP_ACME_EMAIL" \
-              "$panel_port" <<'REMOTE_IPV6'
+              "$panel_port" "$route_probe_name" "$route_probe_value" \
+              <<'REMOTE_IPV6'
           set -euo pipefail
           umask 077
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
           address="$1"
           email="$2"
           panel_port="$3"
+          route_probe_name="$4"
+          route_probe_value="$5"
           audit_log=/root/rr-audit-ip-acme.log
+          [[ "$route_probe_name" =~ ^rr-audit-[0-9]+-[0-9]+$ ]]
+          [[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]
           assert_unit_state() {
             local unit="$1" expected="$2" load_state="" active_state=""
             local unit_file_state=""
@@ -5860,6 +5976,10 @@ jobs:
           PREPARE
           /usr/local/bin/rr --nexus-ip-acme-install "$address" "$email" \
             >>"$audit_log" 2>&1
+          route_probe_path="/var/www/rr-nexus-ip-acme/.well-known/acme-challenge/${route_probe_name}"
+          (umask 022; printf '%s\n' "$route_probe_value" > "$route_probe_path")
+          chmod 644 "$route_probe_path"
+          test "$(stat -c '%u:%g:%a:%h' -- "$route_probe_path")" = 0:0:644:1
           /usr/local/bin/rr --sync-devices >>"$audit_log" 2>&1
           test "$(jq -r '.certificate_mode' /etc/rr-nexus/nexus.json)" = \
             acme-ip-shortlived
@@ -5884,21 +6004,30 @@ jobs:
           SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
             -o UserKnownHostsFile="$c_known_hosts" "root@$RR_C_HOST" \
             bash -s -- "$RR_B_PUBLIC_IPV6" "$panel_port" "$ipv6_url" \
-              "$node_port" <<'REMOTE_C_IPV6'
+              "$node_port" "$route_probe_name" "$route_probe_value" \
+              <<'REMOTE_C_IPV6'
           set -euo pipefail
           set +x
           address="$1"
           panel_port="$2"
           subscription_url="$3"
           node_port="$4"
+          route_probe_name="$5"
+          route_probe_value="$6"
           output=$(mktemp /tmp/rr-ip-acme-v6.XXXXXX)
           trap 'rm -f -- "$output"' EXIT
           command -v curl >/dev/null
           command -v openssl >/dev/null
+          [[ "$route_probe_name" =~ ^rr-audit-[0-9]+-[0-9]+$ ]]
+          [[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]
           http_code=$(curl -gsS --noproxy '*' --connect-timeout 10 --max-time 30 \
             -o /dev/null -w '%{http_code}' \
             "http://[${address}]/.well-known/acme-challenge/rr-audit-not-found")
           test "$http_code" = 404
+          probe_body=$(curl -gfsS --noproxy '*' --connect-timeout 10 \
+            --max-time 30 \
+            "http://[${address}]/.well-known/acme-challenge/${route_probe_name}")
+          test "$probe_body" = "$route_probe_value"
           curl -gfsS --noproxy '*' --connect-timeout 10 --max-time 30 \
             "https://[${address}]:${panel_port}/healthz" >/dev/null
           printf '' | openssl s_client \
@@ -5931,6 +6060,46 @@ jobs:
             fi
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
+          assert_rr_http_routes_absent() {
+            local path=""
+            for path in \
+              /etc/nginx/sites-available/rr-nexus.conf \
+              /etc/nginx/sites-available/rr-nexus.conf.port \
+              /etc/nginx/sites-available/rr-nexus-ip.conf \
+              /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+              /etc/nginx/sites-enabled/rr-nexus.conf \
+              /etc/nginx/sites-enabled/rr-nexus-port.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf; do
+              [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+            done
+          }
+          command -v pgrep >/dev/null
+          old_nginx_master=$(systemctl show -p MainPID --value nginx.service)
+          [[ "$old_nginx_master" =~ ^[1-9][0-9]*$ ]]
+          test "$(systemctl show -p ActiveState --value nginx.service)" = active
+          old_nginx_workers=()
+          while IFS= read -r worker_pid; do
+            [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]]
+            worker_start=$(awk '{print $22}' "/proc/${worker_pid}/stat")
+            [[ "$worker_start" =~ ^[1-9][0-9]*$ ]]
+            old_nginx_workers+=("${worker_pid}:${worker_start}")
+          done < <(pgrep -P "$old_nginx_master" -x nginx)
+          test "${#old_nginx_workers[@]}" -ge 1
+          old_nginx_workers_retired() {
+            local identity="" pid="" expected_start="" current_start=""
+            for identity in "${old_nginx_workers[@]}"; do
+              pid="${identity%%:*}"
+              expected_start="${identity#*:}"
+              if [ ! -e "/proc/${pid}" ]; then
+                continue
+              fi
+              [ -r "/proc/${pid}/stat" ] || return 1
+              current_start=$(awk '{print $22}' "/proc/${pid}/stat") || return 1
+              [[ "$current_start" =~ ^[1-9][0-9]*$ ]] || return 1
+              [ "$current_start" != "$expected_start" ] || return 1
+            done
+          }
           /usr/local/bin/rr --nexus-ip-acme-uninstall >>"$audit_log" 2>&1
           assert_unit_state rr-nexus-ip-acme.service not-found:inactive:not-found
           assert_unit_state rr-nexus-ip-acme.timer not-found:inactive:not-found
@@ -5938,16 +6107,13 @@ jobs:
             /var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme \
             /etc/systemd/system/rr-nexus-ip-acme.service \
             /etc/systemd/system/rr-nexus-ip-acme.timer \
-            /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
-            /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
-            /etc/nginx/sites-available/rr-nexus-ip.conf \
-            /etc/nginx/sites-enabled/rr-nexus-ip.conf \
             /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
             /etc/rr-nexus/certs/.ip-cert-pending \
             /usr/local/lib/rr-vps/nexus-ip-cert-gate \
             /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
             test ! -e "$path" && test ! -L "$path"
           done
+          assert_rr_http_routes_absent
           assert_unit_state rr-nexus.service loaded:active:enabled
           curl -fsS --connect-timeout 2 --max-time 10 \
             http://127.0.0.1:7900/healthz >/dev/null
@@ -5960,16 +6126,35 @@ jobs:
             rr_run_with_update_locks direct 180 uninstall_all_locked
           ' >>"$audit_log" 2>&1
           rm -rf -- /root/rr-audit-ip-candidate
+          assert_rr_http_routes_absent
           test ! -e /usr/local/bin/rr
           test ! -e /usr/local/lib/rr
+          old_workers_gone=false
+          worker_wait=0
+          while [ "$worker_wait" -lt 30 ]; do
+            if old_nginx_workers_retired; then
+              old_workers_gone=true
+              break
+            fi
+            worker_wait=$((worker_wait + 1))
+            [ "$worker_wait" -lt 30 ] && sleep 1
+          done
+          test "$old_workers_gone" = true
+          new_nginx_master=$(systemctl show -p MainPID --value nginx.service)
+          [[ "$new_nginx_master" =~ ^[1-9][0-9]*$ ]]
+          test "$(systemctl show -p ActiveState --value nginx.service)" = active
+          new_worker_count=0
+          while IFS= read -r worker_pid; do
+            [[ "$worker_pid" =~ ^[1-9][0-9]*$ ]]
+            worker_start=$(awk '{print $22}' "/proc/${worker_pid}/stat")
+            [[ "$worker_start" =~ ^[1-9][0-9]*$ ]]
+            new_worker_count=$((new_worker_count + 1))
+          done < <(pgrep -P "$new_nginx_master" -x nginx)
+          test "$new_worker_count" -ge 1
           REMOTE_FINAL
           cleanup_required=false
           if nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" "$panel_port"; then
             echo 'IP ACME audit panel port remained reachable after uninstall.' >&2
-            exit 1
-          fi
-          if nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" 80; then
-            echo 'IP ACME audit HTTP challenge port remained reachable after uninstall.' >&2
             exit 1
           fi
           SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
@@ -5981,12 +6166,6 @@ jobs:
           if curl -gkfsS --noproxy '*' --connect-timeout 5 --max-time 10 \
             "https://[${address}]:${panel_port}/healthz" >/dev/null 2>&1; then
             echo 'IPv6 panel remained reachable after IP ACME uninstall.' >&2
-            exit 1
-          fi
-          if curl -gsS --noproxy '*' --connect-timeout 5 --max-time 10 \
-            "http://[${address}]/.well-known/acme-challenge/rr-audit-closed" \
-            >/dev/null 2>&1; then
-            echo 'IPv6 challenge port remained reachable after IP ACME uninstall.' >&2
             exit 1
           fi
           REMOTE_C_CLOSED
