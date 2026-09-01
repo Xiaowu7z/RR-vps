@@ -70,7 +70,7 @@ Show the installed version:
 rr --version
 ```
 
-Choose menu option `8` to update. Choose option `6` and enter `UNINSTALL` to remove RR-vps. The uninstall result prints the project URL and reinstall command for future use.
+Choose menu option `8` to update. Choose option `6` and enter `y` (upper- or lowercase) to confirm removal. The uninstall result prints the project URL and reinstall command for future use.
 
 Common operations:
 
