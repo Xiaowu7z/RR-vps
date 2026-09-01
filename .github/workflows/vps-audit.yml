@@ -784,56 +784,95 @@ jobs:
             local snapshot="" raw_state=0 ambiguous_state=0
             local current_ambiguous_state=0 result=1
             local release_failed=false
+            reboot_cleared_gate=role-rejected
             [ "$role" = A ] || return 1
+            reboot_cleared_gate=tempdir-failed
             snapshot=$(mktemp -d "$stage/reboot-cleared-firewall.XXXXXX") || \
               return 1
+            reboot_cleared_gate=tempdir-meta-failed
             chmod 700 "$snapshot" || {
               rm -rf -- "$snapshot"
               return 1
             }
-            if ! load_config_with_defaults >>"$recovery_log" 2>&1 || \
-               ! rr_firewall_lock_acquire; then
+            reboot_cleared_gate=config-load-failed
+            if ! load_config_with_defaults >>"$recovery_log" 2>&1; then
               rm -rf -- "$snapshot"
               return 1
             fi
-            if ! rr_firewall_fail_closed_quarantine_active || \
-               ! rr_firewall_load_fail_closed_quarantine || \
-               [ "$RR_FIREWALL_QUARANTINE_EVIDENCE_KIND" != \
-                 firewall-evidence-v1 ] || \
-               ! rr_firewall_quarantine_evidence_is_trusted || \
-               ! rr_uninstall_firewall_quarantine_artifacts_are_owned || \
-               ! rr_audit_quarantine_supervisor_is_quiescent || \
-               rr_firewall_persistence_backend_available || \
-               ! rr_restore_firewall_snapshot_has_managed_raw_rules \
-                   "$evidence/firewall"; then
-              result=1
+            reboot_cleared_gate=lock-failed
+            if ! rr_firewall_lock_acquire; then
+              rm -rf -- "$snapshot"
+              return 1
+            fi
+            if ! rr_firewall_fail_closed_quarantine_active; then
+              reboot_cleared_gate=quarantine-inactive
+            elif ! rr_firewall_load_fail_closed_quarantine; then
+              reboot_cleared_gate=quarantine-load-failed
+            elif [ "$RR_FIREWALL_QUARANTINE_EVIDENCE_KIND" != \
+                   firewall-evidence-v1 ]; then
+              reboot_cleared_gate=kind-invalid
+            elif ! rr_firewall_quarantine_evidence_is_trusted; then
+              reboot_cleared_gate=evidence-untrusted
+            elif ! rr_uninstall_firewall_quarantine_artifacts_are_owned; then
+              reboot_cleared_gate=artifacts-unowned
+            elif ! rr_audit_quarantine_supervisor_is_quiescent; then
+              reboot_cleared_gate=supervisor-unsettled
+            elif rr_firewall_persistence_backend_available; then
+              reboot_cleared_gate=persistence-present
             else
-              rr_firewall_snapshot_has_ambiguous_legacy_rules \
-                "$evidence" "$desired" >>"$recovery_log" 2>&1
-              ambiguous_state=$?
-              if [ "$ambiguous_state" -ne 1 ]; then
-                result=1
-              elif ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
-                   >>"$recovery_log" 2>&1 || \
-                   ! rr_restore_verify_firewall_pre_mutation_snapshot "$snapshot" \
-                   >>"$recovery_log" 2>&1; then
-                result=1
+              rr_restore_firewall_snapshot_has_managed_raw_rules \
+                "$evidence/firewall" >>"$recovery_log" 2>&1
+              raw_state=$?
+              if [ "$raw_state" -eq 1 ]; then
+                reboot_cleared_gate=old-managed-absent
+              elif [ "$raw_state" -ne 0 ]; then
+                reboot_cleared_gate=old-managed-error
               else
-                rr_restore_firewall_snapshot_has_managed_raw_rules \
-                  "$snapshot/firewall" >>"$recovery_log" 2>&1
-                raw_state=$?
-                if [ "$raw_state" -eq 1 ]; then
-                  rr_firewall_snapshot_has_ambiguous_legacy_rules \
-                    "$snapshot" "$desired" >>"$recovery_log" 2>&1
-                  current_ambiguous_state=$?
-                  if [ "$current_ambiguous_state" -eq 1 ]; then
-                    result=0
+                rr_firewall_snapshot_has_ambiguous_legacy_rules \
+                  "$evidence" "$desired" >>"$recovery_log" 2>&1
+                ambiguous_state=$?
+                if [ "$ambiguous_state" -eq 0 ]; then
+                  reboot_cleared_gate=old-ambiguous
+                elif [ "$ambiguous_state" -ne 1 ]; then
+                  reboot_cleared_gate=old-ambiguity-error
+                elif ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
+                     >>"$recovery_log" 2>&1; then
+                  reboot_cleared_gate=current-capture-failed
+                elif ! rr_restore_verify_firewall_pre_mutation_snapshot "$snapshot" \
+                     >>"$recovery_log" 2>&1; then
+                  reboot_cleared_gate=current-verify-failed
+                else
+                  rr_restore_firewall_snapshot_has_managed_raw_rules \
+                    "$snapshot/firewall" >>"$recovery_log" 2>&1
+                  raw_state=$?
+                  if [ "$raw_state" -eq 0 ]; then
+                    reboot_cleared_gate=current-managed-present
+                  elif [ "$raw_state" -ne 1 ]; then
+                    reboot_cleared_gate=current-managed-error
+                  else
+                    rr_firewall_snapshot_has_ambiguous_legacy_rules \
+                      "$snapshot" "$desired" >>"$recovery_log" 2>&1
+                    current_ambiguous_state=$?
+                    if [ "$current_ambiguous_state" -eq 0 ]; then
+                      reboot_cleared_gate=current-ambiguous
+                    elif [ "$current_ambiguous_state" -ne 1 ]; then
+                      reboot_cleared_gate=current-ambiguity-error
+                    else
+                      reboot_cleared_gate=owned
+                      result=0
+                    fi
                   fi
                 fi
               fi
             fi
-            rr_firewall_lock_release || release_failed=true
-            rm -rf -- "$snapshot" || result=1
+            if ! rr_firewall_lock_release; then
+              release_failed=true
+              reboot_cleared_gate=release-failed
+            fi
+            if ! rm -rf -- "$snapshot"; then
+              reboot_cleared_gate=tempdir-cleanup-failed
+              result=1
+            fi
             [ "$release_failed" = false ] || result=1
             return "$result"
           }
@@ -1178,6 +1217,7 @@ jobs:
           reboot_state=not-needed
           reboot_required=false
           reboot_cleared_owned=false
+          reboot_cleared_gate=not-invoked
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1405,6 +1445,8 @@ jobs:
             "$diag_nonce" "$role" "$firewall_repair"
           printf 'SAFE_DIAG nonce=%s role=%s live_raw=%s\n' \
             "$diag_nonce" "$role" "$live_raw"
+          printf 'SAFE_DIAG nonce=%s role=%s reboot_cleared_gate=%s\n' \
+            "$diag_nonce" "$role" "$reboot_cleared_gate"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
@@ -1493,6 +1535,7 @@ jobs:
                [[ "$payload" =~ ^quarantine_probe=(not-present|load-failed|kind-invalid|evidence-invalid|raw-no-persistence|raw-error|ambiguous|ambiguous-error|ready-raw|ready-no-raw)$ ]] ||
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
+               [[ "$payload" =~ ^reboot_cleared_gate=(not-invoked|role-rejected|tempdir-failed|tempdir-meta-failed|config-load-failed|lock-failed|quarantine-inactive|quarantine-load-failed|kind-invalid|evidence-untrusted|artifacts-unowned|supervisor-unsettled|persistence-present|old-managed-absent|old-managed-error|old-ambiguous|old-ambiguity-error|current-capture-failed|current-verify-failed|current-managed-present|current-managed-error|current-ambiguous|current-ambiguity-error|release-failed|tempdir-cleanup-failed|owned)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
