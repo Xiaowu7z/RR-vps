@@ -189,9 +189,9 @@ jobs:
                   for index, line in enumerate(lines, 1):
                       if relevant.search(line):
                           chosen.append((index, line))
-                  chosen = chosen[-35:]
-                  if not chosen:
-                      chosen = list(enumerate(lines[-15:], max(1, len(lines) - 14)))
+                  chosen = chosen[-25:]
+                  tail = list(enumerate(lines[-20:], max(1, len(lines) - 19)))
+                  chosen = sorted(dict(chosen + tail).items())
                   print(
                       f"DIAG_LOG label={label} file={safe_name} "
                       f"bytes={len(raw)} lines={len(lines)} sha256={digest} excerpts={len(chosen)}"
