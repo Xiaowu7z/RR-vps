@@ -53,9 +53,14 @@ jobs:
           remote_fixture="$guard_tmp/remote.fixture"
           printf '%s\n' 'old-format-entry' > "$RR_LOCAL_MANIFEST"
           cp "$RR_LOCAL_MANIFEST" "$remote_fixture"
-          rr_update_guard_download() { cp "$remote_fixture" "$2"; }
+          # Stable consumes an immutable verified release asset, never Raw.
+          rr_update_guard_download() { return 1; }
+          rr_update_guard_copy_verified_asset() {
+            [ "$1" = manifest.sha256 ] && cp "$remote_fixture" "$2"
+          }
           check_update
           [ "$UPDATE_CHECK_STATE" = latest ]
+          [ "$UPDATE_AVAILABLE" = false ]
           printf '%s\n' 'old-format-entry' 'future/new/type/file.xyz' > "$remote_fixture"
           check_update
           [ "$UPDATE_CHECK_STATE" = available ]
