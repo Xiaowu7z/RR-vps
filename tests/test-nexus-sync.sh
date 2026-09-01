@@ -106,12 +106,14 @@ printf '%s\n' \
     'class InvalidHash(Exception): pass' \
     'class VerifyMismatchError(Exception): pass' \
     > "$stub_root/argon2/exceptions.py"
+RR_UPDATE_MAINTENANCE_FILE="$test_root/update-maintenance" \
 PYTHONPATH="$stub_root:$REPO_ROOT/nexus" python3 - <<'PY'
 import threading
 import types
 
 import rr_nexus
 
+assert not rr_nexus.update_maintenance_active()
 assert rr_nexus.DEVICE_SYNC_TIMEOUT_SECONDS == 300
 
 class GapLock:

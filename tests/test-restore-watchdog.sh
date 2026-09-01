@@ -52,6 +52,9 @@ rr_test_restore_marker_view_systemctl() {
 test_root=$(mktemp -d)
 trap 'rm -rf "$test_root"' EXIT
 
+export RR_FIREWALL_LOCK_FILE="$test_root/run/firewall.lock"
+export RR_FIREWALL_QUARANTINE_DIR="$test_root/firewall-quarantine"
+export RR_FIREWALL_QUARANTINE_FILE="$RR_FIREWALL_QUARANTINE_DIR/firewall-quarantine"
 RR_BACKUP_WORK_DIR="$test_root/state"
 RR_RESTORE_ACTIVE="$RR_BACKUP_WORK_DIR/active"
 RR_RESTORE_RUNTIME_READY="$RR_BACKUP_WORK_DIR/runtime-ready"
@@ -63,6 +66,7 @@ RR_LEGACY_UPDATE_BRIDGE_FILE="$test_root/run/legacy-update-bridge"
 RR_RESTORE_LIVE_LOCK_FILE="$test_root/run/rr-restore-live.lock"
 RR_RESTORE_WATCH_TIMEOUT=5
 mkdir -p "$RR_BACKUP_WORK_DIR" "$test_root/run" "$(dirname "$RR_LEGACY_UPDATE_LOCK_FILE")"
+install -d -m 700 "$RR_FIREWALL_QUARANTINE_DIR"
 
 stage="$RR_BACKUP_WORK_DIR/restore.good"
 other_stage="$RR_BACKUP_WORK_DIR/restore.other"

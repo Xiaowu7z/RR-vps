@@ -29,6 +29,7 @@ export RR_HEALTH_TIMER_FILE="$TEST_ROOT/systemd/argo-rr-health.timer"
 export RR_HEALTH_SERVICE_FILE="$TEST_ROOT/systemd/argo-rr-health.service"
 export RR_HEALTH_RESTART_HELPER="$TEST_ROOT/bin/auto_update_sub.py"
 export RR_UPDATE_LOCK_FILE="$TEST_ROOT/run/rr-update.lock"
+export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/run/update-maintenance"
 export RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/run/legacy-rr-update.lock"
 export RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/run/legacy-update-bridge"
 export RR_UPDATE_RECOVER_SOURCE_ONLY=1
