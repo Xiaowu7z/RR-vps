@@ -278,6 +278,9 @@ EOF
 chmod 755 "$SINGBOX_BIN"
 export TEST_REALITY_PRIVATE="$private" TEST_REALITY_PUBLIC="$public" \
     TEST_REALITY_SHORT="$short_id"
+# The production function was sourced above.  A later same-name definition is
+# an intentional fault-injection stub for the separate credential-repair case.
+# shellcheck disable=SC2218
 rotate_reality_keypair
 [ "$(grep -c '^PRIVATE_KEY=' "$CONFIG_FILE")" -eq 1 ]
 [ "$(grep -c '^PUBLIC_KEY=' "$CONFIG_FILE")" -eq 1 ]
@@ -313,6 +316,7 @@ else
     [ "$reality_crash_status" -eq 137 ] || exit 1
 fi
 [ "$(sha256sum "$CONFIG_FILE")" = "$before" ]
+# shellcheck disable=SC2218
 rotate_reality_keypair
 grep -Fxq "PRIVATE_KEY=$other_private" "$CONFIG_FILE"
 grep -Fxq "PUBLIC_KEY=$other_public" "$CONFIG_FILE"
