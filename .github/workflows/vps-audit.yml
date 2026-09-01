@@ -137,18 +137,45 @@ jobs:
 
           target = Path("modules/10-system.sh")
           original = target.read_text(encoding="utf-8")
-          old = '    [ "$value" = "PathExists=${marker}" ] || return 1\n'
-          new = '    [ "$value" = "${marker} (PathExists)" ] || return 1\n'
-          if original.count(old) != 1 or new in original:
-              raise SystemExit(1)
-          target.write_text(original.replace(old, new), encoding="utf-8")
+          replacements = (
+              (
+                  '    local conditions="" asserts=""\n',
+                  '    local need_reload="" transient=""\n',
+              ),
+              (
+                  '        conditions=$(systemctl show --property=Conditions --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1\n'
+                  '        asserts=$(systemctl show --property=Asserts --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1\n'
+                  '        [ -z "$conditions" ] && [ -z "$asserts" ] || return 1\n',
+                  '        systemctl show --property=Conditions --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" >/dev/null 2>&1 || return 1\n'
+                  '        systemctl show --property=Asserts --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" >/dev/null 2>&1 || return 1\n'
+                  '        need_reload=$(systemctl show --property=NeedDaemonReload --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1\n'
+                  '        transient=$(systemctl show --property=Transient --value \\\n'
+                  '            "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1\n'
+                  '        [ "$need_reload" = no ] && [ "$transient" = no ] || return 1\n',
+              ),
+              (
+                  '    [ "$value" = "PathExists=${marker}" ] || return 1\n',
+                  '    [ "$value" = "${marker} (PathExists)" ] || return 1\n',
+              ),
+          )
+          patched = original
+          for old, new in replacements:
+              if patched.count(old) != 1 or new in patched:
+                  raise SystemExit(1)
+              patched = patched.replace(old, new)
+          target.write_text(patched, encoding="utf-8")
           PY
           python3 scripts/rebuild-bundle.py >/dev/null
           python3 scripts/rebuild-bundle.py --check >/dev/null
           test "$(sha256sum modules/10-system.sh | awk '{print $1}')" = \
-            943980f76fc2cb176d4d3da323bd09d0c8dd50fd5b2cc632c001cba29de3de97
+            594718fc3406c8b6f0ae9b1851fa8fc9a1cfa7acb4eb751f31404ec265387c64
           test "$(sha256sum rr-bundle.tar.gz | awk '{print $1}')" = \
-            6a4220ac33da90e31c04e4b9634643318470094e06832a6731f5c1eeee8a4ab6
+            cc5beb8b4ab9daabc45eea1c14a5cd39f51d7af3b731e78b0568b08398fd6a89
           bundle_sha=$(sha256sum rr-bundle.tar.gz | awk '{print $1}')
           if ! sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz \
               "root@$host:$stage/rr-bundle.tar.gz" >"$runner_log" 2>&1; then
