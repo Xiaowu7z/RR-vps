@@ -828,26 +828,39 @@ rr_ip_acme_external_snapshot_is_complete() {
 }
 
 rr_ip_acme_parent_chain_is_safe() {
-    local target="${1:-}"
+    local target="${1:-}" may_be_missing="${2:-false}"
     case "$target" in
         "$RR_IP_ACME_STATE_ROOT"|"$RR_IP_ACME_WEBROOT") ;;
         *) return 1 ;;
     esac
-    python3 - "$target" <<'PY'
+    case "$may_be_missing" in true|false) ;; *) return 1 ;; esac
+    python3 - "$target" "$may_be_missing" <<'PY'
 import os
 import stat
 import sys
 
-target = sys.argv[1]
+target, may_be_missing_text = sys.argv[1:]
+may_be_missing = may_be_missing_text == "true"
 if not target.startswith("/") or os.path.normpath(target) != target:
     raise SystemExit(1)
 parent = os.path.dirname(target)
 parts = parent.split(os.sep)
 current = "/"
+sticky_ancestor_needs_safe_child = False
 for component in parts[1:]:
     current = os.path.join(current, component)
     try:
         info = os.lstat(current)
+    except FileNotFoundError:
+        # An authoritative absent snapshot performs no mutation when the
+        # target and every recovery sidecar are already absent.  In that
+        # narrow case the missing immediate parent is safe once its preceding
+        # chain is privileged.  Never accept a missing earlier ancestor or a
+        # child directly beneath an unresolved sticky namespace such as /tmp.
+        if (may_be_missing and current == parent
+                and not sticky_ancestor_needs_safe_child):
+            raise SystemExit(0)
+        raise SystemExit(1)
     except OSError:
         raise SystemExit(1)
     mode = stat.S_IMODE(info.st_mode)
@@ -860,6 +873,9 @@ for component in parts[1:]:
     if mode & 0o022:
         if current == parent or not (mode & stat.S_ISVTX):
             raise SystemExit(1)
+        sticky_ancestor_needs_safe_child = True
+    else:
+        sticky_ancestor_needs_safe_child = False
 if os.path.realpath(parent) != parent:
     raise SystemExit(1)
 PY
@@ -1269,6 +1285,18 @@ rr_remove_ip_acme_tree_for_absent_snapshot() {
     retired="${target}.rr-update-recovery-old"
     stage_owner="${stage}.owner"
     retired_owner="${retired}.owner"
+    # A clean host legitimately has neither the managed tree nor its RR-only
+    # immediate parent.  Prove the existing prefix is privileged, then keep
+    # the absent rollback a strict no-op.  If any target or recovery artifact
+    # exists, retain the original all-parents-present deletion gate below.
+    if [ ! -e "$target" ] && [ ! -L "$target" ] && \
+       [ ! -e "$stage" ] && [ ! -L "$stage" ] && \
+       [ ! -e "$stage_owner" ] && [ ! -L "$stage_owner" ] && \
+       [ ! -e "$retired" ] && [ ! -L "$retired" ] && \
+       [ ! -e "$retired_owner" ] && [ ! -L "$retired_owner" ]; then
+        rr_ip_acme_parent_chain_is_safe "$target" true
+        return
+    fi
     rr_ip_acme_parent_chain_is_safe "$target" || return 1
     if [ -e "$stage_owner" ] || [ -L "$stage_owner" ]; then
         # An absent rollback may encounter a copy-stage left by an interrupted

@@ -301,6 +301,41 @@ pass 'owned directory replay is canonical, non-following, and SIGKILL-idempotent
     [ ! -e "$RR_IP_ACME_STATE_ROOT" ] && [ ! -e "$RR_IP_ACME_WEBROOT" ] || \
         fail 'candidate-created trees survived an absent rollback snapshot'
 
+    RR_IP_ACME_STATE_ROOT="$fixture/missing-state-parent/state"
+    RR_IP_ACME_WEBROOT="$fixture/missing-web-parent/webroot"
+    rr_restore_ip_acme_directories_if_recorded "$fixture/new-backup" || \
+        fail 'clean absent snapshot rejected missing RR-only parent directories'
+    [ ! -e "$fixture/missing-state-parent" ] && \
+        [ ! -e "$fixture/missing-web-parent" ] || \
+        fail 'clean absent rollback created a missing RR-only parent'
+
+    RR_IP_ACME_STATE_ROOT="$fixture/missing-ancestor/missing-parent/state"
+    RR_IP_ACME_WEBROOT="$fixture/missing-ancestor/missing-parent/webroot"
+    if rr_restore_ip_acme_directories_if_recorded "$fixture/new-backup"; then
+        fail 'absent rollback accepted a missing earlier ancestor'
+    fi
+
+    victim="$fixture/absent-victim"
+    mkdir -p "$victim"
+    printf 'survive\n' > "$victim/sentinel"
+    ln -s "$victim" "$fixture/absent-attack-parent"
+    RR_IP_ACME_STATE_ROOT="$fixture/absent-attack-parent/state"
+    RR_IP_ACME_WEBROOT="$fixture/absent-attack-parent/webroot"
+    if rr_restore_ip_acme_directories_if_recorded "$fixture/new-backup"; then
+        fail 'absent rollback accepted a symlinked missing-parent prefix'
+    fi
+    [ "$(cat "$victim/sentinel")" = survive ] || \
+        fail 'absent rollback modified a symlink victim'
+
+    mkdir -m 777 "$fixture/absent-writable-parent"
+    RR_IP_ACME_STATE_ROOT="$fixture/absent-writable-parent/state"
+    RR_IP_ACME_WEBROOT="$fixture/absent-writable-parent/webroot"
+    if rr_restore_ip_acme_directories_if_recorded "$fixture/new-backup"; then
+        fail 'absent rollback accepted a writable immediate parent'
+    fi
+
+    RR_IP_ACME_STATE_ROOT="$fixture/live/state"
+    RR_IP_ACME_WEBROOT="$fixture/live/webroot"
     make_state_tree "$RR_IP_ACME_STATE_ROOT" legacy@example.com
     make_webroot_tree "$RR_IP_ACME_WEBROOT"
     rr_restore_ip_acme_directories_if_recorded "$fixture/legacy-backup" || \
@@ -308,7 +343,7 @@ pass 'owned directory replay is canonical, non-following, and SIGKILL-idempotent
     [ -d "$RR_IP_ACME_STATE_ROOT" ] && [ -d "$RR_IP_ACME_WEBROOT" ] || \
         fail 'legacy markerless transaction mutated IP-ACME paths'
 )
-pass 'new absent snapshots remove only owned candidate trees while legacy snapshots remain no-op'
+pass 'new absent snapshots handle clean parents safely while legacy snapshots remain no-op'
 
 (
     export RR_UPDATE_RECOVER_SOURCE_ONLY=1
