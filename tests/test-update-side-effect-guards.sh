@@ -1244,6 +1244,9 @@ iptables() {
     done
     [ "$HOP_PRESENT" = true ]
 }
+ip6tables() {
+    iptables "$@"
+}
 ENTRY_IP_MODE=ipv4
 RR_UPDATE_TRANSACTION=1
 rr_validate_hop_rules HY2 8443 20000:20010 || fail 'existing hop rule failed read-only validation'
