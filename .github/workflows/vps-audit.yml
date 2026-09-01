@@ -162,6 +162,10 @@ jobs:
                   '    [ "$value" = "PathExists=${marker}" ] || return 1\n',
                   '    [ "$value" = "${marker} (PathExists)" ] || return 1\n',
               ),
+              (
+                  'if schedule != ["OnBootSec", "OnUnitActiveSec"]:\n',
+                  'if sorted(schedule) != ["OnBootSec", "OnUnitActiveSec"]:\n',
+              ),
           )
           patched = original
           for old, new in replacements:
@@ -173,9 +177,9 @@ jobs:
           python3 scripts/rebuild-bundle.py >/dev/null
           python3 scripts/rebuild-bundle.py --check >/dev/null
           test "$(sha256sum modules/10-system.sh | awk '{print $1}')" = \
-            594718fc3406c8b6f0ae9b1851fa8fc9a1cfa7acb4eb751f31404ec265387c64
+            a73a194e15ffbb22ceed4b5cfba11201565d1e4764c2c964a731862d3cf4304c
           test "$(sha256sum rr-bundle.tar.gz | awk '{print $1}')" = \
-            cc5beb8b4ab9daabc45eea1c14a5cd39f51d7af3b731e78b0568b08398fd6a89
+            f29463bdbbe7401f7abc7bb6572cc00c45024ca5a38cbf26179c0338a2e9039e
           bundle_sha=$(sha256sum rr-bundle.tar.gz | awk '{print $1}')
           if ! sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz \
               "root@$host:$stage/rr-bundle.tar.gz" >"$runner_log" 2>&1; then
