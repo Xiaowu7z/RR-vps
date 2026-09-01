@@ -832,8 +832,12 @@ jobs:
                   "$evidence" "$desired" >>"$recovery_log" 2>&1
                 ambiguous_state=$?
                 if [ "$ambiguous_state" -eq 0 ]; then
-                  reboot_cleared_gate=old-ambiguous
-                elif [ "$ambiguous_state" -ne 1 ]; then
+                  reboot_old_ambiguity=observed
+                  ambiguous_state=1
+                else
+                  reboot_old_ambiguity=absent
+                fi
+                if [ "$ambiguous_state" -ne 1 ]; then
                   reboot_cleared_gate=old-ambiguity-error
                 elif ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
                      >>"$recovery_log" 2>&1; then
@@ -1218,6 +1222,7 @@ jobs:
           reboot_required=false
           reboot_cleared_owned=false
           reboot_cleared_gate=not-invoked
+          reboot_old_ambiguity=not-invoked
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
             reboot_guard=not-applicable
@@ -1447,6 +1452,8 @@ jobs:
             "$diag_nonce" "$role" "$live_raw"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_cleared_gate=%s\n' \
             "$diag_nonce" "$role" "$reboot_cleared_gate"
+          printf 'SAFE_DIAG nonce=%s role=%s reboot_old_ambiguity=%s\n' \
+            "$diag_nonce" "$role" "$reboot_old_ambiguity"
           printf 'SAFE_DIAG nonce=%s role=%s reboot=%s\n' \
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
@@ -1536,6 +1543,7 @@ jobs:
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
                [[ "$payload" =~ ^reboot_cleared_gate=(not-invoked|role-rejected|tempdir-failed|tempdir-meta-failed|config-load-failed|lock-failed|quarantine-inactive|quarantine-load-failed|kind-invalid|evidence-untrusted|artifacts-unowned|supervisor-unsettled|persistence-present|old-managed-absent|old-managed-error|old-ambiguous|old-ambiguity-error|current-capture-failed|current-verify-failed|current-managed-present|current-managed-error|current-ambiguous|current-ambiguity-error|release-failed|tempdir-cleanup-failed|owned)$ ]] ||
+               [[ "$payload" =~ ^reboot_old_ambiguity=(not-invoked|observed|absent)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
                [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
                [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
