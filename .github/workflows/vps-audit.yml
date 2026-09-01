@@ -781,7 +781,8 @@ jobs:
             local directory="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
             local evidence="$directory/firewall-evidence"
             local desired="$evidence/desired.namespace"
-            local snapshot="" raw_state=0 ambiguous_state=0 result=1
+            local snapshot="" raw_state=0 ambiguous_state=0
+            local current_ambiguous_state=0 result=1
             local release_failed=false
             [ "$role" = A ] || return 1
             snapshot=$(mktemp -d "$stage/reboot-cleared-firewall.XXXXXX") || \
@@ -821,10 +822,13 @@ jobs:
                 rr_restore_firewall_snapshot_has_managed_raw_rules \
                   "$snapshot/firewall" >>"$recovery_log" 2>&1
                 raw_state=$?
-                if [ "$raw_state" -eq 1 ] && \
-                   rr_firewall_snapshots_match_after_clear \
-                     "$evidence" "$snapshot" >>"$recovery_log" 2>&1; then
-                  result=0
+                if [ "$raw_state" -eq 1 ]; then
+                  rr_firewall_snapshot_has_ambiguous_legacy_rules \
+                    "$snapshot" "$desired" >>"$recovery_log" 2>&1
+                  current_ambiguous_state=$?
+                  if [ "$current_ambiguous_state" -eq 1 ]; then
+                    result=0
+                  fi
                 fi
               fi
             fi
