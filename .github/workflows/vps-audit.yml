@@ -128,6 +128,27 @@ jobs:
           stage="${stage_lines[0]}"
           [[ "$stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]]
           validated_stage="$stage"
+          test "$(sha256sum modules/10-system.sh | awk '{print $1}')" = \
+            9718b04b640d17cea956322b509c8545b6459279bf49aa675ebcfb0db6c5ff16
+          test "$(sha256sum rr-bundle.tar.gz | awk '{print $1}')" = \
+            2353fd75c28744f72b2e3bd40dd48a40076fa31a67e082b96d312e0043f58229
+          python3 - <<'PY'
+          from pathlib import Path
+
+          target = Path("modules/10-system.sh")
+          original = target.read_text(encoding="utf-8")
+          old = '    [ "$value" = "PathExists=${marker}" ] || return 1\n'
+          new = '    [ "$value" = "${marker} (PathExists)" ] || return 1\n'
+          if original.count(old) != 1 or new in original:
+              raise SystemExit(1)
+          target.write_text(original.replace(old, new), encoding="utf-8")
+          PY
+          python3 scripts/rebuild-bundle.py >/dev/null
+          python3 scripts/rebuild-bundle.py --check >/dev/null
+          test "$(sha256sum modules/10-system.sh | awk '{print $1}')" = \
+            943980f76fc2cb176d4d3da323bd09d0c8dd50fd5b2cc632c001cba29de3de97
+          test "$(sha256sum rr-bundle.tar.gz | awk '{print $1}')" = \
+            6a4220ac33da90e31c04e4b9634643318470094e06832a6731f5c1eeee8a4ab6
           bundle_sha=$(sha256sum rr-bundle.tar.gz | awk '{print $1}')
           if ! sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz \
               "root@$host:$stage/rr-bundle.tar.gz" >"$runner_log" 2>&1; then
