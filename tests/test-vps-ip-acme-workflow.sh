@@ -496,6 +496,9 @@ def assert_contract(candidate: dict) -> None:
     assert body.count('grep -q \'^vless://\'') >= 4
     assert body.count('test "$probe_body" = "$route_probe_value"') == 1
     assert body.count('[[ "$route_probe_value" =~ ^[0-9a-f]{64}$ ]]') == 2
+    residue_guard = 'if [ -e "$path" ] || [ -L "$path" ]; then'
+    assert body.count(residue_guard) == 2
+    assert 'test ! -e "$path" && test ! -L "$path"' not in body
     final_start = body.index("bash -s <<'REMOTE_FINAL'")
     final_end = body.index("\nREMOTE_FINAL", final_start)
     final_cleanup = body[final_start:final_end]
@@ -758,6 +761,22 @@ expect_contract_rejected(
         "/etc/nginx/sites-available/ignored.conf",
     ),
     "public-IP cleanup owned HTTP routes",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'if [ -e "$path" ] || [ -L "$path" ]; then',
+        "if false; then",
+        1,
+    ),
+    "public-IP IPv4 cleanup residue fail-hard proof",
+)
+expect_contract_rejected(
+    mutated_ip_body(
+        'if [ -e "$path" ] || [ -L "$path" ]; then',
+        "if false; then",
+        2,
+    ),
+    "public-IP final cleanup residue fail-hard proof",
 )
 expect_contract_rejected(
     mutated_ip_body(

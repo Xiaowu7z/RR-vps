@@ -5951,7 +5951,9 @@ jobs:
             /etc/rr-nexus/certs/.ip-cert-pending \
             /usr/local/lib/rr-vps/nexus-ip-cert-gate \
             /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
-            test ! -e "$path" && test ! -L "$path"
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              exit 1
+            fi
           done
           bash -s -- "$address" "$email" "$panel_port" <<'PREPARE'
           set -euo pipefail
@@ -6111,7 +6113,9 @@ jobs:
             /etc/rr-nexus/certs/.ip-cert-pending \
             /usr/local/lib/rr-vps/nexus-ip-cert-gate \
             /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
-            test ! -e "$path" && test ! -L "$path"
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              exit 1
+            fi
           done
           assert_rr_http_routes_absent
           assert_unit_state rr-nexus.service loaded:active:enabled
