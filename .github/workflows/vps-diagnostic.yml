@@ -164,11 +164,40 @@ jobs:
               except Exception as exc:
                   print(f"DIAG_STATE label={label} name={name} rc=exception value={type(exc).__name__}")
 
+          def file_state(name, path):
+              try:
+                  st = os.lstat(path)
+                  kind = "symlink" if os.path.islink(path) else (
+                      "file" if os.path.isfile(path) else (
+                          "dir" if os.path.isdir(path) else "other"
+                      )
+                  )
+                  print(
+                      f"DIAG_FILE label={label} name={name} kind={kind} "
+                      f"uid={st.st_uid} gid={st.st_gid} mode={st.st_mode & 0o7777:o} "
+                      f"nlink={st.st_nlink} size={st.st_size}"
+                  )
+              except FileNotFoundError:
+                  print(f"DIAG_FILE label={label} name={name} kind=absent")
+              except Exception as exc:
+                  print(f"DIAG_FILE label={label} name={name} kind=query-error type={type(exc).__name__}")
+
           print(f"DIAG_REMOTE label={label} stage={sanitize(open('/root/rr-audit-stage').read().strip()) if os.path.isfile('/root/rr-audit-stage') else 'absent'}")
           command("rr-version", ["/usr/local/bin/rr", "--version"])
           command("sing-box-version", ["/usr/local/bin/sing-box", "version"])
           for unit in ("rr-nexus.service", "sing-box.service", "nginx.service", "rr-update-recovery.service"):
               command("unit-" + unit, ["systemctl", "is-active", unit])
+          for prop in ("LoadState", "FragmentPath", "DropInPaths", "UnitFileState"):
+              command(
+                  "recovery-" + prop,
+                  ["systemctl", "show", "--property=" + prop, "--value", "rr-update-recovery.service"],
+              )
+          file_state("recovery-helper", "/usr/local/sbin/rr-update-recover")
+          file_state("external-helper", "/usr/local/sbin/rr-update-external-state")
+          file_state("recovery-unit", "/etc/systemd/system/rr-update-recovery.service")
+          file_state("recovery-dropins", "/etc/systemd/system/rr-update-recovery.service.d")
+          file_state("transaction-root", "/var/lib/rr-update")
+          file_state("active-transaction", "/var/lib/rr-update/active")
 
           log_paths = sorted(glob.glob("/root/rr-audit-*.log"))
           print(f"DIAG_LOG_COUNT label={label} count={len(log_paths)}")
