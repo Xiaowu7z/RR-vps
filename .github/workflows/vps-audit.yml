@@ -203,8 +203,11 @@ jobs:
           safe_object_state restore_active /var/lib/rr-backup/active
           safe_object_state recovery_helper /usr/local/sbin/rr-update-recover
           safe_object_state recovery_unit /etc/systemd/system/rr-update-recovery.service
-          for unit in rr-update-recovery.service rr-nexus.service sing-box.service \
-            argo-rr-health.timer rr-subscription-quarantine.service; do
+          for unit in rr-update-recovery.service rr-restore-recovery.service \
+            rr-restore-watchdog.service rr-subscription-quarantine.service \
+            rr-nexus.service rr-subscription.service sing-box.service \
+            rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+            argo-rr-health.timer argo-rr-health.service; do
             load=$(safe_unit_value "$unit" LoadState)
             active=$(safe_unit_value "$unit" ActiveState)
             enabled=$(safe_unit_value "$unit" UnitFileState)
@@ -254,6 +257,27 @@ jobs:
           }
           rr_audit_cloudflared_process_present() {
             pgrep -x cloudflared >/dev/null 2>&1
+          }
+          rr_audit_callable_state() {
+            local callback="$1" result=0
+            declare -F "$callback" >/dev/null 2>&1 || {
+              printf '%s\n' missing
+              return 0
+            }
+            "$callback" >/dev/null 2>&1
+            result=$?
+            case "$result" in
+              0) printf '%s\n' present ;;
+              1) printf '%s\n' absent ;;
+              *) printf '%s\n' error ;;
+            esac
+          }
+          rr_audit_cloudflared_state() {
+            if rr_audit_cloudflared_process_present; then
+              printf '%s\n' present
+            else
+              printf '%s\n' absent
+            fi
           }
           rr_audit_product_evidence_present() {
             local target=""
@@ -338,6 +362,200 @@ jobs:
             rm -f -- "$marker" || return 1
             sync -f "$parent" || return 1
             rr_audit_path_absent "$marker"
+          }
+          rr_audit_classify_update_root() {
+            local root=/var/lib/rr-update transactions=/var/lib/rr-update/transactions
+            [ "$role" = B ] || { printf '%s\n' not-applicable; return 0; }
+            rr_audit_path_absent "$root" && { printf '%s\n' absent; return 0; }
+            [ -d "$root" ] && [ ! -L "$root" ] || {
+              printf '%s\n' unsafe
+              return 0
+            }
+            command -v mountpoint >/dev/null 2>&1 || {
+              printf '%s\n' unsafe
+              return 0
+            }
+            mountpoint -q -- "$root" && { printf '%s\n' unsafe; return 0; }
+            [ "$(readlink -e -- "$root" 2>/dev/null)" = "$root" ] || {
+              printf '%s\n' unsafe
+              return 0
+            }
+            [ "$(stat -c '%u:%g:%a' -- "$root" 2>/dev/null)" = 0:0:700 ] || {
+              printf '%s\n' unsafe
+              return 0
+            }
+            if [ -z "$(find "$root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+              printf '%s\n' empty
+              return 0
+            fi
+            if [ -d "$transactions" ] && [ ! -L "$transactions" ] && \
+               [ "$(readlink -e -- "$transactions" 2>/dev/null)" = "$transactions" ] && \
+               [ "$(stat -c '%u:%g:%a' -- "$transactions" 2>/dev/null)" = 0:0:700 ] && \
+               ! mountpoint -q -- "$transactions" && \
+               [ -z "$(find "$root" -mindepth 1 -maxdepth 1 ! -name transactions -print -quit 2>/dev/null)" ] && \
+               [ -z "$(find "$transactions" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+              printf '%s\n' transactions-empty
+            else
+              printf '%s\n' other
+            fi
+          }
+          rr_audit_classify_v710_orphan() {
+            local marker=/run/rr-vps/update-maintenance parent=/run/rr-vps
+            local target="" canonical="" marker_value="" last_byte="" spec="" token=""
+            local -a marker_lines=() evidence_specs=(
+              launcher:/usr/local/bin/rr runtime:/usr/local/lib/rr
+              config:/etc/argo_vmess.conf singbox-bin:/usr/local/bin/sing-box
+              subscription-bin:/usr/local/bin/auto_update_sub.py
+              singbox-config:/etc/sing-box nexus-config:/etc/rr-nexus
+              naive-config:/etc/rr-naive update-config:/etc/rr-update
+              cloudflared-config:/etc/rr-cloudflared nexus-state:/var/lib/rr-nexus
+              update-state:/var/lib/rr-update backup-state:/var/lib/rr-backup
+              recovery-helper:/usr/local/sbin/rr-update-recover
+              external-helper:/usr/local/sbin/rr-update-external-state
+              recovery-unit:/etc/systemd/system/rr-update-recovery.service
+              recovery-dropin:/etc/systemd/system/rr-update-recovery.service.d
+              restore-unit:/etc/systemd/system/rr-restore-recovery.service
+              watchdog-unit:/etc/systemd/system/rr-restore-watchdog.service
+              quarantine-unit:/etc/systemd/system/rr-subscription-quarantine.service
+              nexus-unit:/etc/systemd/system/rr-nexus.service
+              subscription-unit:/etc/systemd/system/rr-subscription.service
+              singbox-unit:/etc/systemd/system/sing-box.service
+              ip-acme-service:/etc/systemd/system/rr-nexus-ip-acme.service
+              ip-acme-timer:/etc/systemd/system/rr-nexus-ip-acme.timer
+              health-timer:/etc/systemd/system/argo-rr-health.timer
+              health-service:/etc/systemd/system/argo-rr-health.service
+              ip-acme-site:/etc/nginx/sites-available/rr-nexus-ip-acme-http.conf
+              ip-acme-enabled:/etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf
+              lego:/usr/local/lib/rr-vps/lego lego-install:/usr/local/lib/rr-vps/lego.install
+            )
+            [ "$role" = B ] || { printf '%s\n' not-applicable; return 0; }
+            rr_audit_path_absent "$marker" && { printf '%s\n' not-present; return 0; }
+            for spec in "${evidence_specs[@]}"; do
+              token="${spec%%:*}"
+              target="${spec#*:}"
+              rr_audit_path_absent "$target" || {
+                printf 'evidence-%s\n' "$token"
+                return 0
+              }
+            done
+            rr_audit_path_absent /var/lib/rr-backup/active || {
+              printf '%s\n' restore-active
+              return 0
+            }
+            for target in subscription_server_running managed_singbox_running; do
+              declare -F "$target" >/dev/null 2>&1 || {
+                printf '%s\n' helper-missing
+                return 0
+              }
+              "$target" >/dev/null 2>&1 && {
+                printf 'process-%s\n' "$target"
+                return 0
+              }
+            done
+            rr_audit_cloudflared_process_present && {
+              printf '%s\n' process-cloudflared
+              return 0
+            }
+            for target in rr-update-recovery.service rr-restore-recovery.service \
+              rr-restore-watchdog.service rr-subscription-quarantine.service \
+              rr-nexus.service rr-subscription.service sing-box.service \
+              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+              argo-rr-health.timer argo-rr-health.service; do
+              rr_audit_unit_absent "$target" || {
+                printf '%s\n' unit-state
+                return 0
+              }
+            done
+            [ -d "$parent" ] && [ ! -L "$parent" ] || {
+              printf '%s\n' parent-type
+              return 0
+            }
+            command -v mountpoint >/dev/null 2>&1 || {
+              printf '%s\n' parent-mount-check
+              return 0
+            }
+            mountpoint -q -- "$parent" && { printf '%s\n' parent-mount; return 0; }
+            canonical=$(readlink -e -- "$parent" 2>/dev/null) || {
+              printf '%s\n' parent-canonical
+              return 0
+            }
+            [ "$canonical" = "$parent" ] || { printf '%s\n' parent-canonical; return 0; }
+            [ "$(stat -c '%u:%g:%a' -- "$parent" 2>/dev/null)" = 0:0:700 ] || {
+              printf '%s\n' parent-meta
+              return 0
+            }
+            [ -f "$marker" ] && [ ! -L "$marker" ] || {
+              printf '%s\n' marker-type
+              return 0
+            }
+            [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || {
+              printf '%s\n' marker-meta
+              return 0
+            }
+            mapfile -t marker_lines < "$marker" || { printf '%s\n' marker-read; return 0; }
+            [ "${#marker_lines[@]}" -eq 1 ] || { printf '%s\n' marker-lines; return 0; }
+            [[ "${marker_lines[0]}" =~ ^/var/lib/rr-update/transactions/[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ ]] || {
+              printf '%s\n' marker-format
+              return 0
+            }
+            marker_value="${marker_lines[0]}"
+            [ "$(stat -c %s -- "$marker" 2>/dev/null)" -eq "$(( ${#marker_value} + 1 ))" ] || {
+              printf '%s\n' marker-size
+              return 0
+            }
+            last_byte=$(tail -c 1 -- "$marker" 2>/dev/null | od -An -tx1 | tr -d ' \n') || {
+              printf '%s\n' marker-read
+              return 0
+            }
+            [ "$last_byte" = 0a ] || { printf '%s\n' marker-newline; return 0; }
+            rr_audit_path_absent "$marker_value" || { printf '%s\n' target-present; return 0; }
+            printf '%s\n' eligible
+          }
+          rr_audit_classify_quarantine() {
+            local directory="${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}"
+            local evidence="$directory/firewall-evidence" desired="" raw_state=0 ambiguous_state=0
+            rr_firewall_fail_closed_quarantine_active || {
+              printf '%s\n' not-present
+              return 0
+            }
+            rr_firewall_load_fail_closed_quarantine >/dev/null 2>&1 || {
+              printf '%s\n' load-failed
+              return 0
+            }
+            [ "$RR_FIREWALL_QUARANTINE_EVIDENCE_KIND" = firewall-evidence-v1 ] || {
+              printf '%s\n' kind-invalid
+              return 0
+            }
+            rr_restore_verify_firewall_pre_mutation_snapshot "$evidence" >/dev/null 2>&1 || {
+              printf '%s\n' evidence-invalid
+              return 0
+            }
+            desired="$evidence/desired.namespace"
+            if rr_restore_firewall_snapshot_has_managed_raw_rules "$evidence/firewall" \
+                 >/dev/null 2>&1; then
+              if ! rr_firewall_persistence_backend_available; then
+                printf '%s\n' raw-no-persistence
+                return 0
+              fi
+              raw_state=1
+            else
+              raw_state=$?
+              [ "$raw_state" -eq 1 ] || { printf '%s\n' raw-error; return 0; }
+              raw_state=0
+            fi
+            if rr_firewall_snapshot_has_ambiguous_legacy_rules "$evidence" "$desired" \
+                 >/dev/null 2>&1; then
+              printf '%s\n' ambiguous
+              return 0
+            else
+              ambiguous_state=$?
+              [ "$ambiguous_state" -eq 1 ] || { printf '%s\n' ambiguous-error; return 0; }
+            fi
+            if [ "$raw_state" -eq 1 ]; then
+              printf '%s\n' ready-raw
+            else
+              printf '%s\n' ready-no-raw
+            fi
           }
           rr_audit_repair_known_mismatched_current_hook() {
             local directory=/etc/letsencrypt/renewal-hooks/deploy
@@ -499,6 +717,24 @@ jobs:
             rr_audit_cloudflared_process_present && return 0
             return 1
           }
+          subscription_process_state=$(rr_audit_callable_state subscription_server_running)
+          singbox_process_state=$(rr_audit_callable_state managed_singbox_running)
+          cloudflared_process_state=$(rr_audit_cloudflared_state)
+          orphan_probe=$(rr_audit_classify_v710_orphan)
+          update_root_probe=$(rr_audit_classify_update_root)
+          quarantine_probe=$(rr_audit_classify_quarantine)
+          printf 'SAFE_DIAG nonce=%s role=%s process=subscription state=%s\n' \
+            "$diag_nonce" "$role" "$subscription_process_state"
+          printf 'SAFE_DIAG nonce=%s role=%s process=singbox state=%s\n' \
+            "$diag_nonce" "$role" "$singbox_process_state"
+          printf 'SAFE_DIAG nonce=%s role=%s process=cloudflared state=%s\n' \
+            "$diag_nonce" "$role" "$cloudflared_process_state"
+          printf 'SAFE_DIAG nonce=%s role=%s orphan_probe=%s\n' \
+            "$diag_nonce" "$role" "$orphan_probe"
+          printf 'SAFE_DIAG nonce=%s role=%s update_root=%s\n' \
+            "$diag_nonce" "$role" "$update_root_probe"
+          printf 'SAFE_DIAG nonce=%s role=%s quarantine_probe=%s\n' \
+            "$diag_nonce" "$role" "$quarantine_probe"
           callback_marker="$stage/callback-entered"
           : > "$trace"
           : > "$product_log"
@@ -640,6 +876,14 @@ jobs:
             "$diag_nonce" "$role" "$uninstall_state"
           printf 'SAFE_DIAG nonce=%s role=%s residue=%s\n' \
             "$diag_nonce" "$role" "$residue_state"
+          printf 'SAFE_DIAG nonce=%s role=%s process=subscription_after state=%s\n' \
+            "$diag_nonce" "$role" \
+            "$(rr_audit_callable_state subscription_server_running)"
+          printf 'SAFE_DIAG nonce=%s role=%s process=singbox_after state=%s\n' \
+            "$diag_nonce" "$role" \
+            "$(rr_audit_callable_state managed_singbox_running)"
+          printf 'SAFE_DIAG nonce=%s role=%s process=cloudflared_after state=%s\n' \
+            "$diag_nonce" "$role" "$(rr_audit_cloudflared_state)"
           safe_traces=()
           while IFS= read -r trace_line; do
             if [[ "$trace_line" =~ ^\+*RRX\|${diag_nonce}\|([A-Za-z0-9._-]+):([0-9]+):([A-Za-z0-9_+-]+)\| ]]; then
@@ -681,10 +925,14 @@ jobs:
             [[ "$line" == "$safe_prefix"* ]] || continue
             payload="${line#"$safe_prefix"}"
             if [[ "$payload" =~ ^object=(launcher|runtime|config|active_tx|maintenance|restore_active|recovery_helper|recovery_unit|launcher_after|runtime_after|config_after|active_tx_after|maintenance_after)\ state=(absent|file|dir|symlink|other)$ ]] ||
-               [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-nexus\.service|sing-box\.service|argo-rr-health\.timer|rr-subscription-quarantine\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
+               [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-restore-recovery\.service|rr-restore-watchdog\.service|rr-subscription-quarantine\.service|rr-nexus\.service|rr-subscription\.service|sing-box\.service|rr-nexus-ip-acme\.service|rr-nexus-ip-acme\.timer|argo-rr-health\.timer|argo-rr-health\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
                [[ "$payload" =~ ^ufw=(absent|installed)\ persistence=(absent|present)$ ]] ||
                [[ "$payload" =~ ^lock_probe=(available|busy|unsafe|other)$ ]] ||
                [[ "$payload" =~ ^backend=(iptables|ip6tables)\ state=(missing|ready|error)$ ]] ||
+               [[ "$payload" =~ ^process=(subscription|singbox|cloudflared)(_after)?\ state=(present|absent|missing|error)$ ]] ||
+               [[ "$payload" =~ ^orphan_probe=(not-applicable|not-present|evidence-(launcher|runtime|config|singbox-bin|subscription-bin|singbox-config|nexus-config|naive-config|update-config|cloudflared-config|nexus-state|update-state|backup-state|recovery-helper|external-helper|recovery-unit|recovery-dropin|restore-unit|watchdog-unit|quarantine-unit|nexus-unit|subscription-unit|singbox-unit|ip-acme-service|ip-acme-timer|health-timer|health-service|ip-acme-site|ip-acme-enabled|lego|lego-install)|restore-active|helper-missing|process-(subscription_server_running|managed_singbox_running|cloudflared)|unit-state|parent-type|parent-mount-check|parent-mount|parent-canonical|parent-meta|marker-type|marker-meta|marker-read|marker-lines|marker-format|marker-size|marker-newline|target-present|eligible)$ ]] ||
+               [[ "$payload" =~ ^update_root=(not-applicable|absent|empty|transactions-empty|other|unsafe)$ ]] ||
+               [[ "$payload" =~ ^quarantine_probe=(not-present|load-failed|kind-invalid|evidence-invalid|raw-no-persistence|raw-error|ambiguous|ambiguous-error|ready-raw|ready-no-raw)$ ]] ||
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|failed)$ ]] ||
                [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
                [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
