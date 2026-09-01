@@ -725,8 +725,11 @@ jobs:
             [ "$release_failed" = false ] || state=error
             printf '%s\n' "$state"
           }
-          rr_audit_quarantine_supervisor_is_settled() {
+          rr_audit_quarantine_supervisor_is_quiescent() {
             local load_state="" active_state="" file_state="" unit=""
+            local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+            local wants="$systemd_root/timers.target.wants"
+            local timer_link="$wants/rr-firewall-quarantine-guard.timer"
             rr_firewall_quarantine_supervisor_effective || return 1
             for unit in service path timer; do
               load_state=$(systemctl show \
@@ -740,11 +743,100 @@ jobs:
                 --property=UnitFileState --value 2>/dev/null) || return 1
               case "$unit:$load_state:$active_state:$file_state" in
                 service:loaded:inactive:static|\
-                path:loaded:active:enabled|\
+                path:loaded:inactive:disabled|\
                 timer:loaded:inactive:disabled) ;;
                 *) return 1 ;;
               esac
             done
+            rr_firewall_root_directory_chain_is_safe "$wants" || return 1
+            rr_audit_path_absent "$timer_link"
+          }
+          rr_audit_quarantine_reboot_guard_is_armed() {
+            local load_state="" active_state="" file_state="" unit=""
+            local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+            local wants="$systemd_root/timers.target.wants"
+            local timer_file="$systemd_root/rr-firewall-quarantine-guard.timer"
+            local timer_link="$wants/rr-firewall-quarantine-guard.timer"
+            local link_identity="" file_identity=""
+            rr_firewall_fail_closed_quarantine_active || return 1
+            rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
+            rr_firewall_quarantine_supervisor_effective || return 1
+            for unit in service path timer; do
+              load_state=$(systemctl show \
+                "rr-firewall-quarantine-guard.$unit" \
+                --property=LoadState --value 2>/dev/null) || return 1
+              active_state=$(systemctl show \
+                "rr-firewall-quarantine-guard.$unit" \
+                --property=ActiveState --value 2>/dev/null) || return 1
+              file_state=$(systemctl show \
+                "rr-firewall-quarantine-guard.$unit" \
+                --property=UnitFileState --value 2>/dev/null) || return 1
+              case "$unit:$load_state:$active_state:$file_state" in
+                service:loaded:inactive:static|\
+                path:loaded:inactive:disabled|\
+                timer:loaded:inactive:enabled) ;;
+                *) return 1 ;;
+              esac
+            done
+            rr_firewall_root_directory_chain_is_safe "$wants" || return 1
+            [ -L "$timer_link" ] || return 1
+            [ "$(stat -c '%u:%g:%h' -- "$timer_link" 2>/dev/null)" = 0:0:1 ] || \
+              return 1
+            [ "$(readlink -f -- "$timer_link" 2>/dev/null)" = "$timer_file" ] || \
+              return 1
+            link_identity=$(stat -Lc '%d:%i' -- "$timer_link" 2>/dev/null) || \
+              return 1
+            file_identity=$(stat -Lc '%d:%i' -- "$timer_file" 2>/dev/null) || \
+              return 1
+            [[ "$link_identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+            [ "$link_identity" = "$file_identity" ]
+          }
+          rr_audit_disarm_quarantine_reboot_guard() {
+            local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+            local wants="$systemd_root/timers.target.wants"
+            rr_firewall_quarantine_supervisor_effective || return 1
+            systemctl stop rr-firewall-quarantine-guard.path \
+              >>"$recovery_log" 2>&1 || return 1
+            systemctl disable --now rr-firewall-quarantine-guard.timer \
+              >>"$recovery_log" 2>&1 || return 1
+            systemctl stop rr-firewall-quarantine-guard.service \
+              >>"$recovery_log" 2>&1 || return 1
+            systemctl reset-failed rr-firewall-quarantine-guard.service \
+              rr-firewall-quarantine-guard.path \
+              rr-firewall-quarantine-guard.timer \
+              >>"$recovery_log" 2>&1 || return 1
+            sync -f "$wants" || return 1
+            sync -f "$systemd_root" || return 1
+            rr_audit_quarantine_supervisor_is_quiescent
+          }
+          rr_audit_arm_quarantine_reboot_guard() {
+            local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+            local wants="$systemd_root/timers.target.wants"
+            reboot_guard=not-armed
+            rr_firewall_fail_closed_quarantine_active || return 1
+            rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
+            rr_audit_quarantine_supervisor_is_quiescent || return 1
+            reboot_guard=arm-failed-unsafe
+            if ! systemctl start rr-firewall-quarantine-guard.service \
+                   >>"$recovery_log" 2>&1 || \
+               ! rr_firewall_fail_closed_quarantine_active || \
+               ! rr_uninstall_firewall_quarantine_artifacts_are_owned || \
+               ! rr_audit_quarantine_supervisor_is_quiescent; then
+              if rr_audit_disarm_quarantine_reboot_guard; then
+                reboot_guard=arm-failed-safe
+              fi
+              return 1
+            fi
+            if ! systemctl enable rr-firewall-quarantine-guard.timer \
+                   >>"$recovery_log" 2>&1 || \
+               ! sync -f "$wants" || ! sync -f "$systemd_root" || \
+               ! rr_audit_quarantine_reboot_guard_is_armed; then
+              if rr_audit_disarm_quarantine_reboot_guard; then
+                reboot_guard=arm-failed-safe
+              fi
+              return 1
+            fi
+            reboot_guard=armed
           }
           rr_audit_prepare_ephemeral_firewall_reboot() {
             local load_state="" active_state="" file_state=""
@@ -761,7 +853,7 @@ jobs:
             reboot_gate=quarantine-unowned
             rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
             reboot_gate=supervisor-unsettled
-            rr_audit_quarantine_supervisor_is_settled || return 1
+            rr_audit_quarantine_supervisor_is_quiescent || return 1
             reboot_gate=restore-active
             rr_audit_path_absent /var/lib/rr-backup/active || return 1
             rr_audit_path_absent /run/rr-vps/restore-live || return 1
@@ -807,7 +899,7 @@ jobs:
             reboot_gate=postcheck-failed
             rr_uninstall_firewall_quarantine_artifacts_are_owned || return 1
             rr_firewall_fail_closed_quarantine_active || return 1
-            rr_audit_quarantine_supervisor_is_settled || return 1
+            rr_audit_quarantine_supervisor_is_quiescent || return 1
             rr_audit_path_absent /var/lib/rr-backup/active || return 1
             rr_audit_path_absent /run/rr-vps/restore-live || return 1
             for unit in rr-restore-recovery.service rr-restore-watchdog.service \
@@ -828,6 +920,8 @@ jobs:
             sync -f /var/lib/rr-update/active || return 1
             sync -f /var/lib/rr-vps/firewall-quarantine || return 1
             sync -f /var/lib/rr-vps || return 1
+            reboot_gate=guard-arm-failed
+            rr_audit_arm_quarantine_reboot_guard || return 1
             reboot_gate=prepared
           }
           rr_audit_publish_legacy_update_bridge() {
@@ -973,8 +1067,10 @@ jobs:
           reboot_required=false
           if [ "$role" = B ]; then
             reboot_gate=not-applicable
+            reboot_guard=not-applicable
           else
             reboot_gate=not-invoked
+            reboot_guard=not-armed
           fi
           external_helper_cleanup=not-applicable
           hook_remediation=not-run
@@ -1113,6 +1209,7 @@ jobs:
           if [ "$callback_entered" = no ]; then
             remediation_failed=true
             if [ "$role" != B ]; then reboot_gate=update-lock-rejected; fi
+            if [ "$role" != B ]; then reboot_guard=not-armed; fi
             firewall_repair=not-run
             live_raw=not-probed
             reboot_state=not-needed
@@ -1147,6 +1244,8 @@ jobs:
             "$diag_nonce" "$role" "$reboot_state"
           printf 'SAFE_DIAG nonce=%s role=%s reboot_gate=%s\n' \
             "$diag_nonce" "$role" "$reboot_gate"
+          printf 'SAFE_DIAG nonce=%s role=%s reboot_guard=%s\n' \
+            "$diag_nonce" "$role" "$reboot_guard"
           printf 'SAFE_DIAG nonce=%s role=%s external_helper_cleanup=%s\n' \
             "$diag_nonce" "$role" "$external_helper_cleanup"
           printf 'SAFE_DIAG nonce=%s role=%s hook_remediation=%s\n' \
@@ -1213,6 +1312,7 @@ jobs:
           seen_cleanup_deferred=0
           seen_reboot_prepared=0
           seen_reboot_gate=0
+          seen_reboot_guard=0
           safe_prefix="SAFE_DIAG nonce=${diag_nonce} role=${TARGET_ROLE} "
           while IFS= read -r line; do
             [[ "$line" == "$safe_prefix"* ]] || continue
@@ -1229,7 +1329,8 @@ jobs:
                [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|reboot-required|failed)$ ]] ||
                [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
                [[ "$payload" =~ ^reboot=(not-needed|prepared|rejected)$ ]] ||
-               [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|prepared)$ ]] ||
+               [[ "$payload" =~ ^reboot_gate=(not-applicable|not-invoked|update-lock-rejected|legacy-lock-rejected|role-rejected|ufw-not-installed|persistence-present|quarantine-inactive|quarantine-unowned|supervisor-unsettled|restore-active|managed-unit-present|recovery-unowned|recovery-not-ready|runtime-present|disable-failed|recovery-unowned-post|recovery-not-disabled|postcheck-failed|sync-failed|guard-arm-failed|prepared)$ ]] ||
+               [[ "$payload" =~ ^reboot_guard=(not-applicable|not-armed|armed|arm-failed-safe|arm-failed-unsafe)$ ]] ||
                [[ "$payload" =~ ^external_helper_cleanup=(not-applicable|not-present|not-run|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
                [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
@@ -1243,6 +1344,9 @@ jobs:
               fi
               if [[ "$payload" =~ ^reboot_gate= ]]; then
                 seen_reboot_gate=$((seen_reboot_gate + 1))
+              fi
+              if [[ "$payload" =~ ^reboot_guard= ]]; then
+                seen_reboot_guard=$((seen_reboot_guard + 1))
               fi
             elif [[ "$payload" =~ ^uninstall=(success|not-needed|not-run|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
               printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
@@ -1259,7 +1363,8 @@ jobs:
             fi
           done < "$runner_log"
           if [ "$safe_line_count" -eq 0 ] || [ "$seen_uninstall" -ne 1 ] || \
-             [ "$seen_reboot_gate" -ne 1 ]; then
+             [ "$seen_reboot_gate" -ne 1 ] || \
+             [ "$seen_reboot_guard" -ne 1 ]; then
             printf 'SAFE_DIAG role=%s runner=remote-error-raw-suppressed\n' \
               "$TARGET_ROLE" >&2
             exit 1
@@ -1376,8 +1481,11 @@ jobs:
               [ "$load" = not-found ] && [ "$active" = inactive ] && \
                 { [ -z "$enabled" ] || [ "$enabled" = not-found ]; }
             }
-            rr_audit_quarantine_supervisor_is_settled() {
+            rr_audit_quarantine_supervisor_is_quiescent() {
               local load_state="" active_state="" file_state="" unit=""
+              local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+              local wants="$systemd_root/timers.target.wants"
+              local timer_link="$wants/rr-firewall-quarantine-guard.timer"
               rr_firewall_quarantine_supervisor_effective || return 1
               for unit in service path timer; do
                 load_state=$(systemctl show \
@@ -1391,11 +1499,13 @@ jobs:
                   --property=UnitFileState --value 2>/dev/null) || return 1
                 case "$unit:$load_state:$active_state:$file_state" in
                   service:loaded:inactive:static|\
-                  path:loaded:active:enabled|\
+                  path:loaded:inactive:disabled|\
                   timer:loaded:inactive:disabled) ;;
                   *) return 1 ;;
                 esac
               done
+              rr_firewall_root_directory_chain_is_safe "$wants" || return 1
+              rr_audit_path_absent "$timer_link"
             }
             rr_audit_live_managed_raw_state() {
               local snapshot="" state=error raw_status=0 release_failed=false
@@ -1435,13 +1545,18 @@ jobs:
             for settle_attempt in $(seq 1 20); do
               rr_firewall_fail_closed_quarantine_active || exit 4
               rr_uninstall_firewall_quarantine_artifacts_are_owned || exit 4
-              if rr_audit_quarantine_supervisor_is_settled; then
+              if rr_audit_quarantine_supervisor_is_quiescent; then
                 supervisor_settled=true
                 break
               fi
               sleep 1
             done
             [ "$supervisor_settled" = true ] || exit 4
+            postboot_systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
+            postboot_wants="$postboot_systemd_root/timers.target.wants"
+            sync -f "$postboot_wants" || exit 4
+            sync -f "$postboot_systemd_root" || exit 4
+            rr_audit_quarantine_supervisor_is_quiescent || exit 4
             rr_update_recovery_unit_is_owned || exit 4
             recovery_load=$(systemctl show rr-update-recovery.service \
               --property=LoadState --value 2>/dev/null) || exit 4
