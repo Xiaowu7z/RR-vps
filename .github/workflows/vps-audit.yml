@@ -13,6 +13,9 @@ concurrency:
 jobs:
   diagnose:
     name: Safe diagnostic · ${{ matrix.role }}
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/audit/fix-v720-ip-acme-final'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -35,6 +38,8 @@ jobs:
       - name: Prepare SSH client
         run: |
           set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/audit/fix-v720-ip-acme-final
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/rebuild-bundle.py --check
           sudo apt-get update -qq
@@ -52,13 +57,44 @@ jobs:
           export SSHPASS="$TARGET_PASS"
           host="$TARGET_HOST"
           [[ "$TARGET_ROLE" =~ ^[ABC]$ ]]
+          test -n "$host"
+          [[ "$host" != *$'\n'* ]]
+          [[ "$host" != *$'\r'* ]]
           [[ "$TARGET_HOST_KEY" != *$'\n'* ]]
           read -r host_key_type host_key_data host_key_extra <<<"$TARGET_HOST_KEY"
           test "$host_key_type" = ssh-ed25519
           [[ "$host_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
           test -z "$host_key_extra"
+          diag_nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+          [[ "$diag_nonce" =~ ^[0-9a-f]{32}$ ]]
           known_hosts="$RUNNER_TEMP/known-hosts-${TARGET_ROLE}"
+          runner_log=$(mktemp "$RUNNER_TEMP/rr-safe-diag-${TARGET_ROLE}.XXXXXX")
+          stage_out=$(mktemp "$RUNNER_TEMP/rr-safe-stage-${TARGET_ROLE}.XXXXXX")
+          chmod 600 "$runner_log" "$stage_out"
+          validated_stage=""
+          cleanup_runner() {
+            local rc=$?
+            trap - EXIT
+            set +e
+            if [[ "$validated_stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]] &&
+               declare -p ssh_opts >/dev/null 2>&1; then
+              sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
+                "$validated_stage" >>"$runner_log" 2>&1 <<'CLEANUP_REMOTE'
+              set -u
+              remote_stage="$1"
+              [[ "$remote_stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]] || exit 2
+              rm -rf -- "$remote_stage"
+          CLEANUP_REMOTE
+              cleanup_ssh_rc=$?
+              [ "$cleanup_ssh_rc" -eq 0 ] || rc=1
+            fi
+            rm -f -- "$runner_log" "$stage_out" "$known_hosts" \
+              >/dev/null 2>&1 || rc=1
+            exit "$rc"
+          }
+          trap cleanup_runner EXIT
           (umask 077; printf '%s %s %s\n' "$host" "$host_key_type" "$host_key_data" > "$known_hosts")
+          ssh-keygen -F "$host" -f "$known_hosts" >/dev/null
           ssh_opts=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
             -o LogLevel=ERROR -o PreferredAuthentications=password
@@ -66,22 +102,47 @@ jobs:
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
             -o UserKnownHostsFile="$known_hosts"
           )
-          stage=$(sshpass -e ssh "${ssh_opts[@]}" "root@$host" \
-            'umask 077; mktemp -d /root/rr-safe-diag.XXXXXX')
+          if ! sshpass -e ssh "${ssh_opts[@]}" "root@$host" \
+              'umask 077; mktemp -d /root/rr-safe-diag.XXXXXX' \
+              >"$stage_out" 2>"$runner_log"; then
+            printf 'SAFE_DIAG role=%s runner=create-stage-error\n' "$TARGET_ROLE" >&2
+            exit 1
+          fi
+          mapfile -t stage_lines < "$stage_out"
+          if [ "${#stage_lines[@]}" -ne 1 ]; then
+            printf 'SAFE_DIAG role=%s runner=invalid-stage-output\n' "$TARGET_ROLE" >&2
+            exit 1
+          fi
+          stage="${stage_lines[0]}"
           [[ "$stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]]
+          validated_stage="$stage"
           bundle_sha=$(sha256sum rr-bundle.tar.gz | awk '{print $1}')
-          sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz \
-            "root@$host:$stage/rr-bundle.tar.gz"
+          if ! sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz \
+              "root@$host:$stage/rr-bundle.tar.gz" >"$runner_log" 2>&1; then
+            printf 'SAFE_DIAG role=%s runner=upload-error\n' "$TARGET_ROLE" >&2
+            exit 1
+          fi
+          set +e
           sshpass -e ssh "${ssh_opts[@]}" "root@$host" bash -s -- \
-            "$TARGET_ROLE" "$stage" "$bundle_sha" <<'REMOTE'
+            "$TARGET_ROLE" "$stage" "$bundle_sha" "$diag_nonce" \
+            >"$runner_log" 2>&1 <<'REMOTE'
           set -uo pipefail
           umask 077
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
           role="$1"
           stage="$2"
           expected_bundle_sha="$3"
+          diag_nonce="$4"
           [[ "$role" =~ ^[ABC]$ ]] || exit 2
           [[ "$stage" =~ ^/root/rr-safe-diag\.[A-Za-z0-9]+$ ]] || exit 2
+          [[ "$diag_nonce" =~ ^[0-9a-f]{32}$ ]] || exit 2
+          cleanup_remote() {
+            local rc=$?
+            trap - EXIT
+            rm -rf -- "$stage" || rc=1
+            exit "$rc"
+          }
+          trap cleanup_remote EXIT
           runtime="$stage/runtime"
           trace="$stage/trace.log"
           product_log="$stage/product.log"
@@ -93,25 +154,33 @@ jobs:
           for module_file in "$runtime"/modules/*.sh; do
             source "$module_file" || exit 3
           done
+          set +e
           safe_object_state() {
             local label="$1" target="$2" state=""
             if [ -L "$target" ]; then state=symlink
             elif [ ! -e "$target" ]; then state=absent
-            elif [ -f "$target" ]; then state=regular
-            elif [ -d "$target" ]; then state=directory
+            elif [ -f "$target" ]; then state=file
+            elif [ -d "$target" ]; then state=dir
             else state=other
             fi
-            printf 'SAFE_DIAG role=%s object=%s state=%s\n' "$role" "$label" "$state"
+            printf 'SAFE_DIAG nonce=%s role=%s object=%s state=%s\n' \
+              "$diag_nonce" "$role" "$label" "$state"
           }
           safe_unit_value() {
             local unit="$1" property="$2" value=""
-            value=$(systemctl show "$unit" --property="$property" --value 2>/dev/null) || value=query-error
-            case "$value" in
-              loaded|not-found|masked|active|inactive|failed|activating|deactivating|\
-              enabled|disabled|static|indirect|generated|transient|query-error|'') ;;
-              *) value=other ;;
-            esac
-            printf '%s\n' "${value:-empty}"
+            if ! value=$(systemctl show "$unit" --property="$property" --value 2>/dev/null); then
+              value=query-error
+            elif [ -z "$value" ]; then
+              value=empty
+            else
+              case "$value" in
+                loaded|not-found|masked|active|inactive|failed|activating|deactivating|\
+                reloading|maintenance|enabled|disabled|static|indirect|generated|transient|\
+                linked|linked-runtime|enabled-runtime|alias) ;;
+                *) value=other ;;
+              esac
+            fi
+            printf '%s\n' "$value"
           }
           safe_object_state launcher /usr/local/bin/rr
           safe_object_state runtime /usr/local/lib/rr
@@ -126,54 +195,139 @@ jobs:
             load=$(safe_unit_value "$unit" LoadState)
             active=$(safe_unit_value "$unit" ActiveState)
             enabled=$(safe_unit_value "$unit" UnitFileState)
-            printf 'SAFE_DIAG role=%s unit=%s load=%s active=%s enabled=%s\n' \
-              "$role" "$unit" "$load" "$active" "$enabled"
+            printf 'SAFE_DIAG nonce=%s role=%s unit=%s load=%s active=%s enabled=%s\n' \
+              "$diag_nonce" "$role" "$unit" "$load" "$active" "$enabled"
           done
           ufw_state=absent
-          dpkg-query -W -f='${db:Status-Abbrev}' ufw 2>/dev/null | grep -q '^ii' && ufw_state=installed
+          if dpkg-query -W -f='${db:Status-Abbrev}' ufw 2>/dev/null | grep -q '^ii'; then
+            ufw_state=installed
+          fi
           persistence_state=absent
           command -v netfilter-persistent >/dev/null 2>&1 && persistence_state=present
-          printf 'SAFE_DIAG role=%s ufw=%s persistence=%s\n' \
-            "$role" "$ufw_state" "$persistence_state"
-          set +e
+          printf 'SAFE_DIAG nonce=%s role=%s ufw=%s persistence=%s\n' \
+            "$diag_nonce" "$role" "$ufw_state" "$persistence_state"
           rr_run_with_update_locks direct 5 true >/dev/null 2>&1
-          lock_rc=$?
-          set -e
-          printf 'SAFE_DIAG role=%s lock_probe_rc=%s\n' "$role" "$lock_rc"
+          raw_lock_rc=$?
+          case "$raw_lock_rc" in
+            0) lock_state=available ;;
+            75) lock_state=busy ;;
+            76) lock_state=unsafe ;;
+            *) lock_state=other ;;
+          esac
+          printf 'SAFE_DIAG nonce=%s role=%s lock_probe=%s\n' \
+            "$diag_nonce" "$role" "$lock_state"
           for backend in iptables ip6tables; do
             backend_state=missing
             if command -v "$backend" >/dev/null 2>&1; then
-              "$backend" -w 5 -t filter -S INPUT >/dev/null 2>&1
-              backend_rc=$?
-              [ "$backend_rc" -eq 0 ] && backend_state=ready || backend_state=error
+              if "$backend" -w 5 -t filter -S INPUT >/dev/null 2>&1; then
+                backend_state=ready
+              else
+                backend_state=error
+              fi
             fi
-            printf 'SAFE_DIAG role=%s backend=%s state=%s\n' \
-              "$role" "$backend" "$backend_state"
+            printf 'SAFE_DIAG nonce=%s role=%s backend=%s state=%s\n' \
+              "$diag_nonce" "$role" "$backend" "$backend_state"
           done
+          callback_marker="$stage/callback-entered"
+          diag_uninstall_callback() {
+            : > "$callback_marker"
+            chmod 600 "$callback_marker"
+            uninstall_all_locked
+          }
           exec 9>"$trace"
-          PS4='+SAFE_TRACE:${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}: '
-          set +e
+          PS4='+RRX|'"$diag_nonce"'|${BASH_SOURCE[0]##*/}:${LINENO}:${FUNCNAME[0]:-top}| '
           (
             BASH_XTRACEFD=9
             set -x
-            rr_run_with_update_locks direct 120 uninstall_all_locked
+            rr_run_with_update_locks direct 120 diag_uninstall_callback
           ) >"$product_log" 2>&1
-          uninstall_rc=$?
-          set -e
+          raw_uninstall_rc=$?
           exec 9>&-
           chmod 600 "$trace" "$product_log"
-          printf 'SAFE_DIAG role=%s uninstall_rc=%s\n' "$role" "$uninstall_rc"
-          grep -oE 'SAFE_TRACE:[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9_+-]+' \
-            "$trace" | tail -n 80 | while IFS= read -r token; do
-              printf 'SAFE_DIAG role=%s trace=%s\n' "$role" "$token"
-            done
+          if [ -f "$callback_marker" ]; then callback_entered=yes; else callback_entered=no; fi
+          printf 'SAFE_DIAG nonce=%s role=%s callback_entered=%s\n' \
+            "$diag_nonce" "$role" "$callback_entered"
+          if [ "$raw_uninstall_rc" -eq 0 ]; then
+            uninstall_state=success
+          elif [ "$raw_uninstall_rc" -eq 75 ]; then
+            uninstall_state=lock-busy
+          elif [ "$raw_uninstall_rc" -eq 76 ]; then
+            uninstall_state=lock-unsafe
+          elif [ "$callback_entered" = no ]; then
+            uninstall_state=wrapper-other
+          else
+            case "$raw_uninstall_rc" in
+              1) uninstall_state=callback-rc1 ;;
+              2) uninstall_state=callback-rc2 ;;
+              3) uninstall_state=callback-rc3 ;;
+              *) uninstall_state=callback-other ;;
+            esac
+          fi
+          printf 'SAFE_DIAG nonce=%s role=%s uninstall=%s\n' \
+            "$diag_nonce" "$role" "$uninstall_state"
+          safe_traces=()
+          while IFS= read -r trace_line; do
+            if [[ "$trace_line" =~ ^\+*RRX\|${diag_nonce}\|([A-Za-z0-9._-]+):([0-9]+):([A-Za-z0-9_+-]+)\| ]]; then
+              safe_trace="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+              if [ "${#safe_traces[@]}" -eq 80 ]; then
+                safe_traces=("${safe_traces[@]:1}")
+              fi
+              safe_traces+=("$safe_trace")
+            fi
+          done < "$trace"
+          for safe_trace in "${safe_traces[@]}"; do
+            printf 'SAFE_DIAG nonce=%s role=%s trace=%s\n' \
+              "$diag_nonce" "$role" "$safe_trace"
+          done
           safe_object_state launcher_after /usr/local/bin/rr
           safe_object_state runtime_after /usr/local/lib/rr
           safe_object_state config_after /etc/argo_vmess.conf
           safe_object_state active_tx_after /var/lib/rr-update/active
           safe_object_state maintenance_after /run/rr-vps/update-maintenance
-          cleanup_rc=0
-          rm -rf -- "$stage" || cleanup_rc=$?
-          printf 'SAFE_DIAG role=%s cleanup_rc=%s\n' "$role" "$cleanup_rc"
+          cleanup_state=retry
+          if rm -rf -- "$stage"; then
+            cleanup_state=success
+            trap - EXIT
+          fi
+          printf 'SAFE_DIAG nonce=%s role=%s cleanup=%s\n' \
+            "$diag_nonce" "$role" "$cleanup_state"
+          [ "$cleanup_state" = success ] || exit 5
           exit 0
           REMOTE
+          remote_rc=$?
+          set -e
+          safe_line_count=0
+          seen_uninstall=0
+          seen_cleanup=0
+          safe_prefix="SAFE_DIAG nonce=${diag_nonce} role=${TARGET_ROLE} "
+          while IFS= read -r line; do
+            [[ "$line" == "$safe_prefix"* ]] || continue
+            payload="${line#"$safe_prefix"}"
+            if [[ "$payload" =~ ^object=(launcher|runtime|config|active_tx|maintenance|restore_active|recovery_helper|recovery_unit|launcher_after|runtime_after|config_after|active_tx_after|maintenance_after)\ state=(absent|file|dir|symlink|other)$ ]] ||
+               [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-nexus\.service|sing-box\.service|argo-rr-health\.timer|rr-subscription-quarantine\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
+               [[ "$payload" =~ ^ufw=(absent|installed)\ persistence=(absent|present)$ ]] ||
+               [[ "$payload" =~ ^lock_probe=(available|busy|unsafe|other)$ ]] ||
+               [[ "$payload" =~ ^backend=(iptables|ip6tables)\ state=(missing|ready|error)$ ]] ||
+               [[ "$payload" =~ ^callback_entered=(yes|no)$ ]] ||
+               [[ "$payload" =~ ^trace=[A-Za-z0-9._-]+:[0-9]+:[A-Za-z0-9_+-]+$ ]]; then
+              printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
+              safe_line_count=$((safe_line_count + 1))
+            elif [[ "$payload" =~ ^uninstall=(success|lock-busy|lock-unsafe|wrapper-other|callback-rc1|callback-rc2|callback-rc3|callback-other)$ ]]; then
+              printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
+              safe_line_count=$((safe_line_count + 1))
+              seen_uninstall=1
+            elif [[ "$payload" =~ ^cleanup=(success|retry)$ ]]; then
+              printf 'SAFE_DIAG role=%s %s\n' "$TARGET_ROLE" "$payload"
+              safe_line_count=$((safe_line_count + 1))
+              if [ "${BASH_REMATCH[1]}" = success ]; then
+                seen_cleanup=1
+              fi
+            fi
+          done < "$runner_log"
+          if [ "$remote_rc" -ne 0 ] || [ "$safe_line_count" -eq 0 ] || \
+             [ "$seen_uninstall" -ne 1 ] || [ "$seen_cleanup" -ne 1 ]; then
+            printf 'SAFE_DIAG role=%s runner=remote-error-raw-suppressed\n' \
+              "$TARGET_ROLE" >&2
+            exit 1
+          fi
+          validated_stage=""
