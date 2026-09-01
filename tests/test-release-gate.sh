@@ -8034,6 +8034,22 @@ assert "is_canonical_owned_partial_draft" in partial
 assert 'complete_owned_draft_assets "$draft_id" "$RUN_OWNER_MARKER"' in partial
 assert "is_exact_mutable_draft" in partial
 assert "publish_draft_and_confirm" in partial
+assert partial.count("assert_immutable_releases_enabled") == 2
+initial_immutable = partial.index("assert_immutable_releases_enabled")
+complete_assets = partial.index(
+    'complete_owned_draft_assets "$draft_id" "$RUN_OWNER_MARKER"'
+)
+exact_draft = partial.index("is_exact_mutable_draft", complete_assets)
+final_tag = partial.index("assert_run_owned_target_tag", exact_draft)
+final_immutable = partial.rindex("assert_immutable_releases_enabled")
+final_gate = partial.index("assert_release_gate", final_immutable)
+publish_call = partial.index(
+    'publish_draft_and_confirm "$draft_id" "$RUN_OWNER_MARKER"', final_gate
+)
+assert (
+    initial_immutable < complete_assets < exact_draft < final_tag
+    < final_immutable < final_gate < publish_call
+)
 owned_end = driver.index("absent)", partial_end)
 owned_tag = driver[partial_end:owned_end]
 assert 'reconcile_owned_mutable_target "$LOADED_TAG_OBJECT_SHA"' in owned_tag
@@ -8298,7 +8314,7 @@ first_pure_v710 = b_job.index(
     "          assert_pure_v710_recovery_runtime\n", old_core_install
 )
 first_candidate_upgrade = b_job.index(
-    "          install_candidate >/root/rr-audit-upgrade.log", first_pure_v710
+    '          if ! install_candidate >"$upgrade_log" 2>&1; then', first_pure_v710
 )
 second_pure_v710 = b_job.index(
     "          assert_pure_v710_recovery_runtime\n", first_pure_v710 + 1
@@ -8319,10 +8335,30 @@ assert b_job.count("source /usr/local/sbin/rr-update-recover") == 3
 assert b_job.count("rr_quarantine_firewall_inventory_is_exact 18081") == 2
 legacy_assert_start = b_job.index("          assert_legacy_quarantine() {")
 legacy_assert_end = b_job.index(
-    "          install_candidate >/root/rr-audit-upgrade.log", legacy_assert_start
+    '          if ! install_candidate >"$upgrade_log" 2>&1; then', legacy_assert_start
 )
 legacy_assert = b_job[legacy_assert_start:legacy_assert_end]
 assert legacy_assert.count("            assert_product_quarantine_firewall\n") == 1
+upgrade_log_init = b_job.index(
+    "          upgrade_log=/root/rr-audit-upgrade.log", legacy_assert_start
+)
+safe_diag_start = b_job.index("          emit_safe_upgrade_diag() {", upgrade_log_init)
+safe_diag_end = b_job.index("\n          }", safe_diag_start) + len("\n          }")
+safe_diag = b_job[safe_diag_start:safe_diag_end]
+for fragment in (
+    'rm -f -- "$upgrade_log"',
+    '(umask 077; : > "$upgrade_log")',
+    "0:0:600:1",
+    "[ -f \"$log\" ] && [ ! -L \"$log\" ]",
+    "LC_ALL=C grep -aE",
+    "^\\\\[RR-vps\\\\] DIAG",
+    "update_failure_gate=${checkpoint_re} rollback_phase=${phase_re}",
+    "rollback_writer_gate=${writer_re}",
+):
+    assert fragment in b_job[upgrade_log_init:first_candidate_upgrade]
+assert "grep -aE 'DIAG'" not in safe_diag
+assert b_job.count('            emit_safe_upgrade_diag "$upgrade_log"\n') == 2
+assert b_job.count("root-only log retained on the VPS.") == 2
 first_rollback = b_job.index(
     "          /usr/local/sbin/rr-update-recover rollback", legacy_assert_end
 )
@@ -8330,7 +8366,8 @@ first_legacy_assert_call = b_job.index(
     "          assert_legacy_quarantine\n", first_rollback
 )
 second_upgrade = b_job.index(
-    "          install_candidate >>/root/rr-audit-upgrade.log", first_legacy_assert_call
+    '          if ! install_candidate >>"$upgrade_log" 2>&1; then',
+    first_legacy_assert_call,
 )
 second_upgrade_runtime = b_job.index(
     "          assert_candidate_runtime\n", second_upgrade

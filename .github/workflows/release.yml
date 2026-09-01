@@ -1148,6 +1148,7 @@ jobs:
                 echo "The completed draft is no longer bound to its owned annotated tag." >&2
                 exit 1
               }
+              assert_immutable_releases_enabled
               assert_release_gate
               publish_draft_and_confirm "$draft_id" "$RUN_OWNER_MARKER"
               verify_published_release "$draft_id" "$RUN_OWNER_MARKER"

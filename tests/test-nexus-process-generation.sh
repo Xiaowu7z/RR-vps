@@ -35,7 +35,7 @@ nexus_ip_acme_normalize_address() {
 }
 nexus_ip_acme_is_global_address() { [ "${1:-}" = 8.8.8.8 ]; }
 nexus_ip_acme_email_is_valid() { [ "${1:-}" = ops@example.test ]; }
-nexus_service_start_preflight() { return 0; }
+nexus_service_start_preflight() { return "${PREFLIGHT_STATUS:-0}"; }
 nexus_local_backend_health_check() { return 0; }
 
 reset_case() {
@@ -68,11 +68,16 @@ reset_case() {
     RUNTIME_CERTIFICATE_MODE=pending-acme-ip
     RESTART_MODE=both
     RESTART_STATUS=0
+    PREFLIGHT_STATUS=0
+    RESET_STATUS=0
+    START_LIMIT_HIT=true
     RESTART_LOG="$CASE_ROOT/restarts.log"
+    SYSTEMCTL_LOG="$CASE_ROOT/systemctl.log"
     CURL_LOG="$CASE_ROOT/curl.log"
     DEACTIVATE_LOG="$CASE_ROOT/deactivate.log"
     DISARM_LOG="$CASE_ROOT/disarm.log"
     : > "$RESTART_LOG"
+    : > "$SYSTEMCTL_LOG"
     : > "$CURL_LOG"
     : > "$DEACTIVATE_LOG"
     : > "$DISARM_LOG"
@@ -112,7 +117,15 @@ systemctl() {
                 *) return 1 ;;
             esac
             ;;
+        reset-failed)
+            [ "${2:-}" = rr-nexus ] || return 1
+            printf 'reset-failed\n' >> "$SYSTEMCTL_LOG"
+            [ "$RESET_STATUS" -eq 0 ] || return "$RESET_STATUS"
+            START_LIMIT_HIT=false
+            ;;
         restart)
+            printf 'restart\n' >> "$SYSTEMCTL_LOG"
+            [ "$START_LIMIT_HIT" = false ] || return 75
             printf 'restart\n' >> "$RESTART_LOG"
             case "$RESTART_MODE" in
                 both) MAIN_PID=$((MAIN_PID + 1)); STARTED_AT=$((STARTED_AT + 100)) ;;
@@ -207,6 +220,36 @@ pass 'runtime generation requires exact load/active/running/enabled/PID/timestam
     [ "$status" -eq 7 ] || fail 'failed systemctl restart was accepted'
 )
 pass 'restart proves both generation fields advance and preserves command failure'
+
+(
+    reset_case start-limit-boundary
+    write_public_config pending-acme-ip
+    nexus_systemctl_restart_checked >/dev/null ||
+        fail 'checked Nexus restart did not clear a StartLimitHit latch'
+    [ "$(tr '\n' ' ' < "$SYSTEMCTL_LOG")" = 'reset-failed restart ' ] ||
+        fail 'Nexus reset-failed/restart ordering changed'
+
+    : > "$SYSTEMCTL_LOG"
+    : > "$RESTART_LOG"
+    PREFLIGHT_STATUS=1
+    START_LIMIT_HIT=true
+    if nexus_systemctl_restart_checked >/dev/null 2>&1; then
+        fail 'Nexus restart accepted a failed identity preflight'
+    fi
+    [ ! -s "$SYSTEMCTL_LOG" ] && [ ! -s "$RESTART_LOG" ] ||
+        fail 'failed Nexus identity preflight still touched systemd'
+
+    : > "$SYSTEMCTL_LOG"
+    PREFLIGHT_STATUS=0
+    RESET_STATUS=74
+    START_LIMIT_HIT=true
+    if nexus_systemctl_restart_checked >/dev/null 2>&1; then
+        fail 'Nexus restart accepted a reset-failed error'
+    fi
+    [ "$(cat "$SYSTEMCTL_LOG")" = reset-failed ] && [ ! -s "$RESTART_LOG" ] ||
+        fail 'Nexus restarted after reset-failed failed'
+)
+pass 'Nexus restart clears StartLimitHit only after exact identity preflight'
 
 (
     reset_case promotion

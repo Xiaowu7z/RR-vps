@@ -224,6 +224,9 @@ MOCK_PRIVATE_MOUNTS=no
 MOCK_SYSTEM_CALL_FILTER='~@privileged'
 expect_rejected 'legacy unit with a non-default system-call filter' \
     rr_update_recovery_unit_is_owned_or_absent
+MOCK_SYSTEM_CALL_FILTER=''
+expect_rejected 'legacy unit with an empty system-call filter rendering' \
+    rr_update_recovery_unit_is_owned_or_absent
 MOCK_SYSTEM_CALL_FILTER='~'
 
 printf '%s\n' '[7/7] snapshot failures identify the recovery-runtime stage safely'

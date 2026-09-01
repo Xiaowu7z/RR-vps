@@ -37,6 +37,132 @@ def assert_contract(candidate: dict) -> None:
     ):
         assert candidate_jobs[name]["if"] == push_condition, name
 
+    debian_audit = next(
+        step for step in candidate_jobs["debian-full"]["steps"]
+        if step.get("name") == "Install all protocols and domain panel"
+    )["run"]
+    require_fragment(
+        debian_audit,
+        "23443 25443 n '' ''",
+        "Debian active-UFW audit",
+    )
+    require_fragment(
+        debian_audit,
+        'test -z "$HY2_HOP_PORTS"',
+        "Debian active-UFW audit",
+    )
+    require_fragment(
+        debian_audit,
+        "rr_netfilter_rr_namespace_is_empty",
+        "Debian active-UFW audit",
+    )
+    assert "30000:30010" not in debian_audit
+
+    transaction_audit = next(
+        step for step in candidate_jobs["ubuntu-transaction"]["steps"]
+        if step.get("name") == "Clean host and install local Nexus"
+    )["run"]
+    for fragment in (
+        "purge -y ufw",
+        "rr_audit_remove_rule_all",
+        "rr_audit_assert_rule_absent",
+        "rr_audit_cleanup_cross_fixture optional",
+        "rr_audit_cleanup_cross_fixture required",
+        "rr_audit_remove_ufw_for_netfilter",
+        "rr_firewall_lock_acquire",
+        "rr_firewall_lock_release",
+        "--comment argo-rr-managed-block -j DROP",
+        "--comment argo-rr-audit-fixture -j REDIRECT --to-ports 65431",
+        "--comment rr-audit-user-sentinel -j ACCEPT",
+        "--comment rr-audit-user-sentinel -j REDIRECT --to-ports 65433",
+        "rr_firewall_persistence_backend_available",
+        "netfilter-persistent save",
+        "service iptables save",
+    ):
+        require_fragment(transaction_audit, fragment, "Ubuntu netfilter audit")
+    cleanup_definition = transaction_audit.index(
+        "rr_audit_cleanup_cross_fixture()"
+    )
+    ufw_definition = transaction_audit.index(
+        "rr_audit_remove_ufw_for_netfilter()", cleanup_definition
+    )
+    first_optional = transaction_audit.index(
+        "rr_audit_cleanup_cross_fixture optional", ufw_definition
+    )
+    ufw_helper = transaction_audit[ufw_definition:first_optional]
+    ufw_lock = ufw_helper.index("rr_firewall_lock_acquire")
+    ufw_disable = ufw_helper.index("ufw --force disable", ufw_lock)
+    ufw_status = ufw_helper.index("status=$(LC_ALL=C ufw status", ufw_disable)
+    ufw_purge = ufw_helper.index("purge -y ufw", ufw_status)
+    ufw_absent = ufw_helper.rindex("if rr_ufw_installed")
+    ufw_release = ufw_helper.index("rr_firewall_lock_release", ufw_absent)
+    assert ufw_helper.count("rr_ufw_installed") == 2
+    assert (
+        ufw_lock < ufw_disable < ufw_status < ufw_purge < ufw_absent < ufw_release
+    )
+    assert "return" not in ufw_helper[
+        ufw_helper.index("\n", ufw_lock) + 1 : ufw_release
+    ]
+    assert "exit" not in ufw_helper[
+        ufw_helper.index("\n", ufw_lock) + 1 : ufw_release
+    ]
+    product_uninstall = transaction_audit.index(
+        "if [ -x /usr/local/bin/rr ]", first_optional
+    )
+    second_optional = transaction_audit.index(
+        "rr_audit_cleanup_cross_fixture optional", first_optional + 1
+    )
+    remove_ufw = transaction_audit.index(
+        "if ! rr_audit_remove_ufw_for_netfilter", second_optional
+    )
+    remove_runtime = transaction_audit.index(
+        'rm -rf -- "$cleanup_runtime"', remove_ufw
+    )
+    first_candidate = transaction_audit.index(
+        "install_candidate >/root/rr-audit-clean-install.log", remove_runtime
+    )
+    install_dependencies = transaction_audit.index(
+        "install_deps </dev/null", first_candidate
+    )
+    required_cleanup = transaction_audit.index(
+        "rr_audit_cleanup_cross_fixture required", install_dependencies
+    )
+    framework_install = transaction_audit.index(
+        "install_main", required_cleanup
+    )
+    assert (
+        cleanup_definition
+        < ufw_definition
+        < first_optional
+        < product_uninstall
+        < second_optional
+        < remove_ufw
+        < remove_runtime
+        < first_candidate
+        < install_dependencies
+        < required_cleanup
+        < framework_install
+    )
+    assert transaction_audit.count("rr_audit_cleanup_cross_fixture optional") == 2
+    assert transaction_audit.count("rr_audit_cleanup_cross_fixture required") == 1
+    flat_transaction = " ".join(transaction_audit.replace("\\\n", " ").split())
+    remove_tuples = (
+        'rr_audit_remove_rule_all "$backend" filter INPUT -p tcp --dport 65431 '
+        '-m comment --comment argo-rr-managed-block -j DROP',
+        'rr_audit_remove_rule_all "$backend" nat PREROUTING -p udp --dport 65432 '
+        '-m comment --comment argo-rr-audit-fixture -j REDIRECT --to-ports 65431',
+        'rr_audit_remove_rule_all "$backend" filter INPUT -p tcp --dport 65433 '
+        '-m comment --comment rr-audit-user-sentinel -j ACCEPT',
+        'rr_audit_remove_rule_all "$backend" nat PREROUTING -p udp --dport 65434 '
+        '-m comment --comment rr-audit-user-sentinel -j REDIRECT --to-ports 65433',
+    )
+    for item in remove_tuples:
+        assert flat_transaction.count(item) == 1, item
+        proof = item.replace(
+            "rr_audit_remove_rule_all", "rr_audit_assert_rule_absent", 1
+        )
+        assert flat_transaction.count(proof) == 1, proof
+
     ip_job = candidate_jobs["public-ip-acme"]
     assert ip_job["if"] == (
         "github.event_name == 'workflow_dispatch' && "
@@ -85,6 +211,12 @@ def assert_contract(candidate: dict) -> None:
         'UserKnownHostsFile="$b_known_hosts"',
         'UserKnownHostsFile="$c_known_hosts"',
         'rr_run_with_update_locks direct 180 uninstall_all_locked',
+        'declare -F rr_run_with_update_locks',
+        'declare -F uninstall_all_locked',
+        'elif declare -F uninstall_all >/dev/null 2>&1; then',
+        'printf "%s\\n" y | uninstall_all',
+        'B IP-ACME pre-clean found incomplete or linked runtime residue.',
+        'B IP-ACME pre-clean failed; root-only log retained on VPS.',
         'bash "$stage/install-core.sh" --upgrade',
         "printf '%s\\n' 1 18081 \"$node_port\" ''",
         'nexus_install',
@@ -119,6 +251,8 @@ def assert_contract(candidate: dict) -> None:
         'assert_unit_state sing-box.service loaded:active:enabled',
         'grep -Fq ":${node_port}?"',
         'test ! -e /usr/local/bin/rr',
+        'test ! -L /usr/local/bin/rr',
+        'test ! -L /usr/local/lib/rr',
         'cleanup_required=false',
         'IP ACME audit HTTP challenge port remained reachable after uninstall.',
         'IPv6 panel remained reachable after IP ACME uninstall.',
@@ -129,6 +263,11 @@ def assert_contract(candidate: dict) -> None:
     assert body.count(
         '/usr/local/bin/rr --nexus-ip-acme-install "$address" "$email"'
     ) == 2
+    assert body.count('/usr/local/bin/rr --nexus-ip-acme-uninstall') == 2
+    assert body.count(
+        'elif declare -F uninstall_all >/dev/null 2>&1; then'
+    ) >= 2
+    assert body.count('printf "%s\\n" y | uninstall_all') >= 2
     assert body.count('test "$before" = "$after"') == 2
     assert body.count(
         'assert_unit_state rr-nexus-ip-acme.timer loaded:active:enabled'
@@ -209,6 +348,61 @@ for job_name, job in jobs.items():
 
 # Mutation checks prove the test is fail-closed for its three release-critical
 # relationships instead of merely searching the unmodified document.
+def replace_nth(text: str, old: str, new: str, occurrence: int) -> str:
+    start = -1
+    for _ in range(occurrence):
+        start = text.index(old, start + 1)
+    return text[:start] + new + text[start + len(old):]
+
+
+def expect_contract_rejected(candidate: dict, label: str) -> None:
+    try:
+        assert_contract(candidate)
+    except (AssertionError, ValueError):
+        return
+    raise AssertionError(f"{label} mutation was accepted")
+
+
+def mutated_transaction(old: str, new: str, occurrence: int = 1) -> dict:
+    candidate = deepcopy(workflow)
+    step = next(
+        item for item in candidate["jobs"]["ubuntu-transaction"]["steps"]
+        if item.get("name") == "Clean host and install local Nexus"
+    )
+    step["run"] = replace_nth(step["run"], old, new, occurrence)
+    return candidate
+
+
+expect_contract_rejected(
+    mutated_transaction("rr_firewall_lock_acquire || return 1", ":", 2),
+    "UFW firewall-lock acquire",
+)
+expect_contract_rejected(
+    mutated_transaction("rr_firewall_lock_release || failed=true", ":", 2),
+    "UFW firewall-lock release",
+)
+expect_contract_rejected(
+    mutated_transaction(
+        "if rr_ufw_installed; then\n    failed=true\n  fi\n"
+        "  rr_firewall_lock_release",
+        "if false; then\n    failed=true\n  fi\n"
+        "  rr_firewall_lock_release",
+    ),
+    "UFW final absence proof",
+)
+expect_contract_rejected(
+    mutated_transaction("rr_audit_cleanup_cross_fixture optional", ":", 1),
+    "first optional fixture cleanup",
+)
+expect_contract_rejected(
+    mutated_transaction("rr_audit_cleanup_cross_fixture optional", ":", 2),
+    "second optional fixture cleanup",
+)
+expect_contract_rejected(
+    mutated_transaction("--dport 65431", "--dport 65430", 1),
+    "exact firewall fixture port",
+)
+
 mutation = deepcopy(workflow)
 mutation["jobs"]["public-ip-acme"]["if"] = (
     "github.event_name == 'push' && github.ref == 'refs/heads/main'"
@@ -245,6 +439,21 @@ except AssertionError:
     pass
 else:
     raise AssertionError("IPv4 IP-SAN verification mutation was accepted")
+
+mutation = deepcopy(workflow)
+transaction_step = next(
+    step for step in mutation["jobs"]["ubuntu-transaction"]["steps"]
+    if step.get("name") == "Clean host and install local Nexus"
+)
+transaction_step["run"] = transaction_step["run"].replace(
+    "rr_audit_cleanup_cross_fixture required", ":", 1
+)
+try:
+    assert_contract(mutation)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("required persisted fixture-cleanup mutation was accepted")
 
 print("VPS public-IP ACME workflow contract: PASS")
 PY
