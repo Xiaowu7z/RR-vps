@@ -1011,13 +1011,16 @@ rr_cloudflared_effective_identity_is_exact() {
     for property in RootDirectory RootImage MountImages ExtensionImages \
         ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths \
         InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths \
-        Environment EnvironmentFiles PassEnvironment PAMName SystemCallFilter; do
+        Environment EnvironmentFiles PassEnvironment PAMName; do
         value=$(rr_cloudflared_show "$property") || return 1
         [ -z "$value" ] || return 1
     done
-    # The unset sentinel differs across systemd versions.  With an empty
-    # SystemCallFilter it has no execution semantics, but the query itself must
-    # remain readable so an unsupported/incomplete effective view fails shut.
+    value=$(rr_cloudflared_show SystemCallFilter) || return 1
+    [ "$value" = '~' ] || return 1
+    # SystemCallErrorNumber's unset sentinel differs across systemd versions,
+    # but it has no execution semantics while SystemCallFilter is the exact
+    # default above.  The query must remain readable so an incomplete effective
+    # view still fails shut.
     rr_cloudflared_show SystemCallErrorNumber >/dev/null || return 1
     rr_cloudflared_effective_dropins_are_exact
 }

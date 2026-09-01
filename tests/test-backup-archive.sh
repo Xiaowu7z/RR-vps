@@ -1461,16 +1461,18 @@ EOF
                 'show certbot.service --property=TemporaryFileSystem --value'|\
                 'show certbot.service --property=NoExecPaths --value'|\
                 'show certbot.service --property=NetworkNamespacePath --value'|\
-                'show certbot.service --property=RestrictAddressFamilies --value'|\
-                'show certbot.service --property=RestrictNetworkInterfaces --value'|\
-                'show certbot.service --property=RestrictFileSystems --value'|\
-                'show certbot.service --property=SystemCallFilter --value'|\
                 'show certbot.service --property=MountImages --value'|\
                 'show certbot.service --property=ExtensionImages --value'|\
                 'show certbot.service --property=ExtensionDirectories --value'|\
                 'show certbot.service --property=JoinsNamespaceOf --value'|\
                 'show certbot.service --property=IPAddressDeny --value')
                     printf '\n'
+                    ;;
+                'show certbot.service --property=RestrictAddressFamilies --value'|\
+                'show certbot.service --property=RestrictNetworkInterfaces --value'|\
+                'show certbot.service --property=RestrictFileSystems --value'|\
+                'show certbot.service --property=SystemCallFilter --value')
+                    printf '%s\n' '~'
                     ;;
                 'show certbot.service --property=PrivateNetwork --value'|\
                 'show certbot.service --property=DynamicUser --value'|\

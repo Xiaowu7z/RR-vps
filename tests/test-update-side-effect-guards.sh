@@ -330,10 +330,10 @@ pass 'effective ACME route probe is bounded, dual-stack and cleanup-safe'
     SERVICE_NO_EXEC_PATHS=''
     SERVICE_NETWORK_NAMESPACE_PATH=''
     SERVICE_PRIVATE_USERS=no
-    SERVICE_RESTRICT_ADDRESS_FAMILIES=''
-    SERVICE_RESTRICT_NETWORK_INTERFACES=''
-    SERVICE_RESTRICT_FILESYSTEMS=''
-    SERVICE_SYSTEM_CALL_FILTER=''
+    SERVICE_RESTRICT_ADDRESS_FAMILIES='~'
+    SERVICE_RESTRICT_NETWORK_INTERFACES='~'
+    SERVICE_RESTRICT_FILESYSTEMS='~'
+    SERVICE_SYSTEM_CALL_FILTER='~'
     SERVICE_MOUNT_IMAGES=''
     SERVICE_EXTENSION_IMAGES=''
     SERVICE_EXTENSION_DIRECTORIES=''
@@ -623,16 +623,21 @@ pass 'effective ACME route probe is bounded, dual-stack and cleanup-safe'
         fail 'Certbot service with a private user namespace passed validation'
     fi
     SERVICE_PRIVATE_USERS=no
+    SERVICE_RESTRICT_ADDRESS_FAMILIES='~AF_UNIX'
+    if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
+        fail 'Certbot service with restricted address families passed validation'
+    fi
+    SERVICE_RESTRICT_ADDRESS_FAMILIES='~'
     SERVICE_RESTRICT_NETWORK_INTERFACES=lo
     if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
         fail 'Certbot service with restricted network interfaces passed validation'
     fi
-    SERVICE_RESTRICT_NETWORK_INTERFACES=''
+    SERVICE_RESTRICT_NETWORK_INTERFACES='~'
     SERVICE_SYSTEM_CALL_FILTER='~@network-io'
     if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
         fail 'Certbot service with a network-blocking syscall filter passed validation'
     fi
-    SERVICE_SYSTEM_CALL_FILTER=''
+    SERVICE_SYSTEM_CALL_FILTER='~'
     SERVICE_MOUNT_IMAGES='/tmp/lineage.raw:/etc/letsencrypt'
     if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
         fail 'Certbot service with a mounted lineage image passed validation'
@@ -660,7 +665,7 @@ pass 'effective ACME route probe is bounded, dual-stack and cleanup-safe'
     if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
         fail 'Certbot service with restricted filesystems passed validation'
     fi
-    SERVICE_RESTRICT_FILESYSTEMS=''
+    SERVICE_RESTRICT_FILESYSTEMS='~'
     SYSTEMD_VERSION=255
     SERVICE_DROPINS=/etc/systemd/system/certbot.service.d/unknown.conf
     if rr_certbot_renewal_runtime_is_ready naive.example.invalid; then
@@ -1021,7 +1026,6 @@ pass 'ordinary post-update Naive path gates writes and later services on lineage
             'show --property=EnvironmentFiles --value sing-box.service'|\
             'show --property=PassEnvironment --value sing-box.service'|\
             'show --property=PAMName --value sing-box.service'|\
-            'show --property=SystemCallFilter --value sing-box.service'|\
             'show --property=Conditions --value sing-box.service'|\
             'show --property=Asserts --value sing-box.service'|\
             'show --property=DropInPaths --value sing-box.service'|\
@@ -1030,6 +1034,8 @@ pass 'ordinary post-update Naive path gates writes and later services on lineage
             'show --property=ExecStop --value sing-box.service'|\
             'show --property=ExecStopPost --value sing-box.service')
                 printf '\n' ;;
+            'show --property=SystemCallFilter --value sing-box.service')
+                printf '%s\n' '~' ;;
             'show --property=ProtectSystem --value sing-box.service')
                 printf '%s\n' no ;;
             'show --property=ProtectHome --value sing-box.service')

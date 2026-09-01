@@ -506,7 +506,8 @@ rr_singbox_service_guards_are_effective() {
     local exec_start="" exec_reload="" interval="" burst="" restart=""
     local restart_prevent="" user="" working_directory="" dynamic_user=""
     local private_network="" root_directory="" root_image="" conditions="" asserts=""
-    local dropin_paths="" exec_condition="" restore_present=false firewall_present=false
+    local dropin_paths="" exec_condition="" value=""
+    local restore_present=false firewall_present=false
     local -a rr_singbox_gate_lines=()
     local systemd_root="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}"
     local restore_name="${RR_RESTORE_GATE_DROPIN_NAME:-zzzz-rr-restore-gate.conf}"
@@ -695,6 +696,10 @@ PY
     if declare -F rr_firewall_effective_marker_view_is_safe \
         >/dev/null 2>&1; then
         rr_firewall_effective_marker_view_is_safe sing-box.service || return 1
+    else
+        value=$(systemctl show --property=SystemCallFilter --value \
+            sing-box.service 2>/dev/null) || return 1
+        [ "$value" = '~' ] || return 1
     fi
 }
 
@@ -765,11 +770,14 @@ rr_singbox_legacy_service_is_owned() {
         rr_firewall_effective_marker_view_is_safe sing-box.service || return 1
     else
         for property in RootDirectory RootImage Environment EnvironmentFiles \
-            PAMName SystemCallFilter; do
+            PAMName; do
             value=$(systemctl show --property="$property" --value \
                 sing-box.service 2>/dev/null) || return 1
             [ -z "$value" ] || return 1
         done
+        value=$(systemctl show --property=SystemCallFilter --value \
+            sing-box.service 2>/dev/null) || return 1
+        [ "$value" = '~' ] || return 1
     fi
     value=$(systemctl show --property=StartLimitIntervalUSec --value \
         sing-box.service 2>/dev/null) || return 1
@@ -1028,12 +1036,14 @@ rr_health_effective_namespace_is_exact() {
     for property in RootDirectory RootImage MountImages ExtensionImages \
         ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths \
         InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths \
-        Environment EnvironmentFiles PassEnvironment UnsetEnvironment PAMName \
-        SystemCallFilter; do
+        Environment EnvironmentFiles PassEnvironment UnsetEnvironment PAMName; do
         value=$(systemctl show --property="$property" --value "$unit" \
             2>/dev/null) || return 1
         [ -z "$value" ] || return 1
     done
+    value=$(systemctl show --property=SystemCallFilter --value "$unit" \
+        2>/dev/null) || return 1
+    [ "$value" = '~' ] || return 1
     if [ "$systemd_version" -ge 254 ]; then
         root_ephemeral=$(systemctl show --property=RootEphemeral --value "$unit" \
             2>/dev/null) || return 1

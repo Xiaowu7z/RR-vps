@@ -275,11 +275,14 @@ systemctl() {
                 RootEphemeral)
                     printf 'no\n'
                     ;;
+                SystemCallFilter)
+                    printf '%s\n' '~'
+                    ;;
                 RootDirectory|RootImage|MountImages|ExtensionImages|\
                 ExtensionDirectories|TemporaryFileSystem|BindPaths|\
                 BindReadOnlyPaths|InaccessiblePaths|JoinsNamespaceOf|\
                 ReadOnlyPaths|ReadWritePaths|Environment|EnvironmentFiles|\
-                PassEnvironment|PAMName|SystemCallFilter|Conditions|Asserts)
+                PassEnvironment|PAMName|Conditions|Asserts)
                     printf '\n'
                     ;;
                 ExecStart)

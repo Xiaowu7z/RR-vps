@@ -118,6 +118,7 @@ printf '%s\n' '[2/7] managed unit is atomically rewritten and effectively re-pro
     unknown_dropin=false
     managed_dropins=false
     omit_firewall_condition=false
+    singbox_system_call_filter='~'
     systemctl() {
         case "$*" in
             daemon-reload) manager_reloaded=true ;;
@@ -154,9 +155,10 @@ printf '%s\n' '[2/7] managed unit is atomically rewritten and effectively re-pro
             'show --property=Environment --value sing-box.service'|\
             'show --property=EnvironmentFiles --value sing-box.service'|\
             'show --property=PAMName --value sing-box.service'|\
-            'show --property=SystemCallFilter --value sing-box.service'|\
             'show --property=Conditions --value sing-box.service'|\
             'show --property=Asserts --value sing-box.service') printf '\n' ;;
+            'show --property=SystemCallFilter --value sing-box.service')
+                printf '%s\n' "$singbox_system_call_filter" ;;
             'show --property=ExecCondition --value sing-box.service')
                 if [ "$managed_dropins" = true ]; then
                     printf '%s' '{ path=/bin/sh ; argv[]=/bin/sh -c [ ! -e /var/lib/rr-backup/active ] && [ ! -L /var/lib/rr-backup/active ] || exec /usr/bin/timeout 15s /usr/local/bin/rr --restore-service-gate ; ignore_errors=no }'
@@ -191,10 +193,26 @@ printf '%s\n' '[2/7] managed unit is atomically rewritten and effectively re-pro
             *) return 1 ;;
         esac
     }
+    rr_singbox_legacy_service_is_owned || {
+        echo 'Exact legacy unit failed its effective-identity proof.' >&2
+        exit 1
+    }
+    singbox_system_call_filter='~@privileged'
+    if rr_singbox_legacy_service_is_owned; then
+        echo 'Legacy unit proof accepted a non-default system-call filter.' >&2
+        exit 1
+    fi
+    singbox_system_call_filter='~'
     ensure_singbox_service_guards
     grep -Fxq 'ExecStartPre=/usr/local/bin/rr --singbox-certificate-gate' \
         "$RR_SINGBOX_SERVICE_FILE"
     grep -Fxq 'RestartPreventExitStatus=78' "$RR_SINGBOX_SERVICE_FILE"
+    singbox_system_call_filter='~@privileged'
+    if rr_singbox_service_guards_are_effective; then
+        echo 'Current unit proof accepted a non-default system-call filter.' >&2
+        exit 1
+    fi
+    singbox_system_call_filter='~'
     omit_gate=true
     if rr_singbox_service_guards_are_effective; then
         echo 'Effective unit proof accepted a missing certificate gate.' >&2

@@ -559,6 +559,8 @@ printf '%s\n' '[11/11] health unit pair rolls back partial publication and prove
                     RootEphemeral:argo-rr-health.service|ProtectHome:argo-rr-health.service|\
                     ProtectSystem:argo-rr-health.service)
                         printf '%s\n' no ;;
+                    SystemCallFilter:argo-rr-health.service)
+                        printf '%s\n' '~' ;;
                     RootDirectory:argo-rr-health.service|RootImage:argo-rr-health.service|\
                     MountImages:argo-rr-health.service|ExtensionImages:argo-rr-health.service|\
                     ExtensionDirectories:argo-rr-health.service|\
@@ -569,7 +571,7 @@ printf '%s\n' '[11/11] health unit pair rolls back partial publication and prove
                     ReadOnlyPaths:argo-rr-health.service|ReadWritePaths:argo-rr-health.service|\
                     Environment:argo-rr-health.service|EnvironmentFiles:argo-rr-health.service|\
                     PassEnvironment:argo-rr-health.service|UnsetEnvironment:argo-rr-health.service|\
-                    PAMName:argo-rr-health.service|SystemCallFilter:argo-rr-health.service)
+                    PAMName:argo-rr-health.service)
                         printf '\n' ;;
                     Unit:argo-rr-health.timer)
                         printf '%s\n' argo-rr-health.service ;;

@@ -2553,7 +2553,6 @@ rr_restore_effective_marker_view_is_safe() {
         ExtensionDirectories TemporaryFileSystem BindPaths BindReadOnlyPaths
         InaccessiblePaths JoinsNamespaceOf ReadOnlyPaths ReadWritePaths
         EnvironmentFiles PassEnvironment UnsetEnvironment PAMName
-        SystemCallFilter
     )
     version_line=$(systemctl --version 2>/dev/null | head -n 1) || return 1
     [[ "$version_line" =~ ^systemd[[:space:]]+([0-9]+)([[:space:]]|$) ]] || \
@@ -2576,6 +2575,9 @@ rr_restore_effective_marker_view_is_safe() {
             2>/dev/null) || return 1
         [ -z "$value" ] || return 1
     done
+    value=$(systemctl show --property=SystemCallFilter --value "$unit" \
+        2>/dev/null) || return 1
+    [ "$value" = '~' ] || return 1
     value=$(systemctl show --property=Environment --value "$unit" \
         2>/dev/null) || return 1
     [ "$value" = "$expected_environment" ] || return 1

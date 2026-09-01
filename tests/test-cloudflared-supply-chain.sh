@@ -287,8 +287,11 @@ cf_systemctl() {
                     :
                     ;;
                 SystemCallFilter)
-                    [ "$CF_UNIT_STATE" = current_syscall ] && printf '~statx\n'
-                    :
+                    if [ "$CF_UNIT_STATE" = current_syscall ]; then
+                        printf '~statx\n'
+                    else
+                        printf '~\n'
+                    fi
                     ;;
                 SystemCallErrorNumber) printf '2147483646\n' ;;
                 RootDirectory|RootImage|MountImages|ExtensionImages|ExtensionDirectories|TemporaryFileSystem|BindPaths|InaccessiblePaths|JoinsNamespaceOf|ReadOnlyPaths|ReadWritePaths|EnvironmentFiles|PassEnvironment) ;;

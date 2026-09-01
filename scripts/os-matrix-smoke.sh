@@ -159,6 +159,13 @@ case "$command" in
                     printf '\n'
                 fi
                 ;;
+            UMask)
+                if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
+                    printf '%s\n' 0077
+                else
+                    printf '%s\n' 0022
+                fi
+                ;;
             Type)
                 if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
                     printf '%s\n' oneshot
@@ -170,13 +177,16 @@ case "$command" in
                 printf '%s\n' no
                 ;;
             RemainAfterExit) printf '%s\n' no ;;
+            SystemCallFilter|RestrictAddressFamilies|RestrictNetworkInterfaces|\
+            RestrictFileSystems)
+                printf '%s\n' '~'
+                ;;
             User|Group|WorkingDirectory|ExecStartPre|ExecStartPost|ExecStop|\
             ExecStopPost|ExecReload|ExecCondition|Conditions|Asserts|\
             RootDirectory|RootImage|MountImages|ExtensionImages|\
             ExtensionDirectories|TemporaryFileSystem|BindPaths|BindReadOnlyPaths|\
             InaccessiblePaths|JoinsNamespaceOf|ReadOnlyPaths|ReadWritePaths|\
-            EnvironmentFiles|PassEnvironment|UnsetEnvironment|PAMName|\
-            SystemCallFilter)
+            EnvironmentFiles|PassEnvironment|UnsetEnvironment|PAMName)
                 printf '\n'
                 ;;
             Paths)
@@ -379,6 +389,7 @@ fi
 # configuration exists in the container, so post-update correctly avoids
 # touching unrelated services while still exercising download-independent
 # bundle verification, snapshot, atomic runtime switch and guard deployment.
+umask 077
 RR_BUNDLE_FILE="$repo_root/rr-bundle.tar.gz" \
 RR_GUARD_FILE="$repo_root/scripts/update-guard.sh" \
     bash scripts/install-core.sh --upgrade

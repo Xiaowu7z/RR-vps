@@ -125,6 +125,7 @@ jobs:
             tests/test-vps-ip-acme-workflow.sh
           )
           root_contract_tests=(
+            tests/test-install-recovery-runtime.sh
             tests/test-nexus-gate-rollback.sh
             tests/test-nexus-ip-acme.sh
           )
@@ -152,6 +153,7 @@ jobs:
             echo "Running ${test_script}"
             case "${test_script##*/}" in
               test-installer-restore-gate.sh|\
+              test-install-recovery-runtime.sh|\
               test-nexus-core-supply-chain.sh|\
               test-nexus-gate-rollback.sh|\
               test-nexus-ip-acme.sh|\
