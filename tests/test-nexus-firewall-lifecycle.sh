@@ -385,6 +385,8 @@ pass 'uninstall preserves evidence and never reports success on firewall status 
     NEXUS_SERVICE_FILE="$case_root/rr-nexus.service"
     NEXUS_DB_FILE="$case_root/nexus.db"
     NEXUS_APP="$case_root/rr_nexus.py"
+    NEXUS_DATA_DIR="$case_root/data"
+    NEXUS_INSTALL_TRANSACTION_ROOT="$NEXUS_DATA_DIR/install-transactions"
     mkdir -p "$case_root"
     printf '%s\n' INSTALL_COMPLETE=true > "$CONFIG_FILE"
     printf '%s\n' '# app' > "$NEXUS_APP"
@@ -431,6 +433,8 @@ pass 'install defers public activation and rolls back metadata on later setup fa
     NEXUS_SERVICE_FILE="$case_root/rr-nexus.service"
     NEXUS_DB_FILE="$case_root/nexus.db"
     NEXUS_APP="$case_root/rr_nexus.py"
+    NEXUS_DATA_DIR="$case_root/data"
+    NEXUS_INSTALL_TRANSACTION_ROOT="$NEXUS_DATA_DIR/install-transactions"
     NEXUS_NGINX_AVAILABLE_DIR="$case_root/sites-available"
     NEXUS_NGINX_ENABLED_DIR="$case_root/sites-enabled"
     NEXUS_NGINX_SITE="$NEXUS_NGINX_AVAILABLE_DIR/rr-nexus.conf"
@@ -443,6 +447,7 @@ pass 'install defers public activation and rolls back metadata on later setup fa
     NEXUS_PID=0
     NEXUS_STARTED=0
     CURL_CALLS=0
+    NGINX_TEST_CALLS=0
     DOMAIN_ACTIVATIONS=0
     IP_ACTIVATIONS=0
     load_config_with_defaults() { INSTALL_COMPLETE=true; }
@@ -466,6 +471,10 @@ pass 'install defers public activation and rolls back metadata on later setup fa
     nexus_enable_public_ip_https() { IP_ACTIVATIONS=$((IP_ACTIVATIONS + 1)); }
     ss() { return 1; }
     curl() { CURL_CALLS=$((CURL_CALLS + 1)); return 1; }
+    nginx() {
+        [ "$#" -eq 1 ] && [ "$1" = -t ] || return 2
+        NGINX_TEST_CALLS=$((NGINX_TEST_CALLS + 1))
+    }
     sleep() { :; }
     systemctl() {
         local property="" argument=""
@@ -528,6 +537,7 @@ pass 'install defers public activation and rolls back metadata on later setup fa
     install_output=$(< "$case_root/install.output")
     [ "$install_status" -ne 0 ] || fail 'active-but-unhealthy backend was reported as install success'
     [ "$CURL_CALLS" -eq 10 ] || fail 'backend health proof was not bounded to ten attempts'
+    [ "$NGINX_TEST_CALLS" -eq 1 ] || fail 'install abort did not prove the empty proxy state'
     [ "$NEXUS_ACTIVE" = false ] || fail 'unhealthy backend remained active after install abort'
     [ ! -e "$NEXUS_CONFIG_FILE" ] && [ ! -e "$NEXUS_SERVICE_FILE" ] ||
         fail 'unhealthy fresh install retained candidate metadata'
@@ -545,6 +555,8 @@ pass 'active-but-unhealthy backend aborts install before public exposure or succ
     NEXUS_SERVICE_FILE="$case_root/rr-nexus.service"
     NEXUS_DB_FILE="$case_root/nexus.db"
     NEXUS_APP="$case_root/rr_nexus.py"
+    NEXUS_DATA_DIR="$case_root/data"
+    NEXUS_INSTALL_TRANSACTION_ROOT="$NEXUS_DATA_DIR/install-transactions"
     mkdir -p "$case_root"
     printf '%s\n' INSTALL_COMPLETE=true > "$CONFIG_FILE"
     printf '%s\n' '# app' > "$NEXUS_APP"

@@ -3975,8 +3975,9 @@ nexus_remove_public_proxy() {
     if systemctl is-active --quiet nginx >/dev/null 2>&1; then
         systemctl reload nginx >/dev/null 2>&1 || return 1
         return 0
+    else
+        active_status=$?
     fi
-    active_status=$?
     # systemctl uses 3 for an inactive/failed unit.  Any other result is an
     # inability to prove whether a live Nginx still holds the removed proxy.
     [ "$active_status" -eq 3 ]
