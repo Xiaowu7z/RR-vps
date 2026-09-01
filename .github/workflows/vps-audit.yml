@@ -202,6 +202,7 @@ jobs:
           safe_object_state maintenance /run/rr-vps/update-maintenance
           safe_object_state restore_active /var/lib/rr-backup/active
           safe_object_state recovery_helper /usr/local/sbin/rr-update-recover
+          safe_object_state external_helper /usr/local/sbin/rr-update-external-state
           safe_object_state recovery_unit /etc/systemd/system/rr-update-recovery.service
           for unit in rr-update-recovery.service rr-restore-recovery.service \
             rr-restore-watchdog.service rr-subscription-quarantine.service \
@@ -308,6 +309,78 @@ jobs:
               rr_audit_path_absent "$target" || return 0
             done
             return 1
+          }
+          rr_audit_non_external_product_evidence_present() {
+            local target=""
+            for target in \
+              /usr/local/bin/rr /usr/local/lib/rr /etc/argo_vmess.conf \
+              /usr/local/bin/sing-box /usr/local/bin/auto_update_sub.py \
+              /etc/sing-box /etc/rr-nexus /etc/rr-naive /etc/rr-update \
+              /etc/rr-cloudflared /var/lib/rr-nexus /var/lib/rr-update \
+              /var/lib/rr-backup \
+              /usr/local/sbin/rr-update-recover \
+              /etc/systemd/system/rr-update-recovery.service \
+              /etc/systemd/system/rr-update-recovery.service.d \
+              /etc/systemd/system/rr-restore-recovery.service \
+              /etc/systemd/system/rr-restore-watchdog.service \
+              /etc/systemd/system/rr-subscription-quarantine.service \
+              /etc/systemd/system/rr-nexus.service \
+              /etc/systemd/system/rr-subscription.service \
+              /etc/systemd/system/sing-box.service \
+              /etc/systemd/system/rr-nexus-ip-acme.service \
+              /etc/systemd/system/rr-nexus-ip-acme.timer \
+              /etc/systemd/system/argo-rr-health.timer \
+              /etc/systemd/system/argo-rr-health.service \
+              /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+              /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+              /usr/local/lib/rr-vps/lego \
+              /usr/local/lib/rr-vps/lego.install; do
+              rr_audit_path_absent "$target" || return 0
+            done
+            return 1
+          }
+          rr_audit_remove_known_orphan_external_helper() {
+            local target=/usr/local/sbin/rr-update-external-state
+            local source="$runtime/scripts/update-external-state.py"
+            local target_before="" target_after="" source_hash="" target_hash=""
+            local unit=""
+            rr_audit_non_external_product_evidence_present && return 1
+            rr_audit_path_absent /var/lib/rr-backup/active || return 1
+            for unit in subscription_server_running managed_singbox_running; do
+              declare -F "$unit" >/dev/null 2>&1 || return 1
+              "$unit" >/dev/null 2>&1 && return 1
+            done
+            rr_audit_cloudflared_process_present && return 1
+            for unit in rr-update-recovery.service rr-restore-recovery.service \
+              rr-restore-watchdog.service rr-subscription-quarantine.service \
+              rr-nexus.service rr-subscription.service sing-box.service \
+              rr-nexus-ip-acme.service rr-nexus-ip-acme.timer \
+              argo-rr-health.timer argo-rr-health.service; do
+              rr_audit_unit_absent "$unit" || return 1
+            done
+            rr_uninstall_regular_file_is_exact "$target" 755 || return 1
+            [ -f "$source" ] && [ ! -L "$source" ] || return 1
+            case "$(stat -c '%u:%g:%a:%h' -- "$source" 2>/dev/null)" in
+              0:0:700:1|0:0:755:1) ;;
+              *) return 1 ;;
+            esac
+            source_hash=$(sha256sum -- "$source" 2>/dev/null | awk '{print $1}') || return 1
+            [ "$source_hash" = bf61a9ed170a67309f562937d4057252b81e3afc85c9f2e277f2aa30a9f06e98 ] || \
+              return 1
+            target_before=$(stat -c '%d:%i:%u:%g:%a:%h:%s' -- "$target" 2>/dev/null) || \
+              return 1
+            target_hash=$(sha256sum -- "$target" 2>/dev/null | awk '{print $1}') || return 1
+            [ "$target_hash" = "$source_hash" ] && cmp -s -- "$target" "$source" || return 1
+            sync -f "$target" || return 1
+            sync -f /usr/local/sbin || return 1
+            target_after=$(stat -c '%d:%i:%u:%g:%a:%h:%s' -- "$target" 2>/dev/null) || \
+              return 1
+            [ "$target_before" = "$target_after" ] || return 1
+            [ "$(sha256sum -- "$target" 2>/dev/null | awk '{print $1}')" = "$source_hash" ] && \
+              cmp -s -- "$target" "$source" || return 1
+            unlink -- "$target" || return 1
+            sync -f /usr/local/sbin || return 1
+            rr_audit_path_absent "$target"
           }
           rr_audit_remove_v710_orphan_maintenance() {
             local marker=/run/rr-vps/update-maintenance parent=/run/rr-vps
@@ -604,6 +677,40 @@ jobs:
                 >>"$recovery_log" 2>&1 &&
               ! rr_firewall_fail_closed_quarantine_active
           }
+          rr_audit_live_managed_raw_state() {
+            local snapshot="" state=error raw_status=0 release_failed=false
+            snapshot=$(mktemp -d "$stage/live-firewall.XXXXXX") || {
+              printf '%s\n' error
+              return 0
+            }
+            chmod 700 "$snapshot" || {
+              rm -rf -- "$snapshot"
+              printf '%s\n' error
+              return 0
+            }
+            if ! load_config_with_defaults >>"$recovery_log" 2>&1 || \
+               ! rr_firewall_lock_acquire; then
+              rm -rf -- "$snapshot"
+              printf '%s\n' error
+              return 0
+            fi
+            if ! rr_uninstall_capture_firewall_snapshot "$snapshot" \
+                   >>"$recovery_log" 2>&1 || \
+               ! rr_restore_verify_firewall_pre_mutation_snapshot "$snapshot" \
+                   >>"$recovery_log" 2>&1; then
+              state=error
+            elif rr_restore_firewall_snapshot_has_managed_raw_rules \
+                   "$snapshot/firewall" >>"$recovery_log" 2>&1; then
+              state=present
+            else
+              raw_status=$?
+              if [ "$raw_status" -eq 1 ]; then state=absent; else state=error; fi
+            fi
+            rr_firewall_lock_release || release_failed=true
+            rm -rf -- "$snapshot" || state=error
+            [ "$release_failed" = false ] || state=error
+            printf '%s\n' "$state"
+          }
           rr_audit_publish_legacy_update_bridge() {
             local marker="$RR_LEGACY_UPDATE_BRIDGE_FILE" parent="" canonical=""
             local temporary="" marker_state=0
@@ -742,6 +849,8 @@ jobs:
           chmod 600 "$trace" "$product_log" "$recovery_log"
           remediation_failed=false
           firewall_repair=not-run
+          live_raw=not-probed
+          external_helper_cleanup=not-applicable
           hook_remediation=not-run
           orphan_state=not-run
           uninstall_state=not-run
@@ -766,11 +875,34 @@ jobs:
             if [ "$remediation_failed" = false ]; then
               firewall_repair=not-needed
               if rr_firewall_fail_closed_quarantine_active; then
-                if rr_run_without_inherited_update_lock_fds \
-                     rr_audit_repair_firewall_without_update_fds; then
+                locked_quarantine_probe=$(rr_audit_classify_quarantine)
+                if [ "$locked_quarantine_probe" = raw-no-persistence ]; then
+                  live_raw=$(rr_audit_live_managed_raw_state)
+                  if [ "$live_raw" = absent ] && \
+                     rr_uninstall_firewall_quarantine_artifacts_are_owned; then
+                    firewall_repair=deferred-owned
+                  else
+                    firewall_repair=failed
+                    remediation_failed=true
+                  fi
+                elif rr_run_without_inherited_update_lock_fds \
+                       rr_audit_repair_firewall_without_update_fds; then
                   firewall_repair=success
                 else
                   firewall_repair=failed
+                  remediation_failed=true
+                fi
+              fi
+            fi
+            if [ "$role" = B ]; then
+              external_helper_cleanup=not-present
+              if ! rr_audit_path_absent /usr/local/sbin/rr-update-external-state; then
+                if [ "$remediation_failed" = true ]; then
+                  external_helper_cleanup=not-run
+                elif rr_audit_remove_known_orphan_external_helper; then
+                  external_helper_cleanup=removed
+                else
+                  external_helper_cleanup=rejected
                   remediation_failed=true
                 fi
               fi
@@ -847,6 +979,12 @@ jobs:
           if [ "$callback_entered" = no ]; then
             remediation_failed=true
             firewall_repair=not-run
+            live_raw=not-probed
+            if [ "$role" = B ]; then
+              external_helper_cleanup=not-run
+            else
+              external_helper_cleanup=not-applicable
+            fi
             hook_remediation=not-run
             if [ "$role" = B ]; then orphan_state=not-run; else orphan_state=not-applicable; fi
             case "$lock_run_rc" in
@@ -866,6 +1004,10 @@ jobs:
           chmod 600 "$recovery_log" 2>/dev/null || true
           printf 'SAFE_DIAG nonce=%s role=%s firewall_repair=%s\n' \
             "$diag_nonce" "$role" "$firewall_repair"
+          printf 'SAFE_DIAG nonce=%s role=%s live_raw=%s\n' \
+            "$diag_nonce" "$role" "$live_raw"
+          printf 'SAFE_DIAG nonce=%s role=%s external_helper_cleanup=%s\n' \
+            "$diag_nonce" "$role" "$external_helper_cleanup"
           printf 'SAFE_DIAG nonce=%s role=%s hook_remediation=%s\n' \
             "$diag_nonce" "$role" "$hook_remediation"
           printf 'SAFE_DIAG nonce=%s role=%s orphan_maintenance=%s\n' \
@@ -903,6 +1045,7 @@ jobs:
           safe_object_state config_after /etc/argo_vmess.conf
           safe_object_state active_tx_after /var/lib/rr-update/active
           safe_object_state maintenance_after /run/rr-vps/update-maintenance
+          safe_object_state external_helper_after /usr/local/sbin/rr-update-external-state
           final_rc=0
           [ "$remediation_failed" = false ] || final_rc=6
           cleanup_state=retry
@@ -924,7 +1067,7 @@ jobs:
           while IFS= read -r line; do
             [[ "$line" == "$safe_prefix"* ]] || continue
             payload="${line#"$safe_prefix"}"
-            if [[ "$payload" =~ ^object=(launcher|runtime|config|active_tx|maintenance|restore_active|recovery_helper|recovery_unit|launcher_after|runtime_after|config_after|active_tx_after|maintenance_after)\ state=(absent|file|dir|symlink|other)$ ]] ||
+            if [[ "$payload" =~ ^object=(launcher|runtime|config|active_tx|maintenance|restore_active|recovery_helper|external_helper|recovery_unit|launcher_after|runtime_after|config_after|active_tx_after|maintenance_after|external_helper_after)\ state=(absent|file|dir|symlink|other)$ ]] ||
                [[ "$payload" =~ ^unit=(rr-update-recovery\.service|rr-restore-recovery\.service|rr-restore-watchdog\.service|rr-subscription-quarantine\.service|rr-nexus\.service|rr-subscription\.service|sing-box\.service|rr-nexus-ip-acme\.service|rr-nexus-ip-acme\.timer|argo-rr-health\.timer|argo-rr-health\.service)\ load=(loaded|not-found|masked|query-error|empty|other)\ active=(active|inactive|failed|activating|deactivating|reloading|maintenance|query-error|empty|other)\ enabled=(enabled|disabled|static|indirect|generated|transient|linked|linked-runtime|enabled-runtime|alias|masked|query-error|empty|other)$ ]] ||
                [[ "$payload" =~ ^ufw=(absent|installed)\ persistence=(absent|present)$ ]] ||
                [[ "$payload" =~ ^lock_probe=(available|busy|unsafe|other)$ ]] ||
@@ -933,7 +1076,9 @@ jobs:
                [[ "$payload" =~ ^orphan_probe=(not-applicable|not-present|evidence-(launcher|runtime|config|singbox-bin|subscription-bin|singbox-config|nexus-config|naive-config|update-config|cloudflared-config|nexus-state|update-state|backup-state|recovery-helper|external-helper|recovery-unit|recovery-dropin|restore-unit|watchdog-unit|quarantine-unit|nexus-unit|subscription-unit|singbox-unit|ip-acme-service|ip-acme-timer|health-timer|health-service|ip-acme-site|ip-acme-enabled|lego|lego-install)|restore-active|helper-missing|process-(subscription_server_running|managed_singbox_running|cloudflared)|unit-state|parent-type|parent-mount-check|parent-mount|parent-canonical|parent-meta|marker-type|marker-meta|marker-read|marker-lines|marker-format|marker-size|marker-newline|target-present|eligible)$ ]] ||
                [[ "$payload" =~ ^update_root=(not-applicable|absent|empty|transactions-empty|other|unsafe)$ ]] ||
                [[ "$payload" =~ ^quarantine_probe=(not-present|load-failed|kind-invalid|evidence-invalid|raw-no-persistence|raw-error|ambiguous|ambiguous-error|ready-raw|ready-no-raw)$ ]] ||
-               [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|failed)$ ]] ||
+               [[ "$payload" =~ ^firewall_repair=(not-needed|not-run|success|deferred-owned|failed)$ ]] ||
+               [[ "$payload" =~ ^live_raw=(not-probed|absent|present|error)$ ]] ||
+               [[ "$payload" =~ ^external_helper_cleanup=(not-applicable|not-present|not-run|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^hook_remediation=(not-run|not-present|matched|repaired-known|rejected)$ ]] ||
                [[ "$payload" =~ ^orphan_maintenance=(not-run|not-applicable|not-present|removed|rejected)$ ]] ||
                [[ "$payload" =~ ^callback_entered=(yes|no)$ ]] ||
