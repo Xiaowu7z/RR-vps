@@ -791,10 +791,23 @@ printf '%s\n' '[4/7] Nexus sync serializes callbacks, releases errors and reuses
 printf '%s\n' '[5/7] backup and restore share the update lock and delegate recovery safely'
 (
     # shellcheck disable=SC1091
+    source modules/10-system.sh
+    # shellcheck disable=SC1091
     source modules/55-resilience.sh
+    restore_entry=$(declare -f rr_restore_backup)
+    restore_firewall_callback=$(declare -f rr_restore_backup_with_firewall_lock)
+    [[ "$restore_entry" == *'rr_run_with_update_locks direct 0 rr_restore_backup_with_firewall_lock'* ]] ||
+        fail 'restore does not acquire the update lock before joining the firewall domain'
+    [[ "$restore_entry" != *'rr_firewall_lock_acquire'* ]] ||
+        fail 'restore retains the firewall->update AB/BA lock order'
+    [[ "$restore_firewall_callback" == *'rr_firewall_lock_acquire'* &&
+       "$restore_firewall_callback" == *'rr_restore_backup_locked "$@"'* &&
+       "$restore_firewall_callback" == *'rr_firewall_lock_release'* ]] ||
+        fail 'restore firewall callback does not cover the delegated transaction'
     resilience_root="$test_root/resilience-calls"
     mkdir -m 700 "$resilience_root"
     RR_RESTORE_LOCK_FILE="$resilience_root/update.lock"
+    RR_FIREWALL_LOCK_FILE="$resilience_root/locks/firewall.lock"
     RR_LEGACY_UPDATE_LOCK_FILE="$resilience_root/legacy.lock"
     RR_LEGACY_UPDATE_BRIDGE_FILE="$resilience_root/bridge/legacy-update-bridge"
     RR_BACKUP_WORK_DIR="$resilience_root/work"
@@ -1368,7 +1381,8 @@ grep -Fq 'rr_close_inherited_installer_lock_fds' <<<"$delegate_body" && \
     grep -Fq 'exec {lock_fd}>&-' <<<"$delegate_close_body" && \
     grep -Fq 'LEGACY_UPDATE_LOCK_FD=""' <<<"$delegate_close_body" && \
     grep -Fq 'UPDATE_LOCK_FD=""' <<<"$delegate_close_body" && \
-    grep -Fq 'RR_UPDATE_LOCK_HELD=1 "$@"' <<<"$delegate_body" || \
+    grep -Fq 'RR_UPDATE_LOCK_HELD=1 RR_RESTORE_LOCK_HELD=1 "$@"' \
+        <<<"$delegate_body" || \
     fail 'installer delegate does not close both inherited fds before invoking children'
 resilience_source_flat=$(tr '\n' ' ' < modules/55-resilience.sh)
 grep -Eq 'RR_RESTORE_LOCK_HELD=1[[:space:]\\]+rr_restore_recover_active' \
@@ -1384,13 +1398,16 @@ installer_entry=$(sed -n '/^rr_prepare_update_lock_file "\$RR_UPDATE_LOCK_FILE"/
 new_lock_line=$(grep -n 'flock -n "$UPDATE_LOCK_FD"' <<<"$installer_entry" | head -n 1 | cut -d: -f1)
 legacy_lock_line=$(grep -n 'rr_acquire_legacy_update_lock "$RR_LEGACY_UPDATE_LOCK_FILE"' \
     <<<"$installer_entry" | head -n 1 | cut -d: -f1)
-fetch_line=$(grep -n '^rr_fetch_release' <<<"$installer_entry" | head -n 1 | cut -d: -f1)
+restore_gate_line=$(grep -n '^rr_install_release_after_locks || exit 1$' \
+    <<<"$installer_entry" | head -n 1 | cut -d: -f1)
 [[ "$new_lock_line" =~ ^[0-9]+$ && "$legacy_lock_line" =~ ^[0-9]+$ && \
-   "$fetch_line" =~ ^[0-9]+$ ]] || fail 'installer dual-lock ordering evidence is incomplete'
-[ "$new_lock_line" -lt "$legacy_lock_line" ] && [ "$legacy_lock_line" -lt "$fetch_line" ] || \
-    fail 'installer does not hold new then legacy locks before transaction work'
+   "$restore_gate_line" =~ ^[0-9]+$ ]] || \
+    fail 'installer dual-lock/restore-gate ordering evidence is incomplete'
+[ "$new_lock_line" -lt "$legacy_lock_line" ] && \
+    [ "$legacy_lock_line" -lt "$restore_gate_line" ] || \
+    fail 'installer does not hold new then legacy locks before the restore gate'
 legacy_failure_tail=${installer_entry#*if ! rr_acquire_legacy_update_lock}
-legacy_failure_block=${legacy_failure_tail%%rr_fetch_release*}
+legacy_failure_block=${legacy_failure_tail%%rr_install_release_after_locks*}
 grep -Fq 'exec {UPDATE_LOCK_FD}>&-' <<<"$legacy_failure_block" || \
     fail 'installer does not close its new lock fd when legacy acquisition fails'
 

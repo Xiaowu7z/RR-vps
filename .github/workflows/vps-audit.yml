@@ -18,7 +18,7 @@ concurrency:
 jobs:
   debian-full:
     name: A · Debian 12 · all protocol services and public HTTPS
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -90,6 +90,9 @@ jobs:
           audit_exit() {
             rc=$?
             trap - EXIT
+            if ! rm -f -- /root/rr-audit-panel-pass; then rc=1; fi
+            if [ -e /root/rr-audit-panel-pass ] || \
+               [ -L /root/rr-audit-panel-pass ]; then rc=1; fi
             find /root -maxdepth 1 -type f -name 'rr-audit-*.log' \
               -exec chmod 600 {} + 2>/dev/null || true
             exit "$rc"
@@ -282,7 +285,6 @@ jobs:
 
           panel_pass=$(openssl rand -hex 20)
           test "${#panel_pass}" -ge 12
-          (umask 077; printf '%s\n' "$panel_pass" > /root/rr-audit-panel-pass)
           panel_log=/root/rr-audit-nexus.log
           : > "$panel_log"
           chmod 600 "$panel_log"
@@ -300,6 +302,9 @@ jobs:
             exit 1
           fi
           unset panel_pass
+          rm -f -- /root/rr-audit-panel-pass
+          test ! -e /root/rr-audit-panel-pass
+          test ! -L /root/rr-audit-panel-pass
 
           /usr/local/bin/rr --version | grep -F "RR-vps ${expected_version}" >/dev/null
           expected_rr=$(awk '$2 == "rr" {print $1}' /usr/local/lib/rr/manifest.sha256)
@@ -315,7 +320,8 @@ jobs:
           test "$(stat -c %a /etc/sing-box/config.json)" = 600
           test "$(stat -c %a /var/lib/rr-nexus/nexus.db)" = 600
           test "$(stat -c %a /etc/rr-nexus/nexus.json)" = 600
-          test "$(stat -c %a /root/rr-audit-panel-pass)" = 600
+          test ! -e /root/rr-audit-panel-pass
+          test ! -L /root/rr-audit-panel-pass
           test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
           foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
             'PRAGMA foreign_key_check;') || exit 1
@@ -362,6 +368,19 @@ jobs:
           fi
           test "$(sha256sum "/etc/letsencrypt/live/${panel_domain}/fullchain.pem" | awk '{print $1}')" != \
             "$(sha256sum "/etc/letsencrypt/live/${naive_domain}/fullchain.pem" | awk '{print $1}')"
+          # Static lineage and local-route proofs are necessary but cannot
+          # prove DNS/public reachability.  Exercise the actual ACME staging
+          # challenge for both independently managed lineages on the Debian
+          # release host; keep verbose Certbot output in the root-only audit
+          # log so domains/account details never enter Actions output.
+          for renewal_domain in "$panel_domain" "$naive_domain"; do
+            if ! certbot renew --cert-name "$renewal_domain" --dry-run \
+              --non-interactive \
+              >>"$panel_log" 2>&1; then
+              echo 'A Certbot staging renewal dry-run failed; root-only log retained on VPS.' >&2
+              exit 1
+            fi
+          done
           ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])24443$'
           ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])21443$'
           ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\])22443$'
@@ -421,7 +440,7 @@ jobs:
 
   ubuntu-upgrade:
     name: B · Ubuntu 22.04 · v7.1.0 data upgrade and rollback
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -487,6 +506,9 @@ jobs:
           audit_exit() {
             rc=$?
             trap - EXIT
+            if ! rm -f -- /root/rr-audit-panel-pass; then rc=1; fi
+            if [ -e /root/rr-audit-panel-pass ] || \
+               [ -L /root/rr-audit-panel-pass ]; then rc=1; fi
             find /root -maxdepth 1 -type f -name 'rr-audit-*.log' \
               -exec chmod 600 {} + 2>/dev/null || true
             exit "$rc"
@@ -791,7 +813,6 @@ jobs:
 
           panel_pass=$(openssl rand -hex 20)
           test "${#panel_pass}" -ge 12
-          (umask 077; printf '%s\n' "$panel_pass" > /root/rr-audit-panel-pass)
           old_panel_log=/root/rr-audit-old-nexus.log
           : > "$old_panel_log"
           chmod 600 "$old_panel_log"
@@ -808,6 +829,9 @@ jobs:
             exit 1
           fi
           unset panel_pass
+          rm -f -- /root/rr-audit-panel-pass
+          test ! -e /root/rr-audit-panel-pass
+          test ! -L /root/rr-audit-panel-pass
 
           # A disposable upgrade fixture must start from an empty device set.
           # This prevents an interrupted historical audit from contaminating
@@ -1058,6 +1082,9 @@ jobs:
           audit_exit() {
             rc=$?
             trap - EXIT
+            if ! rm -f -- /root/rr-audit-panel-pass; then rc=1; fi
+            if [ -e /root/rr-audit-panel-pass ] || \
+               [ -L /root/rr-audit-panel-pass ]; then rc=1; fi
             find /root -maxdepth 1 -type f -name 'rr-audit-*.log' \
               -exec chmod 600 {} + 2>/dev/null || true
             exit "$rc"
@@ -1183,7 +1210,7 @@ jobs:
 
   ubuntu-transaction:
     name: C · Ubuntu 24.04 · clean transaction, recovery, and local tunnel
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -1252,6 +1279,9 @@ jobs:
           audit_exit() {
             rc=$?
             trap - EXIT
+            if ! rm -f -- /root/rr-audit-panel-pass; then rc=1; fi
+            if [ -e /root/rr-audit-panel-pass ] || \
+               [ -L /root/rr-audit-panel-pass ]; then rc=1; fi
             find /root -maxdepth 1 -type f -name 'rr-audit-*.log' \
               -exec chmod 600 {} + 2>/dev/null || true
             exit "$rc"
@@ -1475,7 +1505,6 @@ jobs:
           done
 
           panel_pass=$(openssl rand -hex 20)
-          (umask 077; printf '%s\n' "$panel_pass" > /root/rr-audit-panel-pass)
           if ! printf '%s\n' 1 17900 auditadmin "$panel_pass" "$panel_pass" '' \
             | bash -c '
                 set -o pipefail
@@ -1488,6 +1517,9 @@ jobs:
             exit 1
           fi
           unset panel_pass
+          rm -f -- /root/rr-audit-panel-pass
+          test ! -e /root/rr-audit-panel-pass
+          test ! -L /root/rr-audit-panel-pass
           test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
           test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
           test "$(jq -r '.port' /etc/rr-nexus/nexus.json)" = 7900
@@ -1561,6 +1593,9 @@ jobs:
           audit_exit() {
             rc=$?
             trap - EXIT
+            if ! rm -f -- /root/rr-audit-panel-pass; then rc=1; fi
+            if [ -e /root/rr-audit-panel-pass ] || \
+               [ -L /root/rr-audit-panel-pass ]; then rc=1; fi
             find /root -maxdepth 1 -type f -name 'rr-audit-*.log' \
               -exec chmod 600 {} + 2>/dev/null || true
             exit "$rc"
@@ -1738,7 +1773,7 @@ jobs:
 
   cross-machine-migration-scale:
     name: A → C · encrypted migration and 500-device scale
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [debian-full, ubuntu-transaction]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -1778,6 +1813,7 @@ jobs:
           passphrase_file="$RUNNER_TEMP/rr-audit-cross-passphrase"
           backup_file="$RUNNER_TEMP/rr-audit-cross.rrbak"
           fingerprint_file="$RUNNER_TEMP/rr-audit-cross-fingerprint.json"
+          audit_stage=runner-preflight
 
           prepare_known_hosts() {
             local host="$1" pinned_key="$2" destination="$3"
@@ -1791,8 +1827,6 @@ jobs:
               "$host" "$host_key_type" "$host_key_data" > "$destination")
             ssh-keygen -F "$host" -f "$destination" >/dev/null
           }
-          prepare_known_hosts "$a_host" "$RR_A_HOST_KEY" "$a_known_hosts"
-          prepare_known_hosts "$c_host" "$RR_C_HOST_KEY" "$c_known_hosts"
           ssh_common=(
             -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
             -o LogLevel=ERROR -o PreferredAuthentications=password
@@ -1800,119 +1834,2012 @@ jobs:
             -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
           )
 
+          arm_audit_source_cleanup_timer() {
+            SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" \
+              bash -s <<'REMOTE_A_ARM'
+          set -euo pipefail
+          umask 077
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          timer_unit=rr-audit-cross-cleanup-a.timer
+          service_unit=rr-audit-cross-cleanup-a.service
+          state_dir=/var/lib/rr-audit-cross-cleanup-a
+          helper="$state_dir/helper"
+          helper_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-a.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-a.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-a.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-a.timer
+          source_config=/root/rr-audit-cross-source-config
+          source_hash=/root/rr-audit-cross-source-config.sha256
+          source_hash_tmp=/root/.rr-audit-cross-source-config.sha256.new
+          recover_tmp=/etc/.rr-audit-cross-source-config.recover
+          expected_helper_sha=6260506ef5a36f37c525c92dc934bf52f043c8600f6c2d1ec497965b83508c25
+          live_config=/etc/argo_vmess.conf
+
+          validate_directory() {
+            local path="$1" expected_mode="$2"
+            [ -d "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a' "$path")" = "0:0:$expected_mode" ]
+          }
+
+          validate_config() {
+            local path="$1" expected_sha="$2" size="" actual_sha=""
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:600:1 ] || return 1
+            size=$(stat -c %s "$path") || return 1
+            [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+            [ "$size" -le 262144 ] || return 1
+            actual_sha=$(sha256sum "$path" | awk '{print $1}') || return 1
+            [ "$actual_sha" = "$expected_sha" ] || return 1
+            [ "$(grep -c '^INSTALL_COMPLETE=true$' "$path")" -eq 1 ] || return 1
+            [ "$(grep -c '^NAIVE_ENABLED=true$' "$path")" -eq 1 ] || return 1
+            [ "$(grep -c '^NAIVE_ENABLED=' "$path")" -eq 1 ] || return 1
+          }
+
+          validate_hash_file() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:600:1 ] || return 1
+            [ "$(wc -c < "$path")" -eq 65 ] || return 1
+            grep -Eq '^[a-f0-9]{64}$' "$path"
+          }
+
+          validate_helper() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:700:1 ] || return 1
+            [ "$(sha256sum "$path" | awk '{print $1}')" = \
+              "$expected_helper_sha" ]
+          }
+
+          validate_deadline() {
+            local epoch="" calendar="" rendered=""
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$deadline_file")" = 0:0:600:1 ] || return 1
+            [ "$(wc -l < "$deadline_file")" -eq 2 ] || return 1
+            epoch=$(sed -n '1p' "$deadline_file") || return 1
+            calendar=$(sed -n '2p' "$deadline_file") || return 1
+            [[ "$epoch" =~ ^[1-9][0-9]{9,}$ ]] || return 1
+            rendered=$(date -u -d "@$epoch" '+%Y-%m-%d %H:%M:%S UTC') || return 1
+            [ "$calendar" = "$rendered" ]
+          }
+
+          validate_unit_file() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:644:1 ]
+          }
+
+          validate_unit_hashes() {
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$unit_hashes")" = 0:0:600:1 ] || return 1
+            awk -v service="$service_file" -v timer="$timer_file" '
+              NR == 1 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+              }
+              NR == 2 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+              }
+              END { if (NR != 2) exit 1 }
+            ' "$unit_hashes" || return 1
+            sha256sum --check --strict "$unit_hashes" >/dev/null
+          }
+
+          validate_bundle() {
+            validate_directory "$state_dir" 700
+            validate_helper "$helper"
+            test ! -e "$helper_tmp" && test ! -L "$helper_tmp"
+            test ! -e "$deadline_tmp" && test ! -L "$deadline_tmp"
+            test ! -e "$unit_hashes_tmp" && test ! -L "$unit_hashes_tmp"
+            test ! -e "$service_tmp" && test ! -L "$service_tmp"
+            test ! -e "$timer_tmp" && test ! -L "$timer_tmp"
+            validate_deadline
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            [ -L "$timer_link" ]
+            [ "$(readlink -f "$timer_link")" = "$timer_file" ]
+          }
+
+          disarm_bundle() {
+            local timer_load="" service_load="" attempt=""
+            validate_bundle
+            systemctl disable --now "$timer_unit"
+            test ! -e "$timer_link" && test ! -L "$timer_link"
+            service_load=$(systemctl show -p LoadState --value "$service_unit")
+            if [ "$service_load" != not-found ]; then
+              systemctl stop "$service_unit"
+              if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+                systemctl reset-failed "$service_unit"
+              fi
+            fi
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            rm -f -- "$service_file" "$timer_file"
+            test ! -e "$service_file" && test ! -L "$service_file"
+            test ! -e "$timer_file" && test ! -L "$timer_file"
+            systemctl daemon-reload
+            for attempt in $(seq 1 15); do
+              timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+              service_load=$(systemctl show -p LoadState --value "$service_unit")
+              if [ "$timer_load" = not-found ] && \
+                 [ "$service_load" = not-found ]; then
+                break
+              fi
+              test "$attempt" -lt 15
+              sleep 1
+            done
+            test "$timer_load" = not-found
+            test "$service_load" = not-found
+            if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+              [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+              [ "$(stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+              rm -f -- "$timer_stamp"
+            fi
+            test ! -e "$timer_stamp" && test ! -L "$timer_stamp"
+            validate_helper "$helper"
+            validate_deadline
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ]
+            rm -f -- "$unit_hashes" "$deadline_file" "$helper"
+            test ! -e "$unit_hashes" && test ! -L "$unit_hashes"
+            test ! -e "$deadline_file" && test ! -L "$deadline_file"
+            test ! -e "$helper" && test ! -L "$helper"
+            rmdir "$state_dir"
+            sync -f /var/lib
+          }
+
+          write_helper() {
+            [ ! -e "$helper_tmp" ] && [ ! -L "$helper_tmp" ] || return 1
+            (set -C; /usr/bin/tee "$helper_tmp" >/dev/null \
+              <<'RR_A_CLEANUP_HELPER'
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          state_dir=/var/lib/rr-audit-cross-cleanup-a
+          self="$state_dir/helper"
+          self_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_unit=rr-audit-cross-cleanup-a.service
+          timer_unit=rr-audit-cross-cleanup-a.timer
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-a.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-a.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-a.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-a.timer
+          cleanup_mode="${1:-}"
+          source_config=/root/rr-audit-cross-source-config
+          source_hash=/root/rr-audit-cross-source-config.sha256
+          recover_tmp=/etc/.rr-audit-cross-source-config.recover
+          live_config=/etc/argo_vmess.conf
+
+          validate_directory() {
+            local path="$1" expected_mode="$2"
+            [ -d "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a' "$path")" = \
+              "0:0:$expected_mode" ]
+          }
+
+          validate_unit_file() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$path")" = 0:0:644:1 ]
+          }
+
+          validate_deadline() {
+            local epoch="" calendar="" rendered=""
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$deadline_file")" = \
+              0:0:600:1 ] || return 1
+            [ "$(/usr/bin/wc -l < "$deadline_file")" -eq 2 ] || return 1
+            epoch=$(/usr/bin/sed -n '1p' "$deadline_file") || return 1
+            calendar=$(/usr/bin/sed -n '2p' "$deadline_file") || return 1
+            [[ "$epoch" =~ ^[1-9][0-9]{9,}$ ]] || return 1
+            rendered=$(/usr/bin/date -u -d "@$epoch" \
+              '+%Y-%m-%d %H:%M:%S UTC') || return 1
+            [ "$calendar" = "$rendered" ]
+          }
+
+          validate_unit_hashes() {
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$unit_hashes")" = \
+              0:0:600:1 ] || return 1
+            /usr/bin/awk -v service="$service_file" -v timer="$timer_file" '
+              NR == 1 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+              }
+              NR == 2 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+              }
+              END { if (NR != 2) exit 1 }
+            ' "$unit_hashes" || return 1
+            /usr/bin/sha256sum --check --strict "$unit_hashes" >/dev/null
+          }
+
+          validate_bundle() {
+            validate_directory "$state_dir" 700
+            [ -f "$self" ] && [ ! -L "$self" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$self")" = 0:0:700:1 ] || return 1
+            [ "$(/usr/bin/sha256sum "$self" | /usr/bin/awk '{print $1}')" = \
+              "$RR_AUDIT_HELPER_SHA" ] || return 1
+            [ ! -e "$self_tmp" ] && [ ! -L "$self_tmp" ] || return 1
+            [ ! -e "$deadline_tmp" ] && [ ! -L "$deadline_tmp" ] || return 1
+            [ ! -e "$unit_hashes_tmp" ] && [ ! -L "$unit_hashes_tmp" ] || return 1
+            [ ! -e "$service_tmp" ] && [ ! -L "$service_tmp" ] || return 1
+            [ ! -e "$timer_tmp" ] && [ ! -L "$timer_tmp" ] || return 1
+            validate_deadline
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            [ -L "$timer_link" ]
+            [ "$(/usr/bin/readlink -f "$timer_link")" = "$timer_file" ]
+          }
+
+          self_disarm() {
+            validate_bundle
+            /usr/bin/systemctl disable --now "$timer_unit"
+            [ ! -e "$timer_link" ] && [ ! -L "$timer_link" ]
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            /usr/bin/rm -f -- "$service_file" "$timer_file"
+            [ ! -e "$service_file" ] && [ ! -L "$service_file" ]
+            [ ! -e "$timer_file" ] && [ ! -L "$timer_file" ]
+            /usr/bin/systemctl daemon-reload
+            [ "$(/usr/bin/systemctl show -p LoadState --value \
+              "$timer_unit")" = not-found ]
+            if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+              [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+              [ "$(/usr/bin/stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+              /usr/bin/rm -f -- "$timer_stamp"
+            fi
+            [ ! -e "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+            /usr/bin/rm -f -- "$unit_hashes" "$deadline_file" "$self"
+            [ ! -e "$unit_hashes" ] && [ ! -L "$unit_hashes" ]
+            [ ! -e "$deadline_file" ] && [ ! -L "$deadline_file" ]
+            [ ! -e "$self" ] && [ ! -L "$self" ]
+            /usr/bin/rmdir "$state_dir"
+            /usr/bin/sync -f /var/lib
+          }
+
+          validate_config() {
+            local path="$1" expected_sha="$2" size="" actual_sha=""
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$path")" = 0:0:600:1 ] || return 1
+            size=$(/usr/bin/stat -c %s "$path") || return 1
+            [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+            [ "$size" -le 262144 ] || return 1
+            actual_sha=$(/usr/bin/sha256sum "$path" | /usr/bin/awk '{print $1}') || return 1
+            [ "$actual_sha" = "$expected_sha" ] || return 1
+            [ "$(/usr/bin/grep -c '^INSTALL_COMPLETE=true$' "$path")" -eq 1 ] || return 1
+            [ "$(/usr/bin/grep -c '^NAIVE_ENABLED=true$' "$path")" -eq 1 ] || return 1
+            [ "$(/usr/bin/grep -c '^NAIVE_ENABLED=' "$path")" -eq 1 ] || return 1
+          }
+
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state=""
+            local unit_file_state=""
+            load_state=$(/usr/bin/systemctl show -p LoadState --value "$unit" \
+              2>/dev/null) || return 1
+            active_state=$(/usr/bin/systemctl show -p ActiveState --value "$unit" \
+              2>/dev/null) || return 1
+            unit_file_state=$(/usr/bin/systemctl show -p UnitFileState --value "$unit" \
+              2>/dev/null) || return 1
+            [ "$load_state:$active_state:$unit_file_state" = "$expected" ]
+          }
+
+          wait_local_nexus() {
+            local deadline=$((SECONDS + 30))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              assert_unit_state rr-nexus.service loaded:active:enabled || return 1
+              if /usr/bin/curl -fsS --connect-timeout 1 --max-time 3 \
+                   http://127.0.0.1:7900/healthz >/dev/null 2>&1; then
+                return 0
+              fi
+              /usr/bin/sleep 1
+            done
+            return 1
+          }
+
+          [ "$0" = "$self" ]
+          [ "$#" -eq 1 ]
+          case "$cleanup_mode" in timer|exit) ;; *) exit 1 ;; esac
+          [[ "${RR_AUDIT_HELPER_SHA:-}" =~ ^[a-f0-9]{64}$ ]]
+          validate_bundle
+          deadline_epoch=$(/usr/bin/sed -n '1p' "$deadline_file")
+          if [ "$cleanup_mode" = timer ] && \
+             [ "$(/usr/bin/date +%s)" -lt "$deadline_epoch" ]; then
+            exit 0
+          fi
+          [ -f "$source_hash" ] && [ ! -L "$source_hash" ]
+          [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$source_hash")" = 0:0:600:1 ]
+          [ "$(/usr/bin/wc -c < "$source_hash")" -eq 65 ]
+          /usr/bin/grep -Eq '^[a-f0-9]{64}$' "$source_hash"
+          expected_source_sha=$(<"$source_hash")
+          [[ "$expected_source_sha" =~ ^[a-f0-9]{64}$ ]]
+
+          if [ -e "$source_config" ] || [ -L "$source_config" ]; then
+            validate_config "$source_config" "$expected_source_sha"
+            if [ -e "$recover_tmp" ] || [ -L "$recover_tmp" ]; then
+              validate_config "$recover_tmp" "$expected_source_sha"
+              /usr/bin/cmp -s "$source_config" "$recover_tmp"
+              /usr/bin/rm -f -- "$recover_tmp"
+            fi
+            /usr/bin/install -o root -g root -m 600 "$source_config" "$recover_tmp"
+            validate_config "$recover_tmp" "$expected_source_sha"
+            /usr/bin/cmp -s "$source_config" "$recover_tmp"
+            /usr/bin/sync -f "$recover_tmp"
+            /usr/bin/mv -fT -- "$recover_tmp" "$live_config"
+            /usr/bin/sync -f /etc
+          else
+            [ ! -e "$recover_tmp" ] && [ ! -L "$recover_tmp" ]
+          fi
+          validate_config "$live_config" "$expected_source_sha"
+
+          # The audit stops these units before it creates the source-config
+          # snapshot.  A timeout in that interval therefore has no snapshot
+          # as a restart signal; always restore and prove the pre-audit
+          # active/enabled runtime state after the config proof succeeds.
+          /usr/bin/systemctl restart rr-nexus.service
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          /usr/bin/systemctl restart argo-rr-health.timer
+          assert_unit_state argo-rr-health.timer loaded:active:enabled
+          wait_local_nexus
+
+          /usr/bin/rm -f -- /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass
+          for target in /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass; do
+            [ ! -e "$target" ] && [ ! -L "$target" ]
+          done
+          validate_config "$live_config" "$expected_source_sha"
+          if [ "$cleanup_mode" = timer ]; then
+            if [ -e "$source_config" ] || [ -L "$source_config" ]; then
+              /usr/bin/rm -f -- "$source_config"
+              [ ! -e "$source_config" ] && [ ! -L "$source_config" ]
+            fi
+            /usr/bin/rm -f -- "$source_hash"
+            [ ! -e "$source_hash" ] && [ ! -L "$source_hash" ]
+            self_disarm
+          else
+            [ -f "$source_hash" ] && [ ! -L "$source_hash" ]
+            validate_bundle
+          fi
+          RR_A_CLEANUP_HELPER
+            )
+            chmod 700 "$helper_tmp"
+            chown root:root "$helper_tmp"
+            validate_helper "$helper_tmp"
+            mv -fT -- "$helper_tmp" "$helper"
+            sync -f "$state_dir"
+            validate_helper "$helper"
+          }
+
+          ensure_helper() {
+            if [ -e "$helper" ] || [ -L "$helper" ]; then
+              [ ! -e "$helper_tmp" ] && [ ! -L "$helper_tmp" ]
+              validate_helper "$helper"
+            elif [ -e "$helper_tmp" ] || [ -L "$helper_tmp" ]; then
+              validate_helper "$helper_tmp"
+              mv -fT -- "$helper_tmp" "$helper"
+              sync -f "$state_dir"
+              validate_helper "$helper"
+            else
+              write_helper
+            fi
+          }
+
+          residual=false
+          for path in "$state_dir" "$service_file" "$timer_file" \
+            "$service_tmp" "$timer_tmp" "$timer_link"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then residual=true; fi
+          done
+          if [ "$residual" = true ]; then
+            validate_bundle
+            RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+            rm -f -- "$source_config" "$source_hash" "$source_hash_tmp" \
+              "$recover_tmp"
+            for evidence in "$source_config" "$source_hash" "$source_hash_tmp" \
+              "$recover_tmp"; do
+              test ! -e "$evidence" && test ! -L "$evidence"
+            done
+            disarm_bundle
+          fi
+          test ! -e "$state_dir" && test ! -L "$state_dir"
+          test ! -e "$service_file" && test ! -L "$service_file"
+          test ! -e "$timer_file" && test ! -L "$timer_file"
+          test ! -e "$service_tmp" && test ! -L "$service_tmp"
+          test ! -e "$timer_tmp" && test ! -L "$timer_tmp"
+          test ! -e "$timer_link" && test ! -L "$timer_link"
+          if [ -e "$source_config" ] || [ -L "$source_config" ] || \
+             [ -e "$source_hash" ] || [ -L "$source_hash" ] || \
+             [ -e "$source_hash_tmp" ] || [ -L "$source_hash_tmp" ] || \
+             [ -e "$recover_tmp" ] || [ -L "$recover_tmp" ]; then
+            exit 1
+          fi
+          for evidence in "$source_config" "$source_hash" "$source_hash_tmp" \
+            "$recover_tmp"; do
+            test ! -e "$evidence" && test ! -L "$evidence"
+          done
+          install -d -o root -g root -m 700 "$state_dir"
+          validate_directory "$state_dir" 700
+          rm -f -- /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass
+          for target in /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass; do
+            test ! -e "$target" && test ! -L "$target"
+          done
+
+          live_sha=$(sha256sum "$live_config" | awk '{print $1}')
+          [[ "$live_sha" =~ ^[a-f0-9]{64}$ ]]
+          validate_config "$live_config" "$live_sha"
+          (set -C; printf '%s\n' "$live_sha" > "$source_hash_tmp")
+          chmod 600 "$source_hash_tmp"
+          chown root:root "$source_hash_tmp"
+          validate_hash_file "$source_hash_tmp"
+          mv -fT -- "$source_hash_tmp" "$source_hash"
+          sync -f /root
+          validate_hash_file "$source_hash"
+          ensure_helper
+          deadline_epoch=$(date -u -d '+75 minutes' +%s)
+          deadline_calendar=$(date -u -d "@$deadline_epoch" \
+            '+%Y-%m-%d %H:%M:%S UTC')
+          (set -C; printf '%s\n%s\n' "$deadline_epoch" "$deadline_calendar" \
+            > "$deadline_tmp")
+          chmod 600 "$deadline_tmp"
+          chown root:root "$deadline_tmp"
+          mv -fT -- "$deadline_tmp" "$deadline_file"
+          sync -f "$state_dir"
+          validate_deadline
+          [ ! -e "$service_tmp" ] && [ ! -L "$service_tmp" ]
+          (set -C; tee "$service_tmp" >/dev/null <<EOF
+          [Unit]
+          Description=RR audit source durable cleanup
+          After=network-online.target
+          Wants=network-online.target
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=oneshot
+          Environment=RR_AUDIT_HELPER_SHA=$expected_helper_sha
+          ExecStart=$helper timer
+          Restart=on-failure
+          RestartSec=30s
+          EOF
+          )
+          chmod 644 "$service_tmp"
+          chown root:root "$service_tmp"
+          mv -fT -- "$service_tmp" "$service_file"
+          [ ! -e "$timer_tmp" ] && [ ! -L "$timer_tmp" ]
+          (set -C; tee "$timer_tmp" >/dev/null <<EOF
+          [Unit]
+          Description=RR audit source cleanup deadline
+
+          [Timer]
+          OnCalendar=$deadline_calendar
+          OnActiveSec=5m
+          OnUnitInactiveSec=5m
+          Persistent=true
+          AccuracySec=1s
+          RandomizedDelaySec=0
+          Unit=$service_unit
+
+          [Install]
+          WantedBy=timers.target
+          EOF
+          )
+          chmod 644 "$timer_tmp"
+          chown root:root "$timer_tmp"
+          mv -fT -- "$timer_tmp" "$timer_file"
+          sync -f /etc/systemd/system
+          validate_unit_file "$service_file"
+          validate_unit_file "$timer_file"
+          (set -C; sha256sum "$service_file" "$timer_file" > "$unit_hashes_tmp")
+          chmod 600 "$unit_hashes_tmp"
+          chown root:root "$unit_hashes_tmp"
+          mv -fT -- "$unit_hashes_tmp" "$unit_hashes"
+          sync -f "$state_dir"
+          validate_unit_hashes
+          systemctl daemon-reload
+          systemctl enable --now "$timer_unit"
+          validate_bundle
+          RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+          validate_bundle
+          test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+          test "$(systemctl show -p ActiveState --value "$timer_unit")" = active
+          test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+          test "$(systemctl show -p Transient --value "$timer_unit")" = no
+          test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+          test "$(systemctl show -p ActiveState --value "$service_unit")" = inactive
+          test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+          test "$(systemctl show -p Transient --value "$service_unit")" = no
+          test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+          test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+          test "$(systemctl show -p StartLimitIntervalUSec --value "$service_unit")" = 0
+          test "$(systemctl show -p Triggers --value "$timer_unit")" = "$service_unit"
+          test "$(systemctl show -p TriggeredBy --value "$service_unit")" = "$timer_unit"
+          test "$(systemctl show -p Environment --value "$service_unit")" = \
+            "RR_AUDIT_HELPER_SHA=$expected_helper_sha"
+          expected_exec_prefix="{ path=$helper ; argv[]=$helper timer ; "
+          exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+          case "$exec_start" in
+            "$expected_exec_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          exec_metadata=${exec_start#"$expected_exec_prefix"}
+          [[ "$exec_metadata" == *'}' ]]
+          [[ "$exec_metadata" != *' path='* ]]
+          [[ "$exec_start" != *$'\n'* ]]
+          REMOTE_A_ARM
+          }
+
+          arm_audit_target_cleanup_timer() {
+            SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" \
+              bash -s <<'REMOTE_C_ARM'
+          set -euo pipefail
+          umask 077
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          timer_unit=rr-audit-cross-cleanup-c.timer
+          service_unit=rr-audit-cross-cleanup-c.service
+          state_dir=/var/lib/rr-audit-cross-cleanup-c
+          helper="$state_dir/helper"
+          helper_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-c.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-c.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-c.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-c.timer
+          expected_helper_sha=f9707bccf6f8270423a56ad03beba61b6b3ee12df62bff02b9929552d024da3d
+
+          validate_directory() {
+            local path="$1" expected_mode="$2"
+            [ -d "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a' "$path")" = "0:0:$expected_mode" ]
+          }
+
+          validate_helper() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:700:1 ] || return 1
+            [ "$(sha256sum "$path" | awk '{print $1}')" = \
+              "$expected_helper_sha" ]
+          }
+
+          validate_deadline() {
+            local epoch="" calendar="" rendered=""
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$deadline_file")" = 0:0:600:1 ] || return 1
+            [ "$(wc -l < "$deadline_file")" -eq 2 ] || return 1
+            epoch=$(sed -n '1p' "$deadline_file") || return 1
+            calendar=$(sed -n '2p' "$deadline_file") || return 1
+            [[ "$epoch" =~ ^[1-9][0-9]{9,}$ ]] || return 1
+            rendered=$(date -u -d "@$epoch" '+%Y-%m-%d %H:%M:%S UTC') || return 1
+            [ "$calendar" = "$rendered" ]
+          }
+
+          validate_unit_file() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:644:1 ]
+          }
+
+          validate_unit_hashes() {
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$unit_hashes")" = 0:0:600:1 ] || return 1
+            awk -v service="$service_file" -v timer="$timer_file" '
+              NR == 1 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+              }
+              NR == 2 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+              }
+              END { if (NR != 2) exit 1 }
+            ' "$unit_hashes" || return 1
+            sha256sum --check --strict "$unit_hashes" >/dev/null
+          }
+
+          validate_bundle() {
+            validate_directory "$state_dir" 700
+            validate_helper "$helper"
+            test ! -e "$helper_tmp" && test ! -L "$helper_tmp"
+            test ! -e "$deadline_tmp" && test ! -L "$deadline_tmp"
+            test ! -e "$unit_hashes_tmp" && test ! -L "$unit_hashes_tmp"
+            test ! -e "$service_tmp" && test ! -L "$service_tmp"
+            test ! -e "$timer_tmp" && test ! -L "$timer_tmp"
+            validate_deadline
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            [ -L "$timer_link" ]
+            [ "$(readlink -f "$timer_link")" = "$timer_file" ]
+          }
+
+          disarm_bundle() {
+            local timer_load="" service_load="" attempt=""
+            validate_bundle
+            systemctl disable --now "$timer_unit"
+            test ! -e "$timer_link" && test ! -L "$timer_link"
+            service_load=$(systemctl show -p LoadState --value "$service_unit")
+            if [ "$service_load" != not-found ]; then
+              systemctl stop "$service_unit"
+              if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+                systemctl reset-failed "$service_unit"
+              fi
+            fi
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            rm -f -- "$service_file" "$timer_file"
+            test ! -e "$service_file" && test ! -L "$service_file"
+            test ! -e "$timer_file" && test ! -L "$timer_file"
+            systemctl daemon-reload
+            for attempt in $(seq 1 15); do
+              timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+              service_load=$(systemctl show -p LoadState --value "$service_unit")
+              if [ "$timer_load" = not-found ] && \
+                 [ "$service_load" = not-found ]; then
+                break
+              fi
+              test "$attempt" -lt 15
+              sleep 1
+            done
+            test "$timer_load" = not-found
+            test "$service_load" = not-found
+            if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+              [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+              [ "$(stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+              rm -f -- "$timer_stamp"
+            fi
+            test ! -e "$timer_stamp" && test ! -L "$timer_stamp"
+            validate_helper "$helper"
+            validate_deadline
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ]
+            rm -f -- "$unit_hashes" "$deadline_file" "$helper"
+            test ! -e "$unit_hashes" && test ! -L "$unit_hashes"
+            test ! -e "$deadline_file" && test ! -L "$deadline_file"
+            test ! -e "$helper" && test ! -L "$helper"
+            rmdir "$state_dir"
+            sync -f /var/lib
+          }
+
+          write_helper() {
+            [ ! -e "$helper_tmp" ] && [ ! -L "$helper_tmp" ] || return 1
+            (set -C; /usr/bin/tee "$helper_tmp" >/dev/null \
+              <<'RR_C_CLEANUP_HELPER'
+          #!/bin/bash
+          set -euo pipefail
+          umask 077
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          state_dir=/var/lib/rr-audit-cross-cleanup-c
+          self="$state_dir/helper"
+          self_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_unit=rr-audit-cross-cleanup-c.service
+          timer_unit=rr-audit-cross-cleanup-c.timer
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-c.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-c.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-c.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-c.timer
+          cleanup_mode="${1:-}"
+          firewall_lock_fd=""
+
+          validate_directory() {
+            local path="$1" expected_mode="$2"
+            [ -d "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a' "$path")" = \
+              "0:0:$expected_mode" ]
+          }
+
+          validate_unit_file() {
+            local path="$1"
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$path")" = 0:0:644:1 ]
+          }
+
+          validate_deadline() {
+            local epoch="" calendar="" rendered=""
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$deadline_file")" = \
+              0:0:600:1 ] || return 1
+            [ "$(/usr/bin/wc -l < "$deadline_file")" -eq 2 ] || return 1
+            epoch=$(/usr/bin/sed -n '1p' "$deadline_file") || return 1
+            calendar=$(/usr/bin/sed -n '2p' "$deadline_file") || return 1
+            [[ "$epoch" =~ ^[1-9][0-9]{9,}$ ]] || return 1
+            rendered=$(/usr/bin/date -u -d "@$epoch" \
+              '+%Y-%m-%d %H:%M:%S UTC') || return 1
+            [ "$calendar" = "$rendered" ]
+          }
+
+          validate_unit_hashes() {
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$unit_hashes")" = \
+              0:0:600:1 ] || return 1
+            /usr/bin/awk -v service="$service_file" -v timer="$timer_file" '
+              NR == 1 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+              }
+              NR == 2 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+              }
+              END { if (NR != 2) exit 1 }
+            ' "$unit_hashes" || return 1
+            /usr/bin/sha256sum --check --strict "$unit_hashes" >/dev/null
+          }
+
+          validate_bundle() {
+            validate_directory "$state_dir" 700
+            [ -f "$self" ] && [ ! -L "$self" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h' "$self")" = 0:0:700:1 ] || return 1
+            [ "$(/usr/bin/sha256sum "$self" | /usr/bin/awk '{print $1}')" = \
+              "$RR_AUDIT_HELPER_SHA" ] || return 1
+            [ ! -e "$self_tmp" ] && [ ! -L "$self_tmp" ] || return 1
+            [ ! -e "$deadline_tmp" ] && [ ! -L "$deadline_tmp" ] || return 1
+            [ ! -e "$unit_hashes_tmp" ] && [ ! -L "$unit_hashes_tmp" ] || return 1
+            [ ! -e "$service_tmp" ] && [ ! -L "$service_tmp" ] || return 1
+            [ ! -e "$timer_tmp" ] && [ ! -L "$timer_tmp" ] || return 1
+            validate_deadline
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            [ -L "$timer_link" ]
+            [ "$(/usr/bin/readlink -f "$timer_link")" = "$timer_file" ]
+          }
+
+          self_disarm() {
+            validate_bundle
+            /usr/bin/systemctl disable --now "$timer_unit"
+            [ ! -e "$timer_link" ] && [ ! -L "$timer_link" ]
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            /usr/bin/rm -f -- "$service_file" "$timer_file"
+            [ ! -e "$service_file" ] && [ ! -L "$service_file" ]
+            [ ! -e "$timer_file" ] && [ ! -L "$timer_file" ]
+            /usr/bin/systemctl daemon-reload
+            [ "$(/usr/bin/systemctl show -p LoadState --value \
+              "$timer_unit")" = not-found ]
+            if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+              [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+              [ "$(/usr/bin/stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+              /usr/bin/rm -f -- "$timer_stamp"
+            fi
+            [ ! -e "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+            /usr/bin/rm -f -- "$unit_hashes" "$deadline_file" "$self"
+            [ ! -e "$unit_hashes" ] && [ ! -L "$unit_hashes" ]
+            [ ! -e "$deadline_file" ] && [ ! -L "$deadline_file" ]
+            [ ! -e "$self" ] && [ ! -L "$self" ]
+            /usr/bin/rmdir "$state_dir"
+            /usr/bin/sync -f /var/lib
+          }
+
+          lock_directory_is_safe() {
+            local directory="$1" mode=""
+            [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g' -- "$directory" 2>/dev/null)" = \
+              0:0 ] || return 1
+            mode=$(/usr/bin/stat -c '%a' -- "$directory" 2>/dev/null) || return 1
+            [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+            (( (8#$mode & 8#022) == 0 ))
+          }
+
+          lock_file_is_safe() {
+            [ -f /run/rr-vps/locks/firewall.lock ] && \
+              [ ! -L /run/rr-vps/locks/firewall.lock ] || return 1
+            [ "$(/usr/bin/stat -c '%u:%g:%a:%h:%s' -- \
+              /run/rr-vps/locks/firewall.lock 2>/dev/null)" = 0:0:600:1:0 ]
+          }
+
+          acquire_firewall_lock() {
+            local directory="" path_identity="" descriptor_identity=""
+            [ "${EUID:-$(/usr/bin/id -u)}" -eq 0 ] || return 1
+            command -v flock >/dev/null 2>&1 || return 1
+            lock_directory_is_safe /run || return 1
+            for directory in /run/rr-vps /run/rr-vps/locks; do
+              if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+                /usr/bin/mkdir -m 700 -- "$directory" || return 1
+                /usr/bin/chown 0:0 -- "$directory" || return 1
+                /usr/bin/chmod 700 -- "$directory" || return 1
+              fi
+              lock_directory_is_safe "$directory" || return 1
+            done
+            if [ ! -e /run/rr-vps/locks/firewall.lock ] && \
+               [ ! -L /run/rr-vps/locks/firewall.lock ]; then
+              (umask 077; : > /run/rr-vps/locks/firewall.lock) || return 1
+            fi
+            lock_file_is_safe || return 1
+            exec {firewall_lock_fd}<>/run/rr-vps/locks/firewall.lock || return 1
+            path_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+            descriptor_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+            [ "$path_identity" = "$descriptor_identity" ] || return 1
+            flock -w 60 "$firewall_lock_fd" || return 1
+            path_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+            descriptor_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+            [ "$path_identity" = "$descriptor_identity" ] && lock_file_is_safe
+          }
+
+          release_firewall_lock() {
+            local path_identity="" descriptor_identity=""
+            [[ "$firewall_lock_fd" =~ ^[0-9]+$ ]] || return 1
+            path_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+            descriptor_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%h' \
+              "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+            [ "$path_identity" = "$descriptor_identity" ] && lock_file_is_safe
+            flock -u "$firewall_lock_fd"
+            exec {firewall_lock_fd}>&-
+            firewall_lock_fd=""
+          }
+
+          remove_audit_rule_all() {
+            local backend="$1" table="$2" chain="$3" state=0
+            shift 3
+            while :; do
+              if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                   >/dev/null 2>&1; then
+                "$backend" -w 5 -t "$table" -D "$chain" "$@" \
+                  >/dev/null 2>&1 || return 1
+              else
+                state=$?
+                [ "$state" -eq 1 ] && return 0
+                return "$state"
+              fi
+            done
+          }
+
+          assert_audit_rule_absent() {
+            local backend="$1" table="$2" chain="$3" state=0
+            shift 3
+            if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                 >/dev/null 2>&1; then
+              return 1
+            else
+              state=$?
+              [ "$state" -eq 1 ]
+            fi
+          }
+
+          clean_backend() {
+            local backend="$1"
+            remove_audit_rule_all "$backend" filter INPUT -p tcp --dport 65431 \
+              -m comment --comment argo-rr-managed-block -j DROP
+            remove_audit_rule_all "$backend" nat PREROUTING -p udp --dport 65432 \
+              -m comment --comment argo-rr-audit-fixture \
+              -j REDIRECT --to-ports 65431
+            remove_audit_rule_all "$backend" filter INPUT -p tcp --dport 65433 \
+              -m comment --comment rr-audit-user-sentinel -j ACCEPT
+            remove_audit_rule_all "$backend" nat PREROUTING -p udp --dport 65434 \
+              -m comment --comment rr-audit-user-sentinel \
+              -j REDIRECT --to-ports 65433
+          }
+
+          assert_backend_clean() {
+            local backend="$1"
+            assert_audit_rule_absent "$backend" filter INPUT -p tcp --dport 65431 \
+              -m comment --comment argo-rr-managed-block -j DROP
+            assert_audit_rule_absent "$backend" nat PREROUTING -p udp --dport 65432 \
+              -m comment --comment argo-rr-audit-fixture \
+              -j REDIRECT --to-ports 65431
+            assert_audit_rule_absent "$backend" filter INPUT -p tcp --dport 65433 \
+              -m comment --comment rr-audit-user-sentinel -j ACCEPT
+            assert_audit_rule_absent "$backend" nat PREROUTING -p udp --dport 65434 \
+              -m comment --comment rr-audit-user-sentinel \
+              -j REDIRECT --to-ports 65433
+          }
+
+          persist_firewall_cleanup() {
+            if command -v netfilter-persistent >/dev/null 2>&1; then
+              netfilter-persistent save >/dev/null 2>&1
+            elif command -v service >/dev/null 2>&1 && \
+                 [ -x /etc/init.d/iptables ]; then
+              service iptables save >/dev/null 2>&1
+            else
+              return 0
+            fi
+          }
+
+          [ "$0" = "$self" ]
+          [ "$#" -eq 1 ]
+          case "$cleanup_mode" in timer|exit) ;; *) exit 1 ;; esac
+          [[ "${RR_AUDIT_HELPER_SHA:-}" =~ ^[a-f0-9]{64}$ ]]
+          validate_bundle
+          deadline_epoch=$(/usr/bin/sed -n '1p' "$deadline_file")
+          if [ "$cleanup_mode" = timer ] && \
+             [ "$(/usr/bin/date +%s)" -lt "$deadline_epoch" ]; then
+            exit 0
+          fi
+
+          acquire_firewall_lock
+          backend_count=0
+          for backend in iptables ip6tables; do
+            command -v "$backend" >/dev/null 2>&1
+            clean_backend "$backend"
+            assert_backend_clean "$backend"
+            backend_count=$((backend_count + 1))
+          done
+          [ "$backend_count" -eq 2 ]
+          persist_firewall_cleanup
+          for backend in iptables ip6tables; do
+            assert_backend_clean "$backend"
+          done
+          release_firewall_lock
+
+          /usr/bin/rm -f -- /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /run/rr-audit-cross-restored-fingerprint.json \
+            /run/rr-audit-cross-target-access.json \
+            /run/rr-audit-cross-target-network.txt \
+            /run/rr-audit-cross-target-channel \
+            /run/rr-audit-cross-target-bind \
+            /run/rr-audit-cross-target-firewall \
+            /run/rr-audit-cross-restored-firewall \
+            /run/rr-audit-cross-firewall-before-validate \
+            /run/rr-audit-cross-firewall-before-validate.tmp \
+            /run/rr-audit-cross-firewall-after-validate \
+            /run/rr-audit-cross-firewall-after-validate.tmp \
+            /root/rr-audit-cross-restore.log \
+            /root/rr-audit-cross-firewall-validate.log \
+            /root/rr-audit-panel-pass
+          for target in /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /run/rr-audit-cross-restored-fingerprint.json \
+            /run/rr-audit-cross-target-access.json \
+            /run/rr-audit-cross-target-network.txt \
+            /run/rr-audit-cross-target-channel \
+            /run/rr-audit-cross-target-bind \
+            /run/rr-audit-cross-target-firewall \
+            /run/rr-audit-cross-restored-firewall \
+            /run/rr-audit-cross-firewall-before-validate \
+            /run/rr-audit-cross-firewall-before-validate.tmp \
+            /run/rr-audit-cross-firewall-after-validate \
+            /run/rr-audit-cross-firewall-after-validate.tmp \
+            /root/rr-audit-cross-restore.log \
+            /root/rr-audit-cross-firewall-validate.log \
+            /root/rr-audit-panel-pass; do
+            [ ! -e "$target" ] && [ ! -L "$target" ]
+          done
+          if [ "$cleanup_mode" = timer ]; then
+            self_disarm
+          else
+            validate_bundle
+          fi
+          RR_C_CLEANUP_HELPER
+            )
+            chmod 700 "$helper_tmp"
+            chown root:root "$helper_tmp"
+            validate_helper "$helper_tmp"
+            mv -fT -- "$helper_tmp" "$helper"
+            sync -f "$state_dir"
+            validate_helper "$helper"
+          }
+
+          ensure_helper() {
+            if [ -e "$helper" ] || [ -L "$helper" ]; then
+              [ ! -e "$helper_tmp" ] && [ ! -L "$helper_tmp" ]
+              validate_helper "$helper"
+            elif [ -e "$helper_tmp" ] || [ -L "$helper_tmp" ]; then
+              validate_helper "$helper_tmp"
+              mv -fT -- "$helper_tmp" "$helper"
+              sync -f "$state_dir"
+              validate_helper "$helper"
+            else
+              write_helper
+            fi
+          }
+
+          residual=false
+          for path in "$state_dir" "$service_file" "$timer_file" \
+            "$service_tmp" "$timer_tmp" "$timer_link"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then residual=true; fi
+          done
+          if [ "$residual" = true ]; then
+            validate_bundle
+            RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+            disarm_bundle
+          fi
+          test ! -e "$state_dir" && test ! -L "$state_dir"
+          test ! -e "$service_file" && test ! -L "$service_file"
+          test ! -e "$timer_file" && test ! -L "$timer_file"
+          test ! -e "$service_tmp" && test ! -L "$service_tmp"
+          test ! -e "$timer_tmp" && test ! -L "$timer_tmp"
+          test ! -e "$timer_link" && test ! -L "$timer_link"
+          install -d -o root -g root -m 700 "$state_dir"
+          validate_directory "$state_dir" 700
+          ensure_helper
+          validate_helper "$helper"
+          test ! -e "$helper_tmp" && test ! -L "$helper_tmp"
+          deadline_epoch=$(date -u -d '+75 minutes' +%s)
+          deadline_calendar=$(date -u -d "@$deadline_epoch" \
+            '+%Y-%m-%d %H:%M:%S UTC')
+          (set -C; printf '%s\n%s\n' "$deadline_epoch" "$deadline_calendar" \
+            > "$deadline_tmp")
+          chmod 600 "$deadline_tmp"
+          chown root:root "$deadline_tmp"
+          mv -fT -- "$deadline_tmp" "$deadline_file"
+          sync -f "$state_dir"
+          validate_deadline
+          [ ! -e "$service_tmp" ] && [ ! -L "$service_tmp" ]
+          (set -C; tee "$service_tmp" >/dev/null <<EOF
+          [Unit]
+          Description=RR audit target durable cleanup
+          After=network-online.target
+          Wants=network-online.target
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=oneshot
+          Environment=RR_AUDIT_HELPER_SHA=$expected_helper_sha
+          ExecStart=$helper timer
+          Restart=on-failure
+          RestartSec=30s
+          EOF
+          )
+          chmod 644 "$service_tmp"
+          chown root:root "$service_tmp"
+          mv -fT -- "$service_tmp" "$service_file"
+          [ ! -e "$timer_tmp" ] && [ ! -L "$timer_tmp" ]
+          (set -C; tee "$timer_tmp" >/dev/null <<EOF
+          [Unit]
+          Description=RR audit target cleanup deadline
+
+          [Timer]
+          OnCalendar=$deadline_calendar
+          OnActiveSec=5m
+          OnUnitInactiveSec=5m
+          Persistent=true
+          AccuracySec=1s
+          RandomizedDelaySec=0
+          Unit=$service_unit
+
+          [Install]
+          WantedBy=timers.target
+          EOF
+          )
+          chmod 644 "$timer_tmp"
+          chown root:root "$timer_tmp"
+          mv -fT -- "$timer_tmp" "$timer_file"
+          sync -f /etc/systemd/system
+          validate_unit_file "$service_file"
+          validate_unit_file "$timer_file"
+          (set -C; sha256sum "$service_file" "$timer_file" > "$unit_hashes_tmp")
+          chmod 600 "$unit_hashes_tmp"
+          chown root:root "$unit_hashes_tmp"
+          mv -fT -- "$unit_hashes_tmp" "$unit_hashes"
+          sync -f "$state_dir"
+          validate_unit_hashes
+          systemctl daemon-reload
+          systemctl enable --now "$timer_unit"
+          validate_bundle
+          RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+          validate_bundle
+          test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+          test "$(systemctl show -p ActiveState --value "$timer_unit")" = active
+          test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+          test "$(systemctl show -p Transient --value "$timer_unit")" = no
+          test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+          test "$(systemctl show -p ActiveState --value "$service_unit")" = inactive
+          test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+          test "$(systemctl show -p Transient --value "$service_unit")" = no
+          test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+          test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+          test "$(systemctl show -p StartLimitIntervalUSec --value "$service_unit")" = 0
+          test "$(systemctl show -p Triggers --value "$timer_unit")" = "$service_unit"
+          test "$(systemctl show -p TriggeredBy --value "$service_unit")" = "$timer_unit"
+          test "$(systemctl show -p Environment --value "$service_unit")" = \
+            "RR_AUDIT_HELPER_SHA=$expected_helper_sha"
+          expected_exec_prefix="{ path=$helper ; argv[]=$helper timer ; "
+          exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+          case "$exec_start" in
+            "$expected_exec_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          exec_metadata=${exec_start#"$expected_exec_prefix"}
+          [[ "$exec_metadata" == *'}' ]]
+          [[ "$exec_metadata" != *' path='* ]]
+          [[ "$exec_start" != *$'\n'* ]]
+          REMOTE_C_ARM
+          }
+
+          finalize_audit_source_artifacts() {
+            local expected_backup_size="$1" expected_backup_sha="$2"
+            local expected_fingerprint_size="$3" expected_fingerprint_sha="$4"
+            SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" bash -s -- \
+              "$expected_backup_size" "$expected_backup_sha" \
+              "$expected_fingerprint_size" "$expected_fingerprint_sha" \
+              <<'REMOTE_A_FINALIZE'
+          set -euo pipefail
+          expected_backup_size="$1"
+          expected_backup_sha="$2"
+          expected_fingerprint_size="$3"
+          expected_fingerprint_sha="$4"
+          timer_unit=rr-audit-cross-cleanup-a.timer
+          service_unit=rr-audit-cross-cleanup-a.service
+          state_dir=/var/lib/rr-audit-cross-cleanup-a
+          helper="$state_dir/helper"
+          helper_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-a.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-a.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-a.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-a.timer
+          expected_helper_sha=6260506ef5a36f37c525c92dc934bf52f043c8600f6c2d1ec497965b83508c25
+
+          validate_helper() {
+            [ -f "$helper" ] && [ ! -L "$helper" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$helper")" = 0:0:700:1 ] || return 1
+            [ "$(sha256sum "$helper" | awk '{print $1}')" = \
+              "$expected_helper_sha" ]
+          }
+          validate_unit_file() {
+            [ -f "$1" ] && [ ! -L "$1" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$1")" = 0:0:644:1 ]
+          }
+          validate_bundle() {
+            [ -d "$state_dir" ] && [ ! -L "$state_dir" ]
+            [ "$(stat -c '%u:%g:%a' "$state_dir")" = 0:0:700 ]
+            validate_helper
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ]
+            [ "$(stat -c '%u:%g:%a:%h' "$deadline_file")" = 0:0:600:1 ]
+            [ "$(wc -l < "$deadline_file")" -eq 2 ]
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ]
+            [ "$(stat -c '%u:%g:%a:%h' "$unit_hashes")" = 0:0:600:1 ]
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            [ "$(wc -l < "$unit_hashes")" -eq 2 ]
+            sha256sum --check --strict "$unit_hashes" >/dev/null
+            [ -L "$timer_link" ]
+            [ "$(readlink -f "$timer_link")" = "$timer_file" ]
+            for temporary in "$helper_tmp" "$deadline_tmp" "$unit_hashes_tmp" \
+              "$service_tmp" "$timer_tmp"; do
+              test ! -e "$temporary" && test ! -L "$temporary"
+            done
+          }
+          [[ "$expected_backup_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$expected_fingerprint_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$expected_backup_sha" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$expected_fingerprint_sha" =~ ^[a-f0-9]{64}$ ]]
+          test "$(stat -c '%u:%g:%a:%h' /root/rr-audit-cross.rrbak)" = \
+            0:0:600:1
+          test "$(stat -c %s /root/rr-audit-cross.rrbak)" = \
+            "$expected_backup_size"
+          test "$(sha256sum /root/rr-audit-cross.rrbak | awk '{print $1}')" = \
+            "$expected_backup_sha"
+          test "$(stat -c '%u:%g:%a:%h' \
+            /run/rr-audit-cross-fingerprint.json)" = 0:0:600:1
+          test "$(stat -c %s /run/rr-audit-cross-fingerprint.json)" = \
+            "$expected_fingerprint_size"
+          test "$(sha256sum /run/rr-audit-cross-fingerprint.json | awk '{print $1}')" = \
+            "$expected_fingerprint_sha"
+          validate_bundle
+          test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+          test "$(systemctl show -p ActiveState --value "$timer_unit")" = active
+          test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+          test "$(systemctl show -p Transient --value "$timer_unit")" = no
+          test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+          test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+          test "$(systemctl show -p Transient --value "$service_unit")" = no
+          test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+          test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+          test "$(systemctl show -p StartLimitIntervalUSec --value "$service_unit")" = 0
+          test "$(systemctl show -p Triggers --value "$timer_unit")" = \
+            "$service_unit"
+          test "$(systemctl show -p TriggeredBy --value "$service_unit")" = \
+            "$timer_unit"
+          test "$(systemctl show -p Environment --value "$service_unit")" = \
+            "RR_AUDIT_HELPER_SHA=$expected_helper_sha"
+          expected_exec_prefix="{ path=$helper ; argv[]=$helper timer ; "
+          exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+          case "$exec_start" in
+            "$expected_exec_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          exec_metadata=${exec_start#"$expected_exec_prefix"}
+          [[ "$exec_metadata" == *'}' ]]
+          [[ "$exec_metadata" != *' path='* ]]
+          [[ "$exec_start" != *$'\n'* ]]
+          RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+          for target in /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /etc/.rr-audit-cross-source-config.recover \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass; do
+            test ! -e "$target" && test ! -L "$target"
+          done
+          validate_bundle
+          rm -f -- /root/rr-audit-cross-source-config \
+            /root/rr-audit-cross-source-config.sha256 \
+            /root/.rr-audit-cross-source-config.sha256.new \
+            /etc/.rr-audit-cross-source-config.recover
+          for evidence in /root/rr-audit-cross-source-config \
+            /root/rr-audit-cross-source-config.sha256 \
+            /root/.rr-audit-cross-source-config.sha256.new \
+            /etc/.rr-audit-cross-source-config.recover; do
+            test ! -e "$evidence" && test ! -L "$evidence"
+          done
+          validate_bundle
+          systemctl disable --now "$timer_unit"
+          test ! -e "$timer_link" && test ! -L "$timer_link"
+          service_load=$(systemctl show -p LoadState --value "$service_unit")
+          if [ "$service_load" != not-found ]; then
+            systemctl stop "$service_unit"
+            service_load=$(systemctl show -p LoadState --value "$service_unit")
+            if [ "$service_load" != not-found ] && \
+               [ "$(systemctl show -p ActiveState --value "$service_unit")" = \
+                 failed ]; then
+              systemctl reset-failed "$service_unit"
+            fi
+          fi
+          validate_unit_file "$service_file"
+          validate_unit_file "$timer_file"
+          sha256sum --check --strict "$unit_hashes" >/dev/null
+          rm -f -- "$service_file" "$timer_file"
+          test ! -e "$service_file" && test ! -L "$service_file"
+          test ! -e "$timer_file" && test ! -L "$timer_file"
+          systemctl daemon-reload
+          for attempt in $(seq 1 15); do
+            timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+            service_load=$(systemctl show -p LoadState --value "$service_unit")
+            if [ "$timer_load" = not-found ] && [ "$service_load" = not-found ]; then
+              break
+            fi
+            test "$attempt" -lt 15
+            sleep 1
+          done
+          test "$timer_load" = not-found
+          test "$service_load" = not-found
+          if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+            [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+            [ "$(stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+            rm -f -- "$timer_stamp"
+          fi
+          test ! -e "$timer_stamp" && test ! -L "$timer_stamp"
+          validate_helper
+          rm -f -- "$unit_hashes" "$deadline_file" "$helper"
+          for evidence in "$unit_hashes" "$deadline_file" "$helper"; do
+            test ! -e "$evidence" && test ! -L "$evidence"
+          done
+          rmdir "$state_dir"
+          sync -f /var/lib
+          REMOTE_A_FINALIZE
+          }
+
           recover_audit_source_config() {
             SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
-              -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" '
-                set -euo pipefail
-                backup=/root/rr-audit-cross-source-config
-                if [ -e "$backup" ] || [ -L "$backup" ]; then
-                  [ -f "$backup" ] && [ ! -L "$backup" ]
-                  [ "$(stat -c "%U:%G:%a:%h" "$backup")" = root:root:600:1 ]
-                  [ "$(grep -c "^NAIVE_ENABLED=true$" "$backup")" -eq 1 ]
-                  install -o root -g root -m 600 "$backup" /etc/argo_vmess.conf
-                  cmp -s "$backup" /etc/argo_vmess.conf
-                  rm -f -- "$backup"
-                fi
-                rm -f -- /root/rr-audit-cross-passphrase \
-                  /root/rr-audit-cross.rrbak \
-                  /root/rr-audit-cross-fingerprint.json
-              '
+              -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" \
+              bash -s <<'REMOTE_A_RECOVER'
+          set -euo pipefail
+          umask 077
+          export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+          timer_unit=rr-audit-cross-cleanup-a.timer
+          service_unit=rr-audit-cross-cleanup-a.service
+          state_dir=/var/lib/rr-audit-cross-cleanup-a
+          helper="$state_dir/helper"
+          helper_tmp="$state_dir/.helper.new"
+          deadline_file="$state_dir/deadline"
+          deadline_tmp="$state_dir/.deadline.new"
+          unit_hashes="$state_dir/units.sha256"
+          unit_hashes_tmp="$state_dir/.units.sha256.new"
+          service_file=/etc/systemd/system/rr-audit-cross-cleanup-a.service
+          timer_file=/etc/systemd/system/rr-audit-cross-cleanup-a.timer
+          service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.service.new
+          timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-a.timer.new
+          timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-a.timer
+          timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-a.timer
+          source_config=/root/rr-audit-cross-source-config
+          source_hash=/root/rr-audit-cross-source-config.sha256
+          source_hash_tmp=/root/.rr-audit-cross-source-config.sha256.new
+          recover_tmp=/etc/.rr-audit-cross-source-config.recover
+          expected_helper_sha=6260506ef5a36f37c525c92dc934bf52f043c8600f6c2d1ec497965b83508c25
+
+          validate_helper() {
+            [ -f "$helper" ] && [ ! -L "$helper" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$helper")" = 0:0:700:1 ] || return 1
+            [ "$(sha256sum "$helper" | awk '{print $1}')" = \
+              "$expected_helper_sha" ]
+          }
+          validate_unit_file() {
+            [ -f "$1" ] && [ ! -L "$1" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$1")" = 0:0:644:1 ]
+          }
+          validate_unit_hashes() {
+            [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$unit_hashes")" = 0:0:600:1 ] || return 1
+            awk -v service="$service_file" -v timer="$timer_file" '
+              NR == 1 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+              }
+              NR == 2 {
+                if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+              }
+              END { if (NR != 2) exit 1 }
+            ' "$unit_hashes" || return 1
+            sha256sum --check --strict "$unit_hashes" >/dev/null
+          }
+          validate_bundle() {
+            [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || return 1
+            [ "$(stat -c '%u:%g:%a' "$state_dir")" = 0:0:700 ] || return 1
+            validate_helper
+            [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$deadline_file")" = 0:0:600:1 ] || return 1
+            [ "$(wc -l < "$deadline_file")" -eq 2 ] || return 1
+            validate_unit_file "$service_file"
+            validate_unit_file "$timer_file"
+            validate_unit_hashes
+            [ -L "$timer_link" ]
+            [ "$(readlink -f "$timer_link")" = "$timer_file" ]
+            for temporary in "$helper_tmp" "$deadline_tmp" "$unit_hashes_tmp" \
+              "$service_tmp" "$timer_tmp"; do
+              test ! -e "$temporary" && test ! -L "$temporary"
+            done
+          }
+
+          residual=false
+          for path in "$state_dir" "$service_file" "$timer_file" "$service_tmp" \
+            "$timer_tmp" "$timer_link"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then residual=true; fi
+          done
+          if [ "$residual" = false ]; then
+            for evidence in "$source_config" "$source_hash" "$source_hash_tmp" \
+              "$recover_tmp"; do
+              test ! -e "$evidence" && test ! -L "$evidence"
+            done
+            rm -f -- /run/rr-audit-cross-passphrase \
+              /root/rr-audit-cross.rrbak \
+              /run/rr-audit-cross-fingerprint.json \
+              /root/rr-audit-cross-sync.log \
+              /root/rr-audit-cross-backup.log \
+              /root/rr-audit-panel-pass
+            for target in /run/rr-audit-cross-passphrase \
+              /root/rr-audit-cross.rrbak \
+              /run/rr-audit-cross-fingerprint.json \
+              /root/rr-audit-cross-sync.log \
+              /root/rr-audit-cross-backup.log \
+              /root/rr-audit-panel-pass; do
+              test ! -e "$target" && test ! -L "$target"
+            done
+            exit 0
+          fi
+
+          validate_bundle
+          test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+          test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+          test "$(systemctl show -p Transient --value "$timer_unit")" = no
+          test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+          test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+          test "$(systemctl show -p Transient --value "$service_unit")" = no
+          test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+          test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+          test "$(systemctl show -p StartLimitIntervalUSec --value "$service_unit")" = 0
+          test "$(systemctl show -p Triggers --value "$timer_unit")" = "$service_unit"
+          test "$(systemctl show -p TriggeredBy --value "$service_unit")" = "$timer_unit"
+          test "$(systemctl show -p Environment --value "$service_unit")" = \
+            "RR_AUDIT_HELPER_SHA=$expected_helper_sha"
+          expected_exec_prefix="{ path=$helper ; argv[]=$helper timer ; "
+          exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+          case "$exec_start" in
+            "$expected_exec_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          exec_metadata=${exec_start#"$expected_exec_prefix"}
+          [[ "$exec_metadata" == *'}' ]]
+          [[ "$exec_metadata" != *' path='* ]]
+          [[ "$exec_start" != *$'\n'* ]]
+          service_state=$(systemctl show -p ActiveState --value "$service_unit")
+          if [ "$service_state" != inactive ]; then
+            systemctl stop "$service_unit"
+            if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+              systemctl reset-failed "$service_unit"
+            fi
+          fi
+          RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+          for target in /run/rr-audit-cross-passphrase \
+            /root/rr-audit-cross.rrbak \
+            /run/rr-audit-cross-fingerprint.json \
+            /root/rr-audit-cross-sync.log \
+            /root/rr-audit-cross-backup.log \
+            /root/rr-audit-panel-pass; do
+            test ! -e "$target" && test ! -L "$target"
+          done
+          validate_bundle
+          rm -f -- "$source_config" "$source_hash" "$source_hash_tmp" "$recover_tmp"
+          for evidence in "$source_config" "$source_hash" "$source_hash_tmp" \
+            "$recover_tmp"; do
+            test ! -e "$evidence" && test ! -L "$evidence"
+          done
+          validate_bundle
+          systemctl disable --now "$timer_unit"
+          test ! -e "$timer_link" && test ! -L "$timer_link"
+          systemctl stop "$service_unit"
+          if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+            systemctl reset-failed "$service_unit"
+          fi
+          validate_unit_file "$service_file"
+          validate_unit_file "$timer_file"
+          validate_unit_hashes
+          rm -f -- "$service_file" "$timer_file"
+          test ! -e "$service_file" && test ! -L "$service_file"
+          test ! -e "$timer_file" && test ! -L "$timer_file"
+          systemctl daemon-reload
+          for attempt in $(seq 1 15); do
+            timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+            service_load=$(systemctl show -p LoadState --value "$service_unit")
+            if [ "$timer_load" = not-found ] && \
+               [ "$service_load" = not-found ]; then
+              break
+            fi
+            test "$attempt" -lt 15
+            sleep 1
+          done
+          test "$timer_load" = not-found
+          test "$service_load" = not-found
+          if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+            [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+            [ "$(stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+            rm -f -- "$timer_stamp"
+          fi
+          test ! -e "$timer_stamp" && test ! -L "$timer_stamp"
+          validate_helper
+          rm -f -- "$unit_hashes" "$deadline_file" "$helper"
+          for evidence in "$unit_hashes" "$deadline_file" "$helper"; do
+            test ! -e "$evidence" && test ! -L "$evidence"
+          done
+          rmdir "$state_dir"
+          sync -f /var/lib
+          REMOTE_A_RECOVER
           }
 
           cleanup_audit_target_state() {
             SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
-              -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" '
+              -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" \
+              bash -s <<'REMOTE_C_CLEANUP'
                 set -euo pipefail
+                umask 077
+                export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+                firewall_lock_fd=""
+                lock_directory_is_safe() {
+                  local directory="$1" mode=""
+                  [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+                  [ "$(stat -c '%u:%g' -- "$directory" 2>/dev/null)" = 0:0 ] || return 1
+                  mode=$(stat -c '%a' -- "$directory" 2>/dev/null) || return 1
+                  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+                  (( (8#$mode & 8#022) == 0 ))
+                }
+                lock_file_is_safe() {
+                  [ -f /run/rr-vps/locks/firewall.lock ] && \
+                    [ ! -L /run/rr-vps/locks/firewall.lock ] || return 1
+                  [ "$(stat -c '%u:%g:%a:%h:%s' -- \
+                    /run/rr-vps/locks/firewall.lock 2>/dev/null)" = 0:0:600:1:0 ]
+                }
+                acquire_firewall_lock() {
+                  local directory="" path_identity="" descriptor_identity=""
+                  [ "${EUID:-$(id -u)}" -eq 0 ] || return 1
+                  command -v flock >/dev/null 2>&1 || return 1
+                  lock_directory_is_safe /run || return 1
+                  for directory in /run/rr-vps /run/rr-vps/locks; do
+                    if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+                      mkdir -m 700 -- "$directory" || return 1
+                      chown 0:0 -- "$directory" || return 1
+                      chmod 700 -- "$directory" || return 1
+                    fi
+                    lock_directory_is_safe "$directory" || return 1
+                  done
+                  if [ ! -e /run/rr-vps/locks/firewall.lock ] && \
+                     [ ! -L /run/rr-vps/locks/firewall.lock ]; then
+                    (umask 077; : > /run/rr-vps/locks/firewall.lock) || return 1
+                  fi
+                  lock_file_is_safe || return 1
+                  exec {firewall_lock_fd}<>/run/rr-vps/locks/firewall.lock || return 1
+                  path_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+                  descriptor_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+                  [ "$path_identity" = "$descriptor_identity" ] || return 1
+                  flock -w 60 "$firewall_lock_fd" || return 1
+                  path_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+                  descriptor_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+                  [ "$path_identity" = "$descriptor_identity" ] && lock_file_is_safe
+                }
+                release_firewall_lock() {
+                  local path_identity="" descriptor_identity=""
+                  [[ "$firewall_lock_fd" =~ ^[0-9]+$ ]] || return 1
+                  path_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    /run/rr-vps/locks/firewall.lock 2>/dev/null) || return 1
+                  descriptor_identity=$(stat -Lc '%d:%i:%u:%g:%h' \
+                    "/dev/fd/$firewall_lock_fd" 2>/dev/null) || return 1
+                  [ "$path_identity" = "$descriptor_identity" ] && lock_file_is_safe
+                  flock -u "$firewall_lock_fd"
+                  exec {firewall_lock_fd}>&-
+                  firewall_lock_fd=""
+                }
+                remove_audit_rule_all() {
+                  local backend="$1" table="$2" chain="$3" state=0
+                  shift 3
+                  while :; do
+                    if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                         >/dev/null 2>&1; then
+                      "$backend" -w 5 -t "$table" -D "$chain" "$@" || return 1
+                    else
+                      state=$?
+                      [ "$state" -eq 1 ] && return 0
+                      return "$state"
+                    fi
+                  done
+                }
+                assert_audit_rule_absent() {
+                  local backend="$1" table="$2" chain="$3" state=0
+                  shift 3
+                  if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                       >/dev/null 2>&1; then
+                    return 1
+                  else
+                    state=$?
+                    [ "$state" -eq 1 ]
+                  fi
+                }
+                assert_backend_clean() {
+                  local backend="$1"
+                  assert_audit_rule_absent "$backend" filter INPUT -p tcp \
+                    --dport 65431 -m comment --comment argo-rr-managed-block \
+                    -j DROP
+                  assert_audit_rule_absent "$backend" nat PREROUTING -p udp \
+                    --dport 65432 -m comment --comment argo-rr-audit-fixture \
+                    -j REDIRECT --to-ports 65431
+                  assert_audit_rule_absent "$backend" filter INPUT -p tcp \
+                    --dport 65433 -m comment --comment rr-audit-user-sentinel \
+                    -j ACCEPT
+                  assert_audit_rule_absent "$backend" nat PREROUTING -p udp \
+                    --dport 65434 -m comment --comment rr-audit-user-sentinel \
+                    -j REDIRECT --to-ports 65433
+                }
+                acquire_firewall_lock
+                backend_count=0
                 for backend in iptables ip6tables; do
-                  command -v "$backend" >/dev/null 2>&1 || continue
-                  while "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
-                    -m comment --comment argo-rr-managed-block -j DROP >/dev/null 2>&1; do
-                    "$backend" -w 5 -t filter -D INPUT -p tcp --dport 65431 \
-                      -m comment --comment argo-rr-managed-block -j DROP
-                  done
-                  while "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
+                  command -v "$backend" >/dev/null 2>&1
+                  remove_audit_rule_all "$backend" filter INPUT -p tcp --dport 65431 \
+                    -m comment --comment argo-rr-managed-block -j DROP
+                  remove_audit_rule_all "$backend" filter INPUT -p tcp --dport 65433 \
+                    -m comment --comment rr-audit-user-sentinel -j ACCEPT
+                  remove_audit_rule_all "$backend" nat PREROUTING -p udp --dport 65434 \
+                    -m comment --comment rr-audit-user-sentinel \
+                    -j REDIRECT --to-ports 65433
+                  # Converge fixtures left by the preceding audit contract.
+                  remove_audit_rule_all "$backend" nat PREROUTING -p udp --dport 65432 \
                     -m comment --comment argo-rr-audit-fixture \
-                    -j REDIRECT --to-ports 65431 >/dev/null 2>&1; do
-                    "$backend" -w 5 -t nat -D PREROUTING -p udp --dport 65432 \
-                      -m comment --comment argo-rr-audit-fixture \
-                      -j REDIRECT --to-ports 65431
-                  done
+                    -j REDIRECT --to-ports 65431
+                  assert_backend_clean "$backend"
+                  backend_count=$((backend_count + 1))
                 done
+                [ "$backend_count" -eq 2 ]
                 if command -v netfilter-persistent >/dev/null 2>&1; then
-                  netfilter-persistent save >/dev/null
-                elif command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
-                  service iptables save >/dev/null
+                  netfilter-persistent save >/dev/null 2>&1
+                elif command -v service >/dev/null 2>&1 && \
+                     [ -x /etc/init.d/iptables ]; then
+                  service iptables save >/dev/null 2>&1
                 fi
-                rm -f -- /root/rr-audit-cross-passphrase \
+                for backend in iptables ip6tables; do
+                  assert_backend_clean "$backend"
+                done
+                release_firewall_lock
+                rm -f -- /run/rr-audit-cross-passphrase \
                   /root/rr-audit-cross.rrbak \
-                  /root/rr-audit-cross-fingerprint.json \
-                  /root/rr-audit-cross-restored-fingerprint.json \
-                  /root/rr-audit-cross-target-access.json \
-                  /root/rr-audit-cross-target-network.txt \
-                  /root/rr-audit-cross-target-channel \
-                  /root/rr-audit-cross-target-bind \
-                  /root/rr-audit-cross-target-firewall \
-                  /root/rr-audit-cross-restored-firewall
-              '
+                  /run/rr-audit-cross-fingerprint.json \
+                  /run/rr-audit-cross-restored-fingerprint.json \
+                  /run/rr-audit-cross-target-access.json \
+                  /run/rr-audit-cross-target-network.txt \
+                  /run/rr-audit-cross-target-channel \
+                  /run/rr-audit-cross-target-bind \
+                  /run/rr-audit-cross-target-firewall \
+                  /run/rr-audit-cross-restored-firewall \
+                  /run/rr-audit-cross-firewall-before-validate \
+                  /run/rr-audit-cross-firewall-before-validate.tmp \
+                  /run/rr-audit-cross-firewall-after-validate \
+                  /run/rr-audit-cross-firewall-after-validate.tmp \
+                  /root/rr-audit-cross-restore.log \
+                  /root/rr-audit-cross-firewall-validate.log \
+                  /root/rr-audit-panel-pass
+                for target in /run/rr-audit-cross-passphrase \
+                  /root/rr-audit-cross.rrbak \
+                  /run/rr-audit-cross-fingerprint.json \
+                  /run/rr-audit-cross-restored-fingerprint.json \
+                  /run/rr-audit-cross-target-access.json \
+                  /run/rr-audit-cross-target-network.txt \
+                  /run/rr-audit-cross-target-channel \
+                  /run/rr-audit-cross-target-bind \
+                  /run/rr-audit-cross-target-firewall \
+                  /run/rr-audit-cross-restored-firewall \
+                  /run/rr-audit-cross-firewall-before-validate \
+                  /run/rr-audit-cross-firewall-before-validate.tmp \
+                  /run/rr-audit-cross-firewall-after-validate \
+                  /run/rr-audit-cross-firewall-after-validate.tmp \
+                  /root/rr-audit-cross-restore.log \
+                  /root/rr-audit-cross-firewall-validate.log \
+                  /root/rr-audit-panel-pass; do
+                  test ! -e "$target" && test ! -L "$target"
+                done
+                state_dir=/var/lib/rr-audit-cross-cleanup-c
+                helper="$state_dir/helper"
+                helper_tmp="$state_dir/.helper.new"
+                deadline_file="$state_dir/deadline"
+                deadline_tmp="$state_dir/.deadline.new"
+                unit_hashes="$state_dir/units.sha256"
+                unit_hashes_tmp="$state_dir/.units.sha256.new"
+                service_file=/etc/systemd/system/rr-audit-cross-cleanup-c.service
+                timer_file=/etc/systemd/system/rr-audit-cross-cleanup-c.timer
+                service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.service.new
+                timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.timer.new
+                timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-c.timer
+                timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-c.timer
+                expected_helper_sha=f9707bccf6f8270423a56ad03beba61b6b3ee12df62bff02b9929552d024da3d
+                timer_unit=rr-audit-cross-cleanup-c.timer
+                service_unit=rr-audit-cross-cleanup-c.service
+                validate_helper() {
+                  [ -f "$helper" ] && [ ! -L "$helper" ] || return 1
+                  [ "$(stat -c '%u:%g:%a:%h' "$helper")" = 0:0:700:1 ] || return 1
+                  [ "$(sha256sum "$helper" | awk '{print $1}')" = \
+                    "$expected_helper_sha" ]
+                }
+                validate_unit_file() {
+                  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+                  [ "$(stat -c '%u:%g:%a:%h' "$1")" = 0:0:644:1 ]
+                }
+                validate_unit_hashes() {
+                  [ -f "$unit_hashes" ] && [ ! -L "$unit_hashes" ] || return 1
+                  [ "$(stat -c '%u:%g:%a:%h' "$unit_hashes")" = 0:0:600:1 ] || return 1
+                  awk -v service="$service_file" -v timer="$timer_file" '
+                    NR == 1 {
+                      if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+                    }
+                    NR == 2 {
+                      if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+                    }
+                    END { if (NR != 2) exit 1 }
+                  ' "$unit_hashes" || return 1
+                  sha256sum --check --strict "$unit_hashes" >/dev/null
+                }
+                validate_bundle() {
+                  [ -d "$state_dir" ] && [ ! -L "$state_dir" ] || return 1
+                  [ "$(stat -c '%u:%g:%a' "$state_dir")" = 0:0:700 ] || return 1
+                  validate_helper
+                  [ -f "$deadline_file" ] && [ ! -L "$deadline_file" ] || return 1
+                  [ "$(stat -c '%u:%g:%a:%h' "$deadline_file")" = 0:0:600:1 ] || return 1
+                  [ "$(wc -l < "$deadline_file")" -eq 2 ] || return 1
+                  validate_unit_file "$service_file"
+                  validate_unit_file "$timer_file"
+                  validate_unit_hashes
+                  [ -L "$timer_link" ]
+                  [ "$(readlink -f "$timer_link")" = "$timer_file" ]
+                  for temporary in "$helper_tmp" "$deadline_tmp" "$unit_hashes_tmp" \
+                    "$service_tmp" "$timer_tmp"; do
+                    test ! -e "$temporary" && test ! -L "$temporary"
+                  done
+                }
+
+                for backend in iptables ip6tables; do
+                  assert_backend_clean "$backend"
+                done
+                residual=false
+                for path in "$state_dir" "$service_file" "$timer_file" \
+                  "$service_tmp" "$timer_tmp" "$timer_link"; do
+                  if [ -e "$path" ] || [ -L "$path" ]; then residual=true; fi
+                done
+                if [ "$residual" = false ]; then
+                  test "$(systemctl show -p LoadState --value "$timer_unit")" = not-found
+                  test "$(systemctl show -p LoadState --value "$service_unit")" = not-found
+                  exit 0
+                fi
+
+                validate_bundle
+                test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+                test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+                test "$(systemctl show -p Transient --value "$timer_unit")" = no
+                test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+                test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+                test "$(systemctl show -p Transient --value "$service_unit")" = no
+                test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+                test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+                test "$(systemctl show -p StartLimitIntervalUSec --value \
+                  "$service_unit")" = 0
+                test "$(systemctl show -p Triggers --value "$timer_unit")" = \
+                  "$service_unit"
+                test "$(systemctl show -p TriggeredBy --value "$service_unit")" = \
+                  "$timer_unit"
+                test "$(systemctl show -p Environment --value "$service_unit")" = \
+                  "RR_AUDIT_HELPER_SHA=$expected_helper_sha"
+                expected_exec_prefix="{ path=$helper ; argv[]=$helper timer ; "
+                exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+                case "$exec_start" in
+                  "$expected_exec_prefix"*) ;;
+                  *) exit 1 ;;
+                esac
+                exec_metadata=${exec_start#"$expected_exec_prefix"}
+                [[ "$exec_metadata" == *"}" ]]
+                [[ "$exec_metadata" != *" path="* ]]
+                service_state=$(systemctl show -p ActiveState --value "$service_unit")
+                if [ "$service_state" != inactive ]; then
+                  systemctl stop "$service_unit"
+                  if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+                    systemctl reset-failed "$service_unit"
+                  fi
+                fi
+                RR_AUDIT_HELPER_SHA="$expected_helper_sha" "$helper" exit
+                validate_bundle
+                for backend in iptables ip6tables; do
+                  assert_backend_clean "$backend"
+                done
+                systemctl disable --now "$timer_unit"
+                test ! -e "$timer_link" && test ! -L "$timer_link"
+                systemctl stop "$service_unit"
+                if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+                  systemctl reset-failed "$service_unit"
+                fi
+                validate_unit_file "$service_file"
+                validate_unit_file "$timer_file"
+                validate_unit_hashes
+                rm -f -- "$service_file" "$timer_file"
+                test ! -e "$service_file" && test ! -L "$service_file"
+                test ! -e "$timer_file" && test ! -L "$timer_file"
+                systemctl daemon-reload
+                for attempt in $(seq 1 15); do
+                  timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+                  service_load=$(systemctl show -p LoadState --value "$service_unit")
+                  if [ "$timer_load" = not-found ] && \
+                     [ "$service_load" = not-found ]; then
+                    break
+                  fi
+                  test "$attempt" -lt 15
+                  sleep 1
+                done
+                test "$timer_load" = not-found
+                test "$service_load" = not-found
+                if [ -e "$timer_stamp" ] || [ -L "$timer_stamp" ]; then
+                  [ -f "$timer_stamp" ] && [ ! -L "$timer_stamp" ]
+                  [ "$(stat -c '%u:%g:%h' "$timer_stamp")" = 0:0:1 ]
+                  rm -f -- "$timer_stamp"
+                fi
+                test ! -e "$timer_stamp" && test ! -L "$timer_stamp"
+                validate_helper
+                rm -f -- "$unit_hashes" "$deadline_file" "$helper"
+                for evidence in "$unit_hashes" "$deadline_file" "$helper"; do
+                  test ! -e "$evidence" && test ! -L "$evidence"
+                done
+                rmdir "$state_dir"
+                sync -f /var/lib
+                exit 0
+          REMOTE_C_CLEANUP
           }
 
           cleanup_cross_audit() {
-            rc=$?
+            local body_rc="$?" failure_stage="${audit_stage:-runner-unknown}"
+            local final_rc=0 cleanup_failed=false
             trap - EXIT
-            rm -f -- "$passphrase_file" "$backup_file" "$fingerprint_file"
-            recover_audit_source_config >/dev/null 2>&1 || rc=1
-            cleanup_audit_target_state >/dev/null 2>&1 || rc=1
-            exit "$rc"
+            final_rc="$body_rc"
+            if [ "$body_rc" -ne 0 ]; then
+              case "$failure_stage" in
+                runner-preflight|runner-passphrase|runner-source|runner-copy|\
+                runner-target|runner-complete) ;;
+                *) failure_stage=runner-unknown ;;
+              esac
+              printf 'RR_AUDIT_CROSS_FAILURE side=runner stage=%s rc=%s\n' \
+                "$failure_stage" "$body_rc" >&2
+            fi
+            if ! rm -f -- "$passphrase_file" "$backup_file" "$fingerprint_file" \
+                 >/dev/null 2>&1; then
+              printf 'RR_AUDIT_CROSS_FAILURE side=runner stage=runner-cleanup-local rc=1\n' >&2
+              cleanup_failed=true
+            fi
+            for local_sensitive_file in "$passphrase_file" "$backup_file" \
+              "$fingerprint_file"; do
+              if [ -e "$local_sensitive_file" ] || [ -L "$local_sensitive_file" ]; then
+                cleanup_failed=true
+              fi
+            done
+            if ! recover_audit_source_config >/dev/null 2>&1; then
+              printf 'RR_AUDIT_CROSS_FAILURE side=runner stage=runner-cleanup-source rc=1\n' >&2
+              cleanup_failed=true
+            fi
+            if ! cleanup_audit_target_state >/dev/null 2>&1; then
+              printf 'RR_AUDIT_CROSS_FAILURE side=runner stage=runner-cleanup-target rc=1\n' >&2
+              cleanup_failed=true
+            fi
+            if [ "$cleanup_failed" = true ]; then
+              [ "$final_rc" -ne 0 ] || final_rc=1
+            fi
+            exit "$final_rc"
           }
           trap cleanup_cross_audit EXIT
 
+          prepare_known_hosts "$a_host" "$RR_A_HOST_KEY" "$a_known_hosts"
+          prepare_known_hosts "$c_host" "$RR_C_HOST_KEY" "$c_known_hosts"
           recover_audit_source_config
           cleanup_audit_target_state
+          arm_audit_source_cleanup_timer
+          arm_audit_target_cleanup_timer
+          audit_stage=runner-passphrase
           (umask 077; openssl rand -base64 48 > "$passphrase_file")
           test "$(stat -c %a "$passphrase_file")" = 600
           test "$(wc -c < "$passphrase_file")" -ge 48
           SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$a_known_hosts" -q "$passphrase_file" \
-            "root@$a_host:/root/rr-audit-cross-passphrase"
+            "root@$a_host:/run/rr-audit-cross-passphrase"
           SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$c_known_hosts" -q "$passphrase_file" \
-            "root@$c_host:/root/rr-audit-cross-passphrase"
+            "root@$c_host:/run/rr-audit-cross-passphrase"
+          rm -f -- "$passphrase_file"
+          test ! -e "$passphrase_file" && test ! -L "$passphrase_file"
 
+          audit_stage=runner-source
           SSHPASS="$RR_A_PASS" sshpass -e ssh "${ssh_common[@]}" \
             -o UserKnownHostsFile="$a_known_hosts" "root@$a_host" bash -s <<'REMOTE_A'
           set -euo pipefail
           umask 077
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
-          passphrase_file=/root/rr-audit-cross-passphrase
+          passphrase_file=/run/rr-audit-cross-passphrase
           backup_file=/root/rr-audit-cross.rrbak
-          fingerprint_file=/root/rr-audit-cross-fingerprint.json
+          fingerprint_file=/run/rr-audit-cross-fingerprint.json
           source_config_backup=/root/rr-audit-cross-source-config
+          source_config_hash=/root/rr-audit-cross-source-config.sha256
+          source_config_recover_tmp=/etc/.rr-audit-cross-source-config.recover
           source_config_sha=""
           nexus_stopped=false
           health_timer_stopped=false
           source_config_saved=false
+          audit_stage=a-preflight
+          validate_source_config() {
+            local path="$1" expected_sha="$2" size="" actual_sha=""
+            [ -f "$path" ] && [ ! -L "$path" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$path")" = 0:0:600:1 ] || return 1
+            size=$(stat -c %s "$path") || return 1
+            [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+            [ "$size" -le 262144 ] || return 1
+            actual_sha=$(sha256sum "$path" | awk '{print $1}') || return 1
+            [ "$actual_sha" = "$expected_sha" ] || return 1
+            [ "$(grep -c '^INSTALL_COMPLETE=true$' "$path")" -eq 1 ] || return 1
+            [ "$(grep -c '^NAIVE_ENABLED=true$' "$path")" -eq 1 ] || return 1
+            [ "$(grep -c '^NAIVE_ENABLED=' "$path")" -eq 1 ] || return 1
+          }
+          restore_source_config_snapshot() {
+            [ -f "$source_config_hash" ] && [ ! -L "$source_config_hash" ]
+            [ "$(stat -c '%u:%g:%a:%h' "$source_config_hash")" = 0:0:600:1 ]
+            [ "$(wc -c < "$source_config_hash")" -eq 65 ]
+            grep -Eq '^[a-f0-9]{64}$' "$source_config_hash"
+            [ "$(<"$source_config_hash")" = "$source_config_sha" ]
+            validate_source_config "$source_config_backup" "$source_config_sha"
+            if [ -e "$source_config_recover_tmp" ] || \
+               [ -L "$source_config_recover_tmp" ]; then
+              validate_source_config "$source_config_recover_tmp" \
+                "$source_config_sha"
+              cmp -s "$source_config_backup" "$source_config_recover_tmp"
+              rm -f -- "$source_config_recover_tmp"
+            fi
+            install -o root -g root -m 600 "$source_config_backup" \
+              "$source_config_recover_tmp"
+            validate_source_config "$source_config_recover_tmp" \
+              "$source_config_sha"
+            cmp -s "$source_config_backup" "$source_config_recover_tmp"
+            sync -f "$source_config_recover_tmp"
+            mv -fT -- "$source_config_recover_tmp" /etc/argo_vmess.conf
+            sync -f /etc
+            validate_source_config /etc/argo_vmess.conf "$source_config_sha"
+            cmp -s "$source_config_backup" /etc/argo_vmess.conf
+          }
           finish_source_audit() {
-            rc=$?
+            local body_rc="$?" failure_stage="${audit_stage:-a-unknown}" rc=0
+            local cleanup_failed=false
             trap - EXIT
+            rc="$body_rc"
+            if [ "$body_rc" -ne 0 ]; then
+              case "$failure_stage" in
+                a-preflight|a-scale-fixture|a-scale-sync|a-health-freeze|\
+                a-database-finalize|a-fingerprint|a-config-snapshot|a-backup|\
+                a-config-restore|a-service-resume|a-complete) ;;
+                *) failure_stage=a-unknown ;;
+              esac
+              printf 'RR_AUDIT_CROSS_FAILURE side=A stage=%s rc=%s\n' \
+                "$failure_stage" "$body_rc" >&2
+            fi
             if [ "$source_config_saved" = true ]; then
-              if install -o root -g root -m 600 "$source_config_backup" \
-                   /etc/argo_vmess.conf && \
-                 cmp -s "$source_config_backup" /etc/argo_vmess.conf && \
-                 [ "$(sha256sum /etc/argo_vmess.conf | awk '{print $1}')" = \
-                   "$source_config_sha" ]; then
-                rm -f -- "$source_config_backup" || rc=1
+              if restore_source_config_snapshot; then
+                source_config_saved=false
               else
-                rc=1
+                cleanup_failed=true
               fi
             fi
             if [ "$nexus_stopped" = true ]; then
-              systemctl start rr-nexus.service >/dev/null 2>&1 || rc=1
+              # `start` is a no-op for an active-but-unhealthy Type=simple
+              # service.  Restart it, then make the observable state and the
+              # bounded local readiness check authoritative for cleanup.
+              systemctl restart rr-nexus.service >/dev/null 2>&1 || true
+              if assert_unit_state rr-nexus.service loaded:active:enabled && \
+                 wait_local_nexus; then
+                :
+              else
+                cleanup_failed=true
+              fi
             fi
             if [ "$health_timer_stopped" = true ]; then
-              systemctl start argo-rr-health.timer >/dev/null 2>&1 || rc=1
+              systemctl restart argo-rr-health.timer >/dev/null 2>&1 || true
+              if assert_unit_state argo-rr-health.timer loaded:active:enabled; then
+                :
+              else
+                cleanup_failed=true
+              fi
             fi
-            find /root -maxdepth 1 -type f -name 'rr-audit-cross-*' \
-              -exec chmod 600 {} + 2>/dev/null || true
+            rm -f -- /root/rr-audit-cross-sync.log \
+              /root/rr-audit-cross-backup.log || cleanup_failed=true
+            if ! rm -f -- "$passphrase_file"; then
+              cleanup_failed=true
+            fi
+            if [ -e "$passphrase_file" ] || [ -L "$passphrase_file" ]; then
+              cleanup_failed=true
+            fi
+            if [ "$body_rc" -ne 0 ] || [ "$cleanup_failed" = true ]; then
+              if ! rm -f -- "$backup_file" "$fingerprint_file"; then
+                cleanup_failed=true
+              fi
+              for sensitive_file in "$backup_file" "$fingerprint_file"; do
+                if [ -e "$sensitive_file" ] || [ -L "$sensitive_file" ]; then
+                  cleanup_failed=true
+                fi
+              done
+            fi
+            if [ "$cleanup_failed" = true ]; then
+              printf 'RR_AUDIT_CROSS_FAILURE side=A stage=a-cleanup rc=1\n' >&2
+              [ "$rc" -ne 0 ] || rc=1
+            fi
             exit "$rc"
           }
           trap finish_source_audit EXIT
@@ -1956,6 +3883,7 @@ jobs:
             'PRAGMA foreign_key_check;') || exit 1
           test -z "$foreign_key_errors"
 
+          audit_stage=a-scale-fixture
           python3 - /var/lib/rr-nexus/nexus.db <<'PY'
           import sqlite3
           import sys
@@ -2009,6 +3937,7 @@ jobs:
           chmod 600 /var/lib/rr-nexus/subscriptions/dev_deadbeef0000.txt \
             /tmp/sub_server/nexus/RRAuditStaleToken0001.txt
 
+          audit_stage=a-scale-sync
           for scale in 1 10 100 500; do
             python3 - /var/lib/rr-nexus/nexus.db "$scale" <<'PY'
           import sqlite3
@@ -2176,15 +4105,21 @@ jobs:
             printf 'RR_AUDIT_SCALE scale=%s elapsed_ms=%s\n' "$scale" "$elapsed_ms"
           done
 
+          audit_stage=a-health-freeze
           assert_unit_state argo-rr-health.timer loaded:active:enabled
-          systemctl stop argo-rr-health.timer
           health_timer_stopped=true
-          systemctl stop argo-rr-health.service
+          systemctl stop argo-rr-health.timer
+          # A timer-triggered oneshot may already be in systemd's non-running
+          # failed bookkeeping state.  Stop any live process, normalize that
+          # cache, then retain the strict observable state contract.
+          systemctl stop argo-rr-health.service >/dev/null 2>&1 || true
+          systemctl reset-failed argo-rr-health.service >/dev/null 2>&1 || true
           assert_unit_state argo-rr-health.timer loaded:inactive:enabled
           assert_unit_state argo-rr-health.service loaded:inactive:static
-          systemctl stop rr-nexus.service
           nexus_stopped=true
+          systemctl stop rr-nexus.service
           assert_unit_state rr-nexus.service loaded:inactive:enabled
+          audit_stage=a-database-finalize
           python3 - /var/lib/rr-nexus/nexus.db <<'PY'
           import sqlite3
           import sys
@@ -2226,6 +4161,7 @@ jobs:
               connection.close()
           PY
           sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA wal_checkpoint(FULL);' >/dev/null
+          audit_stage=a-fingerprint
           python3 - /var/lib/rr-nexus/nexus.db "$fingerprint_file" <<'PY'
           import hashlib
           import json
@@ -2268,14 +4204,27 @@ jobs:
               target.write("\n")
           PY
           test "$(stat -c '%U:%G:%a:%h' "$fingerprint_file")" = root:root:600:1
-          test "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf)" -eq 1
-          cp -p -- /etc/argo_vmess.conf "$source_config_backup"
-          chmod 600 "$source_config_backup"
+          audit_stage=a-config-snapshot
+          test -f "$source_config_hash" && test ! -L "$source_config_hash"
+          test "$(stat -c '%u:%g:%a:%h' "$source_config_hash")" = 0:0:600:1
+          test "$(wc -c < "$source_config_hash")" -eq 65
+          grep -Eq '^[a-f0-9]{64}$' "$source_config_hash"
+          expected_source_config_sha=$(<"$source_config_hash")
+          [[ "$expected_source_config_sha" =~ ^[a-f0-9]{64}$ ]]
+          validate_source_config /etc/argo_vmess.conf \
+            "$expected_source_config_sha"
+          test ! -e "$source_config_backup" && test ! -L "$source_config_backup"
+          install -o root -g root -m 600 /etc/argo_vmess.conf \
+            "$source_config_backup"
           source_config_sha=$(sha256sum "$source_config_backup" | awk '{print $1}')
           [[ "$source_config_sha" =~ ^[a-f0-9]{64}$ ]]
+          test "$source_config_sha" = "$expected_source_config_sha"
+          validate_source_config "$source_config_backup" "$source_config_sha"
+          cmp -s /etc/argo_vmess.conf "$source_config_backup"
           source_config_saved=true
           sed -i 's/^NAIVE_ENABLED=true$/NAIVE_ENABLED=false/' /etc/argo_vmess.conf
           test "$(grep -c '^NAIVE_ENABLED=false$' /etc/argo_vmess.conf)" -eq 1
+          audit_stage=a-backup
           passphrase=$(<"$passphrase_file")
           test "${#passphrase}" -ge 10
           RR_BACKUP_PASSPHRASE="$passphrase" \
@@ -2284,41 +4233,49 @@ jobs:
           unset passphrase
           test "$(stat -c '%U:%G:%a:%h' "$backup_file")" = root:root:600:1
           test -s "$backup_file"
-          install -o root -g root -m 600 "$source_config_backup" /etc/argo_vmess.conf
-          cmp -s "$source_config_backup" /etc/argo_vmess.conf
-          test "$(sha256sum /etc/argo_vmess.conf | awk '{print $1}')" = "$source_config_sha"
-          rm -f -- "$source_config_backup"
+          audit_stage=a-config-restore
+          restore_source_config_snapshot
           source_config_saved=false
           test "$(grep -c '^NAIVE_ENABLED=true$' /etc/argo_vmess.conf)" -eq 1
+          audit_stage=a-service-resume
           systemctl start rr-nexus.service
-          nexus_stopped=false
           assert_unit_state rr-nexus.service loaded:active:enabled
           systemctl start argo-rr-health.timer
-          health_timer_stopped=false
           assert_unit_state argo-rr-health.timer loaded:active:enabled
           wait_local_nexus
+          nexus_stopped=false
+          health_timer_stopped=false
+          audit_stage=a-complete
           REMOTE_A
 
+          audit_stage=runner-copy
           SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$a_known_hosts" -q \
             "root@$a_host:/root/rr-audit-cross.rrbak" "$backup_file"
           SSHPASS="$RR_A_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$a_known_hosts" -q \
-            "root@$a_host:/root/rr-audit-cross-fingerprint.json" "$fingerprint_file"
+            "root@$a_host:/run/rr-audit-cross-fingerprint.json" "$fingerprint_file"
           chmod 600 "$backup_file" "$fingerprint_file"
           test -s "$backup_file"
           test -s "$fingerprint_file"
+          backup_size=$(stat -c %s "$backup_file")
+          fingerprint_size=$(stat -c %s "$fingerprint_file")
+          [[ "$backup_size" =~ ^[1-9][0-9]*$ ]]
+          [[ "$fingerprint_size" =~ ^[1-9][0-9]*$ ]]
           backup_sha=$(sha256sum "$backup_file" | awk '{print $1}')
           fingerprint_sha=$(sha256sum "$fingerprint_file" | awk '{print $1}')
           [[ "$backup_sha" =~ ^[a-f0-9]{64}$ ]]
           [[ "$fingerprint_sha" =~ ^[a-f0-9]{64}$ ]]
+          finalize_audit_source_artifacts "$backup_size" "$backup_sha" \
+            "$fingerprint_size" "$fingerprint_sha"
           SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$c_known_hosts" -q "$backup_file" \
             "root@$c_host:/root/rr-audit-cross.rrbak"
           SSHPASS="$RR_C_PASS" sshpass -e scp "${ssh_common[@]}" \
             -o UserKnownHostsFile="$c_known_hosts" -q "$fingerprint_file" \
-            "root@$c_host:/root/rr-audit-cross-fingerprint.json"
+            "root@$c_host:/run/rr-audit-cross-fingerprint.json"
 
+          audit_stage=runner-target
           SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
             -o UserKnownHostsFile="$c_known_hosts" "root@$c_host" bash -s -- \
             "$backup_sha" "$fingerprint_sha" <<'REMOTE_C'
@@ -2327,10 +4284,77 @@ jobs:
           export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
           expected_backup_sha="$1"
           expected_fingerprint_sha="$2"
-          passphrase_file=/root/rr-audit-cross-passphrase
+          passphrase_file=/run/rr-audit-cross-passphrase
           backup_file=/root/rr-audit-cross.rrbak
-          fingerprint_file=/root/rr-audit-cross-fingerprint.json
-          restored_fingerprint=/root/rr-audit-cross-restored-fingerprint.json
+          fingerprint_file=/run/rr-audit-cross-fingerprint.json
+          restored_fingerprint=/run/rr-audit-cross-restored-fingerprint.json
+          cleanup_state_dir=/var/lib/rr-audit-cross-cleanup-c
+          cleanup_helper="$cleanup_state_dir/helper"
+          cleanup_helper_tmp="$cleanup_state_dir/.helper.new"
+          cleanup_deadline="$cleanup_state_dir/deadline"
+          cleanup_deadline_tmp="$cleanup_state_dir/.deadline.new"
+          cleanup_unit_hashes="$cleanup_state_dir/units.sha256"
+          cleanup_unit_hashes_tmp="$cleanup_state_dir/.units.sha256.new"
+          cleanup_service_file=/etc/systemd/system/rr-audit-cross-cleanup-c.service
+          cleanup_timer_file=/etc/systemd/system/rr-audit-cross-cleanup-c.timer
+          cleanup_service_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.service.new
+          cleanup_timer_tmp=/etc/systemd/system/.rr-audit-cross-cleanup-c.timer.new
+          cleanup_timer_link=/etc/systemd/system/timers.target.wants/rr-audit-cross-cleanup-c.timer
+          cleanup_timer_stamp=/var/lib/systemd/timers/stamp-rr-audit-cross-cleanup-c.timer
+          expected_cleanup_helper_sha=f9707bccf6f8270423a56ad03beba61b6b3ee12df62bff02b9929552d024da3d
+          firewall_module=/usr/local/lib/rr/modules/10-system.sh
+          [ -f "$firewall_module" ] && [ ! -L "$firewall_module" ]
+          [ "$(stat -c '%u:%g:%a:%h' "$firewall_module")" = 0:0:644:1 ]
+          # shellcheck disable=SC1090
+          source "$firewall_module"
+          declare -F rr_firewall_lock_acquire >/dev/null
+          declare -F rr_firewall_lock_release >/dev/null
+          validate_cleanup_helper() {
+            [ -f "$cleanup_helper" ] && [ ! -L "$cleanup_helper" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$cleanup_helper")" = 0:0:700:1 ] || return 1
+            [ "$(sha256sum "$cleanup_helper" | awk '{print $1}')" = \
+              "$expected_cleanup_helper_sha" ]
+          }
+          validate_cleanup_unit_file() {
+            [ -f "$1" ] && [ ! -L "$1" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$1")" = 0:0:644:1 ]
+          }
+          validate_cleanup_unit_hashes() {
+            [ -f "$cleanup_unit_hashes" ] && \
+              [ ! -L "$cleanup_unit_hashes" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$cleanup_unit_hashes")" = \
+              0:0:600:1 ] || return 1
+            awk -v service="$cleanup_service_file" \
+              -v timer="$cleanup_timer_file" '
+                NR == 1 {
+                  if ($1 !~ /^[a-f0-9]{64}$/ || $2 != service || NF != 2) exit 1
+                }
+                NR == 2 {
+                  if ($1 !~ /^[a-f0-9]{64}$/ || $2 != timer || NF != 2) exit 1
+                }
+                END { if (NR != 2) exit 1 }
+              ' "$cleanup_unit_hashes" || return 1
+            sha256sum --check --strict "$cleanup_unit_hashes" >/dev/null
+          }
+          validate_cleanup_bundle() {
+            [ -d "$cleanup_state_dir" ] && [ ! -L "$cleanup_state_dir" ] || return 1
+            [ "$(stat -c '%u:%g:%a' "$cleanup_state_dir")" = 0:0:700 ] || return 1
+            validate_cleanup_helper
+            [ -f "$cleanup_deadline" ] && [ ! -L "$cleanup_deadline" ] || return 1
+            [ "$(stat -c '%u:%g:%a:%h' "$cleanup_deadline")" = \
+              0:0:600:1 ] || return 1
+            [ "$(wc -l < "$cleanup_deadline")" -eq 2 ] || return 1
+            validate_cleanup_unit_file "$cleanup_service_file"
+            validate_cleanup_unit_file "$cleanup_timer_file"
+            validate_cleanup_unit_hashes
+            [ -L "$cleanup_timer_link" ]
+            [ "$(readlink -f "$cleanup_timer_link")" = "$cleanup_timer_file" ]
+            for temporary in "$cleanup_helper_tmp" "$cleanup_deadline_tmp" \
+              "$cleanup_unit_hashes_tmp" "$cleanup_service_tmp" \
+              "$cleanup_timer_tmp"; do
+              test ! -e "$temporary" && test ! -L "$temporary"
+            done
+          }
           assert_unit_state() {
             local unit="$1" expected="$2" load_state="" active_state="" unit_file_state=""
             load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
@@ -2341,28 +4365,71 @@ jobs:
             fi
             test "$load_state:$active_state:$unit_file_state" = "$expected"
           }
-          capture_rr_firewall_state() {
-            local output="$1" command_name="" rules="" temporary=""
-            temporary=$(mktemp "${output}.XXXXXX") || return 1
-            : > "$temporary" || { rm -f -- "$temporary"; return 1; }
+          firewall_rule_count() {
+            local backend="$1" table="$2" chain="$3" protocol="$4"
+            local port="$5" comment="$6" target="$7" redirect_port="${8:-}" rules=""
+            rules=$("$backend" -w 5 -t "$table" -S "$chain" 2>/dev/null) || return 1
+            printf '%s\n' "$rules" | awk -v chain="$chain" -v protocol="$protocol" \
+              -v port="$port" -v comment="$comment" -v target="$target" \
+              -v redirect_port="$redirect_port" '
+                $1 == "-A" && $2 == chain &&
+                $0 ~ ("(^|[[:space:]])-p[[:space:]]+" protocol "([[:space:]]|$)") &&
+                $0 ~ ("--dport[[:space:]]+" port "([[:space:]]|$)") &&
+                $0 ~ ("--comment[[:space:]]+\"?" comment "\"?([[:space:]]|$)") &&
+                $0 ~ ("-j[[:space:]]+" target "([[:space:]]|$)") &&
+                (redirect_port == "" ||
+                  $0 ~ ("--to-ports[[:space:]]+" redirect_port "([[:space:]]|$)")) {
+                    count++
+                }
+                END { print count + 0 }
+              '
+          }
+          remove_firewall_rule_all() {
+            local backend="$1" table="$2" chain="$3" state=0
+            shift 3
+            while :; do
+              if "$backend" -w 5 -t "$table" -C "$chain" "$@" \
+                   >/dev/null 2>&1; then
+                "$backend" -w 5 -t "$table" -D "$chain" "$@" || return 1
+              else
+                state=$?
+                [ "$state" -eq 1 ] && return 0
+                return "$state"
+              fi
+            done
+          }
+          capture_full_firewall_state() {
+            local output="$1" command_name="" temporary=""
+            case "$output" in
+              /run/rr-audit-cross-firewall-before-validate)
+                temporary=/run/rr-audit-cross-firewall-before-validate.tmp
+                ;;
+              /run/rr-audit-cross-firewall-after-validate)
+                temporary=/run/rr-audit-cross-firewall-after-validate.tmp
+                ;;
+              *) return 1 ;;
+            esac
+            [ ! -e "$output" ] && [ ! -L "$output" ] || return 1
+            [ ! -e "$temporary" ] && [ ! -L "$temporary" ] || return 1
+            (set -C; : > "$temporary") || return 1
+            chmod 600 "$temporary" || { rm -f -- "$temporary"; return 1; }
+            [ "$(stat -c '%u:%g:%a:%h' "$temporary")" = 0:0:600:1 ] || {
+              rm -f -- "$temporary"
+              return 1
+            }
             for command_name in iptables-save ip6tables-save; do
               if command -v "$command_name" >/dev/null 2>&1; then
-                rules=$("$command_name") || { rm -f -- "$temporary"; return 1; }
                 printf '%s\n' "${command_name}:present" >> "$temporary" || {
                   rm -f -- "$temporary"
                   return 1
                 }
-                if ! printf '%s\n' "$rules" | awk '
-                  /^\*/ { table=substr($0, 2); next }
-                  table == "filter" && $1 == "-A" && $2 == "INPUT" &&
-                    $0 ~ /--comment[[:space:]]+"?argo-rr-(managed|managed-block)"?([[:space:]]|$)/ {
-                      print table ":" $0
-                    }
-                  table == "nat" && $1 == "-A" && $2 == "PREROUTING" &&
-                    $0 ~ /--comment[[:space:]]+"?argo-rr-[A-Za-z0-9_-]+"?([[:space:]]|$)/ {
-                      print table ":" $0
-                    }
-                ' >> "$temporary"; then
+                # iptables-save emits wall-clock-only header/footer comments.
+                # Normalize only those timestamps; every policy and rule byte
+                # remains part of the before/after read-only invariant.
+                if ! "$command_name" 2>/dev/null | sed -E \
+                  -e '/^# Generated by ip(6)?tables-save .* on .+$/d' \
+                  -e '/^# Completed on .+$/d' \
+                  >> "$temporary"; then
                   rm -f -- "$temporary"
                   return 1
                 fi
@@ -2373,57 +4440,92 @@ jobs:
                 }
               fi
             done
-            chmod 600 "$temporary" && mv -f -- "$temporary" "$output" || {
+            if command -v ufw >/dev/null 2>&1; then
+              printf '%s\n' ufw:present >> "$temporary" && \
+                LC_ALL=C ufw status >> "$temporary" 2>/dev/null && \
+                LC_ALL=C ufw show added >> "$temporary" 2>/dev/null || {
+                  rm -f -- "$temporary"
+                  return 1
+                }
+            else
+              printf '%s\n' ufw:absent >> "$temporary" || {
+                rm -f -- "$temporary"
+                return 1
+              }
+            fi
+            mv -fT -- "$temporary" "$output" || {
               rm -f -- "$temporary"
               return 1
             }
+            [ "$(stat -c '%u:%g:%a:%h' "$output")" = 0:0:600:1 ]
+            [ ! -e "$temporary" ] && [ ! -L "$temporary" ]
           }
           persist_rr_firewall_fixture() {
+            [ "$1" = true ] || return 0
             if command -v netfilter-persistent >/dev/null 2>&1; then
-              netfilter-persistent save >/dev/null
+              netfilter-persistent save >/dev/null 2>&1
             elif command -v service >/dev/null 2>&1 && [ -x /etc/init.d/iptables ]; then
-              service iptables save >/dev/null
+              service iptables save >/dev/null 2>&1
             else
-              return 1
+              # Match the product save_firewall contract: if no persistence
+              # backend exists there is nothing to save.  An installed
+              # backend that returns an error still fails this audit.
+              return 0
             fi
           }
-          install_rr_firewall_fixture() {
-            local backend=""
+          install_rr_firewall_fixture() (
+            local backend="" backend_count=0
+            release_fixture_lock() {
+              local result=$?
+              trap - EXIT
+              rr_firewall_lock_release || result=1
+              exit "$result"
+            }
+            rr_firewall_lock_acquire
+            trap release_fixture_lock EXIT
             for backend in iptables ip6tables; do
               command -v "$backend" >/dev/null 2>&1 || return 1
-              "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
-                -m comment --comment argo-rr-managed-block -j DROP \
-                >/dev/null 2>&1 && return 1
-              "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
-                -m comment --comment argo-rr-audit-fixture \
-                -j REDIRECT --to-ports 65431 >/dev/null 2>&1 && return 1
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65431 \
+                argo-rr-managed-block DROP)" -eq 0
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65432 \
+                argo-rr-audit-fixture REDIRECT 65431)" -eq 0
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65433 \
+                rr-audit-user-sentinel ACCEPT)" -eq 0
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65434 \
+                rr-audit-user-sentinel REDIRECT 65433)" -eq 0
               "$backend" -w 5 -t filter -A INPUT -p tcp --dport 65431 \
-                -m comment --comment argo-rr-managed-block -j DROP
+                -m comment --comment argo-rr-managed-block -j DROP >/dev/null 2>&1
               "$backend" -w 5 -t nat -A PREROUTING -p udp --dport 65432 \
                 -m comment --comment argo-rr-audit-fixture \
-                -j REDIRECT --to-ports 65431
+                -j REDIRECT --to-ports 65431 >/dev/null 2>&1
+              "$backend" -w 5 -t filter -A INPUT -p tcp --dport 65433 \
+                -m comment --comment rr-audit-user-sentinel -j ACCEPT >/dev/null 2>&1
+              "$backend" -w 5 -t nat -A PREROUTING -p udp --dport 65434 \
+                -m comment --comment rr-audit-user-sentinel \
+                -j REDIRECT --to-ports 65433 >/dev/null 2>&1
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65431 \
+                argo-rr-managed-block DROP)" -eq 1
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65432 \
+                argo-rr-audit-fixture REDIRECT 65431)" -eq 1
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65433 \
+                rr-audit-user-sentinel ACCEPT)" -eq 1
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65434 \
+                rr-audit-user-sentinel REDIRECT 65433)" -eq 1
+              backend_count=$((backend_count + 1))
             done
-            persist_rr_firewall_fixture
-          }
-          remove_rr_firewall_fixture() {
-            local backend=""
+            [ "$backend_count" -eq 2 ] || return 1
+            persist_rr_firewall_fixture true
             for backend in iptables ip6tables; do
-              command -v "$backend" >/dev/null 2>&1 || continue
-              while "$backend" -w 5 -t filter -C INPUT -p tcp --dport 65431 \
-                -m comment --comment argo-rr-managed-block -j DROP >/dev/null 2>&1; do
-                "$backend" -w 5 -t filter -D INPUT -p tcp --dport 65431 \
-                  -m comment --comment argo-rr-managed-block -j DROP || return 1
-              done
-              while "$backend" -w 5 -t nat -C PREROUTING -p udp --dport 65432 \
-                -m comment --comment argo-rr-audit-fixture \
-                -j REDIRECT --to-ports 65431 >/dev/null 2>&1; do
-                "$backend" -w 5 -t nat -D PREROUTING -p udp --dport 65432 \
-                  -m comment --comment argo-rr-audit-fixture \
-                  -j REDIRECT --to-ports 65431 || return 1
-              done
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65431 \
+                argo-rr-managed-block DROP)" -eq 1
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65432 \
+                argo-rr-audit-fixture REDIRECT 65431)" -eq 1
+              test "$(firewall_rule_count "$backend" filter INPUT tcp 65433 \
+                rr-audit-user-sentinel ACCEPT)" -eq 1
+              test "$(firewall_rule_count "$backend" nat PREROUTING udp 65434 \
+                rr-audit-user-sentinel REDIRECT 65433)" -eq 1
             done
-            persist_rr_firewall_fixture
-          }
+          )
           audit_update_channel_value() {
             local value=stable
             if [ -e /etc/rr-update/channel ] || [ -L /etc/rr-update/channel ]; then
@@ -2434,14 +4536,153 @@ jobs:
             fi
             printf '%s\n' "$value"
           }
-          firewall_fixture_active=false
-          finish_target_audit() {
-            rc=$?
-            trap - EXIT
-            if [ "$firewall_fixture_active" = true ]; then
-              remove_rr_firewall_fixture || rc=1
+          audit_stage=c-preflight
+          disarm_target_cleanup_timer() {
+            local timer_unit=rr-audit-cross-cleanup-c.timer
+            local service_unit=rr-audit-cross-cleanup-c.service
+            local timer_load="" service_load="" attempt=""
+            validate_cleanup_bundle
+            test "$(systemctl show -p LoadState --value "$timer_unit")" = loaded
+            test "$(systemctl show -p ActiveState --value "$timer_unit")" = active
+            test "$(systemctl show -p UnitFileState --value "$timer_unit")" = enabled
+            test "$(systemctl show -p Transient --value "$timer_unit")" = no
+            test "$(systemctl show -p LoadState --value "$service_unit")" = loaded
+            test "$(systemctl show -p ActiveState --value "$service_unit")" = inactive
+            test "$(systemctl show -p UnitFileState --value "$service_unit")" = static
+            test "$(systemctl show -p Transient --value "$service_unit")" = no
+            test "$(systemctl show -p Restart --value "$service_unit")" = on-failure
+            test "$(systemctl show -p RestartUSec --value "$service_unit")" = 30s
+            test "$(systemctl show -p StartLimitIntervalUSec --value \
+              "$service_unit")" = 0
+            test "$(systemctl show -p Triggers --value "$timer_unit")" = \
+              "$service_unit"
+            test "$(systemctl show -p TriggeredBy --value "$service_unit")" = \
+              "$timer_unit"
+            test "$(systemctl show -p Environment --value "$service_unit")" = \
+              "RR_AUDIT_HELPER_SHA=$expected_cleanup_helper_sha"
+            expected_exec_prefix="{ path=$cleanup_helper ; argv[]=$cleanup_helper timer ; "
+            exec_start=$(systemctl show -p ExecStart --value "$service_unit")
+            case "$exec_start" in
+              "$expected_exec_prefix"*) ;;
+              *) return 1 ;;
+            esac
+            exec_metadata=${exec_start#"$expected_exec_prefix"}
+            [[ "$exec_metadata" == *'}' ]]
+            [[ "$exec_metadata" != *' path='* ]]
+            [[ "$exec_start" != *$'\n'* ]]
+            systemctl disable --now "$timer_unit"
+            test ! -e "$cleanup_timer_link" && test ! -L "$cleanup_timer_link"
+            systemctl stop "$service_unit"
+            if [ "$(systemctl show -p ActiveState --value "$service_unit")" = failed ]; then
+              systemctl reset-failed "$service_unit"
             fi
-            exit "$rc"
+            validate_cleanup_unit_file "$cleanup_service_file"
+            validate_cleanup_unit_file "$cleanup_timer_file"
+            validate_cleanup_unit_hashes
+            rm -f -- "$cleanup_service_file" "$cleanup_timer_file"
+            test ! -e "$cleanup_service_file" && test ! -L "$cleanup_service_file"
+            test ! -e "$cleanup_timer_file" && test ! -L "$cleanup_timer_file"
+            systemctl daemon-reload
+            for attempt in $(seq 1 15); do
+              timer_load=$(systemctl show -p LoadState --value "$timer_unit")
+              service_load=$(systemctl show -p LoadState --value "$service_unit")
+              if [ "$timer_load" = not-found ] && \
+                 [ "$service_load" = not-found ]; then
+                break
+              fi
+              test "$attempt" -lt 15
+              sleep 1
+            done
+            test "$timer_load" = not-found
+            test "$service_load" = not-found
+            if [ -e "$cleanup_timer_stamp" ] || [ -L "$cleanup_timer_stamp" ]; then
+              [ -f "$cleanup_timer_stamp" ] && [ ! -L "$cleanup_timer_stamp" ]
+              [ "$(stat -c '%u:%g:%h' "$cleanup_timer_stamp")" = 0:0:1 ]
+              rm -f -- "$cleanup_timer_stamp"
+            fi
+            test ! -e "$cleanup_timer_stamp" && test ! -L "$cleanup_timer_stamp"
+            validate_cleanup_helper
+            rm -f -- "$cleanup_unit_hashes" "$cleanup_deadline" "$cleanup_helper"
+            for evidence in "$cleanup_unit_hashes" "$cleanup_deadline" \
+              "$cleanup_helper"; do
+              test ! -e "$evidence" && test ! -L "$evidence"
+            done
+            rmdir "$cleanup_state_dir"
+            sync -f /var/lib
+          }
+          finish_target_audit() {
+            local body_rc="$?" failure_stage="${audit_stage:-c-unknown}"
+            local final_rc=0 cleanup_failed=false
+            local helper_cleanup_ok=false firewall_cleanup_ok=false
+            local sensitive_cleanup_ok=false
+            trap - EXIT
+            final_rc="$body_rc"
+            if [ "$body_rc" -ne 0 ]; then
+              case "$failure_stage" in
+                c-preflight|c-fixture|c-restore|c-data-verify|c-config-verify|\
+                c-firewall-verify|c-runtime-verify|c-complete) ;;
+                *) failure_stage=c-unknown ;;
+              esac
+              printf 'RR_AUDIT_CROSS_FAILURE side=C stage=%s rc=%s\n' \
+                "$failure_stage" "$body_rc" >&2
+            fi
+            if validate_cleanup_bundle && \
+               RR_AUDIT_HELPER_SHA="$expected_cleanup_helper_sha" \
+                 "$cleanup_helper" exit >/dev/null 2>&1 && \
+               validate_cleanup_bundle; then
+              helper_cleanup_ok=true
+              # A successful self-verifying helper return is authoritative:
+              # it has removed every exact v4/v6 audit rule, persisted the
+              # cleaned state, re-proved rule absence, removed all fixed
+              # artifacts, while retaining its verified durable recovery
+              # bundle until the external disarm proof succeeds.
+              firewall_cleanup_ok=true
+            else
+              cleanup_failed=true
+            fi
+            if [ "$helper_cleanup_ok" = true ]; then
+              sensitive_cleanup_ok=true
+              for sensitive_file in /run/rr-audit-cross-passphrase \
+                /root/rr-audit-cross.rrbak \
+                /run/rr-audit-cross-fingerprint.json \
+                /run/rr-audit-cross-restored-fingerprint.json \
+                /run/rr-audit-cross-target-access.json \
+                /run/rr-audit-cross-target-network.txt \
+                /run/rr-audit-cross-target-channel \
+                /run/rr-audit-cross-target-bind \
+                /run/rr-audit-cross-target-firewall \
+                /run/rr-audit-cross-restored-firewall \
+                /run/rr-audit-cross-firewall-before-validate \
+                /run/rr-audit-cross-firewall-before-validate.tmp \
+                /run/rr-audit-cross-firewall-after-validate \
+                /run/rr-audit-cross-firewall-after-validate.tmp \
+                /root/rr-audit-cross-restore.log \
+                /root/rr-audit-cross-firewall-validate.log \
+                /root/rr-audit-panel-pass \
+                /var/lib/rr-audit-cross-cleanup-c/.helper.new \
+                /var/lib/rr-audit-cross-cleanup-c/.deadline.new \
+                /var/lib/rr-audit-cross-cleanup-c/.units.sha256.new; do
+                if [ -e "$sensitive_file" ] || [ -L "$sensitive_file" ]; then
+                  sensitive_cleanup_ok=false
+                fi
+              done
+            fi
+            if [ "$helper_cleanup_ok" = true ] && \
+               [ "$firewall_cleanup_ok" = true ] && \
+               [ "$sensitive_cleanup_ok" = true ]; then
+              # Keep errexit authoritative inside the disarm function.  A
+              # function invoked as an `if !` condition inherits Bash's
+              # errexit-suppressed context and could otherwise step past a
+              # failed unit/hash proof before deleting the durable bundle.
+              disarm_target_cleanup_timer
+            else
+              cleanup_failed=true
+            fi
+            if [ "$cleanup_failed" = true ]; then
+              printf 'RR_AUDIT_CROSS_FAILURE side=C stage=c-cleanup rc=1\n' >&2
+              [ "$final_rc" -ne 0 ] || final_rc=1
+            fi
+            exit "$final_rc"
           }
           trap finish_target_audit EXIT
           test "$(id -u)" -eq 0
@@ -2459,25 +4700,35 @@ jobs:
             http://127.0.0.1:7900/healthz >/dev/null
           jq -cS '{mode,domain,public_port} +
             (if has("acme_email") then {acme_email:.acme_email} else {} end)' \
-            /etc/rr-nexus/nexus.json > /root/rr-audit-cross-target-access.json
+            /etc/rr-nexus/nexus.json > /run/rr-audit-cross-target-access.json
           grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
             /etc/argo_vmess.conf | LC_ALL=C sort \
-            > /root/rr-audit-cross-target-network.txt
-          audit_update_channel_value > /root/rr-audit-cross-target-channel
+            > /run/rr-audit-cross-target-network.txt
+          audit_update_channel_value > /run/rr-audit-cross-target-channel
           test -f /run/rr-vps-subscription.bind
           test ! -L /run/rr-vps-subscription.bind
           test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
-          cp -p /run/rr-vps-subscription.bind /root/rr-audit-cross-target-bind
-          firewall_fixture_active=true
+          cp -p /run/rr-vps-subscription.bind /run/rr-audit-cross-target-bind
+          audit_stage=c-fixture
           install_rr_firewall_fixture
-          capture_rr_firewall_state /root/rr-audit-cross-target-firewall
-          test "$(grep -Ec '^filter:.*--dport 65431 .*--comment "?argo-rr-managed-block"?([[:space:]]|$)' \
-            /root/rr-audit-cross-target-firewall)" -eq 2
-          test "$(grep -Ec '^nat:.*--dport 65432 .*--comment "?argo-rr-audit-fixture"?([[:space:]]|$)' \
-            /root/rr-audit-cross-target-firewall)" -eq 2
-          chmod 600 /root/rr-audit-cross-target-access.json \
-            /root/rr-audit-cross-target-network.txt /root/rr-audit-cross-target-channel \
-            /root/rr-audit-cross-target-bind /root/rr-audit-cross-target-firewall
+          verified_backend_count=0
+          for backend in iptables ip6tables; do
+            command -v "$backend" >/dev/null 2>&1 || exit 1
+            test "$(firewall_rule_count "$backend" filter INPUT tcp 65431 \
+              argo-rr-managed-block DROP)" -eq 1
+            test "$(firewall_rule_count "$backend" nat PREROUTING udp 65432 \
+              argo-rr-audit-fixture REDIRECT 65431)" -eq 1
+            test "$(firewall_rule_count "$backend" filter INPUT tcp 65433 \
+              rr-audit-user-sentinel ACCEPT)" -eq 1
+            test "$(firewall_rule_count "$backend" nat PREROUTING udp 65434 \
+              rr-audit-user-sentinel REDIRECT 65433)" -eq 1
+            verified_backend_count=$((verified_backend_count + 1))
+          done
+          test "$verified_backend_count" -eq 2
+          chmod 600 /run/rr-audit-cross-target-access.json \
+            /run/rr-audit-cross-target-network.txt /run/rr-audit-cross-target-channel \
+            /run/rr-audit-cross-target-bind
+          audit_stage=c-restore
           passphrase=$(<"$passphrase_file")
           test "${#passphrase}" -ge 10
           RR_BACKUP_PASSPHRASE="$passphrase" \
@@ -2485,6 +4736,7 @@ jobs:
             </dev/null >/root/rr-audit-cross-restore.log 2>&1
           unset passphrase
 
+          audit_stage=c-data-verify
           test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
           foreign_key_errors=$(sqlite3 /var/lib/rr-nexus/nexus.db \
             'PRAGMA foreign_key_check;') || exit 1
@@ -2606,6 +4858,7 @@ jobs:
           PY
           test "$(stat -c '%U:%G:%a:%h' "$restored_fingerprint")" = root:root:600:1
           cmp -s "$fingerprint_file" "$restored_fingerprint"
+          audit_stage=c-config-verify
           test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
           test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
           test "$(jq -r '.port' /etc/rr-nexus/nexus.json)" = 7900
@@ -2613,20 +4866,52 @@ jobs:
           jq -cS '{mode,domain,public_port} +
             (if has("acme_email") then {acme_email:.acme_email} else {} end)' \
             /etc/rr-nexus/nexus.json \
-            | cmp -s /root/rr-audit-cross-target-access.json -
+            | cmp -s /run/rr-audit-cross-target-access.json -
           grep -E '^(ENTRY_IP_MODE|OUTBOUND_IP_MODE|ENTRY_IPV4_ADDRESS|ENTRY_IPV6_ADDRESS|SUB_PORT|SUB_ACCESS_MODE|SUB_DOMAIN|SUB_PUBLIC_PORT_IPV4|SUB_PUBLIC_PORT_IPV6)=' \
             /etc/argo_vmess.conf | LC_ALL=C sort \
-            | cmp -s /root/rr-audit-cross-target-network.txt -
+            | cmp -s /run/rr-audit-cross-target-network.txt -
           audit_update_channel_value \
-            | cmp -s /root/rr-audit-cross-target-channel -
+            | cmp -s /run/rr-audit-cross-target-channel -
           test "$(stat -c '%U:%G:%a:%h' /run/rr-vps-subscription.bind)" = root:root:600:1
-          cmp -s /run/rr-vps-subscription.bind /root/rr-audit-cross-target-bind
-          capture_rr_firewall_state /root/rr-audit-cross-restored-firewall
-          cmp -s /root/rr-audit-cross-target-firewall \
-            /root/rr-audit-cross-restored-firewall
-          rm -f -- /root/rr-audit-cross-restored-firewall
-          remove_rr_firewall_fixture
-          firewall_fixture_active=false
+          cmp -s /run/rr-vps-subscription.bind /run/rr-audit-cross-target-bind
+          audit_stage=c-firewall-verify
+          verified_backend_count=0
+          for backend in iptables ip6tables; do
+            command -v "$backend" >/dev/null 2>&1 || exit 1
+            test "$(firewall_rule_count "$backend" filter INPUT tcp 65431 \
+              argo-rr-managed-block DROP)" -eq 0
+            test "$(firewall_rule_count "$backend" nat PREROUTING udp 65432 \
+              argo-rr-audit-fixture REDIRECT 65431)" -eq 0
+            test "$(firewall_rule_count "$backend" filter INPUT tcp 65433 \
+              rr-audit-user-sentinel ACCEPT)" -eq 1
+            test "$(firewall_rule_count "$backend" nat PREROUTING udp 65434 \
+              rr-audit-user-sentinel REDIRECT 65433)" -eq 1
+            verified_backend_count=$((verified_backend_count + 1))
+          done
+          test "$verified_backend_count" -eq 2
+          capture_full_firewall_state \
+            /run/rr-audit-cross-firewall-before-validate
+          bash -c '
+            set -euo pipefail
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            RR_UPDATE_TRANSACTION=1 open_configured_firewall
+          ' >/root/rr-audit-cross-firewall-validate.log 2>&1
+          capture_full_firewall_state \
+            /run/rr-audit-cross-firewall-after-validate
+          cmp -s /run/rr-audit-cross-firewall-before-validate \
+            /run/rr-audit-cross-firewall-after-validate
+          rm -f -- /run/rr-audit-cross-firewall-before-validate \
+            /run/rr-audit-cross-firewall-after-validate
+          for capture_file in /run/rr-audit-cross-firewall-before-validate \
+            /run/rr-audit-cross-firewall-before-validate.tmp \
+            /run/rr-audit-cross-firewall-after-validate \
+            /run/rr-audit-cross-firewall-after-validate.tmp; do
+            test ! -e "$capture_file" && test ! -L "$capture_file"
+          done
+          audit_stage=c-runtime-verify
           test ! -e /etc/nginx/sites-available/rr-nexus.conf
           for proxy in rr-nexus.conf rr-nexus-port.conf rr-nexus-ip.conf; do
             test ! -e "/etc/nginx/sites-enabled/$proxy"
@@ -2641,7 +4926,7 @@ jobs:
           public_listen=$(ss -H -ltn 'sport = :17900') || exit 1
           test -z "$public_listen"
           IFS='|' read -r target_sub_port target_sub_bind target_sub_mode \
-            target_sub_domain _ < /root/rr-audit-cross-target-bind
+            target_sub_domain _ < /run/rr-audit-cross-target-bind
           [[ "$target_sub_port" =~ ^[0-9]+$ ]]
           test "$target_sub_bind" = 127.0.0.1
           test "$target_sub_mode" = local
@@ -2694,28 +4979,539 @@ jobs:
           done
           grep -Fq "$sample_credential" \
             "/var/lib/rr-nexus/subscriptions/${sample_id}.txt"
+          audit_stage=c-complete
           printf 'RR_AUDIT_CROSS_MIGRATION_COMPLETE devices=500 access=local hashes=verified\n'
           REMOTE_C
+          audit_stage=runner-complete
+
+  public-ip-acme:
+    name: B · trusted public-IP HTTPS · IPv4 and IPv6
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify candidate and prepare SSH client
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/rebuild-bundle.py --check
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass netcat-openbsd
+
+      - name: Issue and externally verify independent IPv4 and IPv6 certificates
+        shell: bash
+        env:
+          RR_IP_ACME_EMAIL: ${{ secrets.RR_IP_ACME_EMAIL }}
+          RR_B_HOST: ${{ secrets.RR_B_HOST }}
+          RR_B_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
+          RR_B_PASS: ${{ secrets.RR_B_PASS }}
+          RR_B_PUBLIC_IPV4: ${{ secrets.RR_B_PUBLIC_IPV4 }}
+          RR_B_PUBLIC_IPV6: ${{ secrets.RR_B_PUBLIC_IPV6 }}
+          RR_C_HOST: ${{ secrets.RR_C_HOST }}
+          RR_C_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
+          RR_C_PASS: ${{ secrets.RR_C_PASS }}
+        run: |
+          set -euo pipefail
+          set +x
+          panel_port=18443
+          node_port=24444
+          b_known_hosts="$RUNNER_TEMP/known-hosts-ip-acme-B"
+          c_known_hosts="$RUNNER_TEMP/known-hosts-ip-acme-C"
+          ipv4_subscription="$RUNNER_TEMP/ip-acme-v4-subscription.txt"
+          cleanup_required=true
+
+          python3 - "$RR_IP_ACME_EMAIL" "$RR_B_PUBLIC_IPV4" \
+            "$RR_B_PUBLIC_IPV6" <<'PY'
+          import ipaddress
+          import re
+          import sys
+
+          email, ipv4_raw, ipv6_raw = sys.argv[1:]
+          if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+              raise SystemExit("invalid IP ACME audit email secret")
+          if any(character in email for character in "\r\n\0"):
+              raise SystemExit("invalid IP ACME audit email secret")
+          ipv4 = ipaddress.ip_address(ipv4_raw)
+          ipv6 = ipaddress.ip_address(ipv6_raw)
+          if ipv4.version != 4 or not ipv4.is_global or ipv4_raw != str(ipv4):
+              raise SystemExit("RR_B_PUBLIC_IPV4 is not a global IPv4 address")
+          if ipv6.version != 6 or not ipv6.is_global or ipv6_raw != str(ipv6):
+              raise SystemExit("RR_B_PUBLIC_IPV6 is not a global IPv6 address")
+          PY
+
+          prepare_known_hosts() {
+            local host="$1" pinned_key="$2" destination="$3"
+            local key_type="" key_data="" key_extra=""
+            [ -n "$host" ]
+            [[ "$host" != *$'\n'* ]]
+            [[ "$pinned_key" != *$'\n'* ]]
+            read -r key_type key_data key_extra <<<"$pinned_key"
+            [ "$key_type" = ssh-ed25519 ]
+            [[ "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+            [ -z "$key_extra" ]
+            (umask 077; printf '%s %s %s\n' \
+              "$host" "$key_type" "$key_data" > "$destination")
+            ssh-keygen -F "$host" -f "$destination" >/dev/null
+          }
+          prepare_known_hosts "$RR_B_HOST" "$RR_B_HOST_KEY" "$b_known_hosts"
+          prepare_known_hosts "$RR_C_HOST" "$RR_C_HOST_KEY" "$c_known_hosts"
+          ssh_common=(
+            -o BatchMode=no -o ConnectTimeout=20 -o ConnectionAttempts=2
+            -o LogLevel=ERROR -o PreferredAuthentications=password
+            -o PubkeyAuthentication=no -o HostKeyAlgorithms=ssh-ed25519
+            -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
+          )
+
+          cleanup_b() {
+            SSHPASS="$RR_B_PASS" sshpass -e ssh "${ssh_common[@]}" \
+              -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
+              bash -s <<'REMOTE_CLEANUP'
+          set -euo pipefail
+          umask 077
+          if [ -x /usr/local/bin/rr ]; then
+            /usr/local/bin/rr --nexus-ip-acme-uninstall \
+              >>/root/rr-audit-ip-acme.log 2>&1 || true
+            bash -c '
+              set -o pipefail
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                # shellcheck disable=SC1090
+                source "$module_file"
+              done
+              rr_run_with_update_locks direct 180 uninstall_all_locked
+            ' >>/root/rr-audit-ip-acme.log 2>&1 || true
+          fi
+          rm -rf -- /root/rr-audit-ip-candidate
+          REMOTE_CLEANUP
+          }
+          finish_ip_audit() {
+            local body_status=$? cleanup_status=0
+            trap - EXIT
+            if [ "$cleanup_required" = true ]; then
+              cleanup_b || cleanup_status=$?
+            fi
+            rm -f -- "$ipv4_subscription"
+            [ "$body_status" -ne 0 ] && exit "$body_status"
+            exit "$cleanup_status"
+          }
+          trap finish_ip_audit EXIT
+
+          bundle_sha=$(sha256sum rr-bundle.tar.gz | awk '{print $1}')
+          core_sha=$(sha256sum scripts/install-core.sh | awk '{print $1}')
+          guard_sha=$(sha256sum scripts/update-guard.sh | awk '{print $1}')
+          export SSHPASS="$RR_B_PASS"
+          sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
+            'install -d -m 700 /root/rr-audit-ip-candidate'
+          sshpass -e scp "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$b_known_hosts" -q \
+            rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
+            "root@$RR_B_HOST:/root/rr-audit-ip-candidate/"
+
+          ipv4_url=$(sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
+            bash -s -- "$bundle_sha" "$core_sha" "$guard_sha" \
+              "$RR_B_PUBLIC_IPV4" "$RR_IP_ACME_EMAIL" \
+              "$panel_port" "$node_port" <<'REMOTE_IPV4'
+          set -euo pipefail
+          umask 077
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+          stage=/root/rr-audit-ip-candidate
+          expected_bundle_sha="$1"
+          expected_core_sha="$2"
+          expected_guard_sha="$3"
+          address="$4"
+          email="$5"
+          panel_port="$6"
+          node_port="$7"
+          audit_log=/root/rr-audit-ip-acme.log
+          : > "$audit_log"
+          chmod 600 "$audit_log"
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state=""
+            local unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
+
+          if [ -x /usr/local/bin/rr ] && [ -d /usr/local/lib/rr/modules ]; then
+            bash -c '
+              set -o pipefail
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                # shellcheck disable=SC1090
+                source "$module_file"
+              done
+              rr_run_with_update_locks direct 180 uninstall_all_locked
+            ' >>"$audit_log" 2>&1
+          fi
+          printf '%s  %s\n' \
+            "$expected_bundle_sha" "$stage/rr-bundle.tar.gz" \
+            "$expected_core_sha" "$stage/install-core.sh" \
+            "$expected_guard_sha" "$stage/update-guard.sh" \
+            | sha256sum -c - >>"$audit_log" 2>&1
+          RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" \
+          RR_GUARD_FILE="$stage/update-guard.sh" \
+            bash "$stage/install-core.sh" --upgrade >>"$audit_log" 2>&1
+
+          printf '%s\n' 1 18081 "$node_port" '' | bash -c '
+            set -o pipefail
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            install_main
+          ' >>"$audit_log" 2>&1
+          panel_password=$(openssl rand -hex 20)
+          printf '%s\n' 1 "$panel_port" auditadmin "$panel_password" \
+            "$panel_password" '' | bash -c '
+              set -o pipefail
+              for module_file in /usr/local/lib/rr/modules/*.sh; do
+                # shellcheck disable=SC1090
+                source "$module_file"
+              done
+              nexus_install
+            ' >>"$audit_log" 2>&1
+          unset panel_password
+
+          token=$(openssl rand -hex 24)
+          python3 - /var/lib/rr-nexus/nexus.db "$token" <<'PY'
+          import datetime
+          import sqlite3
+          import sys
+          import uuid
+
+          database, token = sys.argv[1:]
+          now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+          connection = sqlite3.connect(database, timeout=30)
+          try:
+              connection.execute("BEGIN IMMEDIATE")
+              connection.execute("DELETE FROM devices")
+              connection.execute(
+                  "INSERT INTO devices("
+                  "id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,"
+                  "uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,"
+                  "next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at"
+                  ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  ("dev_a11ce0000001", "ip-acme-audit", str(uuid.uuid4()), token, 1,
+                   1073741824, 0, 0, 0, now, None, "2030-12-31", "2030-09-30",
+                   30, 36, 0, now, now),
+              )
+              connection.commit()
+          finally:
+              connection.close()
+          PY
+          printf '%s\n' "$token" > /run/rr-audit-ip-token
+          chmod 600 /run/rr-audit-ip-token
+
+          bash -s -- "$address" "$email" "$panel_port" <<'PREPARE'
+          set -euo pipefail
+          address="$1"
+          email="$2"
+          panel_port="$3"
+          for module_file in /usr/local/lib/rr/modules/*.sh; do
+            # shellcheck disable=SC1090
+            source "$module_file"
+          done
+          load_config_with_defaults
+          safe_sed ENTRY_IPV4_ADDRESS "$address"
+          safe_sed ENTRY_IP_MODE ipv4
+          load_config_with_defaults
+          select_entry_ip
+          stats_port=$(jq -r '.stats_port' /etc/rr-nexus/nexus.json)
+          nexus_write_config public "$address" "$panel_port" "$stats_port" \
+            "$address" both "$email" pending-acme-ip
+          systemctl restart rr-nexus.service
+          curl -fsS --connect-timeout 2 --max-time 10 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          PREPARE
+          /usr/local/bin/rr --nexus-ip-acme-install "$address" "$email" \
+            >>"$audit_log" 2>&1
+          /usr/local/bin/rr --sync-devices >>"$audit_log" 2>&1
+          test "$(jq -r '.certificate_mode' /etc/rr-nexus/nexus.json)" = \
+            acme-ip-shortlived
+          test "$(jq -r '.domain' /etc/rr-nexus/nexus.json)" = "$address"
+          test "$(jq -r '.public_port' /etc/rr-nexus/nexus.json)" = "$panel_port"
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state sing-box.service loaded:active:enabled
+          assert_unit_state rr-nexus-ip-acme.timer loaded:active:enabled
+          before=$(sha256sum /etc/rr-nexus/certs/ip.crt | awk '{print $1}')
+          systemctl start rr-nexus-ip-acme.service
+          test "$(systemctl show -p Result --value rr-nexus-ip-acme.service)" = success
+          after=$(sha256sum /etc/rr-nexus/certs/ip.crt | awk '{print $1}')
+          test "$before" = "$after"
+          test -s /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
+          grep -q '^vless://' /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
+          token=$(cat /run/rr-audit-ip-token)
+          printf 'https://%s:%s/sub/dev_a11ce0000001/%s/txt\n' \
+            "$address" "$panel_port" "$token"
+          REMOTE_IPV4
+          )
+          [[ "$ipv4_url" =~ ^https://[0-9.]+:[0-9]+/sub/ ]]
+
+          nc -4 -z -w 10 "$RR_B_PUBLIC_IPV4" 80
+          nc -4 -z -w 10 "$RR_B_PUBLIC_IPV4" "$panel_port"
+          curl -fsS --noproxy '*' --connect-timeout 10 --max-time 30 \
+            "https://${RR_B_PUBLIC_IPV4}:${panel_port}/healthz" >/dev/null
+          printf '' | openssl s_client \
+            -connect "${RR_B_PUBLIC_IPV4}:${panel_port}" \
+            -verify_ip "$RR_B_PUBLIC_IPV4" -verify_return_error \
+            -CAfile /etc/ssl/certs/ca-certificates.crt \
+            >/dev/null 2>&1
+          curl -fsS --noproxy '*' --connect-timeout 10 --max-time 30 "$ipv4_url" \
+            > "$ipv4_subscription"
+          test -s "$ipv4_subscription"
+          grep -q '^vless://' "$ipv4_subscription"
+          grep -Fq "$RR_B_PUBLIC_IPV4" "$ipv4_subscription"
+          grep -Fq ":${node_port}?" "$ipv4_subscription"
+
+          ipv6_url=$(sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
+            bash -s -- "$RR_B_PUBLIC_IPV6" "$RR_IP_ACME_EMAIL" \
+              "$panel_port" <<'REMOTE_IPV6'
+          set -euo pipefail
+          umask 077
+          export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
+          address="$1"
+          email="$2"
+          panel_port="$3"
+          audit_log=/root/rr-audit-ip-acme.log
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state=""
+            local unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
+          /usr/local/bin/rr --nexus-ip-acme-uninstall >>"$audit_log" 2>&1
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state rr-nexus-ip-acme.service not-found:inactive:not-found
+          assert_unit_state rr-nexus-ip-acme.timer not-found:inactive:not-found
+          curl -fsS --connect-timeout 2 --max-time 10 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          for path in \
+            /var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme \
+            /etc/systemd/system/rr-nexus-ip-acme.service \
+            /etc/systemd/system/rr-nexus-ip-acme.timer \
+            /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-available/rr-nexus-ip.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip.conf \
+            /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+            /etc/rr-nexus/certs/.ip-cert-pending \
+            /usr/local/lib/rr-vps/nexus-ip-cert-gate \
+            /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
+            test ! -e "$path" && test ! -L "$path"
+          done
+          bash -s -- "$address" "$email" "$panel_port" <<'PREPARE'
+          set -euo pipefail
+          address="$1"
+          email="$2"
+          panel_port="$3"
+          for module_file in /usr/local/lib/rr/modules/*.sh; do
+            # shellcheck disable=SC1090
+            source "$module_file"
+          done
+          load_config_with_defaults
+          safe_sed ENTRY_IPV6_ADDRESS "$address"
+          safe_sed ENTRY_IP_MODE ipv6
+          load_config_with_defaults
+          select_entry_ip
+          stats_port=$(jq -r '.stats_port' /etc/rr-nexus/nexus.json)
+          nexus_write_config public "$address" "$panel_port" "$stats_port" \
+            "$address" both "$email" pending-acme-ip
+          systemctl restart rr-nexus.service
+          curl -fsS --connect-timeout 2 --max-time 10 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          PREPARE
+          /usr/local/bin/rr --nexus-ip-acme-install "$address" "$email" \
+            >>"$audit_log" 2>&1
+          /usr/local/bin/rr --sync-devices >>"$audit_log" 2>&1
+          test "$(jq -r '.certificate_mode' /etc/rr-nexus/nexus.json)" = \
+            acme-ip-shortlived
+          test "$(jq -r '.domain' /etc/rr-nexus/nexus.json)" = "$address"
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          assert_unit_state sing-box.service loaded:active:enabled
+          assert_unit_state rr-nexus-ip-acme.timer loaded:active:enabled
+          before=$(sha256sum /etc/rr-nexus/certs/ip.crt | awk '{print $1}')
+          systemctl start rr-nexus-ip-acme.service
+          test "$(systemctl show -p Result --value rr-nexus-ip-acme.service)" = success
+          after=$(sha256sum /etc/rr-nexus/certs/ip.crt | awk '{print $1}')
+          test "$before" = "$after"
+          test -s /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
+          grep -q '^vless://' /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
+          token=$(cat /run/rr-audit-ip-token)
+          printf 'https://[%s]:%s/sub/dev_a11ce0000001/%s/txt\n' \
+            "$address" "$panel_port" "$token"
+          REMOTE_IPV6
+          )
+          [[ "$ipv6_url" == https://\[*\]:*/sub/* ]]
+
+          SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" "root@$RR_C_HOST" \
+            bash -s -- "$RR_B_PUBLIC_IPV6" "$panel_port" "$ipv6_url" \
+              "$node_port" <<'REMOTE_C_IPV6'
+          set -euo pipefail
+          set +x
+          address="$1"
+          panel_port="$2"
+          subscription_url="$3"
+          node_port="$4"
+          output=$(mktemp /tmp/rr-ip-acme-v6.XXXXXX)
+          trap 'rm -f -- "$output"' EXIT
+          command -v curl >/dev/null
+          command -v openssl >/dev/null
+          http_code=$(curl -gsS --noproxy '*' --connect-timeout 10 --max-time 30 \
+            -o /dev/null -w '%{http_code}' \
+            "http://[${address}]/.well-known/acme-challenge/rr-audit-not-found")
+          test "$http_code" = 404
+          curl -gfsS --noproxy '*' --connect-timeout 10 --max-time 30 \
+            "https://[${address}]:${panel_port}/healthz" >/dev/null
+          printf '' | openssl s_client \
+            -connect "[${address}]:${panel_port}" \
+            -verify_ip "$address" -verify_return_error \
+            -CAfile /etc/ssl/certs/ca-certificates.crt \
+            >/dev/null 2>&1
+          curl -gfsS --noproxy '*' --connect-timeout 10 --max-time 30 \
+            "$subscription_url" > "$output"
+          test -s "$output"
+          grep -q '^vless://' "$output"
+          grep -Fq "$address" "$output"
+          grep -Fq ":${node_port}?" "$output"
+          REMOTE_C_IPV6
+
+          sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$b_known_hosts" "root@$RR_B_HOST" \
+            bash -s <<'REMOTE_FINAL'
+          set -euo pipefail
+          umask 077
+          audit_log=/root/rr-audit-ip-acme.log
+          assert_unit_state() {
+            local unit="$1" expected="$2" load_state="" active_state=""
+            local unit_file_state=""
+            load_state=$(systemctl show -p LoadState --value "$unit" 2>/dev/null) || return 1
+            active_state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null) || return 1
+            unit_file_state=$(systemctl show -p UnitFileState --value "$unit" 2>/dev/null) || return 1
+            if [ "$load_state" = not-found ] && [ -z "$unit_file_state" ]; then
+              unit_file_state=not-found
+            fi
+            test "$load_state:$active_state:$unit_file_state" = "$expected"
+          }
+          /usr/local/bin/rr --nexus-ip-acme-uninstall >>"$audit_log" 2>&1
+          assert_unit_state rr-nexus-ip-acme.service not-found:inactive:not-found
+          assert_unit_state rr-nexus-ip-acme.timer not-found:inactive:not-found
+          for path in \
+            /var/lib/rr-nexus/ip-acme /var/www/rr-nexus-ip-acme \
+            /etc/systemd/system/rr-nexus-ip-acme.service \
+            /etc/systemd/system/rr-nexus-ip-acme.timer \
+            /etc/nginx/sites-available/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip-acme-http.conf \
+            /etc/nginx/sites-available/rr-nexus-ip.conf \
+            /etc/nginx/sites-enabled/rr-nexus-ip.conf \
+            /etc/rr-nexus/certs/ip.crt /etc/rr-nexus/certs/ip.key \
+            /etc/rr-nexus/certs/.ip-cert-pending \
+            /usr/local/lib/rr-vps/nexus-ip-cert-gate \
+            /etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf; do
+            test ! -e "$path" && test ! -L "$path"
+          done
+          assert_unit_state rr-nexus.service loaded:active:enabled
+          curl -fsS --connect-timeout 2 --max-time 10 \
+            http://127.0.0.1:7900/healthz >/dev/null
+          bash -c '
+            set -o pipefail
+            for module_file in /usr/local/lib/rr/modules/*.sh; do
+              # shellcheck disable=SC1090
+              source "$module_file"
+            done
+            rr_run_with_update_locks direct 180 uninstall_all_locked
+          ' >>"$audit_log" 2>&1
+          rm -rf -- /root/rr-audit-ip-candidate
+          test ! -e /usr/local/bin/rr
+          test ! -e /usr/local/lib/rr
+          REMOTE_FINAL
+          cleanup_required=false
+          if nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" "$panel_port"; then
+            echo 'IP ACME audit panel port remained reachable after uninstall.' >&2
+            exit 1
+          fi
+          if nc -4 -z -w 5 "$RR_B_PUBLIC_IPV4" 80; then
+            echo 'IP ACME audit HTTP challenge port remained reachable after uninstall.' >&2
+            exit 1
+          fi
+          SSHPASS="$RR_C_PASS" sshpass -e ssh "${ssh_common[@]}" \
+            -o UserKnownHostsFile="$c_known_hosts" "root@$RR_C_HOST" \
+            bash -s -- "$RR_B_PUBLIC_IPV6" "$panel_port" <<'REMOTE_C_CLOSED'
+          set -euo pipefail
+          address="$1"
+          panel_port="$2"
+          if curl -gkfsS --noproxy '*' --connect-timeout 5 --max-time 10 \
+            "https://[${address}]:${panel_port}/healthz" >/dev/null 2>&1; then
+            echo 'IPv6 panel remained reachable after IP ACME uninstall.' >&2
+            exit 1
+          fi
+          if curl -gsS --noproxy '*' --connect-timeout 5 --max-time 10 \
+            "http://[${address}]/.well-known/acme-challenge/rr-audit-closed" \
+            >/dev/null 2>&1; then
+            echo 'IPv6 challenge port remained reachable after IP ACME uninstall.' >&2
+            exit 1
+          fi
+          REMOTE_C_CLOSED
+          echo 'Trusted public-IP audit passed for independent IPv4 and IPv6 certificates, externally verified personal subscriptions, renewal no-op, and owned cleanup.'
 
   vps-gate:
-    name: Three-VPS release gate
+    name: Event-complete VPS release gate
     if: always()
-    needs: [debian-full, ubuntu-upgrade, ubuntu-transaction, cross-machine-migration-scale]
+    needs:
+      - debian-full
+      - ubuntu-upgrade
+      - ubuntu-transaction
+      - cross-machine-migration-scale
+      - public-ip-acme
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
+    permissions: {}
     steps:
-      - name: Require main and all three independent jobs
+      - name: Require the exact job set for this event
         env:
           A_RESULT: ${{ needs.debian-full.result }}
           B_RESULT: ${{ needs.ubuntu-upgrade.result }}
           C_RESULT: ${{ needs.ubuntu-transaction.result }}
           M_RESULT: ${{ needs.cross-machine-migration-scale.result }}
+          IP_RESULT: ${{ needs.public-ip-acme.result }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
-          test "$A_RESULT" = success
-          test "$B_RESULT" = success
-          test "$C_RESULT" = success
-          test "$M_RESULT" = success
-          echo 'Three-VPS release gate passed with pinned SSH host keys, encrypted A-to-C migration, and real 1/10/100/500-device synchronization; this is not a real client traffic claim.'
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              test "$A_RESULT" = success
+              test "$B_RESULT" = success
+              test "$C_RESULT" = success
+              test "$M_RESULT" = success
+              test "$IP_RESULT" = skipped
+              echo 'Push VPS release gate passed with pinned SSH host keys, encrypted A-to-C migration, and real 1/10/100/500-device synchronization; this is not a real client traffic claim.'
+              ;;
+            workflow_dispatch)
+              test "$A_RESULT" = skipped
+              test "$B_RESULT" = skipped
+              test "$C_RESULT" = skipped
+              test "$M_RESULT" = skipped
+              test "$IP_RESULT" = success
+              echo 'Dispatch VPS release gate passed with externally verified IPv4 and IPv6 trusted-IP HTTPS subscriptions and owned cleanup.'
+              ;;
+            *) exit 1 ;;
+          esac

@@ -18,6 +18,7 @@ source "$REPO_ROOT/modules/10-system.sh"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/modules/55-resilience.sh"
 RR_RESTORE_LOCK_FILE="$TEST_ROOT/locks/update.lock"
+RR_RESTORE_LIVE_LOCK_FILE="$TEST_ROOT/locks/restore-live.lock"
 RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/legacy/rr-update.lock"
 RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/locks/legacy-update-bridge"
 

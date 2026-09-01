@@ -12,7 +12,8 @@ function storedSessionToken() {
 }
 
 const state = {
-  csrf: "", sessionToken: storedSessionToken(), authEpoch: 0, mode: "local", domain: "", port: 7900, sshHost: "服务器IP",
+  csrf: "", sessionToken: storedSessionToken(), authEpoch: 0, mode: "local", domain: "",
+  backendPort: 7900, publicPort: 7900, accessUrl: "", sshHost: "服务器IP",
   devices: [], traffic: null, overview: null, activeView: "overview",
   filter: "all", groupFilter: "all", query: "", metricRange: "24h",
   refreshTimer: null, _prevTraffic: {}, serverPlan: null,
@@ -282,7 +283,9 @@ function showConsole(session) {
   state.csrf = session.csrf;
   state.mode = session.mode;
   state.domain = session.domain || "";
-  state.port = Number(session.port || 7900);
+  state.backendPort = Number(session.port || 7900);
+  state.publicPort = Number(session.public_port || session.port || 7900);
+  state.accessUrl = String(session.access_url || "");
   state.sshHost = session.ssh_host || "服务器IP";
   $("#mode-badge").textContent = state.mode === "public" ? "公网 HTTPS" : "本地隧道";
   $("#login-screen").classList.add("hidden");
@@ -607,15 +610,12 @@ function renderCharts() {
 function configureAccessGuide() {
   let host = state.sshHost;
   if (host.includes(":") && !host.startsWith("[")) host = `[${host}]`;
-  const command = `ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${state.port}:127.0.0.1:${state.port} root@${host}`;
+  const command = `ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes -N -L ${state.publicPort}:127.0.0.1:${state.backendPort} root@${host}`;
   $("#ssh-command").textContent = command;
-  const localUrl = `http://127.0.0.1:${state.port}`;
+  const localUrl = `http://127.0.0.1:${state.publicPort}`;
   $("#local-panel-link").href = localUrl;
   $("#local-panel-link").textContent = localUrl;
-  let publicUrl = "#";
-  if (state.domain && state.domain !== "ip") { publicUrl = `https://${state.domain}`; }
-  else if (state.domain === "ip" && state.sshHost) { publicUrl = `https://${state.sshHost}:${state.port}`; }
-  else { publicUrl = localUrl; }
+  const publicUrl = state.mode === "public" && state.accessUrl ? state.accessUrl : localUrl;
   $("#public-panel-link").href = publicUrl;
   $("#public-panel-link").textContent = publicUrl;
 }
@@ -643,7 +643,7 @@ function renderSecurity() {
   $("#local-mode-card").classList.toggle("active", !isPublic);
   $("#public-mode-card").classList.toggle("active", isPublic);
   $("#ssh-guide").classList.toggle("hidden", isPublic);
-  $("#public-guide").classList.remove("hidden");
+  $("#public-guide").classList.toggle("hidden", !isPublic);
   configureAccessGuide();
   const coreActive = state.overview?.services?.["sing-box"] === "active";
   const statsActive = Boolean(state.overview?.traffic?.available);
@@ -853,7 +853,8 @@ async function openLinks(device) {
     }
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
-    box.classList.toggle("hidden", urls.length === 0);
+    box.classList.remove("hidden");
+    $("#subscription-empty").classList.toggle("hidden", urls.length !== 0);
     $("#subscription-urls").innerHTML = urls.map((item, idx) => {
       const qrPath = `/api/devices/${encodeURIComponent(device.id)}/qr?sub_index=${idx}`;
       return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" data-auth-src="${escapeHtml(qrPath)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-open-sub-qr="${escapeHtml(qrPath)}">打开二维码</button></div>`;
@@ -1562,7 +1563,8 @@ async function rsOpenLinks(id) {
     if (generation !== linksDialogGeneration || !dialog.open) return;
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
-    box.classList.toggle("hidden", urls.length === 0);
+    box.classList.remove("hidden");
+    $("#subscription-empty").classList.toggle("hidden", urls.length !== 0);
     const qrUrlOf = (params) => `/api/remote/qr?server_id=${state.remoteActive}&device_id=${encodeURIComponent(id)}&${params}`;
     $("#subscription-urls").innerHTML = urls.map((item, index) => {
       const qrUrl = qrUrlOf(`sub_index=${index}`);

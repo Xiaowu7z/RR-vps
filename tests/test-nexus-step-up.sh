@@ -101,6 +101,8 @@ def consume_concurrently(
 assert rr_nexus.STEP_UP_TTL_SECONDS == 300
 
 with tempfile.TemporaryDirectory() as directory:
+    rr_nexus.UPDATE_MAINTENANCE_PATH = Path(directory) / "update-maintenance"
+    assert not rr_nexus.update_maintenance_active()
     database = Path(directory) / "nexus.db"
     store = rr_nexus.Store(database)
     state = object.__new__(rr_nexus.NexusState)

@@ -71,13 +71,13 @@ rr_manifest_is_valid() {
         $2 == "scripts/update-external-state.py" { external_state = 1; next }
         $2 ~ /^modules\/[0-9][0-9A-Za-z_-]*\.sh$/ { modules++; next }
         $2 == "nexus/rr_nexus.py" { nexus_app = 1; next }
-        $2 ~ /^nexus\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
+        $2 == "nexus/sub_server.py" { nexus_sub = 1; next }
         $2 ~ /^nexus\/rr_nexus_lib\/[A-Za-z0-9._-]+\.py$/ { nexus_python++; next }
         $2 ~ /^nexus\/static\/[A-Za-z0-9._-]+\.(html|css|js)$/ { nexus_assets++; next }
         { exit 1 }
         END {
             if (!launcher || !naive_hook || !recovery || !external_state || modules < 2) exit 1
-            if (!nexus_app || nexus_assets < 3) exit 1
+            if (!nexus_app || !nexus_sub || nexus_assets < 3) exit 1
         }
     ' "$manifest_file"
 }
@@ -105,7 +105,7 @@ allowed = re.compile(
     r"scripts/(?:naive-cert-hook|update-recover)\.sh|"
     r"scripts/update-external-state\.py|"
     r"modules/[0-9][0-9A-Za-z_-]*\.sh|"
-    r"nexus/[A-Za-z0-9._-]+\.py|"
+    r"nexus/(?:rr_nexus|sub_server)\.py|"
     r"nexus/rr_nexus_lib/[A-Za-z0-9._-]+\.py|"
     r"nexus/static/[A-Za-z0-9._-]+\.(?:html|css|js))$"
 )
@@ -266,7 +266,11 @@ rr_bundle_manifest_matches_trusted_source() {
 
     [ -s "$bundle_manifest" ] || return 1
     trusted_manifest=$(mktemp /tmp/rr-bundle-manifest.XXXXXX) || return 1
-    if rr_download_file "$RR_MANIFEST_URL" "$trusted_manifest" 3 true && \
+    if { [ "${RR_UPDATE_CHANNEL:-stable}" = stable ] &&
+         declare -F rr_update_guard_copy_verified_asset >/dev/null 2>&1 &&
+         rr_update_guard_copy_verified_asset manifest.sha256 "$trusted_manifest" ||
+         { [ "${RR_UPDATE_CHANNEL:-stable}" != stable ] &&
+           rr_download_file "$RR_MANIFEST_URL" "$trusted_manifest" 3 true; }; } && \
        rr_manifest_is_valid "$trusted_manifest" && \
        cmp -s "$bundle_manifest" "$trusted_manifest"; then
         matched=true
@@ -277,11 +281,16 @@ rr_bundle_manifest_matches_trusted_source() {
 
 rr_prepare_bootstrap() {
     local target_file="$1"
-    rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true && \
+    { [ "${RR_UPDATE_CHANNEL:-stable}" = stable ] &&
+      declare -F rr_update_guard_copy_verified_asset >/dev/null 2>&1 &&
+      rr_update_guard_copy_verified_asset install.sh "$target_file" ||
+      { [ "${RR_UPDATE_CHANNEL:-stable}" != stable ] &&
+        rr_download_file "$RR_BOOTSTRAP_URL" "$target_file" 10 true; }; } && \
         [ -s "$target_file" ] && \
+        [ "$(stat -c %s "$target_file" 2>/dev/null || echo 0)" -le 262144 ] && \
         bash -n "$target_file" 2>/dev/null && \
         grep -q '^RR_BOOTSTRAP_VERSION=' "$target_file" && \
-        grep -q 'Xiaowu7z/RR-vps' "$target_file"
+        grep -Fq 'RR_REPOSITORY="Xiaowu7z/RR-vps"' "$target_file"
 }
 
 # H16/T12：健康自愈失败不得静默——写 /var/log/rr-health.log + syslog（logger）。
@@ -630,7 +639,11 @@ rr_run_post_update_finalize() {
     UPDATE_CHECK_ERROR=""
     SCRIPT_VER_STATUS="${YELLOW}检查失败（网络不可用）${RESET}"
     remote_manifest=$(mktemp /tmp/rr-manifest-check.XXXXXX) || return 0
-    if ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3 true; then
+    if { [ "${RR_UPDATE_CHANNEL:-stable}" = stable ] &&
+         { ! declare -F rr_update_guard_copy_verified_asset >/dev/null 2>&1 ||
+           ! rr_update_guard_copy_verified_asset manifest.sha256 "$remote_manifest"; }; } ||
+       { [ "${RR_UPDATE_CHANNEL:-stable}" != stable ] &&
+         ! rr_download_file "$RR_MANIFEST_URL" "$remote_manifest" 3 true; }; then
         UPDATE_CHECK_ERROR="GitHub Raw、API 与 CDN 均不可达"
         SCRIPT_VER_STATUS="${YELLOW}检查失败（下载链路不可用）${RESET}"
         rm -f "$remote_manifest"
@@ -704,14 +717,24 @@ post_update_migrate() {
     migrate_config_schema || return 1
     load_config_with_defaults || return 1
     if [ "${NAIVE_ENABLED:-false}" = true ]; then
-        # Replace the legacy inline certbot hook during hot update.  The 7.1
-        # hook only accepts the configured Naive lineage and cannot copy an
-        # unrelated certificate renewed in the same certbot run.
-        if [ "${RR_PORTABLE_RESTORE:-0}" = 1 ]; then
-            ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || return 1
-        else
-            deploy_naive_cert_hook || return 1
-        fi
+        local singbox_service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
+        # A certificate pair is published with a durable marker between its
+        # two renames.  Upgrade an older RR unit to the exact ExecStartPre
+        # gate before the first possible marker/rename, then prove systemd's
+        # compiled view.  Without an existing safely replaceable RR unit the
+        # migration must not expose a crash window on certificate bytes.
+        [ -f "$singbox_service_file" ] && [ ! -L "$singbox_service_file" ] || {
+            printf '%s\n' \
+                '[安全拒绝] Naive 证书发布前无法确认 RR Sing-box 单元；未改动证书。' >&2
+            return 1
+        }
+        ensure_singbox_service_guards || return 1
+        rr_singbox_service_guards_are_effective || return 1
+        # Every transactional update, not only portable restore, must prove
+        # the live pair, structural Certbot lineage and renewal runtime before
+        # copying the pair or installing the current deploy hook.  This keeps
+        # the ordinary update path from blessing a stale hand-copied leaf.
+        ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || return 1
     fi
 
     # A failed first-install candidate intentionally contains empty keys and
@@ -752,7 +775,7 @@ post_update_migrate() {
             setup_systemd || return 1
             generate_node_and_sub || return 1
         else
-            ensure_singbox_service_guards
+            ensure_singbox_service_guards || return 1
             sync_runtime_state || return 1
         fi
     else
@@ -776,28 +799,54 @@ post_update_migrate() {
         start_argo_tunnel >/dev/null 2>&1 || return 1
     elif [ "$update_tx" = 1 ] && [ "$argo_was_running" != true ]; then
         if [ "${TUNNEL_MODE:-1}" = 2 ]; then
-            systemctl stop cloudflared >/dev/null 2>&1 || true
+            # The pre-transaction inactive snapshot is not ownership proof at
+            # this later action point: an administrator may have replaced the
+            # unit while migration was running.  Preserve absent, legacy,
+            # third-party or otherwise unproved services without a stop.
+            if rr_fixed_argo_service_is_owned; then
+                systemctl stop cloudflared >/dev/null 2>&1 || true
+            fi
         else
             stop_quick_argo_tunnel
         fi
     fi
-    if any_node_protocol_enabled && { [ "$update_tx" != 1 ] || [ "$health_timer_was_enabled" = true ]; }; then
-        setup_health_monitor >/dev/null 2>&1 || true
-    elif [ "$update_tx" = 1 ]; then
-        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
-    elif ! any_node_protocol_enabled; then
-        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || true
+    if any_node_protocol_enabled && \
+       { [ "$update_tx" != 1 ] || [ "$health_timer_was_enabled" = true ]; }; then
+        setup_health_monitor >/dev/null 2>&1 || return 1
+        rr_health_monitor_units_are_current || return 1
+    elif any_node_protocol_enabled; then
+        # Preserve an intentionally disabled timer, but still replace both
+        # unit definitions and prove the compiled candidate.  Otherwise an old
+        # active/enabled timer can make a half-written candidate look healthy,
+        # or a later manual enable can revive stale writer semantics.
+        write_health_monitor_units || return 1
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        rr_health_monitor_unit_definitions_are_current || return 1
+        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || return 1
+        [ "$(systemctl show --property=ActiveState --value \
+            argo-rr-health.timer 2>/dev/null)" = inactive ] || return 1
+        [ "$(systemctl show --property=UnitFileState --value \
+            argo-rr-health.timer 2>/dev/null)" = disabled ] || return 1
+    else
+        write_health_monitor_units || return 1
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        rr_health_monitor_unit_definitions_are_current || return 1
+        systemctl disable --now argo-rr-health.timer >/dev/null 2>&1 || return 1
+        [ "$(systemctl show --property=ActiveState --value \
+            argo-rr-health.timer 2>/dev/null)" = inactive ] || return 1
+        [ "$(systemctl show --property=UnitFileState --value \
+            argo-rr-health.timer 2>/dev/null)" = disabled ] || return 1
     fi
     if [ -f "$NEXUS_SERVICE_FILE" ]; then
         nexus_install_dependencies || return 1
         nexus_migrate_runtime_config || return 1
         nexus_reconcile_public_proxy || return 1
         nexus_enable_traffic_engine || return 1
-        ensure_nexus_service_guards
+        ensure_nexus_service_guards || return 1
         RR_NEXUS_CONFIG="$NEXUS_CONFIG_FILE" python3 "$NEXUS_APP" --check || return 1
         systemctl daemon-reload >/dev/null 2>&1 || return 1
         if [ "$update_tx" != 1 ] || [ "$nexus_was_running" = true ]; then
-            systemctl restart rr-nexus >/dev/null 2>&1 || return 1
+            nexus_systemctl_restart_checked >/dev/null 2>&1 || return 1
         else
             systemctl stop rr-nexus >/dev/null 2>&1 || true
         fi
@@ -849,27 +898,291 @@ PY
     return 0
 }
 
+RR_CERT_RELOAD_PENDING_FORMAT="rr-certificate-consumer-pending-v1"
+
+rr_certificate_reload_directory_is_exact() {
+    local directory="$1" logical="" resolved=""
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    logical=$(realpath -ms -- "$directory" 2>/dev/null) || return 1
+    resolved=$(readlink -e -- "$directory" 2>/dev/null) || return 1
+    [ "$directory" = "$logical" ] && [ "$logical" = "$resolved" ] || return 1
+    [ "$(stat -c '%u:%g:%a' -- "$directory" 2>/dev/null)" = 0:0:700 ]
+}
+
+rr_certificate_reload_marker_read() {
+    local marker="$1" expected_consumer="$2" size=""
+    local -a lines=()
+    case "$expected_consumer" in naive|subscription|nexus) ;; *) return 1 ;; esac
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    size=$(stat -c '%s' -- "$marker" 2>/dev/null) || return 1
+    [ "$size" -gt 0 ] && [ "$size" -le 1024 ] || return 1
+    [ "$(stat -c '%u:%g:%a:%h' -- "$marker" 2>/dev/null)" = 0:0:600:1 ] || \
+        return 1
+    mapfile -t lines < "$marker" || return 1
+    [ "${#lines[@]}" -eq 8 ] || return 1
+    [ "${lines[0]}" = "format=${RR_CERT_RELOAD_PENDING_FORMAT}" ] || return 1
+    [ "${lines[1]}" = "consumer=${expected_consumer}" ] || return 1
+    RR_CERT_RELOAD_MARKER_CONSUMER="${lines[1]#consumer=}"
+    RR_CERT_RELOAD_MARKER_DOMAIN="${lines[2]#domain=}"
+    RR_CERT_RELOAD_MARKER_PORT="${lines[3]#port=}"
+    RR_CERT_RELOAD_MARKER_GENERATION="${lines[4]#generation_sha256=}"
+    RR_CERT_RELOAD_MARKER_CERT_SHA256="${lines[5]#cert_sha256=}"
+    RR_CERT_RELOAD_MARKER_KEY_SHA256="${lines[6]#key_sha256=}"
+    RR_CERT_RELOAD_MARKER_FULLCHAIN_SHA256="${lines[7]#fullchain_sha256=}"
+    [ "${lines[2]}" = "domain=${RR_CERT_RELOAD_MARKER_DOMAIN}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] || return 1
+    [ "${lines[3]}" = "port=${RR_CERT_RELOAD_MARKER_PORT}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && \
+        [ "$RR_CERT_RELOAD_MARKER_PORT" -le 65535 ] || return 1
+    [ "${lines[4]}" = "generation_sha256=${RR_CERT_RELOAD_MARKER_GENERATION}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_GENERATION" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [ "${lines[5]}" = "cert_sha256=${RR_CERT_RELOAD_MARKER_CERT_SHA256}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_CERT_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [ "${lines[6]}" = "key_sha256=${RR_CERT_RELOAD_MARKER_KEY_SHA256}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [ "${lines[7]}" = "fullchain_sha256=${RR_CERT_RELOAD_MARKER_FULLCHAIN_SHA256}" ] && \
+        [[ "$RR_CERT_RELOAD_MARKER_FULLCHAIN_SHA256" =~ ^[0-9a-f]{64}$ ]]
+}
+
+rr_certificate_reload_generation_read() {
+    local lineage="$1" cert_path="" key_path="" fullchain_path=""
+    cert_path=$(readlink -f -- "$lineage/cert.pem" 2>/dev/null) || return 1
+    key_path=$(readlink -f -- "$lineage/privkey.pem" 2>/dev/null) || return 1
+    fullchain_path=$(readlink -f -- "$lineage/fullchain.pem" 2>/dev/null) || return 1
+    RR_CERT_RELOAD_CURRENT_CERT_SHA256=$(sha256sum -- "$lineage/cert.pem" | awk '{print $1}') || return 1
+    RR_CERT_RELOAD_CURRENT_KEY_SHA256=$(sha256sum -- "$lineage/privkey.pem" | awk '{print $1}') || return 1
+    RR_CERT_RELOAD_CURRENT_FULLCHAIN_SHA256=$(sha256sum -- "$lineage/fullchain.pem" | awk '{print $1}') || return 1
+    [[ "$RR_CERT_RELOAD_CURRENT_CERT_SHA256" =~ ^[0-9a-f]{64}$ ]] && \
+        [[ "$RR_CERT_RELOAD_CURRENT_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] && \
+        [[ "$RR_CERT_RELOAD_CURRENT_FULLCHAIN_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+        return 1
+    RR_CERT_RELOAD_CURRENT_GENERATION=$(
+        printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+            "$cert_path" "$key_path" "$fullchain_path" \
+            "$RR_CERT_RELOAD_CURRENT_CERT_SHA256" \
+            "$RR_CERT_RELOAD_CURRENT_KEY_SHA256" \
+            "$RR_CERT_RELOAD_CURRENT_FULLCHAIN_SHA256" | \
+            sha256sum | awk '{print $1}'
+    ) || return 1
+    [[ "$RR_CERT_RELOAD_CURRENT_GENERATION" =~ ^[0-9a-f]{64}$ ]]
+}
+
+rr_certificate_reload_marker_matches_lineage() {
+    local lineage="$1" expected_generation="$RR_CERT_RELOAD_MARKER_GENERATION"
+    local expected_cert="$RR_CERT_RELOAD_MARKER_CERT_SHA256"
+    local expected_key="$RR_CERT_RELOAD_MARKER_KEY_SHA256"
+    local expected_fullchain="$RR_CERT_RELOAD_MARKER_FULLCHAIN_SHA256"
+    rr_certificate_reload_generation_read "$lineage" || return 1
+    [ "$RR_CERT_RELOAD_CURRENT_GENERATION" = "$expected_generation" ] && \
+        [ "$RR_CERT_RELOAD_CURRENT_CERT_SHA256" = "$expected_cert" ] && \
+        [ "$RR_CERT_RELOAD_CURRENT_KEY_SHA256" = "$expected_key" ] && \
+        [ "$RR_CERT_RELOAD_CURRENT_FULLCHAIN_SHA256" = "$expected_fullchain" ]
+}
+
+rr_certificate_reload_tls_is_current() {
+    local consumer="$1" domain="$2" port="$3" certificate="$4"
+    local expected_leaf="" served_leaf="" response="" endpoint=""
+    if [ -n "${RR_CERT_RELOAD_TEST_PROBE:-}" ]; then
+        [ -x "$RR_CERT_RELOAD_TEST_PROBE" ] || return 1
+        "$RR_CERT_RELOAD_TEST_PROBE" "$consumer" "$domain" "$port" "$certificate"
+        return $?
+    fi
+    command -v timeout >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 || \
+        return 1
+    expected_leaf=$(openssl x509 -in "$certificate" -outform DER 2>/dev/null | \
+        sha256sum | awk '{print $1}') || return 1
+    [[ "$expected_leaf" =~ ^[0-9a-f]{64}$ ]] || return 1
+    for endpoint in "127.0.0.1:${port}" "[::1]:${port}"; do
+        response=$(timeout --kill-after=2 8 openssl s_client -connect "$endpoint" \
+            -servername "$domain" -showcerts </dev/null 2>/dev/null) || continue
+        served_leaf=$(printf '%s\n' "$response" | openssl x509 -outform DER \
+            2>/dev/null | sha256sum | awk '{print $1}') || continue
+        [ "$served_leaf" = "$expected_leaf" ] && return 0
+    done
+    return 1
+}
+
+rr_certificate_reload_clear_exact_marker() {
+    local marker="$1" consumer="$2" expected_sha="$3" directory=""
+    rr_certificate_reload_marker_read "$marker" "$consumer" || return 1
+    [ "$(sha256sum -- "$marker" 2>/dev/null | awk '{print $1}')" = \
+        "$expected_sha" ] || return 1
+    directory=$(dirname -- "$marker") || return 1
+    rr_certificate_reload_directory_is_exact "$directory" || return 1
+    rm -f -- "$marker" || return 1
+    sync -f "$directory" || return 1
+    [ ! -e "$marker" ] && [ ! -L "$marker" ]
+}
+
+rr_certificate_reload_retry_naive() {
+    local domain="$1" port="$2" lineage="$3"
+    local target_dir="${RR_NAIVE_CERT_DIR:-/etc/rr-naive}"
+    [ "${NAIVE_ENABLED:-false}" = true ] && \
+        [ "${NAIVE_DOMAIN:-}" = "$domain" ] && \
+        [ "${NAIVE_PORT:-}" = "$port" ] || return 1
+    [ "$(sha256sum -- "$target_dir/fullchain.pem" 2>/dev/null | awk '{print $1}')" = \
+        "$RR_CERT_RELOAD_MARKER_FULLCHAIN_SHA256" ] && \
+        [ "$(sha256sum -- "$target_dir/privkey.pem" 2>/dev/null | awk '{print $1}')" = \
+        "$RR_CERT_RELOAD_MARKER_KEY_SHA256" ] || return 1
+    restart_singbox >/dev/null 2>&1 || return 1
+    managed_singbox_running || return 1
+    rr_certificate_reload_tls_is_current naive "$domain" "$port" \
+        "$lineage/cert.pem"
+}
+
+rr_certificate_reload_retry_subscription() {
+    local domain="$1" port="$2" lineage="$3" sub_pid=""
+    [ "${SUB_ACCESS_MODE:-local}" = https ] && \
+        [ "${SUB_DOMAIN:-}" = "$domain" ] && [ "${SUB_PORT:-}" = "$port" ] || \
+        return 1
+    [ -x "$RR_LAUNCHER" ] || return 1
+    "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1 || return 1
+    [ -f "$SUB_PID_FILE" ] && sub_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
+    is_subscription_pid "$sub_pid" || return 1
+    rr_certificate_reload_tls_is_current subscription "$domain" "$port" \
+        "$lineage/cert.pem"
+}
+
+rr_certificate_reload_retry_nexus() {
+    local domain="$1" port="$2" lineage="$3" config="${NEXUS_CONFIG_FILE:-/etc/rr-nexus/nexus.json}"
+    local mode="" current_domain="" current_port=""
+    local nginx_bin="${RR_CERT_RELOAD_NGINX_BIN:-nginx}"
+    local systemctl_bin="${RR_CERT_RELOAD_SYSTEMCTL_BIN:-systemctl}"
+    [ -f "$config" ] && [ ! -L "$config" ] || return 1
+    mode=$(jq -er '.mode' "$config" 2>/dev/null) || return 1
+    current_domain=$(jq -er '.domain' "$config" 2>/dev/null) || return 1
+    current_port=$(jq -er '.public_port | tostring' "$config" 2>/dev/null) || return 1
+    [ "$mode" = public ] && [ "$current_domain" = "$domain" ] && \
+        [ "$current_port" = "$port" ] || return 1
+    "$nginx_bin" -t >/dev/null 2>&1 || return 1
+    "$systemctl_bin" reload nginx >/dev/null 2>&1 || return 1
+    "$systemctl_bin" is-active --quiet nginx >/dev/null 2>&1 || return 1
+    rr_certificate_reload_tls_is_current nexus "$domain" "$port" \
+        "$lineage/cert.pem"
+}
+
+rr_certificate_reload_retry_one() {
+    local consumer="$1" marker="$2" marker_sha="" domain="" port=""
+    local lineage="" retry_function=""
+    rr_certificate_reload_marker_read "$marker" "$consumer" || return 1
+    marker_sha=$(sha256sum -- "$marker" 2>/dev/null | awk '{print $1}') || return 1
+    [[ "$marker_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    domain="$RR_CERT_RELOAD_MARKER_DOMAIN"
+    port="$RR_CERT_RELOAD_MARKER_PORT"
+    lineage="${RR_LE_LIVE_ROOT:-/etc/letsencrypt/live}/${domain}"
+    rr_certificate_reload_marker_matches_lineage "$lineage" || return 1
+    case "$consumer" in
+        naive) retry_function=rr_certificate_reload_retry_naive ;;
+        subscription) retry_function=rr_certificate_reload_retry_subscription ;;
+        nexus) retry_function=rr_certificate_reload_retry_nexus ;;
+        *) return 1 ;;
+    esac
+    "$retry_function" "$domain" "$port" "$lineage" || return 1
+    rr_certificate_reload_clear_exact_marker "$marker" "$consumer" "$marker_sha"
+}
+
+rr_retry_certificate_reload_pending() {
+    local directory="${RR_CERT_RELOAD_PENDING_DIR:-/var/lib/rr-vps/cert-reload-pending}"
+    local consumer="" marker="" entry="" failed=false
+    local dotglob_was_set=false nullglob_was_set=false
+    local -a entries=()
+    if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+        return 0
+    fi
+    if ! rr_certificate_reload_directory_is_exact "$directory"; then
+        rr_health_log '证书 consumer reload pending 目录不可信；拒绝读取或补偿'
+        return 1
+    fi
+    for consumer in naive subscription nexus; do
+        marker="$directory/${consumer}.pending"
+        [ -e "$marker" ] || [ -L "$marker" ] || continue
+        if ! rr_certificate_reload_retry_one "$consumer" "$marker"; then
+            rr_health_log \
+                "${consumer} 新证书 reload pending 补偿失败或证据不可信；marker 已保留"
+            failed=true
+        fi
+    done
+    shopt -q dotglob && dotglob_was_set=true
+    shopt -q nullglob && nullglob_was_set=true
+    shopt -s dotglob nullglob
+    entries=("$directory"/*)
+    [ "$dotglob_was_set" = true ] || shopt -u dotglob
+    [ "$nullglob_was_set" = true ] || shopt -u nullglob
+    for entry in "${entries[@]}"; do
+        case "$entry" in
+            "$directory/naive.pending"|"$directory/subscription.pending"|\
+            "$directory/nexus.pending") ;;
+            *)
+                rr_health_log '证书 reload pending 目录含未知条目；未触碰且健康检查失败'
+                failed=true
+                ;;
+        esac
+    done
+    [ "$failed" = false ]
+}
+
 ensure_runtime_health() {
+    local rr_health_has_main_config=false
+    local rr_health_main_config_failed=false
+    local rr_health_pending_failed=false
     [ "$HEALTH_CHECK_DONE" = false ] || return 0
-    HEALTH_CHECK_DONE=true
+    if rr_firewall_fail_closed_quarantine_active; then
+        rr_health_log \
+            '防火墙隔离尚未经精确修复；健康检查拒绝重启任何公网运行面'
+        return 1
+    fi
     if ! rr_finalize_committed_firewall health; then
         rr_health_log "已提交更新的订阅防火墙待收敛失败；保留事务证据且未回滚，请运行 rr doctor"
         return 1
     fi
-    [ -f "$CONFIG_FILE" ] || return 0
-    migrate_config_schema >/dev/null 2>&1 || return 0
-    load_config_with_defaults || return 0
+    if [ -f "$CONFIG_FILE" ]; then
+        if migrate_config_schema >/dev/null 2>&1 && load_config_with_defaults; then
+            rr_health_has_main_config=true
+        else
+            rr_health_main_config_failed=true
+            rr_health_log \
+                '主配置迁移或读取失败；仍继续补偿独立 Nexus 证书 pending，最终健康状态保持失败'
+        fi
+    fi
+    if [ "$rr_health_has_main_config" != true ]; then
+        # Nexus has its own exact JSON ownership boundary and can still finish
+        # a pending Nginx reload when the node/subscription config is absent or
+        # malformed.  Clear ambient values so Naive/subscription markers fail
+        # closed while the aggregate loop reaches that independent consumer.
+        NAIVE_ENABLED=false
+        NAIVE_DOMAIN=""
+        NAIVE_PORT=""
+        SUB_ACCESS_MODE=local
+        SUB_DOMAIN=""
+        SUB_PORT=""
+    fi
+    # Certbot may have durably published a new lineage while one or more
+    # consumers failed to reload it.  Retry every exact-owned marker under the
+    # same shared+legacy transaction lock as this health pass, then aggregate
+    # failures so one broken consumer never starves the others.
+    rr_retry_certificate_reload_pending || rr_health_pending_failed=true
+    if [ "$rr_health_main_config_failed" = true ] || \
+       [ "$rr_health_pending_failed" = true ]; then
+        return 1
+    fi
+    [ "$rr_health_has_main_config" = true ] || return 0
     # 首次安装尚未完成时不介入，避免定时器与安装向导争抢端口或隧道。
     # (T10 C 系发现：迁移后的活节点机器 INSTALL_COMPLETE=false 但节点启用，
     #  健康定时器必须介入，否则该机器无自动恢复；仅"无节点协议"时保持旁路)
-    [ "$INSTALL_COMPLETE" = "true" ] || ! any_node_protocol_enabled || return 0
-    if ! any_node_protocol_enabled; then
-        managed_singbox_running && stop_singbox_instances >/dev/null 2>&1 || true
+    if [ "$INSTALL_COMPLETE" != true ] && ! any_node_protocol_enabled; then
+        HEALTH_CHECK_DONE=true
         return 0
     fi
-    ensure_singbox_service_guards
+    if ! any_node_protocol_enabled; then
+        managed_singbox_running && stop_singbox_instances >/dev/null 2>&1 || true
+        HEALTH_CHECK_DONE=true
+        return 0
+    fi
+    ensure_singbox_service_guards || return 1
     # T4：为已部署机器幂等补齐 rr-nexus 单元的 StartLimit + 损坏数据库防重启。
-    [ -f "$NEXUS_SERVICE_FILE" ] && ensure_nexus_service_guards
+    if [ -f "$NEXUS_SERVICE_FILE" ]; then
+        ensure_nexus_service_guards || return 1
+    fi
 
     # H6：sing-box 单元 active 时若存在脱离 unit cgroup 的受管进程，只记录与提示
     # 绝不自动清理（可能是用户手动运行的进程，清理有风险）。
@@ -892,25 +1205,79 @@ ensure_runtime_health() {
         if ! install_singbox >/dev/null 2>&1; then
             SB_CORE_MISSING=true
             rr_health_log "Sing-box 内核缺失且自动重装失败（可能网络不可用），节点未拉起；网络恢复后执行 rr 或菜单 11→7 重试"
+            return 1
         fi
         health_core_version=$(get_singbox_version "$SINGBOX_BIN" 2>/dev/null || true)
+        if [ -z "$health_core_version" ]; then
+            SB_CORE_MISSING=true
+            rr_health_log 'Sing-box 自动重装后仍无法验证内核版本；健康检查失败'
+            return 1
+        fi
     fi
 
-    if [ "$SINGBOX_AUTO_RESTART" = "true" ] && [ -n "$health_core_version" ] && \
-       ! systemctl is-active --quiet sing-box; then
-        if "$SINGBOX_BIN" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-            restart_singbox >/dev/null 2>&1 || true
+    if ! managed_singbox_running; then
+        if [ "$SINGBOX_AUTO_RESTART" != true ]; then
+            rr_health_log '节点配置期望 Sing-box active，但自动重启已关闭且受管进程未运行'
+            return 1
+        fi
+        [ -n "$health_core_version" ] || return 1
+        if ! "$SINGBOX_BIN" check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+            rr_health_log 'Sing-box 配置自检失败；未尝试重启且健康检查失败'
+            return 1
+        fi
+        if ! restart_singbox >/dev/null 2>&1 || ! managed_singbox_running; then
+            rr_health_log 'Sing-box 重启失败或重启后未能证明受管进程 active'
+            return 1
         fi
     fi
 
     if managed_singbox_running && [ "$VM_ENABLED" != "false" ] && \
        [ "$VM_TLS_ENABLED" != "true" ] && ! expected_argo_tunnel_running; then
-        start_argo_tunnel >/dev/null 2>&1 || true
+        if ! start_argo_tunnel >/dev/null 2>&1 || \
+           ! expected_argo_tunnel_running; then
+            rr_health_log '受管 Argo 隧道启动失败或无法证明 active'
+            return 1
+        fi
     fi
 
-    if [ "$HY2_ENABLED" = "true" ] && [ -n "$HY2_HOP_PORTS" ]; then
-        install_hop_rules HY2 "$HY2_PORT" "$HY2_HOP_PORTS" >/dev/null 2>&1 || true
-    fi
+    local hop_label="" hop_enabled=false hop_port="" hop_specs=""
+    local hop_repair_status=0
+    for hop_label in HY2 TU5; do
+        case "$hop_label" in
+            HY2)
+                hop_enabled="${HY2_ENABLED:-false}"
+                hop_port="${HY2_PORT:-}"
+                hop_specs="${HY2_HOP_PORTS:-}"
+                ;;
+            TU5)
+                hop_enabled="${TU5_ENABLED:-false}"
+                hop_port="${TU5_PORT:-}"
+                hop_specs="${TU5_HOP_PORTS:-}"
+                ;;
+        esac
+        [ "$hop_enabled" = true ] && [ -n "$hop_specs" ] || continue
+        hop_repair_status=0
+        install_hop_rules "$hop_label" "$hop_port" "$hop_specs" \
+            >/dev/null 2>&1 || hop_repair_status=$?
+        case "$hop_repair_status" in
+            0) ;;
+            1)
+                rr_health_log \
+                    "${hop_label} 端口跳跃修复失败，但已证明 live 防火墙保持原态；本轮健康检查失败"
+                return 1
+                ;;
+            2)
+                rr_health_log \
+                    "${hop_label} 端口跳跃修复后的防火墙状态不确定；Sing-box 已停止并验证 inactive"
+                return 1
+                ;;
+            3|*)
+                rr_health_log \
+                    "紧急：${hop_label} 端口跳跃修复状态不确定，且无法验证 Sing-box 已停止"
+                return 1
+                ;;
+        esac
+    done
 
     # 设备到期和额度状态可能在无人操作时变化；定时同步只会在用户列表
     # 实际变化时重启 Sing-box，平时不会打断在线节点。
@@ -919,7 +1286,11 @@ ensure_runtime_health() {
        [ -f "${NEXUS_DB_FILE:-/nonexistent}" ]; then
         # timeout can only exec a program; a non-exported Bash function exits
         # 127 without doing any work.  Re-enter through the supported CLI.
-        timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-devices >/dev/null 2>&1 || true
+        if ! timeout --kill-after=5 150 "$RR_LAUNCHER" \
+            --sync-devices >/dev/null 2>&1; then
+            rr_health_log '设备到期与额度同步失败；健康检查未报告成功'
+            return 1
+        fi
     fi
 
     local sub_pid=""
@@ -929,8 +1300,22 @@ ensure_runtime_health() {
        [ ! -s "${SUB_ROOT}/${UUID}/client.json" ]; then
         # 订阅自愈加超时保护：重建含公网入口探测，网络异常时不能拖垮
         # 整个健康检查链（此前实测一次网络抖动把链条卡住导致订阅迟迟未拉起）。
-        timeout --kill-after=5 150 "$RR_LAUNCHER" --sync-subscriptions >/dev/null 2>&1 || true
+        if ! command -v timeout >/dev/null 2>&1 || [ ! -x "$RR_LAUNCHER" ] || \
+           ! timeout --kill-after=5 150 "$RR_LAUNCHER" \
+                --sync-subscriptions >/dev/null 2>&1; then
+            rr_health_log '订阅 PID 或必需产物缺失，且有界同步失败'
+            return 1
+        fi
+        sub_pid=""
+        [ -f "$SUB_PID_FILE" ] && sub_pid=$(cat "$SUB_PID_FILE" 2>/dev/null)
+        if ! is_subscription_pid "$sub_pid" || \
+           [ ! -s "${SUB_ROOT}/${UUID}/jhsub.txt" ] || \
+           [ ! -s "${SUB_ROOT}/${UUID}/client.json" ]; then
+            rr_health_log '订阅同步命令返回成功，但 PID 或必需产物复核仍失败'
+            return 1
+        fi
     fi
+    HEALTH_CHECK_DONE=true
     return 0
 }
 

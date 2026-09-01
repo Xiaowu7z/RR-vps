@@ -211,15 +211,15 @@
         <article class="access-mode-panel glass">
           <div class="access-heading"><div><span class="eyebrow">ACCESS MODE</span><h3>面板访问模式</h3><p>面板进程始终只监听服务器回环地址，不把 7900 直接暴露到公网。</p></div><span id="security-current-mode" class="current-mode">当前：本地模式</span></div>
           <div class="mode-cards">
-            <div id="local-mode-card" class="mode-card active"><div class="mode-card-top"><span class="mode-symbol">⌁</span><span class="recommended">推荐</span></div><h4>本地隧道</h4><p>在自己的电脑建立 SSH 隧道，再访问 127.0.0.1:7900。</p><span class="mode-feature">✓ 不开放管理端口</span><span class="mode-feature">✓ 适合个人管理</span></div>
-            <div id="public-mode-card" class="mode-card"><div class="mode-card-top"><span class="mode-symbol">◎</span><span class="mode-tag">HTTPS</span></div><h4>公网域名</h4><p>通过 Nginx 与 Let's Encrypt 证书提供 HTTPS 入口。</p><span class="mode-feature">✓ 域名证书保护</span><span class="mode-feature">✓ 适合多地点管理</span></div>
+            <div id="local-mode-card" class="mode-card active"><div class="mode-card-top"><span class="mode-symbol">⌁</span><span class="recommended">推荐</span></div><h4>本地隧道</h4><p>在自己的电脑建立 SSH 隧道，再访问页面生成的 127.0.0.1 本地地址。</p><span class="mode-feature">✓ 不开放管理端口</span><span class="mode-feature">✓ 适合个人管理</span></div>
+            <div id="public-mode-card" class="mode-card"><div class="mode-card-top"><span class="mode-symbol">◎</span><span class="mode-tag">HTTPS</span></div><h4>公网 HTTPS</h4><p>使用可信域名证书，或 Let's Encrypt 公网 IP 短期证书提供 HTTPS 入口。</p><span class="mode-feature">✓ 可信证书保护</span><span class="mode-feature">✓ 适合多地点管理</span></div>
           </div>
           <div id="ssh-guide" class="ssh-guide">
             <div class="guide-title"><span class="step-number">1</span><div><b>在你自己的电脑打开终端</b><small>Windows 打开 PowerShell；macOS / Linux 打开“终端”。不要在 VPS 当前窗口执行。</small></div></div>
             <div class="command-box"><code id="ssh-command">正在生成 SSH 命令…</code><button id="copy-ssh-command" class="copy-button">复制命令</button></div>
             <div class="guide-steps"><div><span class="step-number">2</span><p><b>核对指纹并登录</b><small>首次连接先与 VPS 控制台显示的 SSH 主机指纹核对，确认后再输入 root 密码；不要关闭主机密钥校验。</small></p></div><div><span class="step-number">3</span><p><b>保持终端窗口不要关闭</b><small>隧道成功后终端通常保持空白。命令每 30 秒发送保活探测，连续 6 次无响应才退出；打开 <a id="local-panel-link" href="http://127.0.0.1:7900" target="_blank" rel="noopener">http://127.0.0.1:7900</a>，用完按 Ctrl+C。</small></p></div></div>
           </div>
-          <div id="public-guide" class="public-guide hidden"><b>公网面板地址</b><a id="public-panel-link" href="#" target="_blank" rel="noopener">尚未配置域名</a><small>证书、域名和模式切换请在服务器终端运行 <code>rr</code>，进入 RR Nexus 菜单操作。</small></div>
+          <div id="public-guide" class="public-guide hidden"><b>公网面板地址</b><a id="public-panel-link" href="#" target="_blank" rel="noopener">尚未配置可信公网入口</a><small>证书、域名、公网 IP 和模式切换请在服务器终端运行 <code>rr</code>，进入 RR Nexus 菜单操作。</small></div>
         </article>
         <div class="settings-grid">
           <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">◈</span><div><small>MANAGEMENT</small><h3>管理身份安全</h3></div></div><div class="setting-row"><span><b>密码存储</b><small>Argon2id 不可逆哈希</small></span><em class="safe">已保护</em></div><div class="setting-row"><span><b>会话策略</b><small>当前 Origin/标签页 sessionStorage Bearer · 12 小时</small></span><em>隔离</em></div><div class="setting-row"><span><b>登录保护</b><small>5 次失败后限流 30 分钟</small></span><em class="safe">开启</em></div></article>
@@ -230,7 +230,7 @@
           <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⌗</span><div><small>RECOVERY</small><h3>运行与恢复</h3></div></div><div class="setting-row"><span><b>恢复码</b><small>8 个一次性离线恢复码</small></span><em>一次性</em></div><div class="setting-row"><span><b>配置同步</b><small>失败会写入审计，需重试同步</small></span><em>后台</em></div><div class="setting-row"><span><b>服务守护</b><small>rr-nexus 失败自动重启</small></span><em class="safe">开启</em></div></article>
           <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">✓</span><div><small>HEALTH</small><h3>健康与可用性</h3></div></div><div class="setting-row"><span><b>节点核心</b><small id="security-core-note">等待服务状态</small></span><em id="security-core-state">检测中</em></div><div class="setting-row"><span><b>统计通道</b><small id="security-stats-note">等待实时采集</small></span><em id="security-stats-state">检测中</em></div><div class="setting-row"><span><b>管理面板</b><small>仅回环监听</small></span><em class="safe">在线</em></div></article>
           <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">≋</span><div><small>PRIVACY</small><h3>隐私与审计</h3></div></div><div class="setting-row"><span><b>操作审计</b><small>登录、创建、修改、删除</small></span><em class="safe">记录</em></div><div class="setting-row"><span><b>订阅目录</b><small>服务端权限 0700</small></span><em>私有</em></div><div class="setting-row"><span><b>数据库</b><small>本机 SQLite · 权限 0600</small></span><em>本地</em></div></article>
-          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⛁</span><div><small>MULTI-SERVER</small><h3>远程钥匙（多服务器管理）</h3></div></div><div class="setting-row"><span><b>签发状态</b><small id="rs-key-state-note">仅公网证书（域名 + Let's Encrypt）面板可签发</small></span><em id="rs-key-state">检测中</em></div><div id="rs-key-box-wrap" class="hidden"><div class="rs-keybox"><span class="rs-keybox-tag">接入钥匙 · 发给主面板管理员</span><code id="rs-key-text"></code></div><div class="toolbar-actions"><button class="button ghost" id="rs-key-copy">📋 复制钥匙</button><button class="button danger ghost" id="rs-key-revoke">🗑 吊销全部并重新生成</button></div></div><div class="toolbar-actions"><button class="button primary" id="rs-key-issue">＋ 生成接入钥匙</button></div><p class="form-hint">安全说明：钥匙由本面板 256 位密钥签发（HMAC-SHA256 防伪），主面板只能持用、无法伪造；篡改立即失效；远程操作写入审计日志；同一来源 30 分钟内验证失败达到 10 次后会被限流。</p></article>
+          <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⛁</span><div><small>MULTI-SERVER</small><h3>远程钥匙（多服务器管理）</h3></div></div><div class="setting-row"><span><b>签发状态</b><small id="rs-key-state-note">仅可信公网证书（域名或公网 IP ACME）面板可签发</small></span><em id="rs-key-state">检测中</em></div><div id="rs-key-box-wrap" class="hidden"><div class="rs-keybox"><span class="rs-keybox-tag">接入钥匙 · 发给主面板管理员</span><code id="rs-key-text"></code></div><div class="toolbar-actions"><button class="button ghost" id="rs-key-copy">📋 复制钥匙</button><button class="button danger ghost" id="rs-key-revoke">🗑 吊销全部并重新生成</button></div></div><div class="toolbar-actions"><button class="button primary" id="rs-key-issue">＋ 生成接入钥匙</button></div><p class="form-hint">安全说明：钥匙由本面板 256 位密钥签发（HMAC-SHA256 防伪），主面板只能持用、无法伪造；篡改立即失效；远程操作写入审计日志；同一来源 30 分钟内验证失败达到 10 次后会被限流。</p></article>
           <article class="settings-group glass"><div class="settings-head"><span class="settings-icon">⇩</span><div><small>SCRIPT UPDATE</small><h3>脚本更新</h3></div></div><div class="setting-row"><span><b>当前版本</b><small>主面板脚本</small></span><em id="local-ver">检测中</em></div><label>更新通道<select id="update-channel"><option value="stable">Stable 正式版</option><option value="beta">Beta 测试版</option></select></label><div class="setting-row"><span><b>更新方式</b><small>预检 → 双层校验 → 原子切换 → 健康门禁 → 回滚尝试</small></span><em class="safe">事务式</em></div><div id="local-update-box" class="rs-update-box hidden"></div><div class="toolbar-actions"><button class="button ghost" id="local-update-btn">🔄 检查更新</button><button class="button primary" id="local-update-run-btn">⬆ 一键升级</button></div><p class="form-hint">门禁失败会自动尝试恢复；若恢复不完整，系统保留事务证据并提示运行恢复命令。</p></article>
         </div>
         <button id="change-password-button" class="button secondary">修改密码</button>
@@ -352,7 +352,7 @@
   <dialog id="links-dialog" class="modal links-modal glass">
     <div class="modal-head"><div><span class="eyebrow">PRIVATE SHARE</span><h2 id="links-title">设备连接信息</h2></div><button type="button" class="close-button" data-close-links>×</button></div>
     <div id="links-status" class="links-status"></div>
-    <div id="subscription-box" class="subscription-box hidden"><small>独立订阅地址（按客户端工具选择）</small><div id="subscription-urls"></div></div>
+    <div id="subscription-box" class="subscription-box hidden"><small>独立订阅地址（按客户端工具选择）</small><p id="subscription-empty" class="form-hint hidden" role="status">当前没有可用的个人订阅地址。请在服务器运行 rr，检查订阅入口与证书；公网 IP 模式还必须确保 TCP/80 可从公网访问，以便签发和续期短期证书。</p><div id="subscription-urls"></div></div>
     <div id="links-list" class="links-list"></div>
   </dialog>
 
@@ -380,7 +380,7 @@
   </form></dialog>
 
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=26" defer></script>
+  <script src="/app.js?v=27" defer></script>
   <script src="/admin.js?v=4" defer></script>
   <script src="/optimizer.js?v=11" defer></script>
 

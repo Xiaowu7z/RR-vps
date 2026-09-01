@@ -90,6 +90,13 @@ run_restore_case() (
 
     # shellcheck source=../scripts/update-recover.sh
     source "$REPO_ROOT/scripts/update-recover.sh"
+    # IP-ACME has a dedicated authenticated snapshot/state-machine suite.
+    # Keep this fixture scoped to external-state ordering while satisfying the
+    # current rollback contract without touching host IP-ACME paths.
+    rr_ip_acme_snapshot_contract_is_safe() { return 0; }
+    rr_freeze_ip_acme_writer_if_recorded() { return 0; }
+    rr_restore_ip_acme_directories_if_recorded() { return 0; }
+    rr_ip_acme_runtime_readonly_is_ready() { return 0; }
     tx="$RR_TX_ROOT/transactions/tx"
     mkdir -p "$tx/backup"
     chmod 700 "$RR_TX_ROOT" "$RR_TX_ROOT/transactions" "$tx" "$tx/backup"

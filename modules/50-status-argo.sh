@@ -15,6 +15,23 @@ toggle_argo() {
         case "$sub" in
             1)
                 local argo_port="$PORT"
+                local old_argo_port="$PORT"
+                local old_vm_tls_enabled="$VM_TLS_ENABLED"
+                local fixed_classification=""
+                # Fixed mode shares the binary with a named system service.
+                # Classify it before any core installation or config write so
+                # a foreign service makes the whole enable path read-only.
+                if [ "${TUNNEL_MODE:-1}" = 2 ]; then
+                    fixed_classification=$(rr_fixed_argo_start_classification) || {
+                        echo -e "${RED}[安全拒绝] Cloudflared 服务归属不明，Argo/Vmess 未开启。${RESET}"
+                        sleep 2
+                        return 1
+                    }
+                    case "$fixed_classification" in
+                        absent|current|legacy) ;;
+                        *) return 1 ;;
+                    esac
+                fi
                 if ! ensure_singbox_core; then
                     echo -e "${RED}Sing-box 内核不可用，Argo/Vmess 未开启。${RESET}"
                     sleep 2
@@ -28,20 +45,44 @@ toggle_argo() {
                         return
                     fi
                 fi
-                if ! install_cloudflared; then
+                # Quick mode has no named-unit ownership to arbitrate, so it
+                # may retain the eager package check before config commit.
+                if [ "${TUNNEL_MODE:-1}" != 2 ] && ! install_cloudflared; then
                     echo -e "${RED}Cloudflared 安装失败，Argo/Vmess 未开启。${RESET}"
                     sleep 2
-                    return
+                    return 1
                 fi
                 if apply_config_transaction "开启 Argo/Vmess 节点" \
                     "PORT" "$argo_port" "VM_TLS_ENABLED" "false" "VM_ENABLED" "true"; then
                     if ! ensure_node_service_running; then
-                        apply_config_transaction "回滚未启动的 Argo/Vmess" "VM_ENABLED" "false" >/dev/null 2>&1 || true
-                        echo -e "${RED}[失败] Sing-box 服务未能启动，Argo/Vmess 已回滚为关闭。${RESET}"
+                        if ! apply_config_transaction "回滚未启动的 Argo/Vmess" \
+                            "PORT" "$old_argo_port" \
+                            "VM_TLS_ENABLED" "$old_vm_tls_enabled" \
+                            "VM_ENABLED" "false" >/dev/null 2>&1; then
+                            echo -e "${RED}[严重] Sing-box 启动失败且配置回滚失败，请立即运行 rr doctor。${RESET}"
+                        else
+                            echo -e "${RED}[失败] Sing-box 服务未能启动，Argo/Vmess 已回滚为关闭。${RESET}"
+                        fi
                         sleep 2
                         return 1
                     fi
-                    start_argo_tunnel || echo -e "${RED}[警告] Vmess 已开启，但 Argo 隧道暂未连上。${RESET}"
+                    if ! start_argo_tunnel || ! expected_argo_tunnel_running; then
+                        rr_stop_all_argo_tunnels_for_menu >/dev/null 2>&1 || true
+                        if ! apply_config_transaction "回滚未启动的 Argo/Vmess" \
+                            "PORT" "$old_argo_port" \
+                            "VM_TLS_ENABLED" "$old_vm_tls_enabled" \
+                            "VM_ENABLED" "false" >/dev/null 2>&1; then
+                            echo -e "${RED}[严重] Argo 启动失败且配置回滚失败，请立即运行 rr doctor。${RESET}"
+                        else
+                            echo -e "${RED}[失败] 无法证明受管 Argo 隧道已启动，配置已回滚。${RESET}"
+                        fi
+                        sleep 2
+                        return 1
+                    fi
+                else
+                    echo -e "${RED}[失败] Argo/Vmess 配置提交失败，未启动服务。${RESET}"
+                    sleep 2
+                    return 1
                 fi
                 sleep 2
                 ;;
@@ -56,15 +97,40 @@ toggle_argo() {
         read -p "请选择操作: " sub
         case "$sub" in
             1)
-                if apply_config_transaction "关闭 Argo/Vmess 节点" "VM_ENABLED" "false"; then
-                    if [ "${TUNNEL_MODE:-1}" = "2" ]; then
-                        systemctl stop cloudflared >/dev/null 2>&1 || true
-                    else
-                        stop_quick_argo_tunnel
-                    fi
-                    # 依赖联动：关闭 Argo 后清理优选 CNAME 残留（重开时由 worker 重新抓取）
-                    rm -f /tmp/sub_server/preferred_cnames.txt 2>/dev/null || true
+                local argo_was_running=false
+                if expected_argo_tunnel_running; then
+                    argo_was_running=true
                 fi
+                if ! rr_stop_all_argo_tunnels_for_menu; then
+                    # A stop can fail after changing runtime state.  Restore a
+                    # previously running RR tunnel while the still-true config
+                    # remains authoritative; foreign/legacy units fail before
+                    # any stop and therefore never reach this restart path.
+                    if [ "$argo_was_running" = true ] && \
+                       ! expected_argo_tunnel_running; then
+                        if ! start_argo_tunnel >/dev/null 2>&1 || \
+                           ! expected_argo_tunnel_running; then
+                            echo -e "${RED}[严重] 停止失败后无法恢复原隧道，请立即运行 rr doctor。${RESET}"
+                        fi
+                    fi
+                    echo -e "${RED}[安全拒绝] 无法证明并停止受管 Argo 隧道；配置保持开启。${RESET}"
+                    sleep 2
+                    return 1
+                fi
+                if ! apply_config_transaction \
+                    "关闭 Argo/Vmess 节点" "VM_ENABLED" "false"; then
+                    if [ "$argo_was_running" = true ]; then
+                        if ! start_argo_tunnel >/dev/null 2>&1 || \
+                           ! expected_argo_tunnel_running; then
+                            echo -e "${RED}[严重] 配置提交失败后无法恢复原隧道，请立即运行 rr doctor。${RESET}"
+                        fi
+                    fi
+                    echo -e "${RED}[失败] 关闭配置提交失败，已尝试恢复原隧道状态。${RESET}"
+                    sleep 2
+                    return 1
+                fi
+                # 依赖联动：关闭 Argo 后清理优选 CNAME 残留（重开时由 worker 重新抓取）
+                rm -f /tmp/sub_server/preferred_cnames.txt 2>/dev/null || true
                 sleep 2
                 ;;
             0) return ;;

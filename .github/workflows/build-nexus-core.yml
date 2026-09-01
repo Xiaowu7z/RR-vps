@@ -1,5 +1,14 @@
 name: Build RR Nexus traffic core
 
+env:
+  RR_NEXUS_CORE_VERSION: "1.14.0"
+  RR_NEXUS_CORE_TAG: v1.14.0
+  RR_NEXUS_CORE_SOURCE_SHA: 0b8995879f29a9b98ee027bc17b75e101445b238
+  RR_NEXUS_CORE_UPSTREAM_RELEASE_ID: "379452161"
+  RR_NEXUS_CORE_GO_VERSION: go1.25.5
+  RR_NEXUS_CORE_MIN_GO_VERSION: 1.25.0
+  RR_NEXUS_CORE_BUILD_TAGS: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_v2ray_api
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,6 +16,11 @@ on:
         description: Full main commit SHA that already passed CI
         required: true
         type: string
+      bootstrap_legacy_latest:
+        description: One-time v7.2 migration using the pinned legacy Core Latest
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "17 3 * * *"
 
@@ -25,7 +39,7 @@ jobs:
     outputs:
       builder_sha: ${{ steps.gate.outputs.builder_sha }}
     steps:
-      - name: Require the current main tip and its latest successful CI push
+      - name: Require the current main tip and its latest CI push attempt
         id: gate
         shell: bash
         env:
@@ -66,14 +80,16 @@ jobs:
           ci_runs=$(gh api --paginate --slurp \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
-            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${builder_sha}&per_page=100")
           jq -e --arg sha "$builder_sha" '
-            (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+            (map(.workflow_runs[]) |
+              map(select(.head_sha == $sha and .head_branch == "main" and .event == "push")) |
+              sort_by(.run_number, .run_attempt) | last) as $run |
             $run != null and $run.head_sha == $sha and
             $run.head_branch == "main" and $run.event == "push" and
             $run.status == "completed" and $run.conclusion == "success"
           ' <<<"$ci_runs" >/dev/null || {
-            echo "The latest successful main CI push is not for this core builder SHA." >&2
+            echo "The latest main CI attempt for this core builder SHA is not a completed success." >&2
             exit 1
           }
           main_sha=$(gh api \
@@ -108,12 +124,13 @@ jobs:
       release_tag: ${{ steps.release.outputs.release_tag }}
       needed: ${{ steps.release.outputs.needed }}
     steps:
-      - name: Resolve and validate the latest stable sing-box release
+      - name: Resolve and validate the pinned official sing-box release
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          BOOTSTRAP_LEGACY_LATEST: ${{ inputs.bootstrap_legacy_latest }}
         run: |
           set -euo pipefail
 
@@ -146,37 +163,160 @@ jobs:
             fi
           }
 
+          pinned_legacy_latest_bootstrap_allowed() {
+            local latest_json="$1" target_tag="" legacy_ref="" releases="" refs=""
+            target_tag="${TAG:-${release_tag:-}}"
+            [ "$GITHUB_REPOSITORY" = Xiaowu7z/RR-vps ] &&
+              [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] &&
+              [ "${BOOTSTRAP_LEGACY_LATEST:-false}" = true ] &&
+              [ "$RR_NEXUS_CORE_VERSION" = 1.14.0 ] &&
+              [ "$RR_NEXUS_CORE_TAG" = v1.14.0 ] &&
+              [ "$target_tag" = rr-nexus-core-v1.14.0-r1 ] || return 1
+            jq -e '
+              .id == 377802786 and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786" and
+              .assets_url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets" and
+              .upload_url == "https://uploads.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets{?name,label}" and
+              .html_url == "https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.19" and
+              .tag_name == "rr-nexus-core-v1.13.19" and
+              .target_commitish == "ad69c42e6c6f468b6c643da06e7a461de7d773f3" and
+              .name == "RR Nexus traffic core · sing-box 1.13.19" and
+              .draft == false and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              .created_at == "2026-08-27T12:25:26Z" and
+              .published_at == "2026-08-27T12:26:19Z" and
+              .body == "Built from the official SagerNet/sing-box v1.13.19 source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand." and
+              ([.assets[] | {
+                id, name, state, size, digest, url, browser_download_url,
+                uploader: .uploader.login
+              }] | sort_by(.id)) == ([
+                {id:532275339,name:"BUILD_INFO",state:"uploaded",size:185,
+                 digest:"sha256:bd5aaf67c5f45f4ce9a6065ddb5dc12cd08c50b502fdea39a9c67d5ac68bd96c",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275339",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/BUILD_INFO",
+                 uploader:"github-actions[bot]"},
+                {id:532275341,name:"rr-sing-box-1.13.19-linux-amd64.tar.gz",state:"uploaded",size:20610257,
+                 digest:"sha256:9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275341",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-amd64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275350,name:"rr-sing-box-1.13.19-linux-arm64.tar.gz",state:"uploaded",size:18978144,
+                 digest:"sha256:28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275350",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-arm64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275351,name:"SHA256SUMS",state:"uploaded",size:210,
+                 digest:"sha256:81a4d7114411705ae2af7c7b5e0bbf2c316a630558d2250a757cf6654760151b",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275351",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/SHA256SUMS",
+                 uploader:"github-actions[bot]"}
+              ] | sort_by(.id))
+            ' <<<"$latest_json" >/dev/null || return 1
+            legacy_ref=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/rr-nexus-core-v1.13.19") ||
+              return 1
+            jq -e '
+              .ref == "refs/tags/rr-nexus-core-v1.13.19" and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/git/refs/tags/rr-nexus-core-v1.13.19" and
+              .object.type == "commit" and
+              .object.sha == "ad69c42e6c6f468b6c643da06e7a461de7d773f3"
+            ' <<<"$legacy_ref" >/dev/null || return 1
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -e --argjson pinned "$latest_json" '
+              def material:
+                {
+                  id, url, assets_url, upload_url, html_url, tag_name,
+                  target_commitish, name, draft, prerelease, immutable,
+                  author: .author.login, created_at, published_at, body,
+                  assets: ([.assets[] | {
+                    id, name, state, size, digest, url, browser_download_url,
+                    uploader: .uploader.login
+                  }] | sort_by(.id))
+                };
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.tag_name | type) == "string" and
+                  (.tag_name as $tag |
+                    if ($tag | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($tag | capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)) and
+                ([$inventory[] | select((material) == ($pinned | material))] |
+                  length) == 1)
+            ' <<<"$releases" >/dev/null || return 1
+            refs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v") || return 1
+            jq -e '
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.ref | type) == "string" and
+                  (.ref as $ref |
+                    if ($ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($ref | capture("^refs/tags/v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)))
+            ' <<<"$refs" >/dev/null
+          }
+
           assert_product_latest() {
             local max_attempts="${1:-1}" attempt latest_json
             for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
-                jq -e '
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest"); then
+                if jq -e '
                   (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
                   (.target_commitish | test("^[0-9a-f]{40}$")) and
                   .draft == false and .prerelease == false and .immutable == true and
                   ([.assets[].name] | sort) ==
                   (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
                 ' <<<"$latest_json" >/dev/null; then
-                return 0
+                  return 0
+                fi
+                if pinned_legacy_latest_bootstrap_allowed "$latest_json"; then
+                  echo "::warning::Using the one-time pinned v7.2 legacy Latest bootstrap."
+                  return 0
+                fi
               fi
               [ "$attempt" -eq "$max_attempts" ] || sleep 2
             done
-            echo "Repository Latest is not an immutable complete product release." >&2
+            echo "Repository Latest is neither an immutable complete product nor the exact authorized v7.2 bootstrap release." >&2
             return 1
           }
 
-          release_json=$(api "/repos/SagerNet/sing-box/releases/latest")
-          tag=$(jq -r '.tag_name // empty' <<<"$release_json")
-          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
-            echo "Latest stable sing-box tag is not canonical SemVer: $tag" >&2
+          release_json=$(api "/repos/SagerNet/sing-box/releases/tags/${RR_NEXUS_CORE_TAG}")
+          jq -e --arg tag "$RR_NEXUS_CORE_TAG" \
+            --argjson release_id "$RR_NEXUS_CORE_UPSTREAM_RELEASE_ID" '
+            .id == $release_id and .tag_name == $tag and
+            .draft == false and .prerelease == false and .immutable == true and
+            .author.login == "github-actions[bot]" and
+            .url == ("https://api.github.com/repos/SagerNet/sing-box/releases/" +
+              ($release_id | tostring)) and
+            .html_url == ("https://github.com/SagerNet/sing-box/releases/tag/" + $tag)
+          ' <<<"$release_json" >/dev/null || {
+            echo "Pinned sing-box release identity is no longer exact and immutable." >&2
             exit 1
           }
-          version=${tag#v}
-          source_sha=$(git ls-remote https://github.com/SagerNet/sing-box.git \
-            "refs/tags/${tag}" "refs/tags/${tag}^{}" | \
-            awk '/\^\{\}$/ {print $1; found=1} !first {first=$1} END {if (!found) print first}' | tail -n 1)
-          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "Could not resolve the upstream tag to a commit." >&2
+          tag=$RR_NEXUS_CORE_TAG
+          version=$RR_NEXUS_CORE_VERSION
+          [ "$tag" = "v${version}" ] &&
+            [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+          tag_ref=$(api "/repos/SagerNet/sing-box/git/ref/tags/${tag}")
+          jq -e --arg sha "$RR_NEXUS_CORE_SOURCE_SHA" '
+            .ref == "refs/tags/v1.14.0" and
+            .object.type == "commit" and .object.sha == $sha
+          ' <<<"$tag_ref" >/dev/null || {
+            echo "Pinned official sing-box tag no longer names the audited commit." >&2
+            exit 1
+          }
+          source_ref=$(git ls-remote --tags https://github.com/SagerNet/sing-box.git \
+            "refs/tags/${tag}")
+          [ "$(wc -l <<<"$source_ref")" -eq 1 ] || exit 1
+          source_sha=$(awk -v ref="refs/tags/${tag}" '$2 == ref {print $1}' <<<"$source_ref")
+          [ "$source_sha" = "$RR_NEXUS_CORE_SOURCE_SHA" ] || {
+            echo "Official sing-box tag does not resolve to the audited source commit." >&2
             exit 1
           }
 
@@ -222,6 +362,17 @@ jobs:
           if [ "$matches" -eq 1 ]; then
             current_json=$(jq -c --arg tag "$release_tag" \
               'add | map(select(.tag_name == $tag))[0]' <<<"$releases")
+            if jq -e '
+              .draft == true and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]"
+            ' <<<"$current_json" >/dev/null; then
+              # A strict ownership check and reconciliation runs in the
+              # write-capable publish job.  This read-only resolver must let a
+              # prior run's owned partial transaction reach that gate.
+              echo "Mutable core draft found; deferring exact ownership reconciliation to publish."
+            elif jq -e '
+              .draft == false and .prerelease == false and .immutable == true
+            ' <<<"$current_json" >/dev/null; then
             expected_assets=$(jq -cn --arg version "$version" '[
               "BUILD_INFO", "SHA256SUMS",
               "rr-sing-box-\($version)-linux-amd64.tar.gz",
@@ -242,16 +393,20 @@ jobs:
             for asset in BUILD_INFO SHA256SUMS \
               "rr-sing-box-${version}-linux-amd64.tar.gz" \
               "rr-sing-box-${version}-linux-arm64.tar.gz"; do
-              curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-                --retry 6 --retry-all-errors --retry-delay 2 \
-                "https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${asset}" \
-                -o "$info_dir/$asset"
+              asset_id=$(jq -er --arg asset "$asset" '
+                [.assets[] | select(.name == $asset)] as $matches |
+                if ($matches | length) == 1 and ($matches[0].id | type) == "number"
+                then $matches[0].id else error("asset identity") end
+              ' <<<"$current_json")
+              gh api -H 'Accept: application/octet-stream' \
+                "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                >"$info_dir/$asset"
             done
             awk -F= '
               NF != 2 { exit 1 }
-              $1 !~ /^(SING_BOX_VERSION|SING_BOX_TAG|SOURCE_COMMIT|RR_BUILDER_COMMIT|RR_CORE_RELEASE|BUILD_TAG|SOURCE)$/ { exit 1 }
+              $1 !~ /^(SING_BOX_VERSION|SING_BOX_TAG|SOURCE_COMMIT|RR_BUILDER_COMMIT|RR_CORE_RELEASE|GO_VERSION|CGO_ENABLED|BUILD_TAG|BUILD_TAGS|SOURCE)$/ { exit 1 }
               seen[$1]++ { exit 1 }
-              END { if (NR != 7) exit 1 }
+              END { if (NR != 10) exit 1 }
             ' "$info_dir/BUILD_INFO"
             builder_sha=$(sed -n 's/^RR_BUILDER_COMMIT=//p' "$info_dir/BUILD_INFO")
             [[ "$builder_sha" =~ ^[0-9a-f]{40}$ ]] || {
@@ -267,21 +422,87 @@ jobs:
             grep -Fxq "SOURCE_COMMIT=${source_sha}" "$info_dir/BUILD_INFO"
             grep -Fxq "RR_BUILDER_COMMIT=${builder_sha}" "$info_dir/BUILD_INFO"
             grep -Fxq "RR_CORE_RELEASE=${release_tag}" "$info_dir/BUILD_INFO"
+            grep -Fxq "GO_VERSION=${RR_NEXUS_CORE_GO_VERSION}" "$info_dir/BUILD_INFO"
+            grep -Fxq 'CGO_ENABLED=0' "$info_dir/BUILD_INFO"
             grep -Fxq 'BUILD_TAG=with_v2ray_api' "$info_dir/BUILD_INFO"
+            grep -Fxq "BUILD_TAGS=${RR_NEXUS_CORE_BUILD_TAGS}" "$info_dir/BUILD_INFO"
             grep -Fxq "SOURCE=https://github.com/SagerNet/sing-box/tree/${tag}" "$info_dir/BUILD_INFO"
+
+            tag_refs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${release_tag}")
+            tag_refs=$(jq -ce --arg ref "refs/tags/${release_tag}" \
+              '(add // []) | map(select(.ref == $ref))' <<<"$tag_refs")
+            [ "$(jq -r 'length' <<<"$tag_refs")" -eq 1 ] &&
+              [ "$(jq -r '.[0].object.type' <<<"$tag_refs")" = tag ] || {
+              echo "Existing core release lacks its exact owned annotated tag." >&2
+              exit 1
+            }
+            tag_object_sha=$(jq -r '.[0].object.sha' <<<"$tag_refs")
+            [[ "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]
+            tag_json=$(api "/repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}")
+            owner_marker=$(jq -r '.message' <<<"$tag_json")
+            if [[ "$owner_marker" =~ ^rr-nexus-core-release-owner:v1:([^:]+):([0-9a-f]{40}):([0-9a-f]{64}):([0-9a-f]{64}):([A-Za-z0-9+/]*={0,2})$ ]]; then
+              [ "${BASH_REMATCH[1]}" = "$release_tag" ]
+              owner_commit="${BASH_REMATCH[2]}"
+              payload_sha="${BASH_REMATCH[4]}"
+              payload_b64="${BASH_REMATCH[5]}"
+            else
+              echo "Existing core tag has no canonical transaction owner marker." >&2
+              exit 1
+            fi
+            owner_payload=$(printf '%s' "$payload_b64" | base64 --decode)
+            [ "$(printf '%s' "$owner_payload" | base64 -w 0)" = "$payload_b64" ] &&
+              [ "$(printf '%s' "$owner_payload" | sha256sum | awk '{print $1}')" = "$payload_sha" ] || exit 1
+            owner_assets=$(jq -ceS '
+              if type == "array" then [.[] | {name, size, digest}] | sort_by(.name)
+              else error("asset payload") end
+            ' <<<"$owner_payload")
+            [ "$owner_assets" = "$owner_payload" ] || exit 1
+            api_assets=$(jq -ceS '[.assets[] | {name, size, digest}] | sort_by(.name)' \
+              <<<"$current_json")
+            [ "$owner_assets" = "$api_assets" ] && [ "$owner_commit" = "$builder_sha" ] || {
+              echo "Existing core owner payload does not match release assets/provenance." >&2
+              exit 1
+            }
+            expected_title="RR Nexus traffic core · sing-box ${version}"
+            expected_notes="Built from the official SagerNet/sing-box v${version} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This immutable auxiliary release is consumed only by its versioned tag and never owns repository Latest."
+            body_marker="<!-- ${owner_marker} -->"
+            jq -e --argjson assets "$owner_assets" --arg sha "$builder_sha" \
+              --arg title "$expected_title" --arg notes "$expected_notes" \
+              --arg marker "$body_marker" '
+              (.id | type == "number") and .target_commitish == $sha and
+              .author.login == "github-actions[bot]" and .name == $title and
+              .body == ($notes + "\n\n" + $marker + "\n") and
+              ([.assets[].id] | length == (unique | length)) and
+              all(.assets[]; (.id | type) == "number") and
+              ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
+              all(.assets[];
+                .state == "uploaded" and .uploader.login == "github-actions[bot]")
+            ' <<<"$current_json" >/dev/null || {
+              echo "Existing immutable core release metadata is not exactly owned." >&2
+              exit 1
+            }
+            jq -e --arg sha "$tag_object_sha" --arg tag "$release_tag" \
+              --arg commit "$builder_sha" --arg marker "$owner_marker" '
+              .sha == $sha and .tag == $tag and .message == $marker and
+              .object.type == "commit" and .object.sha == $commit and
+              .tagger.name == "github-actions[bot]" and
+              .tagger.email == "41898282+github-actions[bot]@users.noreply.github.com"
+            ' <<<"$tag_json" >/dev/null || exit 1
             existing_tag_sha=$(resolve_remote_tag_sha "$release_tag")
             [ "$existing_tag_sha" = "$builder_sha" ] || {
               echo "Existing core tag does not resolve to its recorded builder commit." >&2
               exit 1
             }
             builder_runs=$(api --paginate --slurp \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&head_sha=${builder_sha}&per_page=100")
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${builder_sha}&per_page=100")
             jq -e --arg sha "$builder_sha" '
-              map(.workflow_runs[]) | any(
-                .head_sha == $sha and .head_branch == "main" and
-                .event == "push" and .status == "completed" and
-                .conclusion == "success"
-              )
+              (map(.workflow_runs[]) |
+                map(select(.head_sha == $sha and .head_branch == "main" and .event == "push")) |
+                sort_by(.run_number, .run_attempt) | last) as $run |
+              $run != null and $run.head_sha == $sha and
+              $run.head_branch == "main" and $run.event == "push" and
+              $run.status == "completed" and $run.conclusion == "success"
             ' <<<"$builder_runs" >/dev/null || {
               echo "Existing core release was not built from a successful main push." >&2
               exit 1
@@ -293,12 +514,34 @@ jobs:
               END { if (NR != 2) exit 1 }
             ' "$info_dir/SHA256SUMS"
             (cd "$info_dir" && sha256sum -c SHA256SUMS)
+            for asset in BUILD_INFO SHA256SUMS \
+              "rr-sing-box-${version}-linux-amd64.tar.gz" \
+              "rr-sing-box-${version}-linux-arm64.tar.gz"; do
+              local_digest="sha256:$(sha256sum "$info_dir/$asset" | awk '{print $1}')"
+              local_size=$(stat -c %s "$info_dir/$asset")
+              jq -e --arg asset "$asset" --arg digest "$local_digest" \
+                --argjson size "$local_size" '
+                [.assets[] | select(
+                  .name == $asset and .digest == $digest and .size == $size and
+                  .state == "uploaded"
+                )] | length == 1
+              ' <<<"$current_json" >/dev/null || {
+                echo "Existing core asset API digest does not match downloaded bytes: $asset" >&2
+                exit 1
+              }
+            done
             needed=false
+            else
+              echo "Existing core release is foreign, mutable without bot ownership, or unstable." >&2
+              exit 1
+            fi
           else
             existing_tag_sha=$(resolve_remote_tag_sha "$release_tag")
             if [ -n "$existing_tag_sha" ]; then
-              echo "Remote tag $release_tag exists without its immutable release." >&2
-              exit 1
+              # The publish job will accept only an exact annotated owner tag
+              # and will otherwise refuse every mutation.  Allowing it to run
+              # is what makes a tag-only interrupted transaction convergent.
+              echo "Core tag without release found; deferring exact ownership reconciliation to publish."
             fi
           fi
 
@@ -314,6 +557,7 @@ jobs:
   build:
     needs: version
     if: needs.version.outputs.needed == 'true'
+    permissions: {}
     strategy:
       fail-fast: false
       matrix:
@@ -332,6 +576,11 @@ jobs:
           git clone --depth 1 --branch "${{ needs.version.outputs.tag }}" \
             https://github.com/SagerNet/sing-box.git sing-box
           test "$(git -C sing-box rev-parse HEAD)" = "${{ needs.version.outputs.source_sha }}"
+          test "$(git -C sing-box rev-parse HEAD)" = "$RR_NEXUS_CORE_SOURCE_SHA"
+          test "$(sed -n 's/^go //p' sing-box/go.mod | head -n 1)" = \
+            "${RR_NEXUS_CORE_GO_VERSION#go}"
+          test "$(tr -d '\r\n' < sing-box/release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api" = \
+            "$RR_NEXUS_CORE_BUILD_TAGS"
 
       - name: Set up Go from upstream go.mod
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
@@ -343,24 +592,55 @@ jobs:
         shell: bash
         env:
           GOARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           cd sing-box
           tags="$(tr -d '\r\n' < release/DEFAULT_BUILD_TAGS_OTHERS),with_v2ray_api"
+          [ "$tags" = "$RR_NEXUS_CORE_BUILD_TAGS" ]
           shared_ldflags=$(tr -d '\r\n' < release/LDFLAGS)
           export CGO_ENABLED=0 GOOS=linux GOARCH GOTOOLCHAIN=local
-          go build -trimpath -tags "$tags" \
+          case "${GOARCH}:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) ;;
+            *) echo "The ${GOARCH} core must be built on its native Linux runner." >&2; exit 1 ;;
+          esac
+          go_version=$(go env GOVERSION)
+          [ "$go_version" = "$RR_NEXUS_CORE_GO_VERSION" ]
+          [ "$(printf '%s\n%s\n' "$RR_NEXUS_CORE_MIN_GO_VERSION" \
+            "${go_version#go}" | sort -V | tail -n 1)" = "${go_version#go}" ]
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
+          output_dir="../dist/sing-box-${VERSION}-linux-${GOARCH}"
+          binary="${output_dir}/sing-box"
+          version_file="../dist/version-${GOARCH}.txt"
+          go_info_file="../dist/go-build-info-${GOARCH}.txt"
+          mkdir -p "$output_dir"
+          go build -buildvcs=true -trimpath -tags "$tags" \
             -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${shared_ldflags} -s -w -buildid=" \
-            -o sing-box ./cmd/sing-box
-          ./sing-box version | tee version.txt
-          grep -qw 'with_v2ray_api' version.txt
-          mkdir -p "../dist/sing-box-${VERSION}-linux-${GOARCH}"
-          install -m 755 sing-box "../dist/sing-box-${VERSION}-linux-${GOARCH}/sing-box"
-          cp LICENSE "../dist/sing-box-${VERSION}-linux-${GOARCH}/LICENSE"
+            -o "$binary" ./cmd/sing-box
+          "$binary" version | tee "$version_file"
+          mapfile -t version_lines < "$version_file"
+          [ "${#version_lines[@]}" -eq 6 ]
+          [ "${version_lines[0]}" = "sing-box version ${VERSION}" ]
+          [ -z "${version_lines[1]}" ]
+          [ "${version_lines[2]}" = "Environment: ${go_version} linux/${GOARCH}" ]
+          [ "${version_lines[3]}" = "Tags: ${tags}" ]
+          [ "${version_lines[4]}" = "Revision: ${SOURCE_SHA}" ]
+          [ "${version_lines[5]}" = "CGO: disabled" ]
+          go version -m "$binary" | tee "$go_info_file"
+          grep -Fx $'\tbuild\tCGO_ENABLED=0' "$go_info_file"
+          grep -Fx $'\tbuild\tGOOS=linux' "$go_info_file"
+          grep -Fx $'\tbuild\tGOARCH='"${GOARCH}" "$go_info_file"
+          grep -Fx $'\tbuild\t-tags='"${tags}" "$go_info_file"
+          grep -Fx $'\tbuild\tvcs.revision='"${SOURCE_SHA}" "$go_info_file"
+          grep -Fx $'\tbuild\tvcs.modified=false' "$go_info_file"
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
+          cp LICENSE "${output_dir}/LICENSE"
           cd ../dist
           archive="rr-sing-box-${VERSION}-linux-${GOARCH}.tar.gz"
-          tar -czf "$archive" "sing-box-${VERSION}-linux-${GOARCH}"
+          tar --sort=name --format=ustar --mtime='@0' \
+            --owner=0 --group=0 --numeric-owner \
+            -cf - "sing-box-${VERSION}-linux-${GOARCH}" | gzip -n -9 >"$archive"
           sha256sum "$archive" > "${archive}.sha256"
           sha256sum -c "${archive}.sha256"
 
@@ -445,7 +725,10 @@ jobs:
             "SOURCE_COMMIT=${SOURCE_SHA}" \
             "RR_BUILDER_COMMIT=${BUILDER_SHA}" \
             "RR_CORE_RELEASE=${RELEASE_TAG}" \
+            "GO_VERSION=${RR_NEXUS_CORE_GO_VERSION}" \
+            "CGO_ENABLED=0" \
             "BUILD_TAG=with_v2ray_api" \
+            "BUILD_TAGS=${RR_NEXUS_CORE_BUILD_TAGS}" \
             "SOURCE=https://github.com/SagerNet/sing-box/tree/${SOURCE_TAG}" \
             > BUILD_INFO
           sha256sum -c SHA256SUMS
@@ -470,6 +753,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILDER_SHA: ${{ needs.verify-ci.outputs.builder_sha }}
+          BOOTSTRAP_LEGACY_LATEST: ${{ inputs.bootstrap_legacy_latest }}
           IMMUTABLE_SETTINGS_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN || github.token }}
           TAG: ${{ needs.version.outputs.release_tag }}
           VERSION: ${{ needs.version.outputs.version }}
@@ -525,14 +809,16 @@ jobs:
               return 1
             }
             ci_runs=$(api --paginate --slurp \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100")
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${BUILDER_SHA}&per_page=100")
             jq -e --arg sha "$BUILDER_SHA" '
-              (map(.workflow_runs[]) | sort_by(.run_number, .run_attempt) | last) as $run |
+              (map(.workflow_runs[]) |
+                map(select(.head_sha == $sha and .head_branch == "main" and .event == "push")) |
+                sort_by(.run_number, .run_attempt) | last) as $run |
               $run != null and $run.head_sha == $sha and
               $run.head_branch == "main" and $run.event == "push" and
               $run.status == "completed" and $run.conclusion == "success"
             ' <<<"$ci_runs" >/dev/null || {
-              echo "Latest successful main CI changed while the core was building." >&2
+              echo "The latest main CI attempt changed or is not successful." >&2
               return 1
             }
             # This must be the gate's final remote read. A new push may arrive
@@ -559,22 +845,127 @@ jobs:
             }
           }
 
+          pinned_legacy_latest_bootstrap_allowed() {
+            local latest_json="$1" target_tag="" legacy_ref="" releases="" refs=""
+            target_tag="${TAG:-${release_tag:-}}"
+            [ "$GITHUB_REPOSITORY" = Xiaowu7z/RR-vps ] &&
+              [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] &&
+              [ "${BOOTSTRAP_LEGACY_LATEST:-false}" = true ] &&
+              [ "$RR_NEXUS_CORE_VERSION" = 1.14.0 ] &&
+              [ "$RR_NEXUS_CORE_TAG" = v1.14.0 ] &&
+              [ "$target_tag" = rr-nexus-core-v1.14.0-r1 ] || return 1
+            jq -e '
+              .id == 377802786 and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786" and
+              .assets_url == "https://api.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets" and
+              .upload_url == "https://uploads.github.com/repos/Xiaowu7z/RR-vps/releases/377802786/assets{?name,label}" and
+              .html_url == "https://github.com/Xiaowu7z/RR-vps/releases/tag/rr-nexus-core-v1.13.19" and
+              .tag_name == "rr-nexus-core-v1.13.19" and
+              .target_commitish == "ad69c42e6c6f468b6c643da06e7a461de7d773f3" and
+              .name == "RR Nexus traffic core · sing-box 1.13.19" and
+              .draft == false and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              .created_at == "2026-08-27T12:25:26Z" and
+              .published_at == "2026-08-27T12:26:19Z" and
+              .body == "Built from the official SagerNet/sing-box v1.13.19 source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. Latest release, refreshed automatically every day or on demand." and
+              ([.assets[] | {
+                id, name, state, size, digest, url, browser_download_url,
+                uploader: .uploader.login
+              }] | sort_by(.id)) == ([
+                {id:532275339,name:"BUILD_INFO",state:"uploaded",size:185,
+                 digest:"sha256:bd5aaf67c5f45f4ce9a6065ddb5dc12cd08c50b502fdea39a9c67d5ac68bd96c",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275339",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/BUILD_INFO",
+                 uploader:"github-actions[bot]"},
+                {id:532275341,name:"rr-sing-box-1.13.19-linux-amd64.tar.gz",state:"uploaded",size:20610257,
+                 digest:"sha256:9397dcd049cc1ff7f4fa26c29cc25791c7026e40897cc2072b85cd257b6338ad",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275341",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-amd64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275350,name:"rr-sing-box-1.13.19-linux-arm64.tar.gz",state:"uploaded",size:18978144,
+                 digest:"sha256:28c8ed10d203fa77286d0a25deb0377aa33598c08c7b3de256c7d779529716f0",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275350",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/rr-sing-box-1.13.19-linux-arm64.tar.gz",
+                 uploader:"github-actions[bot]"},
+                {id:532275351,name:"SHA256SUMS",state:"uploaded",size:210,
+                 digest:"sha256:81a4d7114411705ae2af7c7b5e0bbf2c316a630558d2250a757cf6654760151b",
+                 url:"https://api.github.com/repos/Xiaowu7z/RR-vps/releases/assets/532275351",
+                 browser_download_url:"https://github.com/Xiaowu7z/RR-vps/releases/download/rr-nexus-core-v1.13.19/SHA256SUMS",
+                 uploader:"github-actions[bot]"}
+              ] | sort_by(.id))
+            ' <<<"$latest_json" >/dev/null || return 1
+            legacy_ref=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/rr-nexus-core-v1.13.19") ||
+              return 1
+            jq -e '
+              .ref == "refs/tags/rr-nexus-core-v1.13.19" and
+              .url == "https://api.github.com/repos/Xiaowu7z/RR-vps/git/refs/tags/rr-nexus-core-v1.13.19" and
+              .object.type == "commit" and
+              .object.sha == "ad69c42e6c6f468b6c643da06e7a461de7d773f3"
+            ' <<<"$legacy_ref" >/dev/null || return 1
+            releases=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -e --argjson pinned "$latest_json" '
+              def material:
+                {
+                  id, url, assets_url, upload_url, html_url, tag_name,
+                  target_commitish, name, draft, prerelease, immutable,
+                  author: .author.login, created_at, published_at, body,
+                  assets: ([.assets[] | {
+                    id, name, state, size, digest, url, browser_download_url,
+                    uploader: .uploader.login
+                  }] | sort_by(.id))
+                };
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.tag_name | type) == "string" and
+                  (.tag_name as $tag |
+                    if ($tag | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($tag | capture("^v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)) and
+                ([$inventory[] | select((material) == ($pinned | material))] |
+                  length) == 1)
+            ' <<<"$releases" >/dev/null || return 1
+            refs=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v") || return 1
+            jq -e '
+              type == "array" and length > 0 and all(.[]; type == "array") and
+              ([.[][]] as $inventory |
+                ($inventory | length) > 0 and
+                all($inventory[];
+                  type == "object" and (.ref | type) == "string" and
+                  (.ref as $ref |
+                    if ($ref | test("^refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+                    then ($ref | capture("^refs/tags/v(?<major>0|[1-9][0-9]*)\\.(?<minor>0|[1-9][0-9]*)\\.(?<patch>0|[1-9][0-9]*)$") |
+                          [(.major|tonumber),(.minor|tonumber),(.patch|tonumber)]) < [7,2,0]
+                    else true end)))
+            ' <<<"$refs" >/dev/null
+          }
+
+
           assert_product_latest() {
             local max_attempts="${1:-1}" attempt latest_json
             for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest") &&
-                jq -e '
+              if latest_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/latest"); then
+                if jq -e '
                   (.tag_name | test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")) and
                   (.target_commitish | test("^[0-9a-f]{40}$")) and
                   .draft == false and .prerelease == false and .immutable == true and
                   ([.assets[].name] | sort) ==
                   (["install.sh", "manifest.sha256", "rr-bundle.tar.gz", "RELEASE_INFO", "SHA256SUMS"] | sort)
                 ' <<<"$latest_json" >/dev/null; then
-                return 0
+                  return 0
+                fi
+                if pinned_legacy_latest_bootstrap_allowed "$latest_json"; then
+                  echo "::warning::Using the one-time pinned v7.2 legacy Latest bootstrap."
+                  return 0
+                fi
               fi
               [ "$attempt" -eq "$max_attempts" ] || sleep 2
             done
-            echo "Repository Latest is not an immutable complete product release." >&2
+            echo "Repository Latest is neither an immutable complete product nor the exact authorized v7.2 bootstrap release." >&2
             return 1
           }
 
@@ -623,41 +1014,470 @@ jobs:
             }
           }
 
-          assert_immutable_releases_enabled
-          assert_release_gate
-          assert_product_latest
-          assert_target_absent
+          list_target_releases() {
+            local inventory
+            inventory=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -ce --arg tag "$TAG" '(add // []) | map(select(.tag_name == $tag))' \
+              <<<"$inventory"
+          }
 
-          # Re-check mutable remote state immediately before the only mutation.
-          assert_product_latest
-          assert_target_absent
-          assert_immutable_releases_enabled
-          # Keep this gate adjacent to the atomic ref creation so a main push
-          # during the release/tag scans cannot publish an obsolete core.
-          assert_release_gate
-          created_ref=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f "ref=refs/tags/${TAG}" -f "sha=${BUILDER_SHA}")
-          jq -e --arg ref "refs/tags/${TAG}" --arg sha "$BUILDER_SHA" '
-            .ref == $ref and .object.type == "commit" and .object.sha == $sha
-          ' <<<"$created_ref" >/dev/null
-          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
-          gh release create "$TAG" \
-            release-assets/BUILD_INFO \
-            release-assets/SHA256SUMS \
-            "release-assets/rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
-            "release-assets/rr-sing-box-${VERSION}-linux-arm64.tar.gz" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --target "$BUILDER_SHA" \
-            --title "RR Nexus traffic core · sing-box ${VERSION}" \
-            --notes "Built from the official SagerNet/sing-box v${VERSION} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This immutable auxiliary release is consumed only by its versioned tag and never owns repository Latest." \
-            --draft
+          list_target_tag_refs() {
+            local inventory
+            inventory=$(api --paginate --slurp \
+              "/repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${TAG}") || return 1
+            jq -ce --arg ref "refs/tags/${TAG}" \
+              '(add // []) | map(select(.ref == $ref))' <<<"$inventory"
+          }
 
-          expected_asset_names=$(jq -cn --arg version "$VERSION" '[
-            "BUILD_INFO", "SHA256SUMS",
-            "rr-sing-box-\($version)-linux-amd64.tar.gz",
-            "rr-sing-box-\($version)-linux-arm64.tar.gz"
-          ] | sort')
+          load_owned_target_tag() {
+            local refs="" count=0 ref_sha="" ref_type="" tag_json="" marker=""
+            local owner_commit="" nonce="" payload_sha="" payload_b64="" payload="" canonical=""
+            LOADED_TAG_STATE=unknown
+            LOADED_TAG_OBJECT_SHA=""
+            LOADED_TAG_OWNER_MARKER=""
+            LOADED_TAG_OWNER_COMMIT=""
+            LOADED_TAG_EXPECTED_ASSETS=""
+            refs=$(list_target_tag_refs) || return 1
+            count=$(jq -r 'length' <<<"$refs")
+            [ "$count" -le 1 ] || {
+              echo "Multiple exact refs exist for $TAG; refusing mutation." >&2
+              return 1
+            }
+            if [ "$count" -eq 0 ]; then
+              LOADED_TAG_STATE=absent
+              return 0
+            fi
+            ref_sha=$(jq -r '.[0].object.sha' <<<"$refs")
+            ref_type=$(jq -r '.[0].object.type' <<<"$refs")
+            [[ "$ref_sha" =~ ^[0-9a-f]{40}$ ]] && [ "$ref_type" = tag ] || {
+              LOADED_TAG_STATE=foreign
+              echo "$TAG is not an owned annotated core tag." >&2
+              return 1
+            }
+            tag_json=$(api "/repos/${GITHUB_REPOSITORY}/git/tags/${ref_sha}") || return 1
+            marker=$(jq -r '.message' <<<"$tag_json")
+            if [[ "$marker" =~ ^rr-nexus-core-release-owner:v1:([^:]+):([0-9a-f]{40}):([0-9a-f]{64}):([0-9a-f]{64}):([A-Za-z0-9+/]*={0,2})$ ]]; then
+              [ "${BASH_REMATCH[1]}" = "$TAG" ] || {
+                LOADED_TAG_STATE=foreign
+                return 1
+              }
+              owner_commit="${BASH_REMATCH[2]}"
+              nonce="${BASH_REMATCH[3]}"
+              payload_sha="${BASH_REMATCH[4]}"
+              payload_b64="${BASH_REMATCH[5]}"
+            else
+              LOADED_TAG_STATE=foreign
+              return 1
+            fi
+            [ -n "$nonce" ] || return 1
+            payload=$(printf '%s' "$payload_b64" | base64 --decode) || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            [ "$(printf '%s' "$payload" | base64 -w 0)" = "$payload_b64" ] &&
+              [ "$(printf '%s' "$payload" | sha256sum | awk '{print $1}')" = "$payload_sha" ] || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            canonical=$(jq -ceS '
+              if type == "array" then
+                [.[] | {name, size, digest}] | sort_by(.name)
+              else error("asset payload is not an array") end
+            ' <<<"$payload") || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            [ "$canonical" = "$payload" ] && jq -e --arg version "$VERSION" '
+              length == 4 and
+              ([.[].name] | sort) == ([
+                "BUILD_INFO", "SHA256SUMS",
+                "rr-sing-box-\($version)-linux-amd64.tar.gz",
+                "rr-sing-box-\($version)-linux-arm64.tar.gz"
+              ] | sort) and
+              ([.[].name] | length == (unique | length)) and
+              all(.[];
+                (keys | sort) == (["digest", "name", "size"] | sort) and
+                (.size | type) == "number" and .size == (.size | floor) and .size > 0 and
+                (.digest | type) == "string" and
+                (.digest | test("^sha256:[0-9a-f]{64}$")))
+            ' <<<"$payload" >/dev/null || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            jq -e --arg sha "$ref_sha" --arg tag "$TAG" --arg commit "$owner_commit" \
+              --arg marker "$marker" '
+              .sha == $sha and .tag == $tag and .message == $marker and
+              .object.type == "commit" and .object.sha == $commit and
+              .tagger.name == "github-actions[bot]" and
+              .tagger.email == "41898282+github-actions[bot]@users.noreply.github.com"
+            ' <<<"$tag_json" >/dev/null || {
+              LOADED_TAG_STATE=foreign
+              return 1
+            }
+            LOADED_TAG_STATE=owned
+            LOADED_TAG_OBJECT_SHA="$ref_sha"
+            LOADED_TAG_OWNER_MARKER="$marker"
+            LOADED_TAG_OWNER_COMMIT="$owner_commit"
+            LOADED_TAG_EXPECTED_ASSETS="$payload"
+          }
+
+          assert_run_owned_target_tag() {
+            load_owned_target_tag || return 1
+            [ "$LOADED_TAG_STATE" = owned ] &&
+              [ -n "${RUN_TAG_OBJECT_SHA:-}" ] &&
+              [ -n "${RUN_OWNER_MARKER:-}" ] &&
+              [ "$LOADED_TAG_OBJECT_SHA" = "$RUN_TAG_OBJECT_SHA" ] &&
+              [ "$LOADED_TAG_OWNER_MARKER" = "$RUN_OWNER_MARKER" ] &&
+              [ "$LOADED_TAG_OWNER_COMMIT" = "$BUILDER_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ]
+          }
+
+          is_owned_mutable_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            jq -e --arg tag "$TAG" --arg sha "$owner_commit" \
+              --arg title "$RELEASE_TITLE" --arg marker "$body_marker" \
+              --argjson expected "$owner_assets" '
+              (.id | type == "number") and .tag_name == $tag and
+              .target_commitish == $sha and .name == $title and
+              .draft == true and .prerelease == false and .immutable == false and
+              .author.login == "github-actions[bot]" and
+              (.body | type == "string") and
+              (.body as $body | ($body | index($marker)) as $first |
+                $first != null and
+                (($body[($first + ($marker | length)):] | contains($marker)) | not)) and
+              (.assets | type == "array") and
+              ([.assets[].name] | length == (unique | length)) and
+              all(.assets[];
+                . as $actual | any($expected[];
+                  .name == $actual.name and
+                  (($actual.state == "uploaded" and
+                    .size == $actual.size and .digest == $actual.digest and
+                    $actual.uploader.login == "github-actions[bot]") or
+                   ($actual.state == "starter" and $actual.size == 0 and
+                    ($actual.digest == null or $actual.digest == "") and
+                    $actual.uploader.login == "github-actions[bot]"))))
+            ' <<<"$release_json" >/dev/null
+          }
+
+          is_adoptable_mutable_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            is_owned_mutable_draft "$release_json" "$owner_marker" \
+              "$owner_commit" "$owner_assets" &&
+              jq -e --arg notes "$RELEASE_NOTES" --arg marker "$body_marker" '
+                .body == ($notes + "\n\n" + $marker + "\n")
+              ' <<<"$release_json" >/dev/null
+          }
+
+          is_exact_mutable_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4"
+            is_adoptable_mutable_draft "$release_json" "$owner_marker" \
+              "$owner_commit" "$owner_assets" &&
+              jq -e --argjson expected "$owner_assets" '
+                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected and
+                all(.assets[]; .state == "uploaded")
+              ' <<<"$release_json" >/dev/null
+          }
+
+          is_exact_public_release() {
+            local release_json="$1" expected_id="$2" owner_marker="$3"
+            local owner_commit="$4" owner_assets="$5" body_marker=""
+            body_marker="<!-- ${owner_marker} -->"
+            jq -e --argjson id "$expected_id" --arg tag "$TAG" --arg sha "$owner_commit" \
+              --arg title "$RELEASE_TITLE" --arg notes "$RELEASE_NOTES" \
+              --arg marker "$body_marker" --argjson expected "$owner_assets" '
+              .id == $id and .tag_name == $tag and .target_commitish == $sha and
+              .name == $title and .draft == false and .prerelease == false and
+              (.immutable == true or .immutable == false) and
+              .author.login == "github-actions[bot]" and
+              .body == ($notes + "\n\n" + $marker + "\n") and
+              ([.assets[].name] | length == (unique | length)) and
+              ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected and
+              all(.assets[];
+                .state == "uploaded" and .uploader.login == "github-actions[bot]")
+            ' <<<"$release_json" >/dev/null
+          }
+
+          delete_owned_target_tag_cas() {
+            local expected_object_sha="$1" expected_marker="$2" refs="" attempt=0
+            local cas_dir=""
+            cas_dir=$(mktemp -d) || return 1
+            git -C "$cas_dir" init -q || { rm -rf -- "$cas_dir"; return 1; }
+            for attempt in 1 2 3; do
+              load_owned_target_tag || { rm -rf -- "$cas_dir"; return 1; }
+              if [ "$LOADED_TAG_STATE" = absent ]; then
+                rm -rf -- "$cas_dir"
+                return 0
+              fi
+              [ "$LOADED_TAG_STATE" = owned ] &&
+                [ "$LOADED_TAG_OBJECT_SHA" = "$expected_object_sha" ] &&
+                [ "$LOADED_TAG_OWNER_MARKER" = "$expected_marker" ] || {
+                rm -rf -- "$cas_dir"
+                return 1
+              }
+              # Smart Git's force-with-lease is the server-side compare-and-swap.
+              # A REST check followed by DELETE would be vulnerable to ref reuse.
+              git -C "$cas_dir" push --quiet \
+                --force-with-lease="refs/tags/${TAG}:${expected_object_sha}" \
+                "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                ":refs/tags/${TAG}" >/dev/null 2>&1 || true
+              refs=$(list_target_tag_refs) || { rm -rf -- "$cas_dir"; return 1; }
+              if [ "$(jq -r 'length' <<<"$refs")" -eq 0 ]; then
+                rm -rf -- "$cas_dir"
+                return 0
+              fi
+              [ "$attempt" -eq 3 ] || sleep 2
+            done
+            rm -rf -- "$cas_dir"
+            echo "Owned tag $TAG was not removed by its exact compare-and-swap." >&2
+            return 1
+          }
+
+          classify_target_release_state() {
+            local releases="" count=0 release_json="" release_id=""
+            TARGET_RELEASE_STATE=unknown
+            TARGET_RELEASE_ID=""
+            TARGET_RELEASE_JSON=""
+            releases=$(list_target_releases) || return 1
+            count=$(jq -r 'length' <<<"$releases")
+            [ "$count" -le 1 ] || {
+              echo "Multiple releases use $TAG; refusing every mutation." >&2
+              return 1
+            }
+            load_owned_target_tag || return 1
+            if [ "$count" -eq 0 ]; then
+              case "$LOADED_TAG_STATE" in
+                absent) TARGET_RELEASE_STATE=absent ;;
+                owned) TARGET_RELEASE_STATE=owned_tag_only ;;
+                *) return 1 ;;
+              esac
+              return 0
+            fi
+            [ "$LOADED_TAG_STATE" = owned ] || return 1
+            release_json=$(jq -c '.[0]' <<<"$releases")
+            release_id=$(jq -r '.id' <<<"$release_json")
+            [[ "$release_id" =~ ^[0-9]+$ ]] || return 1
+            if is_owned_mutable_draft "$release_json" "$LOADED_TAG_OWNER_MARKER" \
+              "$LOADED_TAG_OWNER_COMMIT" "$LOADED_TAG_EXPECTED_ASSETS"; then
+              TARGET_RELEASE_STATE=owned_mutable
+            elif is_exact_public_release "$release_json" "$release_id" \
+              "$LOADED_TAG_OWNER_MARKER" "$LOADED_TAG_OWNER_COMMIT" \
+              "$LOADED_TAG_EXPECTED_ASSETS"; then
+              TARGET_RELEASE_STATE=exact_public
+            else
+              echo "Existing $TAG release is public, foreign, or inconsistent; refusing mutation." >&2
+              return 1
+            fi
+            TARGET_RELEASE_ID="$release_id"
+            TARGET_RELEASE_JSON="$release_json"
+          }
+
+          cleanup_owned_tag_only_on_exit() {
+            local status=$? releases="" count=0
+            trap - EXIT
+            if [ "${cleanup_armed:-false}" = true ]; then
+              if releases=$(list_target_releases); then
+                count=$(jq -r 'length' <<<"$releases")
+                if [ "$count" -eq 0 ] && [ "${draft_creation_attempted:-false}" != true ]; then
+                  delete_owned_target_tag_cas "${RUN_TAG_OBJECT_SHA:-}" \
+                    "${RUN_OWNER_MARKER:-}" ||
+                    echo "Exact tag cleanup refused or failed; no foreign ref was deleted." >&2
+                else
+                  echo "Owned mutable draft transaction was preserved for exact re-adoption." >&2
+                fi
+              else
+                echo "Could not classify remote draft state; preserving the owned tag." >&2
+              fi
+            fi
+            exit "$status"
+          }
+
+          adopt_or_create_draft() {
+            local release_json="" attempt=0 create_response=""
+            classify_target_release_state || return 1
+            case "$TARGET_RELEASE_STATE" in
+              owned_mutable)
+                [ "$LOADED_TAG_OWNER_COMMIT" = "$BUILDER_SHA" ] &&
+                  [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] &&
+                  is_adoptable_mutable_draft "$TARGET_RELEASE_JSON" \
+                    "$LOADED_TAG_OWNER_MARKER" "$BUILDER_SHA" "$expected_assets" || return 1
+                DRAFT_ID="$TARGET_RELEASE_ID"
+                return 0
+                ;;
+              owned_tag_only)
+                assert_run_owned_target_tag || return 1
+                ;;
+              *) return 1 ;;
+            esac
+            draft_creation_attempted=true
+            api --method POST "/repos/${GITHUB_REPOSITORY}/releases" \
+              -f "tag_name=${TAG}" -f "target_commitish=${BUILDER_SHA}" \
+              -f "name=${RELEASE_TITLE}" -f "body=${RELEASE_BODY}" \
+              -F draft=true -F prerelease=false -f make_latest=false \
+              >/dev/null 2>&1 || true
+            for attempt in 1 2 3 4 5 6; do
+              if classify_target_release_state &&
+                [ "$TARGET_RELEASE_STATE" = owned_mutable ] &&
+                [ "$LOADED_TAG_OWNER_COMMIT" = "$BUILDER_SHA" ] &&
+                [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] &&
+                is_adoptable_mutable_draft "$TARGET_RELEASE_JSON" \
+                  "$LOADED_TAG_OWNER_MARKER" "$BUILDER_SHA" "$expected_assets"; then
+                DRAFT_ID="$TARGET_RELEASE_ID"
+                return 0
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "Draft creation outcome is not authoritative; preserving state for re-adoption." >&2
+            return 1
+          }
+
+          ensure_draft_assets() {
+            local asset="" release_json="" matches=0 state="" attempt=0 exact=false
+            for asset in BUILD_INFO SHA256SUMS \
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz"; do
+              release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_ID}") || return 1
+              is_adoptable_mutable_draft "$release_json" "$RUN_OWNER_MARKER" \
+                "$BUILDER_SHA" "$expected_assets" || return 1
+              matches=$(jq -r --arg asset "$asset" \
+                '[.assets[] | select(.name == $asset)] | length' <<<"$release_json")
+              [ "$matches" -le 1 ] || return 1
+              if [ "$matches" -eq 1 ]; then
+                jq -e --arg asset "$asset" --argjson expected "$expected_assets" '
+                  (.assets[] | select(.name == $asset)) as $actual |
+                  any($expected[];
+                    .name == $actual.name and .size == $actual.size and
+                    .digest == $actual.digest and $actual.state == "uploaded")
+                ' <<<"$release_json" >/dev/null || {
+                  echo "Existing draft asset $asset is incomplete or inconsistent; preserving it." >&2
+                  return 1
+                }
+                continue
+              fi
+              # The upload result can be lost after GitHub commits the asset.
+              # Never retry within this run until exact-ID GET proves absence;
+              # the next run can safely re-adopt a still-missing slot.
+              gh release upload "$TAG" "release-assets/$asset" \
+                --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+              exact=false
+              for attempt in 1 2 3 4 5 6; do
+                if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_ID}") &&
+                  is_adoptable_mutable_draft "$release_json" "$RUN_OWNER_MARKER" \
+                    "$BUILDER_SHA" "$expected_assets" &&
+                  jq -e --arg asset "$asset" --argjson expected "$expected_assets" '
+                    ([.assets[] | select(.name == $asset)] | length) == 1 and
+                    (.assets[] | select(.name == $asset)) as $actual |
+                    any($expected[];
+                      .name == $actual.name and .size == $actual.size and
+                      .digest == $actual.digest and $actual.state == "uploaded")
+                  ' <<<"$release_json" >/dev/null; then
+                  exact=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 2
+              done
+              [ "$exact" = true ] || {
+                echo "Asset upload outcome is not exact; preserving draft for re-adoption." >&2
+                return 1
+              }
+            done
+          }
+
+          publish_draft_and_confirm() {
+            local draft_id="$1" attempt=0 release_json=""
+            api --method PATCH "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
+              -F draft=false -f make_latest=false >/dev/null 2>&1 || true
+            for attempt in 1 2 3 4 5 6; do
+              if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}"); then
+                if is_exact_public_release "$release_json" "$draft_id" \
+                  "$RUN_OWNER_MARKER" "$BUILDER_SHA" "$expected_assets"; then
+                  return 0
+                fi
+                if ! is_exact_mutable_draft "$release_json" "$RUN_OWNER_MARKER" \
+                  "$BUILDER_SHA" "$expected_assets"; then
+                  echo "Release $draft_id entered an unrecognized state after PATCH." >&2
+                  return 1
+                fi
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            echo "Publication outcome is not authoritative; preserving the exact owned draft." >&2
+            return 1
+          }
+
+          verify_published_release() {
+            local draft_id="$1" release_json="" exact=false attempt=0
+            local verify_dir="" asset="" asset_id="" verified=false
+            for attempt in 1 2 3 4 5 6; do
+              if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") &&
+                is_exact_public_release "$release_json" "$draft_id" \
+                  "$RUN_OWNER_MARKER" "$BUILDER_SHA" "$expected_assets" &&
+                jq -e '.immutable == true' <<<"$release_json" >/dev/null; then
+                exact=true
+                break
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            [ "$exact" = true ] || {
+              echo "Published core release is not the exact immutable transaction." >&2
+              return 1
+            }
+            assert_run_owned_target_tag || return 1
+            wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA" || return 1
+            assert_product_latest 6 || return 1
+            assert_release_gate || return 1
+
+            verify_dir=$(mktemp -d) || return 1
+            for asset in BUILD_INFO SHA256SUMS \
+              "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
+              "rr-sing-box-${VERSION}-linux-arm64.tar.gz"; do
+              asset_id=$(jq -er --arg asset "$asset" '
+                [.assets[] | select(.name == $asset)] as $matches |
+                if ($matches | length) == 1 and ($matches[0].id | type) == "number"
+                then $matches[0].id else error("asset identity") end
+              ' <<<"$release_json") || { rm -rf -- "$verify_dir"; return 1; }
+              verified=false
+              for attempt in 1 2 3 4 5 6; do
+                if gh api -H 'Accept: application/octet-stream' \
+                  "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                  >"$verify_dir/${asset}.part" 2>/dev/null &&
+                  cmp -s "release-assets/$asset" "$verify_dir/${asset}.part"; then
+                  mv "$verify_dir/${asset}.part" "$verify_dir/$asset"
+                  verified=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 2
+              done
+              [ "$verified" = true ] || {
+                echo "Exact release asset API download differs: $asset" >&2
+                rm -rf -- "$verify_dir"
+                return 1
+              }
+            done
+            (cd "$verify_dir" && sha256sum -c SHA256SUMS) || {
+              rm -rf -- "$verify_dir"
+              return 1
+            }
+            rm -rf -- "$verify_dir"
+
+            # Downloads are not the last word: immutable metadata, the owned
+            # tag, Latest isolation, main tip and latest CI attempt are all
+            # re-read after the bytes have been consumed.
+            release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") || return 1
+            is_exact_public_release "$release_json" "$draft_id" \
+              "$RUN_OWNER_MARKER" "$BUILDER_SHA" "$expected_assets" &&
+              jq -e '.immutable == true' <<<"$release_json" >/dev/null || return 1
+            assert_run_owned_target_tag || return 1
+            wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA" || return 1
+            assert_product_latest 6 || return 1
+            assert_release_gate
+          }
+
           expected_assets=$(
             for asset in BUILD_INFO SHA256SUMS \
               "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
@@ -666,97 +1486,122 @@ jobs:
               size=$(stat -c %s "release-assets/$asset")
               jq -cn --arg name "$asset" --arg digest "$digest" --argjson size "$size" \
                 '{name: $name, size: $size, digest: $digest}'
-            done | jq -sc 'sort_by(.name)'
+            done | jq -scS 'sort_by(.name)'
           )
-          draft_verified=false
-          for attempt in 1 2 3 4 5 6; do
-            if draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
-              jq -e --arg tag "$TAG" --arg target "$BUILDER_SHA" --argjson assets "$expected_assets" '
-                .tag_name == $tag and .target_commitish == $target and
-                .draft == true and .prerelease == false and .immutable == false and
-                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
-                all(.assets[]; .state == "uploaded")
-              ' <<<"$draft_json" >/dev/null; then
-              draft_verified=true
-              break
-            fi
-            [ "$attempt" -eq 6 ] || sleep 2
-          done
-          [ "$draft_verified" = true ] || {
-            echo "New core draft does not contain the exact verified payload." >&2
-            exit 1
-          }
-          draft_id=$(jq -r '.id' <<<"$draft_json")
-          [[ "$draft_id" =~ ^[0-9]+$ ]]
+          RELEASE_TITLE="RR Nexus traffic core · sing-box ${VERSION}"
+          RELEASE_NOTES="Built from the official SagerNet/sing-box v${VERSION} source with the additional with_v2ray_api build tag. SHA256SUMS and BUILD_INFO are included. This immutable auxiliary release is consumed only by its versioned tag and never owns repository Latest."
+          cleanup_armed=false
+          draft_creation_attempted=false
+          DRAFT_ID=""
 
-          # Only the draft ID created above may be changed. Re-run every remote
-          # safety gate immediately before making it public and immutable.
+          classify_target_release_state
+          case "$TARGET_RELEASE_STATE" in
+            exact_public)
+              [ "$LOADED_TAG_OWNER_COMMIT" = "$BUILDER_SHA" ] &&
+                [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] || exit 1
+              RUN_TAG_OBJECT_SHA="$LOADED_TAG_OBJECT_SHA"
+              RUN_OWNER_MARKER="$LOADED_TAG_OWNER_MARKER"
+              RELEASE_MARKER="<!-- ${RUN_OWNER_MARKER} -->"
+              RELEASE_BODY="${RELEASE_NOTES}"$'\n\n'"${RELEASE_MARKER}"$'\n'
+              assert_immutable_releases_enabled
+              assert_release_gate
+              verify_published_release "$TARGET_RELEASE_ID"
+              exit 0
+              ;;
+            owned_mutable|owned_tag_only)
+              [ "$LOADED_TAG_OWNER_COMMIT" = "$BUILDER_SHA" ] &&
+                [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] || {
+                echo "Owned core transaction belongs to another builder/payload; preserving it." >&2
+                exit 1
+              }
+              RUN_TAG_OBJECT_SHA="$LOADED_TAG_OBJECT_SHA"
+              RUN_OWNER_MARKER="$LOADED_TAG_OWNER_MARKER"
+              RELEASE_MARKER="<!-- ${RUN_OWNER_MARKER} -->"
+              RELEASE_BODY="${RELEASE_NOTES}"$'\n\n'"${RELEASE_MARKER}"$'\n'
+              ;;
+            absent)
+              assert_immutable_releases_enabled
+              assert_release_gate
+              assert_product_latest
+              assert_target_absent
+
+              release_nonce=$(openssl rand -hex 32)
+              [[ "$release_nonce" =~ ^[0-9a-f]{64}$ ]]
+              release_payload_sha=$(printf '%s' "$expected_assets" | sha256sum | awk '{print $1}')
+              release_payload_b64=$(printf '%s' "$expected_assets" | base64 -w 0)
+              [[ "$release_payload_sha" =~ ^[0-9a-f]{64}$ ]]
+              [[ "$release_payload_b64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+              RUN_OWNER_MARKER="rr-nexus-core-release-owner:v1:${TAG}:${BUILDER_SHA}:${release_nonce}:${release_payload_sha}:${release_payload_b64}"
+              [ "${#RUN_OWNER_MARKER}" -le 4096 ]
+              RELEASE_MARKER="<!-- ${RUN_OWNER_MARKER} -->"
+              RELEASE_BODY="${RELEASE_NOTES}"$'\n\n'"${RELEASE_MARKER}"$'\n'
+
+              tag_object=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/tags" \
+                -f "tag=${TAG}" -f "message=${RUN_OWNER_MARKER}" \
+                -f "object=${BUILDER_SHA}" -f type=commit \
+                -f 'tagger[name]=github-actions[bot]' \
+                -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com')
+              RUN_TAG_OBJECT_SHA=$(jq -r '.sha' <<<"$tag_object")
+              [[ "$RUN_TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+              jq -e --arg sha "$RUN_TAG_OBJECT_SHA" --arg tag "$TAG" \
+                --arg commit "$BUILDER_SHA" --arg marker "$RUN_OWNER_MARKER" '
+                .sha == $sha and .tag == $tag and .message == $marker and
+                .object.type == "commit" and .object.sha == $commit and
+                .tagger.name == "github-actions[bot]" and
+                .tagger.email == "41898282+github-actions[bot]@users.noreply.github.com"
+              ' <<<"$tag_object" >/dev/null
+
+              # An unreachable annotated object is harmless. Re-prove absence
+              # and every gate immediately before making its ref reachable.
+              classify_target_release_state
+              [ "$TARGET_RELEASE_STATE" = absent ]
+              assert_product_latest
+              assert_target_absent
+              assert_immutable_releases_enabled
+              assert_release_gate
+              cleanup_armed=true
+              trap cleanup_owned_tag_only_on_exit EXIT
+              api --method POST "/repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f "ref=refs/tags/${TAG}" -f "sha=${RUN_TAG_OBJECT_SHA}" \
+                >/dev/null 2>&1 || true
+              ref_ready=false
+              for attempt in 1 2 3 4 5 6; do
+                if assert_run_owned_target_tag; then
+                  ref_ready=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 2
+              done
+              [ "$ref_ready" = true ] || {
+                echo "Annotated core ref creation outcome is not authoritative." >&2
+                exit 1
+              }
+              ;;
+            *) exit 1 ;;
+          esac
+
+          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
+          assert_run_owned_target_tag
           assert_product_latest
           assert_immutable_releases_enabled
           assert_release_gate
-          draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
-          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg target "$BUILDER_SHA" \
-            --argjson assets "$expected_assets" '
-            .id == $id and .tag_name == $tag and .target_commitish == $target and
-            .draft == true and .prerelease == false and .immutable == false and
-            ([.assets[] | {name, size, digest}] | sort_by(.name)) == $assets and
-            all(.assets[]; .state == "uploaded")
-          ' <<<"$draft_json" >/dev/null
+          cleanup_armed=true
+          trap cleanup_owned_tag_only_on_exit EXIT
+          adopt_or_create_draft
+          ensure_draft_assets
+          draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${DRAFT_ID}")
+          is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \
+            "$BUILDER_SHA" "$expected_assets"
+          assert_run_owned_target_tag
           wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
-          main_sha=$(api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
-          [ "$main_sha" = "$BUILDER_SHA" ] || {
-            echo "Main advanced immediately before core draft publication." >&2
-            exit 1
-          }
-          published_json=$(api --method PATCH \
-            "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}" \
-            -F draft=false -f make_latest=false)
-          jq -e --argjson id "$draft_id" --arg tag "$TAG" --arg target "$BUILDER_SHA" '
-            .id == $id and .tag_name == $tag and .target_commitish == $target and
-            .draft == false and .prerelease == false
-          ' <<<"$published_json" >/dev/null
+          assert_product_latest
+          assert_immutable_releases_enabled
+          assert_release_gate
 
-          release_verified=false
-          for attempt in 1 2 3 4 5 6; do
-            if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}") &&
-              jq -e --arg tag "$TAG" --arg target "$BUILDER_SHA" --argjson assets "$expected_asset_names" '
-                .tag_name == $tag and .target_commitish == $target and
-                .draft == false and .prerelease == false and .immutable == true and
-                ([.assets[].name] | sort) == $assets
-              ' <<<"$release_json" >/dev/null; then
-              release_verified=true
-              break
-            fi
-            [ "$attempt" -eq 6 ] || sleep 2
-          done
-          [ "$release_verified" = true ] || {
-            echo "Published core release metadata does not match the verified payload." >&2
-            exit 1
-          }
-          wait_for_remote_tag_sha "$TAG" "$BUILDER_SHA"
-
-          verify_dir=$(mktemp -d)
-          trap 'rm -rf "$verify_dir"' EXIT
-          for asset in BUILD_INFO SHA256SUMS \
-            "rr-sing-box-${VERSION}-linux-amd64.tar.gz" \
-            "rr-sing-box-${VERSION}-linux-arm64.tar.gz"; do
-            verified=false
-            for attempt in 1 2 3 4 5 6; do
-              if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-                --retry 2 --retry-all-errors --retry-delay 1 \
-                "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}" \
-                -o "$verify_dir/${asset}.part" &&
-                cmp -s "release-assets/$asset" "$verify_dir/${asset}.part"; then
-                mv "$verify_dir/${asset}.part" "$verify_dir/$asset"
-                verified=true
-                break
-              fi
-              [ "$attempt" -eq 6 ] || sleep 2
-            done
-            [ "$verified" = true ] || {
-              echo "Published core download differs from builder output: $asset" >&2
-              exit 1
-            }
-          done
-          (cd "$verify_dir" && sha256sum -c SHA256SUMS)
-          assert_product_latest 6
+          # No release DELETE has an authoritative compare-and-swap contract.
+          # From this point, PATCH ambiguity is resolved only by exact-ID GET;
+          # a remaining exact draft is preserved and re-adopted by the rerun.
+          cleanup_armed=false
+          trap - EXIT
+          publish_draft_and_confirm "$DRAFT_ID"
+          verify_published_release "$DRAFT_ID"

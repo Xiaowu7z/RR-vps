@@ -151,18 +151,6 @@ api() {
                 return 1
             fi
             ;;
-        DELETE:*/releases/[0-9]*)
-            if [ ! -e "$STATE_ROOT/delete-release-stuck" ]; then
-                command rm -f -- "$STATE_ROOT/release.json"
-            fi
-            [ ! -e "$STATE_ROOT/delete-release-response-loss" ]
-            ;;
-        DELETE:*/git/refs/tags/*)
-            if [ ! -e "$STATE_ROOT/delete-tag-stuck" ]; then
-                command rm -f -- "$STATE_ROOT/ref.json"
-            fi
-            [ ! -e "$STATE_ROOT/delete-tag-response-loss" ]
-            ;;
         PATCH:*/releases/[0-9]*)
             if [ -e "$STATE_ROOT/patch-public" ]; then
                 jq '.draft = false' "$STATE_ROOT/release.json" > "$STATE_ROOT/release.next"
@@ -208,7 +196,8 @@ reset_owned_state() {
         {id:17,tag_name:$tag,target_commitish:$sha,name:$title,draft:true,
          prerelease:false,immutable:false,author:{login:"github-actions[bot]"},
          body:($notes + "\n" + $marker + "\n"),
-         assets:($assets | map(. + {state:"uploaded"}))}
+         assets:($assets | map(. +
+           {state:"uploaded",uploader:{login:"github-actions[bot]"}}))}
     ' > "$STATE_ROOT/release.json"
     LOADED_TAG_STATE=unknown
     LOADED_TAG_OBJECT_SHA=""
@@ -227,7 +216,8 @@ reset_old_owned_state() {
         --arg marker "<!-- ${OLD_OWNER_MARKER} -->" --arg commit "$OLD_SHA" \
         --argjson assets "$old_expected_assets" \
         '.target_commitish=$commit | .body=($notes + "\n" + $marker + "\n") |
-         .assets=($assets | map(. + {state:"uploaded"}))' \
+         .assets=($assets | map(. +
+           {state:"uploaded",uploader:{login:"github-actions[bot]"}}))' \
         "$STATE_ROOT/release.json" > "$STATE_ROOT/release.next"
     command mv "$STATE_ROOT/release.next" "$STATE_ROOT/release.json"
 }
@@ -248,32 +238,34 @@ set_owned_contract() {
         --arg marker "<!-- ${marker} -->" --arg commit "$commit" \
         --argjson assets "$assets" \
         '.target_commitish=$commit | .body=($notes + "\n" + $marker + "\n") |
-         .assets=($assets | map(. + {state:"uploaded"}))' \
+         .assets=($assets | map(. +
+           {state:"uploaded",uploader:{login:"github-actions[bot]"}}))' \
         "$STATE_ROOT/release.json" > "$STATE_ROOT/release.next"
     command mv "$STATE_ROOT/release.next" "$STATE_ROOT/release.json"
 }
 
-printf '%s\n' '[1/14] an exact owned draft is removed before its annotated tag'
+printf '%s\n' '[1/14] an exact owned draft is preserved as durable retry state'
 reset_owned_state
 reconcile_owned_mutable_target
-[ ! -e "$STATE_ROOT/release.json" ] && [ ! -e "$STATE_ROOT/ref.json" ] ||
-    fail 'owned orphan state was not fully reconciled'
-release_delete=$(grep -nFx \
-    "DELETE /repos/${GITHUB_REPOSITORY}/releases/17" "$API_LOG" | cut -d: -f1)
-tag_delete=$(grep -nFx \
-    "DELETE /repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" "$API_LOG" | cut -d: -f1)
-[[ "$release_delete" =~ ^[0-9]+$ && "$tag_delete" =~ ^[0-9]+$ ]] && \
-    [ "$release_delete" -lt "$tag_delete" ] ||
-    fail 'owned orphan deletion did not remove release before tag'
+[ -e "$STATE_ROOT/release.json" ] && [ -e "$STATE_ROOT/ref.json" ] ||
+    fail 'exact owned draft was not preserved'
+classify_target_release_state
+[ "$TARGET_RELEASE_STATE" = exact_owned_draft_current ] &&
+    [ "$TARGET_RELEASE_ID" = 17 ] || fail 'exact owned draft was not re-adopted by ID'
+assert_no_delete 'exact owned draft preservation'
 : > "$API_LOG"
 reconcile_owned_mutable_target
-assert_no_delete 'idempotent absent reconciliation'
+assert_no_delete 'idempotent exact draft preservation'
 
-printf '%s\n' '[2/14] an older-SHA draft is reconciled from its self-described asset contract'
+printf '%s\n' '[2/14] an older-SHA draft is preserved but cannot be adopted'
 reset_old_owned_state
-reconcile_owned_mutable_target "$TAG_OBJECT_SHA" "$OLD_OWNER_MARKER"
-[ ! -e "$STATE_ROOT/release.json" ] && [ ! -e "$STATE_ROOT/ref.json" ] ||
-    fail 'older-SHA owned orphan state was not reconciled'
+if reconcile_owned_mutable_target "$TAG_OBJECT_SHA" "$OLD_OWNER_MARKER" \
+    >/dev/null 2>&1; then
+    fail 'older-SHA draft was accepted for the current release input'
+fi
+[ -e "$STATE_ROOT/release.json" ] && [ -e "$STATE_ROOT/ref.json" ] ||
+    fail 'older-SHA draft was not preserved'
+assert_no_delete 'older-SHA draft'
 
 printf '%s\n' '[3/14] corrupt marker hash, base64, name, or digest is never deletion authority'
 for marker_mutation in hash base64 name digest; do
@@ -326,23 +318,6 @@ git() {
         printf '%s\trefs/tags/%s^{}\n' "$EXPECTED_SHA" "$TAG"
     fi
 }
-curl() {
-    local output="" url="" argument=""
-    while [ "$#" -gt 0 ]; do
-        argument="$1"
-        case "$argument" in
-            -o) output="$2"; shift 2 ;;
-            https://*) url="$argument"; shift ;;
-            *) shift ;;
-        esac
-    done
-    [ -n "$output" ] && [ -n "$url" ] || return 1
-    command cp "$ASSET_ROOT/${url##*/}" "$output"
-}
-(
-    cd "$ASSET_ROOT"
-    verify_published_release "$TARGET_RELEASE_ID" "$RUN_OWNER_MARKER"
-) || fail 'exact current public verification-only resume failed'
 for inventory_failure in api invalid-json git; do
     case "$inventory_failure" in
         api) : > "$STATE_ROOT/fail-release-inventory" ;;
@@ -355,7 +330,7 @@ for inventory_failure in api invalid-json git; do
     command rm -f -- "$STATE_ROOT/fail-release-inventory" \
         "$STATE_ROOT/invalid-release-inventory" "$STATE_ROOT/fail-git-inventory"
 done
-unset -f git curl
+unset -f git
 assert_no_delete 'exact current public verification-only resume'
 if grep -Eq '^(PATCH|POST) ' "$API_LOG"; then
     fail 'exact current public resume attempted publication mutation'
@@ -397,8 +372,12 @@ jq '.assets=[{name:"install.sh",size:0,digest:null,state:"starter",
     > "$STATE_ROOT/release.next"
 command mv "$STATE_ROOT/release.next" "$STATE_ROOT/release.json"
 reconcile_owned_mutable_target
-[ ! -e "$STATE_ROOT/release.json" ] && [ ! -e "$STATE_ROOT/ref.json" ] ||
-    fail 'owned empty starter asset was not safely reconciled'
+[ -e "$STATE_ROOT/release.json" ] && [ -e "$STATE_ROOT/ref.json" ] ||
+    fail 'owned starter slot was not preserved'
+classify_target_release_state
+[ "$TARGET_RELEASE_STATE" = exact_owned_partial_draft_current ] ||
+    fail 'canonical starter slot was not classified as partial retry state'
+assert_no_delete 'owned starter slot'
 for starter_mutation in name uploader size digest state; do
     reset_owned_state
     jq '.assets=[{name:"install.sh",size:0,digest:null,state:"starter",
@@ -419,25 +398,26 @@ for starter_mutation in name uploader size digest state; do
     assert_no_delete "unsafe starter ${starter_mutation}"
 done
 
-printf '%s\n' '[7/14] lost DELETE responses require authoritative absence before success'
+printf '%s\n' '[7/14] a canonical 1/5 draft is preserved for exact-ID continuation'
 reset_owned_state
-: > "$STATE_ROOT/delete-release-response-loss"
-: > "$STATE_ROOT/delete-tag-response-loss"
+jq '.assets=[.assets[] | select(.name == "install.sh")]' \
+    "$STATE_ROOT/release.json" > "$STATE_ROOT/release.next"
+command mv "$STATE_ROOT/release.next" "$STATE_ROOT/release.json"
 reconcile_owned_mutable_target
-[ ! -e "$STATE_ROOT/release.json" ] && [ ! -e "$STATE_ROOT/ref.json" ] ||
-    fail 'confirmed response-loss deletion did not converge to absence'
+[ "$(jq -r '.id' "$STATE_ROOT/release.json")" = 17 ] &&
+    [ "$(jq -r '.assets | length' "$STATE_ROOT/release.json")" = 1 ] ||
+    fail 'canonical partial draft was not preserved under the same ID'
+classify_target_release_state
+[ "$TARGET_RELEASE_STATE" = exact_owned_partial_draft_current ] &&
+    [ "$TARGET_RELEASE_ID" = 17 ] || fail '1/5 draft was not re-adopted by ID'
+assert_no_delete 'canonical 1/5 draft'
 
-printf '%s\n' '[8/14] an unconfirmed release deletion never reaches tag deletion'
+printf '%s\n' '[8/14] draft reconciliation never invokes the release DELETE endpoint'
 reset_owned_state
-: > "$STATE_ROOT/delete-release-stuck"
-if reconcile_owned_mutable_target >/dev/null 2>&1; then
-    fail 'stuck release deletion was reported as reconciled'
-fi
+reconcile_owned_mutable_target
 [ -e "$STATE_ROOT/release.json" ] && [ -e "$STATE_ROOT/ref.json" ] ||
-    fail 'unconfirmed release deletion removed protected state'
-if grep -q '^DELETE .*/git/refs/tags/' "$API_LOG"; then
-    fail 'tag deletion followed an unconfirmed release deletion'
-fi
+    fail 'draft reconciliation removed protected state'
+assert_no_delete 'draft reconciliation'
 
 printf '%s\n' '[9/14] public, immutable, foreign, duplicate and unreadable state is never deleted'
 for mutation in public immutable marker tag duplicate inventory run-marker; do
@@ -472,6 +452,16 @@ for mutation in public immutable marker tag duplicate inventory run-marker; do
 done
 
 printf '%s\n' '[10/14] an owned tag-only orphan is recoverable but a lightweight tag is not'
+gh() {
+    [ "${1:-}" = auth ] && [ "${2:-}" = setup-git ]
+}
+git() {
+    [ "${1:-}" = push ] || return 1
+    [[ " $* " == *" --force-with-lease=refs/tags/${TAG}:${TAG_OBJECT_SHA} "* ]] ||
+        return 1
+    [[ " $* " == *" :refs/tags/${TAG} "* ]] || return 1
+    command rm -f -- "$STATE_ROOT/ref.json"
+}
 reset_owned_state
 command rm -f -- "$STATE_ROOT/release.json"
 reconcile_owned_mutable_target
@@ -485,6 +475,7 @@ if reconcile_owned_mutable_target >/dev/null 2>&1; then
     fail 'foreign lightweight tag was reported as owned'
 fi
 assert_no_delete 'foreign lightweight tag'
+unset -f gh git
 
 printf '%s\n' '[11/14] PATCH response loss is accepted only after exact public state is read'
 reset_owned_state

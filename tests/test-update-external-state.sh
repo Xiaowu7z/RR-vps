@@ -30,6 +30,7 @@ assert_eq() {
 
 for path in \
     etc/nginx/sites-available etc/nginx/sites-enabled \
+    etc/systemd/system/nginx.service.d usr/local/lib/rr-vps \
     etc/letsencrypt/renewal-hooks/deploy etc/rr-cloudflared \
     etc/systemd/system; do
     mkdir -p "$ROOTFS/$path"
@@ -196,6 +197,13 @@ rm -f "$ROOTFS/etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh"
 printf 'candidate-hook\n' > "$ROOTFS/etc/letsencrypt/renewal-hooks/deploy/rr-certificates.sh"
 printf 'candidate-token\n' > "$ROOTFS/etc/rr-cloudflared/token"
 printf 'candidate-unit\n' > "$ROOTFS/etc/systemd/system/cloudflared.service"
+printf 'candidate-gate-script\n' > \
+    "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+printf 'candidate-gate-dropin\n' > \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+chmod 755 "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+chmod 644 \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
 printf 'disabled\ninactive\n' > "$SERVICE_ROOT/nginx"
 printf 'enabled\nactive\n' > "$SERVICE_ROOT/cloudflared"
 
@@ -208,11 +216,46 @@ cmp -s "$FW_ROOT/ip6tables.filter.INPUT" "$TEST_ROOT/original-v6-filter" || fail
 assert_eq "$(cat "$ROOTFS/etc/nginx/sites-available/rr-nexus.conf")" site-original 'Nginx file was not restored'
 assert_eq "$(readlink "$ROOTFS/etc/nginx/sites-enabled/rr-nexus.conf")" ../sites-available/rr-nexus.conf 'Nginx symlink was not restored'
 [ ! -e "$ROOTFS/etc/nginx/sites-enabled/rr-nexus-ip.conf" ] || fail 'snapshot-missing managed path was not removed'
+[ ! -e "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate" ] && \
+    [ ! -e "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf" ] || \
+    fail 'legacy snapshot did not remove candidate IP certificate gate artifacts'
 assert_eq "$(cat "$ROOTFS/etc/nginx/sites-available/user-site.conf")" user-site-must-survive 'user Nginx site was touched'
 grep -qx enabled "$SERVICE_ROOT/nginx" && grep -qx active "$SERVICE_ROOT/nginx" || fail 'Nginx service state was not restored'
 grep -qx disabled "$SERVICE_ROOT/cloudflared" && grep -qx inactive "$SERVICE_ROOT/cloudflared" || fail 'cloudflared service state was not restored'
 python3 "$HELPER" verify "$BACKUP" --tx-root "$TX_ROOT"
 pass 'restore is exact and leaves unrelated Nginx/firewall state unchanged'
+
+# A target that already owns the fixed gate paths receives the exact former
+# bytes and modes back, rather than only supporting the legacy-absent case.
+BACKUP_GATE="$TX_ROOT/transactions/tx-gate/backup"
+mkdir -p "$BACKUP_GATE"
+chmod 700 "$TX_ROOT/transactions/tx-gate" "$BACKUP_GATE"
+printf 'original-gate-script\n' > \
+    "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+printf 'original-gate-dropin\n' > \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+chmod 755 "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+chmod 644 \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+python3 "$HELPER" snapshot "$BACKUP_GATE" --tx-root "$TX_ROOT"
+printf 'mutated-gate-script\n' > \
+    "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+printf 'mutated-gate-dropin\n' > \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+chmod 700 "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
+chmod 600 \
+    "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+python3 "$HELPER" restore "$BACKUP_GATE" --tx-root "$TX_ROOT"
+assert_eq "$(cat "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate")" \
+    original-gate-script 'existing gate script content was not restored'
+assert_eq "$(cat "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf")" \
+    original-gate-dropin 'existing gate drop-in content was not restored'
+assert_eq "$(stat -c %a "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate")" \
+    755 'existing gate script mode was not restored'
+assert_eq "$(stat -c %a "$ROOTFS/etc/systemd/system/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf")" \
+    644 'existing gate drop-in mode was not restored'
+python3 "$HELPER" verify "$BACKUP_GATE" --tx-root "$TX_ROOT"
+pass 'existing fixed IP certificate gate artifacts are restored exactly'
 
 # A concurrent change to a non-RR rule must reject the restore before touching files.
 printf 'candidate-again\n' > "$ROOTFS/etc/nginx/sites-available/rr-nexus.conf"

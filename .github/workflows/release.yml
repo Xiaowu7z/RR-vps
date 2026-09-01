@@ -55,26 +55,74 @@ jobs:
             exit 1
           }
 
-          require_workflow_success_for_sha() {
-            local workflow_file="$1" gate_name="$2" runs
-            runs=$(gh api \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2026-03-10' \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?branch=main&event=push&head_sha=${REQUESTED_SHA}&per_page=100")
-            jq -e --arg sha "$REQUESTED_SHA" '
-              (.workflow_runs |
-                sort_by([.run_number, .run_attempt]) | last) as $run |
-              $run != null and $run.head_sha == $sha and
-              $run.head_branch == "main" and $run.event == "push" and
-              $run.status == "completed" and $run.conclusion == "success"
-            ' <<<"$runs" >/dev/null || {
-              echo "The latest main push run for ${gate_name} is not a completed success for the requested SHA." >&2
+          require_workflow_success_for_sha() (
+            local workflow_file="$1" expected_event="$2" gate_name="$3"
+            local page=1 page_count=0 expected_total="" accumulated=0
+            local response="" runs_file=""
+            runs_file=$(mktemp) || return 1
+            trap 'rm -f -- "$runs_file"' EXIT
+            while :; do
+              response=$(gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?branch=main&event=${expected_event}&head_sha=${REQUESTED_SHA}&per_page=100&page=${page}") || return 1
+              jq -e '
+                type == "object" and
+                (.total_count | type == "number") and
+                .total_count == (.total_count | floor) and
+                .total_count >= 0 and .total_count <= 10000 and
+                (.workflow_runs | type == "array") and
+                (.workflow_runs | length) <= 100 and
+                all(.workflow_runs[]; type == "object")
+              ' <<<"$response" >/dev/null || return 1
+              if [ -z "$expected_total" ]; then
+                expected_total=$(jq -r '.total_count' <<<"$response")
+              elif [ "$(jq -r '.total_count' <<<"$response")" != "$expected_total" ]; then
+                echo "The ${gate_name} run inventory changed while it was paginated." >&2
+                return 1
+              fi
+              page_count=$(jq -r '.workflow_runs | length' <<<"$response")
+              jq -c '.workflow_runs[]' <<<"$response" >>"$runs_file" || return 1
+              accumulated=$((accumulated + page_count))
+              [ "$accumulated" -le "$expected_total" ] || return 1
+              [ "$page_count" -eq 100 ] || break
+              page=$((page + 1))
+              [ "$page" -le 101 ] || return 1
+            done
+            [ "$accumulated" -eq "$expected_total" ] || {
+              echo "The ${gate_name} run inventory was incomplete." >&2
               return 1
             }
-          }
+            jq -se --arg sha "$REQUESTED_SHA" --arg event "$expected_event" '
+              . as $inventory |
+              ($inventory | map(select(
+                .head_sha == $sha and .head_branch == "main" and .event == $event
+              ))) as $exact |
+              all($inventory[];
+                (.id | type == "number") and .id == (.id | floor) and .id > 0 and
+                (.run_number | type == "number") and
+                  .run_number == (.run_number | floor) and .run_number > 0 and
+                (.run_attempt | type == "number") and
+                  .run_attempt == (.run_attempt | floor) and .run_attempt > 0 and
+                (.status | type == "string") and
+                (.conclusion == null or (.conclusion | type == "string"))) and
+              ([$inventory[].id] | length) ==
+                ([$inventory[].id] | unique | length) and
+              ($inventory | group_by([.run_number, .run_attempt]) |
+                all(.[]; length == 1)) and
+              ($exact | length) > 0 and
+              ($exact | sort_by([.run_number, .run_attempt]) | last) as $run |
+              $run.status == "completed" and $run.conclusion == "success"
+            ' "$runs_file" >/dev/null || {
+              echo "The latest exact ${gate_name} run is not a completed success for the requested SHA." >&2
+              return 1
+            }
+          )
 
-          require_workflow_success_for_sha ci.yml CI
-          require_workflow_success_for_sha vps-audit.yml "VPS audit"
+          require_workflow_success_for_sha ci.yml push "CI push"
+          require_workflow_success_for_sha vps-audit.yml push "VPS audit push"
+          require_workflow_success_for_sha vps-audit.yml workflow_dispatch \
+            "VPS audit workflow_dispatch"
           main_sha=$(gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -250,25 +298,73 @@ jobs:
               "$@"
           }
 
-          assert_workflow_gate() {
-            local workflow_file="$1" gate_name="$2" runs
-            runs=$(api \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?branch=main&event=push&head_sha=${EXPECTED_SHA}&per_page=100")
-            jq -e --arg sha "$EXPECTED_SHA" '
-              (.workflow_runs |
-                sort_by([.run_number, .run_attempt]) | last) as $run |
-              $run != null and $run.head_sha == $sha and
-              $run.head_branch == "main" and $run.event == "push" and
-              $run.status == "completed" and $run.conclusion == "success"
-            ' <<<"$runs" >/dev/null || {
-              echo "The latest main push run for ${gate_name} is not a completed success for the release SHA." >&2
+          assert_workflow_gate() (
+            local workflow_file="$1" expected_event="$2" gate_name="$3"
+            local page=1 page_count=0 expected_total="" accumulated=0
+            local response="" runs_file=""
+            runs_file=$(mktemp) || return 1
+            trap 'rm -f -- "$runs_file"' EXIT
+            while :; do
+              response=$(api \
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow_file}/runs?branch=main&event=${expected_event}&head_sha=${EXPECTED_SHA}&per_page=100&page=${page}") || return 1
+              jq -e '
+                type == "object" and
+                (.total_count | type == "number") and
+                .total_count == (.total_count | floor) and
+                .total_count >= 0 and .total_count <= 10000 and
+                (.workflow_runs | type == "array") and
+                (.workflow_runs | length) <= 100 and
+                all(.workflow_runs[]; type == "object")
+              ' <<<"$response" >/dev/null || return 1
+              if [ -z "$expected_total" ]; then
+                expected_total=$(jq -r '.total_count' <<<"$response")
+              elif [ "$(jq -r '.total_count' <<<"$response")" != "$expected_total" ]; then
+                echo "The ${gate_name} run inventory changed while it was paginated." >&2
+                return 1
+              fi
+              page_count=$(jq -r '.workflow_runs | length' <<<"$response")
+              jq -c '.workflow_runs[]' <<<"$response" >>"$runs_file" || return 1
+              accumulated=$((accumulated + page_count))
+              [ "$accumulated" -le "$expected_total" ] || return 1
+              [ "$page_count" -eq 100 ] || break
+              page=$((page + 1))
+              [ "$page" -le 101 ] || return 1
+            done
+            [ "$accumulated" -eq "$expected_total" ] || {
+              echo "The ${gate_name} run inventory was incomplete." >&2
               return 1
             }
-          }
+            jq -se --arg sha "$EXPECTED_SHA" --arg event "$expected_event" '
+              . as $inventory |
+              ($inventory | map(select(
+                .head_sha == $sha and .head_branch == "main" and .event == $event
+              ))) as $exact |
+              all($inventory[];
+                (.id | type == "number") and .id == (.id | floor) and .id > 0 and
+                (.run_number | type == "number") and
+                  .run_number == (.run_number | floor) and .run_number > 0 and
+                (.run_attempt | type == "number") and
+                  .run_attempt == (.run_attempt | floor) and .run_attempt > 0 and
+                (.status | type == "string") and
+                (.conclusion == null or (.conclusion | type == "string"))) and
+              ([$inventory[].id] | length) ==
+                ([$inventory[].id] | unique | length) and
+              ($inventory | group_by([.run_number, .run_attempt]) |
+                all(.[]; length == 1)) and
+              ($exact | length) > 0 and
+              ($exact | sort_by([.run_number, .run_attempt]) | last) as $run |
+              $run.status == "completed" and $run.conclusion == "success"
+            ' "$runs_file" >/dev/null || {
+              echo "The latest exact ${gate_name} run is not a completed success for the release SHA." >&2
+              return 1
+            }
+          )
 
           assert_verified_sha_gate() {
-            assert_workflow_gate ci.yml CI
-            assert_workflow_gate vps-audit.yml "VPS audit"
+            assert_workflow_gate ci.yml push "CI push"
+            assert_workflow_gate vps-audit.yml push "VPS audit push"
+            assert_workflow_gate vps-audit.yml workflow_dispatch \
+              "VPS audit workflow_dispatch"
           }
 
           assert_main_tip() {
@@ -467,7 +563,8 @@ jobs:
                 . as $actual | any($expected[];
                   .name == $actual.name and
                   (($actual.state == "uploaded" and
-                    .size == $actual.size and .digest == $actual.digest) or
+                    .size == $actual.size and .digest == $actual.digest and
+                    $actual.uploader.login == "github-actions[bot]") or
                    ($actual.state == "starter" and $actual.size == 0 and
                     ($actual.digest == null or $actual.digest == "") and
                     $actual.uploader.login == "github-actions[bot]"))))
@@ -476,16 +573,25 @@ jobs:
 
           is_exact_mutable_draft() {
             local release_json="$1" owner_marker="$2" owner_commit="$3"
+            local owner_assets="$4"
+            is_canonical_owned_partial_draft "$release_json" "$owner_marker" \
+              "$owner_commit" "$owner_assets" &&
+              jq -e --argjson expected "$owner_assets" '
+                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected
+              ' \
+                <<<"$release_json" >/dev/null
+          }
+
+          is_canonical_owned_partial_draft() {
+            local release_json="$1" owner_marker="$2" owner_commit="$3"
             local owner_assets="$4" body_marker=""
             body_marker="<!-- ${owner_marker} -->"
             is_owned_mutable_draft "$release_json" "$owner_marker" \
               "$owner_commit" "$owner_assets" &&
               jq -e --rawfile notes "$RELEASE_NOTES_FILE" \
-                --arg marker "$body_marker" --argjson expected "$owner_assets" '
-                .body == ($notes + "\n" + $marker + "\n") and
-                ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected
-              ' \
-                <<<"$release_json" >/dev/null
+                --arg marker "$body_marker" '
+                .body == ($notes + "\n" + $marker + "\n")
+              ' <<<"$release_json" >/dev/null
           }
 
           is_exact_public_release() {
@@ -503,49 +609,58 @@ jobs:
               .body == ($notes + "\n" + $marker + "\n") and
               ([.assets[].name] | length == (unique | length)) and
               ([.assets[] | {name, size, digest}] | sort_by(.name)) == $expected and
-              all(.assets[]; .state == "uploaded")
+              all(.assets[];
+                .state == "uploaded" and
+                .uploader.login == "github-actions[bot]")
             ' <<<"$release_json" >/dev/null
           }
 
-          resource_is_authoritatively_absent() {
-            local endpoint="$1" response="" status=""
-            if response=$(api --include "$endpoint" 2>&1); then
-              return 1
-            fi
-            status=$(awk 'toupper($1) ~ /^HTTP\// { code=$2 } END { print code }' <<<"$response")
-            [ "$status" = 404 ]
-          }
-
           delete_owned_target_tag() {
-            local expected_object_sha="$1" expected_marker="$2" remaining=""
+            local expected_object_sha="$1" expected_marker="$2" push_status=0
             load_owned_target_tag || return 1
             [ "$LOADED_TAG_STATE" = absent ] && return 0
             [ "$LOADED_TAG_STATE" = owned ] &&
               [ "$LOADED_TAG_OBJECT_SHA" = "$expected_object_sha" ] &&
               [ "$LOADED_TAG_OWNER_MARKER" = "$expected_marker" ] || return 1
-            api --method DELETE "/repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
-              >/dev/null 2>&1 || true
-            resource_is_authoritatively_absent \
-              "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" || {
-              echo "Owned tag $TAG could not be proven absent by its exact ref endpoint." >&2
+
+            # GitHub's REST ref deletion endpoint has no conditional-write
+            # contract. Smart push gives the deletion a server-side CAS: the
+            # remote ref is removed only while it still names the exact owned
+            # annotated object that was just verified.
+            gh auth setup-git >/dev/null
+            git push --porcelain \
+              --force-with-lease="refs/tags/${TAG}:${expected_object_sha}" \
+              origin ":refs/tags/${TAG}" >/dev/null 2>&1 || push_status=$?
+
+            # A failed transport may still have delivered the push. Classify
+            # the authoritative post-push state; never retry deletion against
+            # a ref that could now be foreign.
+            if ! load_owned_target_tag; then
+              echo "Tag $TAG changed to an unrecognized object during CAS cleanup; it was not retried." >&2
               return 1
-            }
-            remaining=$(list_target_tag_refs) || return 1
-            [ "$(jq -r 'length' <<<"$remaining")" -eq 0 ] || {
-              echo "Owned tag $TAG could not be proven absent after deletion." >&2
-              return 1
-            }
+            fi
+            case "$LOADED_TAG_STATE" in
+              absent) return 0 ;;
+              owned)
+                if [ "$LOADED_TAG_OBJECT_SHA" = "$expected_object_sha" ]; then
+                  echo "CAS cleanup left owned tag $TAG in place (push status $push_status)." >&2
+                else
+                  echo "Tag $TAG changed during CAS cleanup; the replacement was preserved." >&2
+                fi
+                return 1
+                ;;
+              *) return 1 ;;
+            esac
           }
 
           reconcile_owned_mutable_target() {
-            local releases="" count=0 release_json="" fresh_json="" after=""
-            local release_id="" expected_marker="" expected_object_sha=""
-            local expected_owner_commit="" expected_owner_assets=""
+            local releases="" count=0 release_json="" fresh_json=""
+            local release_id="" expected_marker=""
             local required_object_sha="${1:-}" required_marker="${2:-}"
             releases=$(list_target_releases) || return 1
             count=$(jq -r 'length' <<<"$releases")
             [ "$count" -le 1 ] || {
-              echo "Multiple releases use $TAG; refusing every destructive action." >&2
+              echo "Multiple releases use $TAG; refusing reconciliation." >&2
               return 1
             }
             if [ "$count" -eq 0 ]; then
@@ -574,38 +689,29 @@ jobs:
               echo "The current release/tag pair is not owned by this cleanup transaction." >&2
               return 1
             fi
-            expected_object_sha="$LOADED_TAG_OBJECT_SHA"
             expected_marker="$LOADED_TAG_OWNER_MARKER"
-            expected_owner_commit="$LOADED_TAG_OWNER_COMMIT"
-            expected_owner_assets="$LOADED_TAG_EXPECTED_ASSETS"
             release_json=$(jq -c '.[0]' <<<"$releases")
-            is_owned_mutable_draft "$release_json" "$expected_marker" \
-              "$expected_owner_commit" "$expected_owner_assets" || {
-              echo "Existing $TAG release is foreign, public, immutable, or inconsistent; refusing deletion." >&2
-              return 1
-            }
             release_id=$(jq -r '.id' <<<"$release_json")
             [[ "$release_id" =~ ^[0-9]+$ ]] || return 1
             fresh_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") || return 1
-            [ "$(jq -r '.id' <<<"$fresh_json")" = "$release_id" ] &&
-              is_owned_mutable_draft "$fresh_json" "$expected_marker" \
-                "$expected_owner_commit" "$expected_owner_assets" || return 1
+            [ "$(jq -r '.id' <<<"$fresh_json")" = "$release_id" ] || return 1
 
-            # A lost DELETE response is acceptable only after the exact-ID GET
-            # returns an authoritative 404 and a fresh inventory also agrees.
-            api --method DELETE "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-              >/dev/null 2>&1 || true
-            resource_is_authoritatively_absent \
-              "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" || {
-              echo "Owned draft $release_id could not be proven absent by its exact endpoint." >&2
+            # GitHub does not support conditional DELETE/PATCH semantics for a
+            # draft release. Never delete a draft automatically. A canonical
+            # owned subset is durable retry state; every other release state
+            # is left untouched and rejected.
+            is_canonical_owned_partial_draft "$fresh_json" "$expected_marker" \
+              "$LOADED_TAG_OWNER_COMMIT" "$LOADED_TAG_EXPECTED_ASSETS" || {
+              echo "Existing $TAG release is not the exact owned retry draft; it was preserved." >&2
               return 1
             }
-            after=$(list_target_releases) || return 1
-            [ "$(jq -r 'length' <<<"$after")" -eq 0 ] || {
-              echo "Owned draft $release_id could not be proven absent after deletion." >&2
+            [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] || {
+              echo "Owned retry draft belongs to another release input; it was preserved." >&2
               return 1
             }
-            delete_owned_target_tag "$expected_object_sha" "$expected_marker"
+            echo "Canonical owned draft $release_id is preserved for retry." >&2
+            return 0
           }
 
           classify_target_release_state() {
@@ -623,7 +729,14 @@ jobs:
             if [ "$count" -eq 0 ]; then
               case "$LOADED_TAG_STATE" in
                 absent) TARGET_RELEASE_STATE=absent ;;
-                owned) TARGET_RELEASE_STATE=owned_mutable ;;
+                owned)
+                  [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+                    [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] || {
+                    echo "Owned tag-only state belongs to another release input; refusing mutation." >&2
+                    return 1
+                  }
+                  TARGET_RELEASE_STATE=owned_tag_only_current
+                  ;;
                 *) return 1 ;;
               esac
               return 0
@@ -632,9 +745,22 @@ jobs:
             release_json=$(jq -c '.[0]' <<<"$releases")
             release_id=$(jq -r '.id' <<<"$release_json")
             [[ "$release_id" =~ ^[0-9]+$ ]] || return 1
-            if is_owned_mutable_draft "$release_json" "$LOADED_TAG_OWNER_MARKER" \
-              "$LOADED_TAG_OWNER_COMMIT" "$LOADED_TAG_EXPECTED_ASSETS"; then
-              TARGET_RELEASE_STATE=owned_mutable
+            release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") || return 1
+            [ "$(jq -r '.id' <<<"$release_json")" = "$release_id" ] || return 1
+            if [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] &&
+              is_exact_mutable_draft "$release_json" "$LOADED_TAG_OWNER_MARKER" \
+                "$EXPECTED_SHA" "$expected_assets"; then
+              TARGET_RELEASE_STATE=exact_owned_draft_current
+              TARGET_RELEASE_ID="$release_id"
+              TARGET_RELEASE_JSON="$release_json"
+              return 0
+            fi
+            if [ "$LOADED_TAG_OWNER_COMMIT" = "$EXPECTED_SHA" ] &&
+              [ "$LOADED_TAG_EXPECTED_ASSETS" = "$expected_assets" ] &&
+              is_canonical_owned_partial_draft "$release_json" \
+                "$LOADED_TAG_OWNER_MARKER" "$EXPECTED_SHA" "$expected_assets"; then
+              TARGET_RELEASE_STATE=exact_owned_partial_draft_current
               TARGET_RELEASE_ID="$release_id"
               TARGET_RELEASE_JSON="$release_json"
               return 0
@@ -657,8 +783,16 @@ jobs:
             local status=$?
             trap - EXIT
             if [ "${cleanup_armed:-false}" = true ]; then
-              reconcile_owned_mutable_target "${RUN_TAG_OBJECT_SHA:-}" "${RUN_OWNER_MARKER:-}" ||
-                echo "Automatic release reconciliation refused or failed; no unverified object was deleted." >&2
+              if [ "${draft_creation_attempted:-false}" = true ]; then
+                # Once the POST may have reached GitHub, an empty inventory is
+                # not authoritative: the response and subsequent list reads
+                # can both lag.  Preserve the exact owned tag so any delayed
+                # draft remains adoptable by the next run.
+                echo "Draft creation was attempted; preserving the owned tag and any delayed draft for exact re-adoption." >&2
+              else
+                reconcile_owned_mutable_target "${RUN_TAG_OBJECT_SHA:-}" "${RUN_OWNER_MARKER:-}" ||
+                  echo "Automatic reconciliation refused or failed; every draft and unverified object was preserved." >&2
+              fi
             fi
             exit "$status"
           }
@@ -685,6 +819,97 @@ jobs:
             done
             echo "Release publication outcome is not yet authoritative; the draft was left untouched." >&2
             return 1
+          }
+
+          complete_owned_draft_assets() {
+            local draft_id="$1" owner_marker="$2" asset="" draft_json=""
+            local slot_state="" upload_template="" upload_url=""
+            local attempt=0 upload_status=0 converged=false
+            for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+              draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") || return 1
+              [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ] &&
+                is_canonical_owned_partial_draft "$draft_json" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets" || {
+                echo "Draft $draft_id changed before the $asset slot could be resumed." >&2
+                return 1
+              }
+              slot_state=$(jq -r --arg name "$asset" '
+                [.assets[] | select(.name == $name)] |
+                if length == 0 then "missing"
+                elif length == 1 then .[0].state
+                else "invalid"
+                end
+              ' <<<"$draft_json")
+              case "$slot_state" in
+                uploaded) continue ;;
+                starter) ;;
+                missing)
+                  assert_run_owned_target_tag || {
+                    echo "Owned annotated tag changed before uploading $asset." >&2
+                    return 1
+                  }
+                  # Re-read all three exact-SHA evidence classes immediately
+                  # before every asset mutation. A newer failed rerun blocks
+                  # this write even when an older attempt succeeded.
+                  assert_release_gate || return 1
+                  upload_template=$(jq -r '.upload_url // empty' <<<"$draft_json")
+                  [ "$upload_template" = \
+                    "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${draft_id}/assets{?name,label}" ] || {
+                    echo "Draft $draft_id does not expose its exact upload relation." >&2
+                    return 1
+                  }
+                  upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${draft_id}/assets?name=${asset}"
+                  upload_status=0
+                  # Upload exactly one missing slot to the exact release ID.
+                  # Never overwrite and never delete an uncertain asset slot.
+                  printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
+                    curl --config - --proto '=https' --proto-redir '=https' \
+                      --tlsv1.2 --fail-with-body --silent --show-error --location \
+                      --request POST \
+                      --header 'Accept: application/vnd.github+json' \
+                      --header 'X-GitHub-Api-Version: 2026-03-10' \
+                      --header 'Content-Type: application/octet-stream' \
+                      --data-binary "@${asset}" "$upload_url" \
+                      >/dev/null 2>&1 || upload_status=$?
+                  ;;
+                *)
+                  echo "Draft $draft_id contains an uncertain $asset slot; it was not overwritten." >&2
+                  return 1
+                  ;;
+              esac
+
+              # The upload response is not authoritative. Re-adopt an exact
+              # uploaded slot by release-ID GET, including its size, digest,
+              # uploader, and the canonical state of every other slot.
+              converged=false
+              for attempt in 1 2 3 4 5 6; do
+                if draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") &&
+                  [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ] &&
+                  is_canonical_owned_partial_draft "$draft_json" "$owner_marker" \
+                    "$EXPECTED_SHA" "$expected_assets" &&
+                  jq -e --arg name "$asset" --argjson expected "$expected_assets" '
+                    ([.assets[] | select(.name == $name)] | length) == 1 and
+                    (.assets[] | select(.name == $name)) as $actual |
+                    any($expected[];
+                      .name == $name and $actual.state == "uploaded" and
+                      $actual.size == .size and $actual.digest == .digest and
+                      $actual.uploader.login == "github-actions[bot]")
+                  ' <<<"$draft_json" >/dev/null; then
+                  converged=true
+                  break
+                fi
+                [ "$attempt" -eq 6 ] || sleep 2
+              done
+              [ "$converged" = true ] || {
+                echo "Asset $asset did not converge on exact draft $draft_id (upload status $upload_status); the slot was preserved." >&2
+                return 1
+              }
+            done
+
+            draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") || return 1
+            [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ] &&
+              is_exact_mutable_draft "$draft_json" "$owner_marker" \
+                "$EXPECTED_SHA" "$expected_assets"
           }
 
           version_gt() {
@@ -766,7 +991,8 @@ jobs:
 
           verify_published_release() {
             local release_id="$1" owner_marker="$2" attempt=0 release_json=""
-            local exact_public=false published_dir="" asset="" verified=false
+            local exact_public=false published_dir="" asset="" asset_json=""
+            local asset_id="" asset_size="" asset_digest="" verified=false
             for attempt in 1 2 3 4 5 6; do
               if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") &&
                 is_exact_public_release "$release_json" "$release_id" "$owner_marker" \
@@ -780,22 +1006,46 @@ jobs:
               echo "Public release $release_id is not the exact verified payload." >&2
               return 1
             }
-            assert_no_newer_product_version || return 1
-            wait_for_remote_tag_sha "$TAG" "$EXPECTED_SHA" || return 1
-            assert_latest_product "$release_id" "$owner_marker" || return 1
-            assert_run_owned_target_tag || {
-              echo "The immutable release is not bound to the owned annotated tag object." >&2
+
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg tag "$TAG" '
+              ([.assets[].id] | length == (unique | length)) and
+              all(.assets[];
+                (.id | type) == "number" and .id == (.id | floor) and .id > 0 and
+                .uploader.login == "github-actions[bot]" and
+                .url == ("https://api.github.com/repos/" + $repo +
+                  "/releases/assets/" + (.id | tostring)) and
+                .browser_download_url == ("https://github.com/" + $repo +
+                  "/releases/download/" + $tag + "/" + .name))
+            ' <<<"$release_json" >/dev/null || {
+              echo "Release $release_id asset identities are not bound to the exact tag/API contract." >&2
               return 1
             }
 
             published_dir=$(mktemp -d) || return 1
             for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+              asset_json=$(jq -ce --arg name "$asset" '
+                [.assets[] | select(.name == $name)] |
+                if length == 1 then .[0] else error("asset identity is not unique") end
+              ' <<<"$release_json") || {
+                rm -rf -- "$published_dir"
+                return 1
+              }
+              asset_id=$(jq -r '.id' <<<"$asset_json")
+              asset_size=$(jq -r '.size' <<<"$asset_json")
+              asset_digest=$(jq -r '.digest' <<<"$asset_json")
+              [[ "$asset_id" =~ ^[1-9][0-9]*$ ]] &&
+                [[ "$asset_size" =~ ^[1-9][0-9]*$ ]] &&
+                [[ "$asset_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                rm -rf -- "$published_dir"
+                return 1
+              }
               verified=false
               for attempt in 1 2 3 4 5 6; do
-                if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-                  --retry 2 --retry-all-errors --retry-delay 1 \
-                  "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/${asset}" \
-                  -o "$published_dir/${asset}.part" &&
+                if api -H 'Accept: application/octet-stream' \
+                  "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                  > "$published_dir/${asset}.part" &&
+                  [ "$(stat -c %s "$published_dir/${asset}.part")" = "$asset_size" ] &&
+                  [ "sha256:$(sha256sum "$published_dir/${asset}.part" | awk '{print $1}')" = "$asset_digest" ] &&
                   cmp -s "$asset" "$published_dir/${asset}.part"; then
                   mv "$published_dir/${asset}.part" "$published_dir/$asset"
                   verified=true
@@ -804,7 +1054,7 @@ jobs:
                 [ "$attempt" -eq 6 ] || sleep 2
               done
               [ "$verified" = true ] || {
-                echo "Latest download for $asset differs from the CI-verified source." >&2
+                echo "Exact release asset $asset differs from its ID, size, digest, or CI source." >&2
                 rm -rf -- "$published_dir"
                 return 1
               }
@@ -814,6 +1064,33 @@ jobs:
               return 1
             }
             rm -rf -- "$published_dir"
+
+            # Downloads are not the end of the transaction: re-read every
+            # mutable trust anchor afterwards so a concurrent Latest/tag/main
+            # or workflow-attempt change cannot be masked by valid bytes.
+            exact_public=false
+            for attempt in 1 2 3 4 5 6; do
+              if release_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}") &&
+                is_exact_public_release "$release_json" "$release_id" "$owner_marker" \
+                  "$EXPECTED_SHA" "$expected_assets" &&
+                jq -e '.immutable == true' <<<"$release_json" >/dev/null; then
+                exact_public=true
+                break
+              fi
+              [ "$attempt" -eq 6 ] || sleep 2
+            done
+            [ "$exact_public" = true ] || {
+              echo "Release $release_id is not the exact immutable publication after download." >&2
+              return 1
+            }
+            assert_run_owned_target_tag || {
+              echo "The immutable release is not bound to the owned annotated tag object." >&2
+              return 1
+            }
+            assert_latest_product "$release_id" "$owner_marker" || return 1
+            assert_verified_sha_gate || return 1
+            assert_main_tip || return 1
+            assert_no_newer_product_version || return 1
           }
 
           expected_assets=$(
@@ -827,11 +1104,13 @@ jobs:
           RELEASE_NOTES_FILE=release-notes.md
           RELEASE_TITLE="RR-vps ${VERSION} 正式版"
           cleanup_armed=false
+          draft_creation_attempted=false
 
           # Classify before any version gate that assumes target absence. An
-          # exact public release from this SHA is a verification-only resume;
-          # an owned mutable orphan (including an older SHA) is reconciled
-          # from the asset contract embedded in its annotated tag.
+          # exact public release is verification-only; an exact current draft
+          # is re-adopted by its annotated owner marker and exact release ID.
+          # Draft releases are never automatically deleted because GitHub has
+          # no conditional mutation contract for release DELETE.
           classify_target_release_state
           case "$TARGET_RELEASE_STATE" in
             exact_public_current)
@@ -842,7 +1121,39 @@ jobs:
               verify_published_release "$TARGET_RELEASE_ID" "$RUN_OWNER_MARKER"
               exit 0
               ;;
-            owned_mutable)
+            exact_owned_draft_current|exact_owned_partial_draft_current)
+              RUN_TAG_OBJECT_SHA="$LOADED_TAG_OBJECT_SHA"
+              RUN_OWNER_MARKER="$LOADED_TAG_OWNER_MARKER"
+              draft_id="$TARGET_RELEASE_ID"
+              assert_immutable_releases_enabled
+              assert_no_newer_product_version
+              assert_release_gate
+              draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
+              [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ]
+              is_canonical_owned_partial_draft "$draft_json" "$RUN_OWNER_MARKER" \
+                "$EXPECTED_SHA" "$expected_assets"
+              assert_run_owned_target_tag || {
+                echo "The re-adopted draft is no longer bound to its owned annotated tag." >&2
+                exit 1
+              }
+              complete_owned_draft_assets "$draft_id" "$RUN_OWNER_MARKER"
+              draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
+              [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ]
+              is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \
+                "$EXPECTED_SHA" "$expected_assets"
+              # The exact-ID draft and tag are rechecked after slot recovery,
+              # followed by the final main/gate read before publication.
+              # No draft or uncertain asset is deleted or overwritten.
+              assert_run_owned_target_tag || {
+                echo "The completed draft is no longer bound to its owned annotated tag." >&2
+                exit 1
+              }
+              assert_release_gate
+              publish_draft_and_confirm "$draft_id" "$RUN_OWNER_MARKER"
+              verify_published_release "$draft_id" "$RUN_OWNER_MARKER"
+              exit 0
+              ;;
+            owned_tag_only_current)
               reconcile_owned_mutable_target "$LOADED_TAG_OBJECT_SHA" \
                 "$LOADED_TAG_OWNER_MARKER"
               ;;
@@ -851,7 +1162,7 @@ jobs:
           esac
           classify_target_release_state
           [ "$TARGET_RELEASE_STATE" = absent ] || {
-            echo "$TAG did not reconcile to authoritative absence." >&2
+            echo "$TAG did not reconcile to authoritative tag/release absence." >&2
             exit 1
           }
           assert_new_monotonic_version
@@ -881,6 +1192,9 @@ jobs:
           } > release-draft-notes.md
           [ -s release-draft-notes.md ] && [ ! -L release-draft-notes.md ]
 
+          # Creating the annotated object is harmless until a ref names it,
+          # but still revalidate the evidence immediately before the write.
+          assert_release_gate
           tag_object=$(api --method POST "/repos/${GITHUB_REPOSITORY}/git/tags" \
             -f "tag=${TAG}" -f "message=${TAG_OWNER_MARKER}" \
             -f "object=${EXPECTED_SHA}" -f type=commit \
@@ -914,16 +1228,20 @@ jobs:
             echo "The annotated release tag changed before draft creation." >&2
             exit 1
           }
-          # This main-tip read must follow the exact annotated-tag recheck and
-          # remain the last remote read before draft creation.
+          # Recheck main after the exact annotated-tag read. The complete
+          # three-evidence gate is repeated below after request construction.
           assert_main_tip
-          gh release create "$TAG" install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --target "$EXPECTED_SHA" \
-            --title "$RELEASE_TITLE" \
-            --notes-file release-draft-notes.md \
-            --draft
+          jq -n --arg tag "$TAG" --arg target "$EXPECTED_SHA" \
+            --arg title "$RELEASE_TITLE" --rawfile body release-draft-notes.md '
+            {tag_name:$tag,target_commitish:$target,name:$title,body:$body,
+             draft:true,prerelease:false}
+          ' > release-create-request.json
+          [ -s release-create-request.json ] && [ ! -L release-create-request.json ]
+          assert_release_gate
+          create_status=0
+          draft_creation_attempted=true
+          api --method POST --input release-create-request.json \
+            "/repos/${GITHUB_REPOSITORY}/releases" >/dev/null 2>&1 || create_status=$?
 
           draft_verified=false
           for attempt in 1 2 3 4 5 6; do
@@ -934,20 +1252,27 @@ jobs:
               draft_json=""
             fi
             if [ -n "$draft_json" ] &&
-               is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \
+               is_canonical_owned_partial_draft "$draft_json" "$RUN_OWNER_MARKER" \
                  "$EXPECTED_SHA" "$expected_assets"; then
-              draft_verified=true
-              break
+              draft_id=$(jq -r '.id' <<<"$draft_json")
+              if [[ "$draft_id" =~ ^[0-9]+$ ]] &&
+                draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}") &&
+                [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ] &&
+                is_canonical_owned_partial_draft "$draft_json" "$RUN_OWNER_MARKER" \
+                  "$EXPECTED_SHA" "$expected_assets" &&
+                [ "$(jq -r '.assets | length' <<<"$draft_json")" -eq 0 ]; then
+                draft_verified=true
+                break
+              fi
             fi
             [ "$attempt" -eq 6 ] || sleep 2
           done
           [ "$draft_verified" = true ] || {
-            echo "New draft release does not contain the exact verified payload." >&2
+            echo "Draft creation status $create_status did not converge to the exact owned empty release ID; any draft was preserved." >&2
             exit 1
           }
-          draft_id=$(jq -r '.id' <<<"$draft_json")
-          [[ "$draft_id" =~ ^[0-9]+$ ]]
 
+          complete_owned_draft_assets "$draft_id" "$RUN_OWNER_MARKER"
           draft_json=$(api "/repos/${GITHUB_REPOSITORY}/releases/${draft_id}")
           [ "$(jq -r '.id' <<<"$draft_json")" = "$draft_id" ]
           is_exact_mutable_draft "$draft_json" "$RUN_OWNER_MARKER" \

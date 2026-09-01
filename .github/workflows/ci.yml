@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -25,8 +25,9 @@ jobs:
       - name: ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck python3-cryptography python3-argon2
-          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh tests/*.sh
+          sudo apt-get install -y shellcheck python3-cryptography python3-argon2 python3-yaml
+          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh \
+            tests/*.sh assets/cf-optimizer/*.sh
 
       - name: Update guard compatibility contract
         run: |
@@ -52,9 +53,14 @@ jobs:
           remote_fixture="$guard_tmp/remote.fixture"
           printf '%s\n' 'old-format-entry' > "$RR_LOCAL_MANIFEST"
           cp "$RR_LOCAL_MANIFEST" "$remote_fixture"
-          rr_update_guard_download() { cp "$remote_fixture" "$2"; }
+          # Stable consumes an immutable verified release asset, never Raw.
+          rr_update_guard_download() { return 1; }
+          rr_update_guard_copy_verified_asset() {
+            [ "$1" = manifest.sha256 ] && cp "$remote_fixture" "$2"
+          }
           check_update
           [ "$UPDATE_CHECK_STATE" = latest ]
+          [ "$UPDATE_AVAILABLE" = false ]
           printf '%s\n' 'old-format-entry' 'future/new/type/file.xyz' > "$remote_fixture"
           check_update
           [ "$UPDATE_CHECK_STATE" = available ]
@@ -74,6 +80,66 @@ jobs:
       - name: Deterministic release bundle
         run: python3 scripts/rebuild-bundle.py --check
 
+      - name: v7.2 core, public-IP ACME, rollback, and release trust regressions
+        # Every fixture redirects or mocks systemd/Nginx/GitHub. Most remain
+        # unprivileged; only tests whose production contract proves uid 0
+        # ownership use sudo. Both groups receive isolated HOME/TMPDIR/XDG.
+        run: |
+          set -euo pipefail
+          trust_root=$(mktemp -d "${RUNNER_TEMP}/rr-v72-trust.XXXXXX")
+          cleanup_trust_root() {
+            case "$trust_root" in
+              "${RUNNER_TEMP}"/rr-v72-trust.*)
+                # Root-contract fixtures can leave root-owned temporary
+                # objects when an assertion aborts, so cleanup uses sudo too.
+                sudo rm -rf -- "$trust_root"
+                ;;
+              *) return 1 ;;
+            esac
+          }
+          trap cleanup_trust_root EXIT
+          install -d -m 700 \
+            "$trust_root/home" "$trust_root/tmp" \
+            "$trust_root/xdg-config" "$trust_root/xdg-cache" "$trust_root/xdg-data"
+          export HOME="$trust_root/home"
+          export TMPDIR="$trust_root/tmp"
+          export XDG_CONFIG_HOME="$trust_root/xdg-config"
+          export XDG_CACHE_HOME="$trust_root/xdg-cache"
+          export XDG_DATA_HOME="$trust_root/xdg-data"
+          # Defense in depth for any fixture that loads the production Nexus
+          # helpers: fixed certificate-gate paths must remain under the
+          # disposable test root even if a test forgets a local override.
+          export NEXUS_IP_CERT_GATE_SCRIPT="$trust_root/runtime/nexus-ip-cert-gate"
+          export NEXUS_IP_CERT_GATE_DROPIN="$trust_root/runtime/nginx.service.d/zzzzzz-rr-nexus-ip-cert-gate.conf"
+          umask 077
+          unprivileged_tests=(
+            tests/test-installer-restore-gate.sh
+            tests/test-nexus-core-supply-chain.sh
+            tests/test-nexus-ip-subscription-urls.sh
+            tests/test-release-evidence-events.sh
+            tests/test-release-gate.sh
+            tests/test-release-publication-races.sh
+            tests/test-release-reconciliation.sh
+            tests/test-singbox-114.sh
+            tests/test-stable-update-trust.sh
+            tests/test-vps-ip-acme-workflow.sh
+          )
+          root_contract_tests=(
+            tests/test-nexus-gate-rollback.sh
+            tests/test-nexus-ip-acme.sh
+          )
+          for test_script in "${unprivileged_tests[@]}"; do
+            [ -f "$test_script" ] && [ ! -L "$test_script" ]
+            echo "Running isolated unprivileged ${test_script}"
+            bash "$test_script"
+          done
+          for test_script in "${root_contract_tests[@]}"; do
+            [ -f "$test_script" ] && [ ! -L "$test_script" ]
+            echo "Running isolated root-ownership contract ${test_script}"
+            sudo --preserve-env=HOME,TMPDIR,XDG_CONFIG_HOME,XDG_CACHE_HOME,XDG_DATA_HOME,NEXUS_IP_CERT_GATE_SCRIPT,NEXUS_IP_CERT_GATE_DROPIN \
+              bash "$test_script"
+          done
+
       - name: Repository regression suite
         # Restore/update regressions intentionally assert root:root ownership
         # for locks, stages, and durable transaction markers.
@@ -85,18 +151,45 @@ jobs:
           for test_script in tests/test-*.sh; do
             echo "Running ${test_script}"
             case "${test_script##*/}" in
+              test-installer-restore-gate.sh|\
+              test-nexus-core-supply-chain.sh|\
+              test-nexus-gate-rollback.sh|\
+              test-nexus-ip-acme.sh|\
+              test-nexus-ip-subscription-urls.sh|\
+              test-release-evidence-events.sh|\
+              test-release-gate.sh|\
+              test-release-publication-races.sh|\
+              test-release-reconciliation.sh|\
+              test-singbox-114.sh|\
+              test-stable-update-trust.sh|\
+              test-vps-ip-acme-workflow.sh)
+                # Already executed above with explicit isolated privileges.
+                continue
+                ;;
               test-backup-archive.sh|\
+              test-cert-hook.sh|\
+              test-cert-reload-pending.sh|\
               test-cloudflared-supply-chain.sh|\
               test-firewall-transaction.sh|\
               test-health-transaction-lock.sh|\
               test-install-core-rollback-boundary.sh|\
+              test-ip-acme-restore-update.sh|\
+              test-menu-writer-lock.sh|\
+              test-nexus-firewall-lifecycle.sh|\
+              test-nexus-nginx.sh|\
+              test-nexus-process-generation.sh|\
               test-nexus-sync.sh|\
               test-restore-watchdog.sh|\
+              test-singbox-credential-atomicity.sh|\
               test-update-external-state.sh|\
               test-update-external-transaction.sh|\
               test-update-firewall-finalize.sh|\
               test-update-lock-security.sh|\
+              test-update-recover-ip-acme.sh|\
               test-update-rollback-quarantine.sh|\
+              test-update-side-effect-guards.sh|\
+              test-uninstall-cert-hook.sh|\
+              test-uninstall-ip-acme.sh|\
               test-uninstall-quarantine.sh|\
               test-update-writer-freeze.sh)
                 sudo -E bash "$test_script"

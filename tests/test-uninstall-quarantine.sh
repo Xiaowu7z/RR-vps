@@ -16,6 +16,7 @@ export RR_QUARANTINE_READY="$TEST_ROOT/run/quarantine.ready"
 export RR_QUARANTINE_GUARD_STATE="$TEST_ROOT/guard-state/guard-state"
 export RR_QUARANTINE_GUARD_SELF="$TEST_ROOT/guard-bin/subscription-quarantine-guard"
 export RR_RECOVERY_SELF="$TEST_ROOT/bin/rr-update-recover"
+export RR_UPDATE_EXTERNAL_HELPER="$TEST_ROOT/bin/rr-update-external-state"
 export RR_IPV6_STATE_FILE="$TEST_ROOT/no-ipv6"
 export RR_UPDATE_LOCK_FILE="$TEST_ROOT/run/rr-update.lock"
 export RR_UPDATE_RECOVER_SOURCE_ONLY=1
@@ -28,6 +29,7 @@ export RR_TEST_QUERY_FAIL="$TEST_ROOT/query-fail"
 export RR_TEST_STOP_FAIL="$TEST_ROOT/stop-fail"
 export RR_TEST_DAEMON_FAIL="$TEST_ROOT/daemon-fail"
 export RR_TEST_SYSTEMD_QUERY_FAIL="$TEST_ROOT/systemd-query-fail"
+export RR_TEST_QUARANTINE_DROPIN="$TEST_ROOT/quarantine-dropin"
 export RR_TEST_HEALTH_STOP_FAIL="$TEST_ROOT/health-stop-fail"
 export RR_TEST_HEALTH_DISABLE_FAIL="$TEST_ROOT/health-disable-fail"
 export RR_TEST_SYNC_FAIL="$TEST_ROOT/sync-fail"
@@ -67,6 +69,15 @@ systemctl() {
             elif [ -e "$RR_QUARANTINE_UNIT" ]; then
                 printf 'disabled\n'
             fi
+            return ;;
+        "show -p FragmentPath --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
+            [ ! -e "$RR_QUARANTINE_UNIT" ] || printf '%s\n' "$RR_QUARANTINE_UNIT"
+            return ;;
+        "show -p DropInPaths --value rr-subscription-quarantine.service")
+            [ ! -e "$RR_TEST_SYSTEMD_QUERY_FAIL" ] || return 1
+            [ ! -e "$RR_TEST_QUARANTINE_DROPIN" ] || \
+                printf '%s\n' "$RR_TEST_QUARANTINE_DROPIN"
             return ;;
     esac
     case "${1:-}:${2:-}" in
@@ -172,23 +183,65 @@ reset_case() {
     rm -rf -- "$RR_TX_ROOT" "$(dirname "$RR_QUARANTINE_UNIT")" \
         "$(dirname "$RR_QUARANTINE_READY")" "$(dirname "$RR_RECOVERY_SELF")" \
         "$(dirname "$RR_QUARANTINE_GUARD_STATE")" \
-        "$(dirname "$RR_QUARANTINE_GUARD_SELF")"
+        "$(dirname "$RR_QUARANTINE_GUARD_SELF")" "$RR_LIB_DIR"
+    rm -f -- "$RR_LAUNCHER"
     rm -f -- "$RR_TEST_RAW_RULE" "$RR_TEST_ACTIVE_UNIT" \
         "$RR_TEST_ENABLED_UNIT" "$RR_TEST_HELPER_LOG" "$RR_TEST_DELETE_FAIL" \
         "$RR_TEST_QUERY_FAIL" "$RR_TEST_STOP_FAIL"
     rm -f -- "$RR_TEST_DAEMON_FAIL"
     rm -f -- "$RR_TEST_SYSTEMD_QUERY_FAIL"
+    rm -f -- "$RR_TEST_QUARANTINE_DROPIN"
     rm -f -- "$RR_TEST_SYNC_FAIL" "$RR_TEST_SUBSCRIPTION_REMAINS" \
         "$RR_TEST_SUBSCRIPTION_STOP_FAIL" "$RR_TEST_OPERATION_LOG"
     RR_TEST_RECREATE_PATH=""
+    RR_UNINSTALL_RECOVERY_HELPER_SHA256=""
+    RR_UNINSTALL_EXTERNAL_HELPER_SHA256=""
+    RR_UNINSTALL_RUNTIME_MANIFEST_SHA256=""
+    RR_UNINSTALL_UPDATE_GUARD_SHA256=""
+    RR_UNINSTALL_RUNTIME_OWNERSHIP_CAPTURED=false
     mkdir -p -- "$RR_TX_ROOT" "$(dirname "$RR_QUARANTINE_UNIT")" \
         "$(dirname "$RR_QUARANTINE_READY")" "$(dirname "$RR_RECOVERY_SELF")"
     chmod 700 -- "$(dirname "$RR_RECOVERY_SELF")"
 }
 
-write_helper() {
-    local mode="$1"
-    cat > "$RR_RECOVERY_SELF" <<'HELPER'
+write_runtime_manifest() {
+    local relative="" target="" digest=""
+    local -a relative_paths=(
+        rr
+        scripts/naive-cert-hook.sh
+        scripts/update-recover.sh
+        scripts/update-external-state.py
+        modules/00-runtime.sh
+        modules/95-install.sh
+        nexus/rr_nexus.py
+        nexus/rr_nexus_lib/security.py
+        nexus/sub_server.py
+        nexus/static/index.html
+        nexus/static/app.css
+        nexus/static/app.js
+    )
+    : > "$RR_LIB_DIR/manifest.sha256"
+    for relative in "${relative_paths[@]}"; do
+        if [ "$relative" = rr ]; then
+            target="$RR_LAUNCHER"
+        else
+            target="$RR_LIB_DIR/$relative"
+        fi
+        digest=$(sha256sum -- "$target" | awk '{print $1}')
+        printf '%s  %s\n' "$digest" "$relative" >> "$RR_LIB_DIR/manifest.sha256"
+    done
+    chmod 644 "$RR_LIB_DIR/manifest.sha256"
+}
+
+write_runtime_fixture() {
+    local helper_mode="$1" path=""
+    mkdir -p -- "$RR_LIB_DIR/scripts" "$RR_LIB_DIR/modules" \
+        "$RR_LIB_DIR/nexus/rr_nexus_lib" "$RR_LIB_DIR/nexus/static" \
+        "$(dirname "$RR_LAUNCHER")"
+    printf '%s\n' '#!/bin/bash' 'exit 0' > "$RR_LAUNCHER"
+    printf '%s\n' '#!/bin/bash' 'exit 0' > \
+        "$RR_LIB_DIR/scripts/naive-cert-hook.sh"
+    cat > "$RR_LIB_DIR/scripts/update-recover.sh" <<'HELPER'
 #!/bin/bash
 set -u
 [ "${1:-}" = clear-quarantine ] || exit 2
@@ -197,29 +250,65 @@ printf '%s\n' "$1" >> "$RR_TEST_HELPER_LOG"
 case "$RR_TEST_HELPER_MODE" in
     success)
         rm -f -- "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
-            "$RR_QUARANTINE_READY" "$RR_TEST_RAW_RULE" \
+            "$RR_QUARANTINE_READY" "$RR_QUARANTINE_GUARD_STATE" \
+            "$RR_QUARANTINE_GUARD_SELF" "$RR_TEST_RAW_RULE" \
             "$RR_TEST_ACTIVE_UNIT" "$RR_TEST_ENABLED_UNIT"
         ;;
     partial)
         rm -f -- "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
-            "$RR_QUARANTINE_READY" "$RR_TEST_ACTIVE_UNIT" \
+            "$RR_QUARANTINE_READY" "$RR_QUARANTINE_GUARD_STATE" \
+            "$RR_QUARANTINE_GUARD_SELF" "$RR_TEST_ACTIVE_UNIT" \
             "$RR_TEST_ENABLED_UNIT"
         ;;
     fail) exit 1 ;;
     *) exit 2 ;;
 esac
 HELPER
-    chmod 700 -- "$RR_RECOVERY_SELF"
-    export RR_TEST_HELPER_MODE="$mode"
+    printf '%s\n' '#!/usr/bin/env python3' 'raise SystemExit(0)' > \
+        "$RR_LIB_DIR/scripts/update-external-state.py"
+    printf '%s\n' '# runtime fixture' > "$RR_LIB_DIR/modules/00-runtime.sh"
+    printf '%s\n' '# uninstall fixture' > "$RR_LIB_DIR/modules/95-install.sh"
+    printf '%s\n' '# nexus fixture' > "$RR_LIB_DIR/nexus/rr_nexus.py"
+    printf '%s\n' '# security fixture' > \
+        "$RR_LIB_DIR/nexus/rr_nexus_lib/security.py"
+    printf '%s\n' '# subscription fixture' > "$RR_LIB_DIR/nexus/sub_server.py"
+    printf '%s\n' '<main>fixture</main>' > "$RR_LIB_DIR/nexus/static/index.html"
+    printf '%s\n' 'body{}' > "$RR_LIB_DIR/nexus/static/app.css"
+    printf '%s\n' 'void 0;' > "$RR_LIB_DIR/nexus/static/app.js"
+    chmod 755 "$RR_LAUNCHER" "$RR_LIB_DIR/scripts/naive-cert-hook.sh" \
+        "$RR_LIB_DIR/scripts/update-recover.sh" \
+        "$RR_LIB_DIR/scripts/update-external-state.py" \
+        "$RR_LIB_DIR/nexus/rr_nexus.py" \
+        "$RR_LIB_DIR/nexus/rr_nexus_lib/security.py" \
+        "$RR_LIB_DIR/nexus/sub_server.py"
+    chmod 644 "$RR_LIB_DIR/modules/00-runtime.sh" \
+        "$RR_LIB_DIR/modules/95-install.sh" "$RR_LIB_DIR/nexus/static/index.html" \
+        "$RR_LIB_DIR/nexus/static/app.css" "$RR_LIB_DIR/nexus/static/app.js"
+    write_runtime_manifest
+    install -m 755 "$RR_LIB_DIR/scripts/update-recover.sh" "$RR_RECOVERY_SELF"
+    install -m 755 "$RR_LIB_DIR/scripts/update-external-state.py" \
+        "$RR_UPDATE_EXTERNAL_HELPER"
+    export RR_TEST_HELPER_MODE="$helper_mode"
 }
 
-printf '%s\n' '[1/21] an absent quarantine needs no recovery helper'
+capture_and_remove_runtime() {
+    rr_uninstall_capture_runtime_ownership
+    rm -rf -- "$RR_LIB_DIR"
+    rm -f -- "$RR_LAUNCHER"
+}
+
+write_helper() {
+    local mode="$1"
+    write_runtime_fixture "$mode"
+}
+
+printf '%s\n' '[1/27] an absent quarantine needs no recovery helper'
 reset_case
 _uninstall_clear_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" "$RR_QUARANTINE_READY"
 [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[2/21] a marker or symlink fails closed without a trusted helper'
+printf '%s\n' '[2/27] a marker or symlink fails closed without a trusted helper'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 if _uninstall_clear_subscription_quarantine \
@@ -238,7 +327,7 @@ if _uninstall_clear_subscription_quarantine \
     exit 1
 fi
 
-printf '%s\n' '[3/21] unsafe helpers and writable ancestors are rejected'
+printf '%s\n' '[3/27] unsafe helpers and writable ancestors are rejected'
 reset_case
 printf 'marker\n' > "$RR_QUARANTINE_FILE"
 write_helper success
@@ -247,7 +336,7 @@ if _uninstall_recovery_helper_is_trusted "$RR_RECOVERY_SELF"; then
     echo 'A group/other-writable recovery helper was trusted.' >&2
     exit 1
 fi
-chmod 700 -- "$RR_RECOVERY_SELF"
+chmod 755 -- "$RR_RECOVERY_SELF"
 ln "$RR_RECOVERY_SELF" "$TEST_ROOT/recovery-hardlink"
 if _uninstall_recovery_helper_is_trusted "$RR_RECOVERY_SELF"; then
     echo 'A multiply linked recovery helper was trusted.' >&2
@@ -266,15 +355,16 @@ unsafe_parent="$TEST_ROOT/unsafe-parent"
 mkdir -p -- "$unsafe_parent/helper-dir"
 chmod 777 -- "$unsafe_parent"
 printf '%s\n' '#!/bin/bash' 'exit 0' > "$unsafe_parent/helper-dir/recover"
-chmod 700 -- "$unsafe_parent/helper-dir" "$unsafe_parent/helper-dir/recover"
+chmod 700 -- "$unsafe_parent/helper-dir"
+chmod 755 -- "$unsafe_parent/helper-dir/recover"
 if _uninstall_recovery_helper_is_trusted "$unsafe_parent/helper-dir/recover"; then
     echo 'A recovery helper below an unsafe ancestor was trusted.' >&2
     exit 1
 fi
 
-printf '%s\n' '[4/21] helper failure preserves quarantine evidence'
+printf '%s\n' '[4/27] helper failure preserves quarantine evidence'
 reset_case
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper fail
 if _uninstall_clear_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" "$RR_QUARANTINE_READY" \
@@ -285,9 +375,9 @@ fi
 [ -e "$RR_QUARANTINE_FILE" ]
 [ "$(cat "$RR_TEST_HELPER_LOG")" = clear-quarantine ]
 
-printf '%s\n' '[5/21] post-clear residue prevents destructive uninstall continuation'
+printf '%s\n' '[5/27] post-clear residue prevents destructive uninstall continuation'
 reset_case
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 : > "$RR_TEST_RAW_RULE"
 write_helper partial
 if _uninstall_clear_subscription_quarantine \
@@ -298,11 +388,13 @@ if _uninstall_clear_subscription_quarantine \
 fi
 [ -e "$RR_TEST_RAW_RULE" ]
 
-printf '%s\n' '[6/21] a trusted helper must remove every quarantine artifact'
+printf '%s\n' '[6/27] a trusted helper must remove every quarantine artifact'
 reset_case
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
-printf 'unit\n' > "$RR_QUARANTINE_UNIT"
+rr_quarantine_write_marker quarantined 7.1.0 18081
+rr_uninstall_render_subscription_quarantine_unit > "$RR_QUARANTINE_UNIT"
+chmod 644 "$RR_QUARANTINE_UNIT"
 printf 'ready\n' > "$RR_QUARANTINE_READY"
+chmod 600 "$RR_QUARANTINE_READY"
 : > "$RR_TEST_RAW_RULE"
 : > "$RR_TEST_ACTIVE_UNIT"
 : > "$RR_TEST_ENABLED_UNIT"
@@ -315,7 +407,7 @@ if _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[7/21] markerless exact RR firewall residue is discovered and removed'
+printf '%s\n' '[7/27] markerless exact RR firewall residue is discovered and removed'
 reset_case
 : > "$RR_TEST_RAW_RULE"
 _uninstall_quarantine_present \
@@ -328,7 +420,7 @@ if _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[8/21] firewall deletion failure remains visible and fails closed'
+printf '%s\n' '[8/27] firewall deletion failure remains visible and fails closed'
 reset_case
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
 : > "$RR_TEST_RAW_RULE"
@@ -344,7 +436,7 @@ if ! _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[9/21] a foreign same-comment rule is never broadened into deletion'
+printf '%s\n' '[9/27] a foreign same-comment rule is never broadened into deletion'
 reset_case
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
 printf 'foreign\n' > "$RR_TEST_RAW_RULE"
@@ -355,7 +447,7 @@ fi
 [ "$(cat "$RR_TEST_RAW_RULE")" = foreign ]
 [ -e "$RR_QUARANTINE_UNIT" ]
 
-printf '%s\n' '[10/21] unreadable firewall or systemd state is quarantine evidence'
+printf '%s\n' '[10/27] unreadable firewall or systemd state is quarantine evidence'
 reset_case
 : > "$RR_TEST_QUERY_FAIL"
 if ! _uninstall_quarantine_present \
@@ -371,7 +463,7 @@ if ! _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[11/21] direct suspend and clear commands respect the shared update lock'
+printf '%s\n' '[11/27] direct suspend and clear commands respect the shared update lock'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 rr_prepare_update_lock_file "$RR_UPDATE_LOCK_FILE"
@@ -388,7 +480,7 @@ fi
 [ -e "$RR_QUARANTINE_FILE" ]
 exec {held_update_fd}>&-
 
-printf '%s\n' '[12/21] suspend failure retains marker and readiness evidence'
+printf '%s\n' '[12/27] suspend failure retains marker and readiness evidence'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 printf 'ready\n' > "$RR_QUARANTINE_READY"
@@ -402,7 +494,7 @@ fi
 [ -e "$RR_QUARANTINE_READY" ]
 [ -e "$RR_TEST_ACTIVE_UNIT" ]
 
-printf '%s\n' '[13/21] pre-firewall finalization failure retains the exact barrier'
+printf '%s\n' '[13/27] pre-firewall finalization failure retains the exact barrier'
 reset_case
 rr_quarantine_write_marker quarantined 7.1.0 18081
 printf 'unit\n' > "$RR_QUARANTINE_UNIT"
@@ -420,7 +512,7 @@ if ! _uninstall_quarantine_present \
     exit 1
 fi
 
-printf '%s\n' '[14/21] existing legacy locks are validated, contended and never recreated'
+printf '%s\n' '[14/27] existing legacy locks are validated, contended and never recreated'
 legacy_root="$TEST_ROOT/legacy-locks"
 mkdir -p -- "$legacy_root"
 chmod 700 -- "$legacy_root"
@@ -455,7 +547,7 @@ _uninstall_acquire_existing_legacy_lock "$absent_legacy" legacy_fd
 [ -z "$legacy_fd" ]
 [ ! -e "$absent_legacy" ]
 
-printf '%s\n' '[15/21] health-unit proof rejects query, stop, disable and ambiguous states'
+printf '%s\n' '[15/27] health-unit proof rejects query, stop, disable and ambiguous states'
 health_systemd_root="$TEST_ROOT/health-systemd"
 RR_RESTORE_SYSTEMD_DIR="$health_systemd_root"
 mkdir -p "$health_systemd_root"
@@ -501,13 +593,14 @@ if _uninstall_health_unit_is_safely_stopped argo-rr-health.timer; then
 fi
 RR_TEST_HEALTH_LOAD_STATE=loaded
 
-printf '%s\n' '[16/21] a failed global durability barrier retains quarantine'
+printf '%s\n' '[16/27] a failed global durability barrier retains quarantine'
 reset_case
 release_systemd_root="$TEST_ROOT/release-systemd"
 release_restart_helper="$TEST_ROOT/release-auto-update-sub.py"
 mkdir -p "$release_systemd_root"
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper success
+capture_and_remove_runtime
 : > "$RR_TEST_SYNC_FAIL"
 if _uninstall_release_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
@@ -518,11 +611,12 @@ if _uninstall_release_subscription_quarantine \
 fi
 [ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[17/21] every runtime and health restart path must be absent'
+printf '%s\n' '[17/27] every runtime and health restart path must be absent'
 reset_case
 mkdir -p "$release_systemd_root"
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper success
+capture_and_remove_runtime
 ln -s "$TEST_ROOT/missing-health-target" "$release_systemd_root/argo-rr-health.timer"
 if _uninstall_release_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
@@ -533,12 +627,13 @@ if _uninstall_release_subscription_quarantine \
 fi
 [ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[18/21] a surviving subscription process retains quarantine'
+printf '%s\n' '[18/27] a surviving subscription process retains quarantine'
 reset_case
 rm -rf -- "$release_systemd_root"
 mkdir -p "$release_systemd_root"
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper success
+capture_and_remove_runtime
 : > "$RR_TEST_SUBSCRIPTION_REMAINS"
 if _uninstall_release_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
@@ -549,12 +644,13 @@ if _uninstall_release_subscription_quarantine \
 fi
 [ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[19/21] restart paths are rechecked after process shutdown'
+printf '%s\n' '[19/27] restart paths are rechecked after process shutdown'
 reset_case
 rm -rf -- "$release_systemd_root"
 mkdir -p "$release_systemd_root"
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper success
+capture_and_remove_runtime
 RR_TEST_RECREATE_PATH="$release_restart_helper"
 if _uninstall_release_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
@@ -565,13 +661,14 @@ if _uninstall_release_subscription_quarantine \
 fi
 [ -e "$RR_QUARANTINE_FILE" ] && [ ! -e "$RR_TEST_HELPER_LOG" ]
 
-printf '%s\n' '[20/21] the durable release gate clears only after every proof succeeds'
+printf '%s\n' '[20/27] the durable release gate clears only after every proof succeeds'
 reset_case
 rm -rf -- "$release_systemd_root"
 rm -f -- "$release_restart_helper"
 mkdir -p "$release_systemd_root"
-printf 'marker\n' > "$RR_QUARANTINE_FILE"
+rr_quarantine_write_marker quarantined 7.1.0 18081
 write_helper success
+capture_and_remove_runtime
 _uninstall_release_subscription_quarantine \
     "$RR_RECOVERY_SELF" "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_UNIT" \
     "$RR_QUARANTINE_READY" "$RR_LIB_DIR" "$RR_LAUNCHER" \
@@ -593,21 +690,207 @@ clear_line=$(grep -n '^clear-quarantine$' "$RR_TEST_OPERATION_LOG" | head -n 1 |
     [ "$stop_line" -lt "$probe_line" ] && [ "$probe_line" -lt "$clear_line" ]
 [ "$(grep -c '^clear-quarantine$' "$RR_TEST_OPERATION_LOG")" -eq 1 ]
 
-printf '%s\n' '[21/21] destructive uninstall keeps quarantine until old restart paths are gone'
+printf '%s\n' '[21/27] runtime ownership is captured from the exact manifest and rechecked'
+reset_case
+write_helper success
+rr_uninstall_capture_runtime_ownership
+[ "$RR_UNINSTALL_RUNTIME_OWNERSHIP_CAPTURED" = true ]
+[[ "$RR_UNINSTALL_RECOVERY_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$RR_UNINSTALL_EXTERNAL_HELPER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$RR_UNINSTALL_RUNTIME_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+rr_uninstall_runtime_ownership_is_unchanged
+printf '%s\n' '# post-capture tamper' >> \
+    "$RR_LIB_DIR/scripts/update-recover.sh"
+if rr_uninstall_runtime_ownership_is_unchanged; then
+    echo 'A post-capture runtime mutation was accepted.' >&2
+    exit 1
+fi
+
+printf '%s\n' '[22/27] malformed manifests and foreign deployed helpers fail closed'
+reset_case
+write_helper success
+head -n 1 "$RR_LIB_DIR/manifest.sha256" >> "$RR_LIB_DIR/manifest.sha256"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A duplicate manifest path was accepted.' >&2
+    exit 1
+fi
+[ "$RR_UNINSTALL_RUNTIME_OWNERSHIP_CAPTURED" = false ]
+reset_case
+write_helper success
+printf '%s\n' '# foreign replacement' >> "$RR_UPDATE_EXTERNAL_HELPER"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A foreign fixed-path external helper was accepted.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+mv "$RR_LIB_DIR/manifest.sha256" "$RR_LIB_DIR/manifest.real"
+ln -s "$RR_LIB_DIR/manifest.real" "$RR_LIB_DIR/manifest.sha256"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A symlink runtime manifest was accepted.' >&2
+    exit 1
+fi
+
+printf '%s\n' '[23/27] runtime inventory rejects undeclared files, directories and special paths'
+reset_case
+write_helper success
+printf '%s\n' foreign > "$RR_LIB_DIR/foreign.conf"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'An undeclared runtime file was accepted for recursive deletion.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+mkdir "$RR_LIB_DIR/foreign-empty-directory"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'An undeclared empty runtime directory was accepted.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+mkfifo "$RR_LIB_DIR/foreign-fifo"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A special runtime file was accepted.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+ln -s "$RR_LIB_DIR/modules/00-runtime.sh" "$RR_LIB_DIR/foreign-link"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'An undeclared runtime symlink was accepted.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+find() {
+    command find "$@"
+    return 1
+}
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A failed runtime inventory walk was accepted.' >&2
+    exit 1
+fi
+unset -f find
+
+printf '%s\n' '[24/27] generated update guard and Python caches have a narrow inventory contract'
+reset_case
+write_helper success
+cat > "$RR_LIB_DIR/modules/61-update-guard.sh" <<'GUARD'
+RR_UPDATE_GUARD_VERSION="3"
+do_update() {
+    :
+}
+check_update() {
+    :
+}
+GUARD
+chmod 644 "$RR_LIB_DIR/modules/61-update-guard.sh"
+mkdir "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__"
+chmod 700 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__"
+printf '\0pyc-fixture' > \
+    "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/security.cpython-312.pyc"
+chmod 600 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/security.cpython-312.pyc"
+rr_uninstall_capture_runtime_ownership
+[[ "$RR_UNINSTALL_UPDATE_GUARD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+chmod 644 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/security.cpython-312.pyc"
+rr_uninstall_runtime_ownership_is_unchanged
+chmod 666 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/security.cpython-312.pyc"
+if rr_uninstall_runtime_ownership_is_unchanged; then
+    echo 'A writable Python cache was accepted.' >&2
+    exit 1
+fi
+chmod 600 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/security.cpython-312.pyc"
+printf '%s\n' '# guard tamper' >> "$RR_LIB_DIR/modules/61-update-guard.sh"
+if rr_uninstall_runtime_ownership_is_unchanged; then
+    echo 'A post-capture update-guard mutation was accepted.' >&2
+    exit 1
+fi
+reset_case
+write_helper success
+mkdir "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__"
+printf '\0foreign' > \
+    "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/foreign.cpython-312.pyc"
+chmod 600 "$RR_LIB_DIR/nexus/rr_nexus_lib/__pycache__/foreign.cpython-312.pyc"
+if rr_uninstall_capture_runtime_ownership; then
+    echo 'A Python cache without a manifest source was accepted.' >&2
+    exit 1
+fi
+
+printf '%s\n' '[25/27] every quarantine artifact and effective unit source is authenticated'
+reset_case
+write_helper success
+_uninstall_recovery_helper_is_trusted "$RR_RECOVERY_SELF"
+rr_quarantine_write_marker quarantined 7.1.0 18081
+mkdir -p "$(dirname "$RR_QUARANTINE_GUARD_STATE")" \
+    "$(dirname "$RR_QUARANTINE_GUARD_SELF")"
+chmod 700 "$(dirname "$RR_QUARANTINE_GUARD_STATE")" \
+    "$(dirname "$RR_QUARANTINE_GUARD_SELF")"
+install -m 600 "$RR_QUARANTINE_FILE" "$RR_QUARANTINE_GUARD_STATE"
+install -m 700 "$RR_RECOVERY_SELF" "$RR_QUARANTINE_GUARD_SELF"
+rr_uninstall_render_subscription_quarantine_unit > "$RR_QUARANTINE_UNIT"
+chmod 644 "$RR_QUARANTINE_UNIT"
+printf 'ready\n' > "$RR_QUARANTINE_READY"
+chmod 600 "$RR_QUARANTINE_READY"
+rr_uninstall_subscription_quarantine_artifacts_are_owned
+: > "$RR_TEST_QUARANTINE_DROPIN"
+if rr_uninstall_subscription_quarantine_artifacts_are_owned; then
+    echo 'An effective quarantine-unit drop-in was accepted.' >&2
+    exit 1
+fi
+rm -f "$RR_TEST_QUARANTINE_DROPIN"
+printf '%s\n' '# guard tamper' >> "$RR_QUARANTINE_GUARD_SELF"
+if rr_uninstall_subscription_quarantine_artifacts_are_owned; then
+    echo 'A tampered independent quarantine guard was accepted.' >&2
+    exit 1
+fi
+install -m 700 "$RR_RECOVERY_SELF" "$RR_QUARANTINE_GUARD_SELF"
+saved_quarantine_ready="$RR_QUARANTINE_READY"
+RR_QUARANTINE_READY="$RR_QUARANTINE_FILE"
+if rr_uninstall_subscription_quarantine_artifacts_are_owned; then
+    echo 'Two quarantine artifact roles were allowed to share one path.' >&2
+    exit 1
+fi
+RR_QUARANTINE_READY="$saved_quarantine_ready"
+
+printf '%s\n' '[26/27] captured helper hashes remain authoritative after runtime deletion'
+reset_case
+write_helper success
+capture_and_remove_runtime
+_uninstall_recovery_helper_is_trusted "$RR_RECOVERY_SELF"
+printf '%s\n' '# replacement' >> "$RR_RECOVERY_SELF"
+if _uninstall_recovery_helper_is_trusted "$RR_RECOVERY_SELF"; then
+    echo 'A post-runtime recovery-helper replacement was trusted.' >&2
+    exit 1
+fi
+if rr_uninstall_remove_captured_runtime_helpers; then
+    echo 'A changed captured helper was deleted.' >&2
+    exit 1
+fi
+[ -e "$RR_RECOVERY_SELF" ] && [ -e "$RR_UPDATE_EXTERNAL_HELPER" ]
+reset_case
+write_helper success
+capture_and_remove_runtime
+rr_uninstall_remove_captured_runtime_helpers
+[ ! -e "$RR_RECOVERY_SELF" ] && [ ! -e "$RR_UPDATE_EXTERNAL_HELPER" ]
+
+printf '%s\n' '[27/27] destructive uninstall keeps quarantine until old restart paths are gone'
 
 # Structural contract: the shared transaction lock and writer freeze must
 # precede destructive cleanup, and quarantine release must follow runtime and
 # health-unit removal while still preceding recovery-helper removal.
 uninstall_wrapper=$(sed -n '/^uninstall_all() {/,/^}/p' "$REPO_ROOT/modules/95-install.sh")
 uninstall_body=$(sed -n '/^uninstall_all_locked() {/,/^}/p' "$REPO_ROOT/modules/95-install.sh")
-timer_line=$(grep -n '_uninstall_health_unit_is_safely_stopped argo-rr-health.timer' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 stop_line=$(grep -n 'stop_subscription_servers' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 clear_line=$(grep -n '_uninstall_release_subscription_quarantine' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
-runtime_delete_line=$(grep -n '"\$RR_LIB_DIR" /usr/local/bin/rr' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+capture_line=$(grep -n 'rr_uninstall_capture_runtime_ownership' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+crash_gate_line=$(grep -n 'rr_firewall_stop_nodes_on_indeterminate_commit' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+runtime_recheck_line=$(grep -n 'rr_uninstall_runtime_ownership_is_unchanged' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+runtime_delete_line=$(grep -n 'rm -rf "\$RR_LIB_DIR" "\${RR_LAUNCHER:-/usr/local/bin/rr}"' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
 sub_root_delete_line=$(grep -n 'rm -rf -- "\$SUB_ROOT"' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
-helper_delete_line=$(grep -n '/usr/local/sbin/rr-update-recover' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
-[ "$timer_line" -le "$stop_line" ]
+helper_delete_line=$(grep -n 'rr_uninstall_remove_captured_runtime_helpers' <<<"$uninstall_body" | head -n 1 | cut -d: -f1)
+[ "$capture_line" -lt "$crash_gate_line" ]
 [ "$stop_line" -lt "$clear_line" ]
+[ "$runtime_recheck_line" -lt "$runtime_delete_line" ]
 [ "$runtime_delete_line" -lt "$clear_line" ]
 [ "$clear_line" -lt "$sub_root_delete_line" ]
 [ "$sub_root_delete_line" -lt "$helper_delete_line" ]

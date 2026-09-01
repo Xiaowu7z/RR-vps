@@ -160,6 +160,12 @@ write_gzip("duplicate.tar.gz", (
     + member("rr-bundle/rr", b"two")
     + end
 ))
+write_gzip("unsupported-nexus-root-module.tar.gz", (
+    member("rr-bundle/rr", b"#!/bin/bash\n:\n")
+    + member("rr-bundle/manifest.sha256", b"fixture\n")
+    + member("rr-bundle/nexus/helper.py", b"pass\n")
+    + end
+))
 
 for fixture_name, typeflag in {
     "symlink": b"2",
@@ -276,16 +282,17 @@ expect_archive_reject() {
     done
 }
 
-printf '%s\n' '[1/4] both archive validators accept canonical regular-file bundles'
+printf '%s\n' '[1/5] both archive validators accept canonical regular-file bundles'
 expect_archive_accept valid.tar.gz
 expect_archive_accept valid-prefix.tar.gz
 expect_archive_accept valid-null-typeflag.tar.gz
 expect_archive_accept valid-zero-trailer.tar.gz
 
-printf '%s\n' '[2/4] both archive validators reject path, type and duplicate attacks'
+printf '%s\n' '[2/5] both archive validators reject path, type and duplicate attacks'
 for fixture in \
     zero-members.tar.gz one-member.tar.gz traversal.tar.gz absolute.tar.gz \
     non-ascii-name.tar.gz ambiguous-name.tar.gz duplicate.tar.gz \
+    unsupported-nexus-root-module.tar.gz \
     symlink.tar.gz hardlink.tar.gz directory.tar.gz character-device.tar.gz \
     block-device.tar.gz fifo.tar.gz contiguous-file.tar.gz pax-extension.tar.gz \
     global-pax-extension.tar.gz gnu-longname.tar.gz gnu-longlink.tar.gz \
@@ -293,7 +300,7 @@ for fixture in \
     expect_archive_reject "$fixture"
 done
 
-printf '%s\n' '[3/4] both archive validators reject malformed headers, truncation and bombs'
+printf '%s\n' '[3/5] both archive validators reject malformed headers, truncation and bombs'
 for fixture in \
     base256-size.tar.gz invalid-octal-size.tar.gz bad-checksum.tar.gz \
     truncated-header.tar.gz truncated-member.tar.gz truncated-padding.tar.gz \
@@ -358,7 +365,7 @@ expect_tree_reject() {
     done
 }
 
-printf '%s\n' '[4/4] both extracted trees reject unmanifested, special and invalid payloads'
+printf '%s\n' '[4/5] both extracted trees reject unmanifested, special and invalid payloads'
 valid_tree="$test_root/tree-valid"
 make_valid_tree "$valid_tree"
 expect_tree_accept "$valid_tree"
@@ -367,6 +374,15 @@ extra_tree="$test_root/tree-extra"
 cp -a "$valid_tree" "$extra_tree"
 printf '%s\n' 'unmanifested' > "$extra_tree/nexus/static/extra.js"
 expect_tree_reject "$extra_tree"
+
+unsupported_root_tree="$test_root/tree-unsupported-nexus-root"
+cp -a "$valid_tree" "$unsupported_root_tree"
+printf '%s\n' 'pass' > "$unsupported_root_tree/nexus/helper.py"
+(
+    cd "$unsupported_root_tree"
+    sha256sum nexus/helper.py >> manifest.sha256
+)
+expect_tree_reject "$unsupported_root_tree"
 
 missing_tree="$test_root/tree-missing"
 cp -a "$valid_tree" "$missing_tree"
@@ -435,5 +451,77 @@ printf '%s\n' 'def broken(:' > "$bad_external_python_tree/scripts/update-externa
     rm -f replacement.digest
 )
 expect_tree_reject "$bad_external_python_tree"
+
+printf '%s\n' '[5/5] release builder rejects schema drift and emits extension-free USTAR'
+python3 - "$REPO_ROOT" "$test_root" <<'PY'
+from __future__ import annotations
+
+import importlib.util
+import io
+import pathlib
+import sys
+import tarfile
+
+repo = pathlib.Path(sys.argv[1])
+test_root = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location(
+    "rr_rebuild_bundle", repo / "scripts/rebuild-bundle.py"
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("could not load release builder")
+builder = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(builder)
+
+
+def fixture_root(name: str) -> pathlib.Path:
+    root = test_root / name
+    (root / "scripts").mkdir(parents=True)
+    (root / "modules").mkdir()
+    (root / "nexus").mkdir()
+    for relative in (
+        "rr",
+        "scripts/naive-cert-hook.sh",
+        "scripts/update-recover.sh",
+        "scripts/update-external-state.py",
+    ):
+        path = root / relative
+        path.write_text("fixture\n", encoding="ascii")
+    return root
+
+
+def expect_release_files_reject(root: pathlib.Path, label: str) -> None:
+    builder.BASE = root
+    try:
+        builder.release_files()
+    except ValueError:
+        return
+    raise SystemExit(f"release builder accepted {label}")
+
+
+nested = fixture_root("builder-nested")
+(nested / "nexus/deeper").mkdir()
+(nested / "nexus/deeper/injected.py").write_text("pass\n", encoding="ascii")
+expect_release_files_reject(nested, "nested Nexus runtime path")
+
+unsupported_root = fixture_root("builder-unsupported-root")
+(unsupported_root / "nexus/helper.py").write_text("pass\n", encoding="ascii")
+expect_release_files_reject(
+    unsupported_root, "Nexus root module the installer would not copy"
+)
+
+long_name = fixture_root("builder-long-name")
+(long_name / "nexus" / (("a" * 86) + ".py")).write_text("pass\n", encoding="ascii")
+expect_release_files_reject(long_name, "archive member name over 100 bytes")
+
+builder.BASE = repo
+manifest = builder.expected_manifest()
+bundle = builder.expected_bundle(manifest)
+with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as archive:
+    members = archive.getmembers()
+    if any(member.pax_headers or member.type != tarfile.REGTYPE for member in members):
+        raise SystemExit("release builder emitted a tar extension or non-regular member")
+    if any(len(member.name.encode("ascii")) > 100 for member in members):
+        raise SystemExit("release builder emitted a member outside its fixed USTAR name field")
+PY
 
 printf '%s\n' 'bundle archive and tree security regressions: PASS'

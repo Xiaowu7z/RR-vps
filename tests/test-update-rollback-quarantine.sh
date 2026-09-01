@@ -29,6 +29,7 @@ export RR_HEALTH_TIMER_FILE="$TEST_ROOT/systemd/argo-rr-health.timer"
 export RR_HEALTH_SERVICE_FILE="$TEST_ROOT/systemd/argo-rr-health.service"
 export RR_HEALTH_RESTART_HELPER="$TEST_ROOT/bin/auto_update_sub.py"
 export RR_UPDATE_LOCK_FILE="$TEST_ROOT/run/rr-update.lock"
+export RR_UPDATE_MAINTENANCE_FILE="$TEST_ROOT/run/update-maintenance"
 export RR_LEGACY_UPDATE_LOCK_FILE="$TEST_ROOT/run/legacy-rr-update.lock"
 export RR_LEGACY_UPDATE_BRIDGE_FILE="$TEST_ROOT/run/legacy-update-bridge"
 export RR_UPDATE_RECOVER_SOURCE_ONLY=1
@@ -387,6 +388,9 @@ printf '%s\n' '[6/20] automatic/manual restore orchestration skips only the unsa
     export RR_HEALTH_SERVICE_FILE="$TEST_ROOT/fake-health.service"
     # shellcheck source=../scripts/update-recover.sh
     source "$REPO_ROOT/scripts/update-recover.sh"
+    # Exact managed-unit identity is covered by the service ownership suites;
+    # this fixture isolates rollback subscription orchestration.
+    rr_managed_service_start_is_safe() { return 0; }
     : > "$RR_HEALTH_SERVICE_FILE"
     restore_log="$TEST_ROOT/restore-systemctl.log"
     quarantine_active="$TEST_ROOT/restore-quarantine-active"
@@ -563,6 +567,7 @@ printf '%s\n' '[7/20] in-process installer rollback consumes the same policy bef
     rr_restore_dir() { :; }
     rr_restore_sqlite() { :; }
     rr_install_restore_external_state_if_required() { :; }
+    rr_restore_ip_acme_update_directories() { :; }
     rr_read_trusted_phase() { printf 'runtime_swapped\n'; }
     rr_quiesce_health_monitor_for_rollback() { :; }
     rr_write_phase() { printf '%s\n' "$1" > "$TX_DIR/phase"; }

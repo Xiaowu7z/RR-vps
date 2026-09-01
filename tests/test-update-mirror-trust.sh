@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
+RR_UPDATE_CHANNEL=stable
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -73,16 +74,41 @@ version_ge() {
 RR_RAW_BASE="https://trusted.invalid/release"
 RR_MANIFEST_URL="${RR_RAW_BASE}/manifest.sha256"
 RR_BOOTSTRAP_URL="${RR_RAW_BASE}/install.sh"
+RR_REPOSITORY="Xiaowu7z/RR-vps"
 RR_LOCAL_MANIFEST="$test_root/local-manifest.sha256"
 SCRIPT_VERSION=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"/\1/p' \
     modules/00-runtime.sh)
 [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
     fail "current runtime version fixture is invalid"
 RR_TEST_DOWNLOAD_TRACE="$test_root/download-trace"
+RR_TEST_GUARD_TRACE="$test_root/guard-trace"
 RR_TEST_EXEC_MARKER="$test_root/bootstrap-executed"
 export RR_TEST_EXEC_MARKER
 cp "$mirror_root/manifest.sha256" "$RR_LOCAL_MANIFEST"
 : > "$RR_TEST_DOWNLOAD_TRACE"
+: > "$RR_TEST_GUARD_TRACE"
+
+rr_update_guard_copy_verified_asset() {
+    local asset="$1" target_file="$2"
+    [ "$RR_REPOSITORY" = "Xiaowu7z/RR-vps" ] || return 1
+    printf '%s %s\n' "$RR_REPOSITORY" "$asset" >> "$RR_TEST_GUARD_TRACE"
+    case "$asset" in
+        manifest.sha256)
+            cp "$REPO_ROOT/manifest.sha256" "$target_file"
+            ;;
+        install.sh)
+            printf '%s\n' \
+                '#!/bin/bash' \
+                'RR_BOOTSTRAP_VERSION=999' \
+                'RR_REPOSITORY="Xiaowu7z/RR-vps"' \
+                'printf "bundle=%s\n" "${RR_BUNDLE_FILE-unset}" > "${RR_TEST_EXEC_MARKER:?}"' \
+                'exit 0' > "$target_file"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 rr_download_file() {
     local source_url="$1" target_file="$2" official_only="${4:-false}"
@@ -91,19 +117,6 @@ rr_download_file() {
         "${RR_RAW_BASE}/rr-bundle.tar.gz")
             [ "$official_only" != true ] || return 1
             cp "$test_root/mirror-bundle.tar.gz" "$target_file"
-            ;;
-        "$RR_MANIFEST_URL")
-            [ "$official_only" = true ] || return 1
-            cp "$REPO_ROOT/manifest.sha256" "$target_file"
-            ;;
-        "$RR_BOOTSTRAP_URL")
-            [ "$official_only" = true ] || return 1
-            printf '%s\n' \
-                '#!/bin/bash' \
-                'RR_BOOTSTRAP_VERSION=999' \
-                '# Xiaowu7z/RR-vps trusted bootstrap fixture' \
-                'printf "bundle=%s\n" "${RR_BUNDLE_FILE-unset}" > "${RR_TEST_EXEC_MARKER:?}"' \
-                'exit 0' > "$target_file"
             ;;
         *)
             return 1
@@ -130,9 +143,9 @@ grep -q '^SCRIPT_VERSION="0.0.0"$' "$mirror_root/modules/00-runtime.sh" || \
     fail "untrusted mirror version prevented trusted bootstrap fallback"
 grep -qx 'bundle=unset' "$RR_TEST_EXEC_MARKER" || \
     fail "untrusted mirror bundle reached the trusted bootstrap"
-grep -q "^true ${RR_MANIFEST_URL}$" "$RR_TEST_DOWNLOAD_TRACE" || \
-    fail "mirror bundle was not authenticated against the trusted manifest"
-grep -q "^true ${RR_BOOTSTRAP_URL}$" "$RR_TEST_DOWNLOAD_TRACE" || \
-    fail "trusted bootstrap fallback was not downloaded"
+grep -q "^${RR_REPOSITORY} manifest.sha256$" "$RR_TEST_GUARD_TRACE" || \
+    fail "mirror bundle was not authenticated against the stable release manifest"
+grep -q "^${RR_REPOSITORY} install.sh$" "$RR_TEST_GUARD_TRACE" || \
+    fail "verified stable bootstrap fallback was not copied"
 
 printf 'PASS: mirror 0.0.0 bundle cannot block or enter trusted fallback\n'

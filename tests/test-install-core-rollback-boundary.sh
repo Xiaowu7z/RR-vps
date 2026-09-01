@@ -34,7 +34,7 @@ make_phase() {
     chmod 600 "$transaction/phase"
 }
 
-printf '%s\n' '[1/11] cleanup preserves a committed transaction even if the active flag is stale'
+printf '%s\n' '[1/12] cleanup preserves a committed transaction even if the active flag is stale'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -94,7 +94,7 @@ printf '%s\n' '[1/11] cleanup preserves a committed transaction even if the acti
         fail 'writer verification failure published settled evidence'
 )
 
-printf '%s\n' '[2/11] direct rollback also refuses a trusted committed phase'
+printf '%s\n' '[2/12] direct rollback also refuses a trusted committed phase'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_transaction_path_is_direct_child)"
@@ -259,6 +259,9 @@ EOF
     }
     rr_restore_dir() { printf 'restore-dir:%s\n' "$1" >> "$operation_log"; }
     rr_restore_sqlite() { printf 'restore-db:%s\n' "$1" >> "$operation_log"; }
+    # IP-ACME directory replay is covered by the dedicated update/restore
+    # suite; this fixture isolates the health-writer rollback boundary.
+    rr_restore_ip_acme_update_directories() { return 0; }
     rr_install_restore_external_state_if_required() { return 0; }
     rr_restore_update_writer_state() {
         if [ "$restore_query_failure" = true ]; then
@@ -340,16 +343,16 @@ EOF
         fail 'rollback terminal phase was published before restored host state was durable'
 )
 
-printf '%s\n' '[3/11] rollback re-freezes a candidate-reenabled health timer before old restore'
+printf '%s\n' '[3/12] rollback re-freezes a candidate-reenabled health timer before old restore'
 run_migrating_rollback health-success false
 
-printf '%s\n' '[4/11] systemctl query/bus failure blocks rollback before old runtime mutation'
+printf '%s\n' '[4/12] systemctl query/bus failure blocks rollback before old runtime mutation'
 run_migrating_rollback health-query-failure true
 
-printf '%s\n' '[5/11] inconsistent absent-but-enabled health service blocks rollback'
+printf '%s\n' '[5/12] inconsistent absent-but-enabled health service blocks rollback'
 run_migrating_rollback health-state-mismatch false false false true
 
-printf '%s\n' '[6/11] generic inactive and disabled checks reject query errors but accept absent units'
+printf '%s\n' '[6/12] generic inactive and disabled checks reject query errors but accept absent units'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_unit_activity_matches)"
@@ -384,13 +387,13 @@ printf '%s\n' '[6/11] generic inactive and disabled checks reject query errors b
         fail 'writer restore rejected a proven absent unit'
 )
 
-printf '%s\n' '[7/11] writer restore query failure retains maintenance and active evidence'
+printf '%s\n' '[7/12] writer restore query failure retains maintenance and active evidence'
 run_migrating_rollback writer-restore-query-failure false true false
 
-printf '%s\n' '[8/11] failed global durability barrier never publishes or clears a terminal rollback'
+printf '%s\n' '[8/12] failed global durability barrier never publishes or clears a terminal rollback'
 run_migrating_rollback rollback-sync-failure false false true
 
-printf '%s\n' '[9/11] prior aborted transactions are cleared durably before their directory is pruned'
+printf '%s\n' '[9/12] prior aborted transactions are cleared durably before their directory is pruned'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -562,7 +565,7 @@ printf '%s\n' '[9/11] prior aborted transactions are cleared durably before thei
     [ -d "$incomplete_tx" ] || fail 'pre-phase SIGKILL orphan was deleted as terminal'
 )
 
-printf '%s\n' '[10/11] settled format-2 retirement does not depend on rollback backup metadata'
+printf '%s\n' '[10/12] settled format-2 retirement does not depend on rollback backup metadata'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -629,7 +632,7 @@ printf '%s\n' '[10/11] settled format-2 retirement does not depend on rollback b
         fail 'settled retirement repeated candidate finalization'
 )
 
-printf '%s\n' '[11/11] installer retires a legacy committed window without a v2 finalizer'
+printf '%s\n' '[11/12] installer retires a legacy committed window without a v2 finalizer'
 (
     # shellcheck disable=SC2294
     eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" rr_legacy_update_lock_mode_is_safe)"
@@ -690,6 +693,205 @@ printf '%s\n' '[11/11] installer retires a legacy committed window without a v2 
         fail 'legacy committed retirement invoked the old launcher or an unexpected helper'
     ! grep -Fq -- '--post-update-finalize' "$operation_log" ||
         fail 'legacy committed retirement invoked the unsupported v2 finalizer'
+)
+
+printf '%s\n' '[12/12] unconfigured hot update accepts only strict health-unit absence'
+(
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" \
+        rr_health_units_are_strictly_absent)"
+    # shellcheck disable=SC2294
+    eval "$(function_body "$REPO_ROOT/scripts/install-core.sh" \
+        rr_verify_update_writer_state)"
+
+    grep -Fq \
+        'RR_CONFIG_FILE="/etc/argo_vmess.conf"' \
+        "$REPO_ROOT/scripts/install-core.sh" ||
+        fail 'installer does not pin the production node-config default'
+    grep -Fq \
+        'RR_HEALTH_SERVICE_FILE="${RR_HEALTH_SERVICE_FILE:-/etc/systemd/system/argo-rr-health.service}"' \
+        "$REPO_ROOT/scripts/install-core.sh" ||
+        fail 'installer does not define the production health-service path'
+
+    case_root="$TEST_ROOT/unconfigured-health"
+    RR_CONFIG_FILE="$case_root/argo_vmess.conf"
+    RR_HEALTH_SERVICE_FILE="$case_root/systemd/argo-rr-health.service"
+    RR_HEALTH_TIMER_FILE="$case_root/systemd/argo-rr-health.timer"
+    RR_LAUNCHER="$case_root/rr"
+    BACKUP_DIR="$case_root/backup"
+    operation_log="$case_root/operations"
+    mkdir -p "$BACKUP_DIR" "$(dirname "$RR_HEALTH_SERVICE_FILE")"
+    : > "$operation_log"
+
+    systemctl_bad_unit=""
+    systemctl_bad_property=""
+    systemctl_bad_value=""
+    systemctl_failed_unit=""
+    systemctl_failed_property=""
+    systemctl_empty_unit_file=false
+    systemctl() {
+        local property="${2#--property=}" unit="${4:-}" value=""
+        [ "${1:-}" = show ] && [ "${3:-}" = --value ] || return 1
+        case "$unit" in
+            argo-rr-health.service|argo-rr-health.timer) ;;
+            *) return 1 ;;
+        esac
+        if [ "$unit" = "$systemctl_failed_unit" ] &&
+           [ "$property" = "$systemctl_failed_property" ]; then
+            return 1
+        fi
+        case "$property" in
+            LoadState) value=not-found ;;
+            ActiveState) value=inactive ;;
+            UnitFileState)
+                if [ "$systemctl_empty_unit_file" = true ]; then
+                    value=""
+                else
+                    value=not-found
+                fi
+                ;;
+            *) return 1 ;;
+        esac
+        if [ "$unit" = "$systemctl_bad_unit" ] &&
+           [ "$property" = "$systemctl_bad_property" ]; then
+            value="$systemctl_bad_value"
+        fi
+        printf '%s\n' "$value"
+    }
+
+    rr_health_units_are_strictly_absent ||
+        fail 'strict absent tuple was rejected'
+    systemctl_empty_unit_file=true
+    rr_health_units_are_strictly_absent ||
+        fail 'legacy empty UnitFileState was rejected for a proven absent unit'
+    systemctl_bad_unit=argo-rr-health.service
+    systemctl_bad_property=LoadState
+    systemctl_bad_value=loaded
+    if rr_health_units_are_strictly_absent; then
+        fail 'empty UnitFileState normalized without a not-found LoadState'
+    fi
+    systemctl_bad_unit=""
+    systemctl_bad_property=""
+    systemctl_bad_value=""
+    systemctl_empty_unit_file=false
+
+    systemctl_bad_unit=argo-rr-health.service
+    systemctl_bad_property=LoadState
+    systemctl_bad_value=loaded
+    if rr_health_units_are_strictly_absent; then
+        fail 'stale compiled health service was accepted as absent'
+    fi
+    systemctl_bad_unit=argo-rr-health.timer
+    systemctl_bad_property=ActiveState
+    systemctl_bad_value=active
+    if rr_health_units_are_strictly_absent; then
+        fail 'active health timer was accepted as absent'
+    fi
+    systemctl_bad_unit=argo-rr-health.service
+    systemctl_bad_property=UnitFileState
+    systemctl_bad_value=enabled
+    if rr_health_units_are_strictly_absent; then
+        fail 'enabled health unit was accepted as absent'
+    fi
+    systemctl_bad_unit=""
+    systemctl_bad_property=""
+    systemctl_bad_value=""
+    systemctl_failed_unit=argo-rr-health.timer
+    systemctl_failed_property=LoadState
+    if rr_health_units_are_strictly_absent; then
+        fail 'systemctl query failure was accepted as absent health state'
+    fi
+    systemctl_failed_unit=""
+    systemctl_failed_property=""
+
+    for health_path in "$RR_HEALTH_SERVICE_FILE" "$RR_HEALTH_TIMER_FILE"; do
+        printf '%s\n' foreign > "$health_path"
+        if rr_health_units_are_strictly_absent; then
+            fail "on-disk health path was accepted as absent: $health_path"
+        fi
+        rm -f -- "$health_path"
+        ln -s missing-health-unit "$health_path"
+        if rr_health_units_are_strictly_absent; then
+            fail "dangling health symlink was accepted as absent: $health_path"
+        fi
+        rm -f -- "$health_path"
+    done
+
+    renderer_failure=false
+    snapshot_failure=""
+    ip_failure=false
+    rr_run_with_delegated_update_lock() {
+        printf 'renderer:%s\n' "$*" >> "$operation_log"
+        [ "$renderer_failure" = false ]
+    }
+    rr_wait_unit_state() {
+        printf 'activity:%s:%s\n' "$1" "$2" >> "$operation_log"
+        [ "$snapshot_failure" != "activity:$1:$2" ]
+    }
+    rr_unit_file_state_matches() {
+        printf 'unit-file:%s:%s\n' "$1" "$2" >> "$operation_log"
+        [ "$snapshot_failure" != "unit-file:$1:$2" ]
+    }
+    rr_subscription_running() { return 1; }
+    rr_verify_ip_acme_update_writer_state() {
+        printf '%s\n' ip-acme >> "$operation_log"
+        [ "$ip_failure" = false ]
+    }
+
+    systemctl_bad_unit=argo-rr-health.service
+    systemctl_bad_property=LoadState
+    systemctl_bad_value=loaded
+    if rr_verify_update_writer_state "$BACKUP_DIR"; then
+        fail 'unconfigured writer verification bypassed the strict absent gate'
+    fi
+    [ ! -s "$operation_log" ] ||
+        fail 'writer snapshot gates ran after strict health absence failed'
+    systemctl_bad_unit=""
+    systemctl_bad_property=""
+    systemctl_bad_value=""
+
+    rr_verify_update_writer_state "$BACKUP_DIR" ||
+        fail 'strictly absent clean-host health state blocked hot update'
+    ! grep -q '^renderer:' "$operation_log" ||
+        fail 'clean-host verification invoked the configured health renderer'
+    for expected in \
+        'activity:sing-box:inactive' 'unit-file:sing-box:disabled' \
+        'activity:rr-nexus:inactive' 'unit-file:rr-nexus:disabled' \
+        'activity:argo-rr-health.timer:inactive' \
+        'unit-file:argo-rr-health.timer:disabled' ip-acme; do
+        grep -Fxq "$expected" "$operation_log" ||
+            fail "clean-host verification skipped snapshot gate: $expected"
+    done
+
+    snapshot_failure=activity:rr-nexus:inactive
+    if rr_verify_update_writer_state "$BACKUP_DIR"; then
+        fail 'clean-host health exception bypassed a Nexus snapshot mismatch'
+    fi
+    snapshot_failure=""
+    ip_failure=true
+    if rr_verify_update_writer_state "$BACKUP_DIR"; then
+        fail 'clean-host health exception bypassed the IP-ACME snapshot gate'
+    fi
+    ip_failure=false
+
+    printf '%s\n' configured > "$RR_CONFIG_FILE"
+    printf '%s\n' service > "$RR_HEALTH_SERVICE_FILE"
+    printf '%s\n' timer > "$RR_HEALTH_TIMER_FILE"
+    : > "$operation_log"
+    rr_verify_update_writer_state "$BACKUP_DIR" ||
+        fail 'configured host no longer uses the original health renderer gate'
+    grep -Fxq "renderer:$RR_LAUNCHER --verify-health-unit-definitions" \
+        "$operation_log" ||
+        fail 'configured host skipped the effective health-unit validator'
+    renderer_failure=true
+    if rr_verify_update_writer_state "$BACKUP_DIR"; then
+        fail 'configured host ignored health renderer validation failure'
+    fi
+    renderer_failure=false
+    rm -f -- "$RR_HEALTH_TIMER_FILE"
+    if rr_verify_update_writer_state "$BACKUP_DIR"; then
+        fail 'configured host accepted a missing health timer'
+    fi
 )
 
 printf '%s\n' 'install-core rollback boundary regressions: PASS'
