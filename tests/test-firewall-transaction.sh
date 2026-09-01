@@ -588,6 +588,20 @@ setup_netfilter_mock() {
     iptables() { mock_netfilter iptables "$@"; }
     ip6tables() { mock_netfilter ip6tables "$@"; }
     netfilter-persistent() { return 0; }
+    # Netfilter-only cases must not consume the runner's saved inactive UFW
+    # program. Keep the fixture empty and reject any unexpected UFW writer.
+    ufw() {
+        if [ "$#" -eq 1 ] && [ "$1" = status ]; then
+            printf '%s\n' 'Status: inactive'
+            return 0
+        fi
+        if [ "$#" -eq 2 ] && [ "$1" = show ] && [ "$2" = added ]; then
+            printf '%s\n' \
+                "Added user rules (see 'ufw status' for running firewall):"
+            return 0
+        fi
+        return 2
+    }
     rr_ufw_backend_state() { return 1; }
     rr_netfilter_backend_state() {
         case "$1" in
