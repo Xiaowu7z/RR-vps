@@ -24,6 +24,36 @@ jobs:
             -o UserKnownHostsFile="$known" -o HostKeyAlgorithms=ssh-ed25519 \
             -o PreferredAuthentications=password -o PubkeyAuthentication=no \
             -o ConnectTimeout=15 "root@$HOST" 'bash -s' <<'REMOTE'
+          # Retire only the identified hung audit process and its descendants.
+          python3 - <<'PY'
+          import os, signal, time
+          from pathlib import Path
+          root = 1072453
+          proc = Path(f'/proc/{root}')
+          if proc.exists():
+              args = (proc/'cmdline').read_bytes().split(b'\0')
+              assert b'/root/rr-stability-candidate/audit-stability-host.sh' in args
+              selected = {root}
+              changed = True
+              while changed:
+                  changed = False
+                  for item in Path('/proc').glob('[0-9]*'):
+                      try:
+                          stat = (item/'stat').read_text().rsplit(')', 1)[1].split()
+                          if int(stat[1]) in selected and int(item.name) not in selected:
+                              selected.add(int(item.name)); changed = True
+                      except (OSError, ValueError, IndexError):
+                          pass
+              for pid in selected:
+                  try: os.kill(pid, signal.SIGSTOP)
+                  except ProcessLookupError: pass
+              for pid in selected:
+                  try: os.kill(pid, signal.SIGKILL)
+                  except ProcessLookupError: pass
+              print('Retired identified hung test processes:', len(selected))
+          else:
+              print('Identified hung audit has already exited')
+          PY
           /usr/local/sbin/rr-update-recover status
           /usr/local/bin/rr --version
           systemctl show sing-box.service rr-nexus.service argo-rr-health.service \
