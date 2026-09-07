@@ -84,6 +84,16 @@ test "$(jq -r '.public_port' "$NEXUS_CONFIG_FILE")" = 443
 test "$(jq -r '.port' "$NEXUS_CONFIG_FILE")" = 7900
 domain=$(jq -r '.domain' "$NEXUS_CONFIG_FILE")
 is_valid_domain "$domain"
+# The released update only validates these tuples; it cannot create missing
+# legacy rules during migration. Refuse before pausing any service.
+phase=preflight-firewall
+for port in 80 443; do
+    rr_validate_protocol_firewall "$port" tcp open || {
+        printf 'FIREWALL_PREPARATION_REQUIRED tcp/%s; run diagnose-v721-firewall.sh before upgrading.\n' "$port"
+        exit 1
+    }
+done
+phase=preflight
 site=/etc/nginx/sites-available/rr-nexus.conf
 old_link=/etc/nginx/sites-enabled/rr-nexus.conf
 new_site=/etc/nginx/sites-available/rr-nexus.conf.port
