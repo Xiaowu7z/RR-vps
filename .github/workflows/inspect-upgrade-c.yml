@@ -28,15 +28,19 @@ jobs:
           /usr/local/bin/rr --version
           systemctl show sing-box.service rr-nexus.service argo-rr-health.service \
             argo-rr-health.timer rr-update-recovery.service -p Id -p ActiveState -p SubState -p Job --no-pager
-          ps -eo pid,ppid,comm,etimes,wchan:24 | awk '/bash|python|curl|systemctl|sing-box|cloudflared|PID/'
-          lslocks -n -o PID,COMMAND,PATH | awk '$3 == "/run/rr-vps/locks/update.lock"'
+          ps -eo pid,ppid,comm,etimes,wchan:24 | awk '/bash|python|curl|systemctl|sing-box|cloudflared|flock|apt|dpkg|tar|sleep|go|PID/'
+          lslocks -n -o PID,COMMAND,PATH
           python3 - <<'PY'
           import re
           from pathlib import Path
-          for line in Path('/root/rr-stability.log').read_text(errors='replace').splitlines()[-35:]:
-              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
-              if ' DIAG ' not in line:
-                  line = re.sub(r'[!-~]{8,}', '[redacted]', line)
-              print(line[:240])
+          for name in ['/root/rr-stability.log','/root/rr-stability-candidate/install-attempt.log']:
+              print('LOG',name)
+              if not Path(name).is_file():
+                  continue
+              for line in Path(name).read_text(errors='replace').splitlines()[-25:]:
+                  line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+                  if ' DIAG ' not in line:
+                      line = re.sub(r'[!-~]{8,}', '[redacted]', line)
+                  print(line[:240])
           PY
           REMOTE
