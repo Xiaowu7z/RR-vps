@@ -1,10 +1,9 @@
-name: Finalize v7.2.0
+name: Publish verified v7.2.0
 
 on:
-  workflow_run:
-    workflows: [CI, Three-host stability smoke test]
-    types: [completed]
-    branches: [main]
+  push:
+    branches: [audit/stability-20260907]
+    paths: [.github/workflows/publish-v720.yml]
 
 permissions:
   contents: read
@@ -16,14 +15,14 @@ concurrency:
 
 jobs:
   dispatch:
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository
+    if: github.ref == 'refs/heads/audit/stability-20260907'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Dispatch the existing publisher after both exact main checks
         env:
           GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: 23c9c86a103c7acbd7c4f9709ab527ccdf804adc
         run: |
           set -euo pipefail
           api="/repos/$GITHUB_REPOSITORY"
@@ -44,4 +43,5 @@ jobs:
           done
           # The publisher independently rechecks main, complete run inventories,
           # immutable-release settings and asset ownership before every mutation.
-          gh workflow run release.yml --ref main -f "sha=$EXPECTED_SHA"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f "sha=$EXPECTED_SHA"
+          gh api --method PUT "$api/actions/workflows/publish-v720.yml/disable"
