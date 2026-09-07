@@ -1,9 +1,6 @@
 name: Three-host installation diagnostics
 
 on:
-  push:
-    branches: [audit/stability-20260907]
-    paths: [.github/workflows/vps-stability.yml, scripts/audit-stability-host.sh]
   workflow_dispatch:
 
 permissions:
@@ -71,4 +68,16 @@ jobs:
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
             scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" 'systemctl show sing-box.service -p User -p WorkingDirectory -p DynamicUser -p PrivateNetwork -p RootDirectory -p RootImage -p Conditions -p Asserts -p DropInPaths; systemctl cat sing-box.service | sed -n "/^Condition/p;/^Assert/p"'
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" python3 - <<'PY'
+          import re
+          from pathlib import Path
+          lines = Path('/root/rr-stability.log').read_text(errors='replace').splitlines()
+          for line in lines[-75:]:
+              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+              line = re.sub(r'(?:\d{1,3}\.){3}\d{1,3}', '[IP]', line)
+              line = re.sub(r'https?://\S+', '[URL]', line)
+              line = re.sub(r'[!-~]{8,}', '[redacted]', line)
+              if line.strip(): print(line[:240])
+          for path in ('/etc/argo_vmess.conf','/usr/local/bin/sing-box'):
+              print('exists',path,Path(path).exists())
+          PY
