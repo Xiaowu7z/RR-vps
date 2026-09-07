@@ -249,8 +249,7 @@ for fragment in (
     'rr_update_guard_copy_verified_asset manifest.sha256 "$remote_manifest"',
     'rr_update_guard_copy_verified_asset install.sh "$target_file"',
     'sort_by([.run_number, .run_attempt]) | last',
-    'vps-audit.yml push "$initial_commit"',
-    'vps-audit.yml workflow_dispatch "$initial_commit"',
+    'vps-stability.yml push "$initial_commit"',
     'rr_update_guard_assert_owned_tag "$initial_tag" "$initial_commit"',
 ):
     if fragment not in guard:

@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# shellcheck source=09-systemd.sh
+source "${BASH_SOURCE[0]%/*}/09-systemd.sh"
 # RR Nexus 可选管理面板、多用户凭据与独立订阅。
 
 NEXUS_CONFIG_FILE="/etc/rr-nexus/nexus.json"
@@ -2089,9 +2091,9 @@ PY
         --property=RootDirectory --value 2>/dev/null) || return 1
     root_image=$(systemctl show rr-nexus.service --property=RootImage --value \
         2>/dev/null) || return 1
-    conditions=$(systemctl show rr-nexus.service --property=Conditions --value \
+    conditions=$(rr_systemd_show rr-nexus.service --property=Conditions --value \
         2>/dev/null) || return 1
-    asserts=$(systemctl show rr-nexus.service --property=Asserts --value \
+    asserts=$(rr_systemd_show rr-nexus.service --property=Asserts --value \
         2>/dev/null) || return 1
     [ "$user" = root ] && [ "$working_directory" = "${RR_LIB_DIR}/nexus" ] && \
         [ "$dynamic_user" = no ] && [ "$private_network" = no ] && \

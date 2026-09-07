@@ -576,7 +576,7 @@ printf '%s\n' '[11/11] health unit pair rolls back partial publication and prove
                     Unit:argo-rr-health.timer)
                         printf '%s\n' argo-rr-health.service ;;
                     TimersMonotonic:argo-rr-health.timer)
-                        printf '%s\n' '{ OnBootSec=30s ; } { OnUnitActiveSec=5min ; }' ;;
+                        printf '%s\n' '{ OnUnitActiveUSec=5min ; next_elapse=0 } { OnBootUSec=30s ; next_elapse=0 }' ;;
                     TimersCalendar:argo-rr-health.timer)
                         printf '\n' ;;
                     RandomizedDelayUSec:argo-rr-health.timer)

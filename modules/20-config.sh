@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# shellcheck source=09-systemd.sh
+source "${BASH_SOURCE[0]%/*}/09-systemd.sh"
 # 本文件由 RR-vps 主入口加载，请勿单独执行。
 
 # ==========================================
@@ -2317,9 +2319,9 @@ rr_certbot_renewal_runtime_is_ready() {
         --property=ExecStartPre --value 2>/dev/null) || return 1
     exec_condition=$(systemctl show certbot.service \
         --property=ExecCondition --value 2>/dev/null) || return 1
-    unit_conditions=$(systemctl show certbot.service \
+    unit_conditions=$(rr_systemd_show certbot.service \
         --property=Conditions --value 2>/dev/null) || return 1
-    unit_asserts=$(systemctl show certbot.service \
+    unit_asserts=$(rr_systemd_show certbot.service \
         --property=Asserts --value 2>/dev/null) || return 1
     service_user=$(systemctl show certbot.service --property=User --value \
         2>/dev/null) || return 1
@@ -2462,9 +2464,9 @@ PY
     timer_dropins=$(systemctl show certbot.timer \
         --property=DropInPaths --value 2>/dev/null) || return 1
     [ -z "${timer_dropins//[[:space:]]/}" ] || return 1
-    timer_conditions=$(systemctl show certbot.timer \
+    timer_conditions=$(rr_systemd_show certbot.timer \
         --property=Conditions --value 2>/dev/null) || return 1
-    timer_asserts=$(systemctl show certbot.timer \
+    timer_asserts=$(rr_systemd_show certbot.timer \
         --property=Asserts --value 2>/dev/null) || return 1
     [ -z "${timer_conditions//[[:space:]]/}" ] || return 1
     [ -z "${timer_asserts//[[:space:]]/}" ] || return 1

@@ -402,8 +402,7 @@ rr_update_guard_prepare_stable_release() {
 
     rr_update_guard_assert_main_tip "$initial_commit" &&
         rr_update_guard_assert_workflow_gate ci.yml push "$initial_commit" &&
-        rr_update_guard_assert_workflow_gate vps-audit.yml push "$initial_commit" &&
-        rr_update_guard_assert_workflow_gate vps-audit.yml workflow_dispatch "$initial_commit" &&
+        rr_update_guard_assert_workflow_gate vps-stability.yml push "$initial_commit" &&
         rr_update_guard_assert_main_tip "$initial_commit" || return 1
 
     for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
@@ -437,8 +436,7 @@ rr_update_guard_prepare_stable_release() {
         [ "$RR_GUARD_STABLE_OWNER_PAYLOAD" = "$initial_owner_payload" ] &&
         [ "$RR_GUARD_STABLE_TAG_OBJECT_SHA" = "$initial_tag_object_sha" ] &&
         rr_update_guard_assert_workflow_gate ci.yml push "$initial_commit" &&
-        rr_update_guard_assert_workflow_gate vps-audit.yml push "$initial_commit" &&
-        rr_update_guard_assert_workflow_gate vps-audit.yml workflow_dispatch "$initial_commit" &&
+        rr_update_guard_assert_workflow_gate vps-stability.yml push "$initial_commit" &&
         rr_update_guard_assert_main_tip "$initial_commit" || return 1
     rm -f "$metadata" "$final_metadata"
 }

@@ -5857,7 +5857,7 @@ def nexus_firewall_lifecycle_contract(candidate):
         # observation laundering, or a swallowed final parser status cannot pass
         # merely by leaving the required tokens in place.
         and hashlib.sha256(effective_identity.encode()).hexdigest()
-        == "7f5d448780f77a1d13c8b78269881dd31003436304833818206d2bb826984155"
+        == "ffeff0351d132b3db24a6a46c60c2745f591e1c9277e74cee1f6c28048b33041"
         and 'raw.count("{") != len(expected)' in effective_identity
         and 'raw.count("}") != len(expected)' in effective_identity
         and 'raw.count("path=") != len(expected)' in effective_identity
@@ -7926,17 +7926,11 @@ for body, helper, sha in (
     ):
         assert token in body, f"missing {helper} inventory invariant: {token}"
 assert 'require_workflow_success_for_sha ci.yml push "CI push"' in verify
-assert 'require_workflow_success_for_sha vps-audit.yml push "VPS audit push"' in verify
-assert (
-    'require_workflow_success_for_sha vps-audit.yml workflow_dispatch \\\n'
-    '            "VPS audit workflow_dispatch"'
-) in verify
+assert 'require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"' in verify
 assert 'assert_workflow_gate ci.yml push "CI push"' in publish
-assert 'assert_workflow_gate vps-audit.yml push "VPS audit push"' in publish
-assert (
-    'assert_workflow_gate vps-audit.yml workflow_dispatch \\\n'
-    '              "VPS audit workflow_dispatch"'
-) in publish
+assert 'assert_workflow_gate vps-stability.yml push "Three-host stability push"' in publish
+assert 'require_workflow_success_for_sha vps-audit.yml' not in verify
+assert 'assert_workflow_gate vps-audit.yml' not in publish
 assert publish.count("assert_release_gate") >= 4
 assert publish.count("assert_verified_sha_gate") >= 2
 assert "assert_main_tip()" in publish

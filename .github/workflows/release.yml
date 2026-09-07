@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: Full main commit SHA that already passed CI and VPS audit
+        description: Full main commit SHA that already passed CI and three-host stability
         required: true
         type: string
 
@@ -120,9 +120,7 @@ jobs:
           )
 
           require_workflow_success_for_sha ci.yml push "CI push"
-          require_workflow_success_for_sha vps-audit.yml push "VPS audit push"
-          require_workflow_success_for_sha vps-audit.yml workflow_dispatch \
-            "VPS audit workflow_dispatch"
+          require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"
           main_sha=$(gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
@@ -362,9 +360,7 @@ jobs:
 
           assert_verified_sha_gate() {
             assert_workflow_gate ci.yml push "CI push"
-            assert_workflow_gate vps-audit.yml push "VPS audit push"
-            assert_workflow_gate vps-audit.yml workflow_dispatch \
-              "VPS audit workflow_dispatch"
+            assert_workflow_gate vps-stability.yml push "Three-host stability push"
           }
 
           assert_main_tip() {
