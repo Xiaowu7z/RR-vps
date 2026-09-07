@@ -2649,7 +2649,7 @@ rr_recovery_helper_is_owned_or_absent() {
     # v7.2.0 copied its standalone helper before taking a snapshot. An aborted
     # 7.0.2 upgrade can therefore retain this exact published helper without a
     # matching source in the still-old runtime. Recognize only that pinned file.
-    if [ "$target" = "$RR_RECOVERY_HELPER" ] && \
+    if [ "$target" = "${RR_RECOVERY_HELPER:-/usr/local/sbin/rr-update-recover}" ] && \
        [ "$(rr_trusted_installed_runtime_version 2>/dev/null)" = 7.0.2 ] && \
        [ "$(sha256sum -- "$target" | cut -d ' ' -f1)" = \
          e2e0b855c8bcd295daf2741c2e58cbf011263aabdedb535066df5ff14ac7b893 ]; then

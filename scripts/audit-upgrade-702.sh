@@ -26,7 +26,7 @@ for path in /etc/systemd/system/sing-box.service.d /etc/systemd/system/rr-nexus.
     if [ -d "$path" ]; then mv "$path" "$saved/$(basename "$path")"; fi
 done
 systemctl daemon-reload
-python3 - "$saved/_var_lib_rr-nexus/nexus.db" <<'PY'
+python3 - <<'PY'
 import datetime, importlib.util, secrets, sqlite3, sys, uuid
 from pathlib import Path
 spec = importlib.util.spec_from_file_location('rr_nexus_702', '/usr/local/lib/rr/nexus/rr_nexus.py')
@@ -35,15 +35,14 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 store = module.Store(Path('/var/lib/rr-nexus/nexus.db'))
 now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-with store.connect() as db, sqlite3.connect(sys.argv[1]) as old:
-    columns = [r[1] for r in db.execute('PRAGMA table_info(users)')]
-    available = {r[1] for r in old.execute('PRAGMA table_info(users)')}
-    columns = [c for c in columns if c in available]
-    names = ','.join('"'+c+'"' for c in columns)
-    db.executemany('INSERT INTO users ('+names+') VALUES ('+','.join('?' for _ in columns)+')', old.execute('SELECT '+names+' FROM users'))
+with store.connect() as db:
     db.execute('INSERT INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
         ('dev_a11ce0000002','legacy-upgrade',str(uuid.uuid4()),secrets.token_hex(24),1,1073741824,1024,now,now))
 PY
+mapfile -t fixture_admin < /root/rr-stability-panel-credentials
+printf '%s\n' "${fixture_admin[1]}" | python3 /usr/local/lib/rr/nexus/rr_nexus.py \
+    --init-admin "${fixture_admin[0]}" >/dev/null
+unset fixture_admin
 /usr/local/bin/rr --version | grep -Fx 'RR-vps 7.0.2'
 /usr/local/bin/rr --sync-devices
 # This is exactly the old noninteractive read/start path used in production.

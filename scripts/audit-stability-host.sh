@@ -13,6 +13,7 @@ finish() {
   rc=$?
   trap - EXIT
   if [ "$rc" != 0 ]; then
+    lslocks -n -o PID,COMMAND,PATH | awk '$3 == "/run/rr-vps/locks/update.lock"' >&3 || true
     test ! -f /root/rr-stability-lines.log || tail -25 /root/rr-stability-lines.log >&3
     test ! -f /root/rr-stability-return.log || tail -20 /root/rr-stability-return.log >&3
     python3 - "$log" <<'PYLOG' >&3
@@ -49,14 +50,39 @@ phase=runtime-install
 candidate=$(mktemp -d /root/rr-stability-payload.XXXXXX)
 tar -xzf "$stage/rr-bundle.tar.gz" -C "$candidate"
 (cd "$candidate/rr-bundle"; sha256sum -c manifest.sha256 >/dev/null)
+install_candidate() {
+  local attempt=0 result=0 attempt_log="$stage/install-attempt.log"
+  while [ "$attempt" -lt 3 ]; do
+    result=0
+    RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
+      bash "$stage/install-core.sh" --upgrade >"$attempt_log" 2>&1 || result=$?
+    cat "$attempt_log"
+    [ "$result" != 0 ] || return 0
+    # Retry only the explicit no-mutation busy-lock rejection. Never rerun a
+    # failed transaction automatically or remove/replace the shared lock.
+    grep -Fq '另一个安装/更新任务正在运行，本次未改动系统。' "$attempt_log" || return "$result"
+    flock -w 45 /run/rr-vps/locks/update.lock true || return 1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
 if [ "$role" = C ]; then
   bash "$stage/audit-upgrade-702.sh" "$candidate/rr-bundle" 3>&-
 fi
 if [ -f /usr/local/lib/rr/modules/09-systemd.sh ] || [ "$role" = C ]; then
   # Exercise the complete transaction, including the manifest-verified helper.
   # Copying selected modules cannot prove that a released upgrade succeeds.
-  RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
-    bash "$stage/install-core.sh" --upgrade 3>&-
+  if [ "$role" != C ] && \
+     cmp -s "$candidate/rr-bundle/manifest.sha256" /usr/local/lib/rr/manifest.sha256 && \
+     cmp -s "$candidate/rr-bundle/scripts/update-recover.sh" /usr/local/sbin/rr-update-recover && \
+     [ "$(/usr/local/bin/rr --version)" = "RR-vps $expected_version" ]; then
+    # A successful previous attempt already installed these exact runtime
+    # bytes. Recheck every member below and observe stability without another
+    # reinstall when only the audit harness changed.
+    printf 'STABILITY role=%s identical_installed_runtime=reused\n' "$role" >&3
+  else
+    install_candidate 3>&-
+  fi
 else
   # A's old installer retained failed rollback evidence. Keep it as a private
   # backup before installing the candidate on this never-completed test host.
