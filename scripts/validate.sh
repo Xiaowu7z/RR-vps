@@ -29,6 +29,9 @@ if command -v node >/dev/null 2>&1; then
     node --check nexus/static/admin.js
 fi
 
+echo "[1/13] Certbot calendar output compatibility"
+bash tests/test-certbot-calendar.sh
+
 echo "[2/13] Combined module loading"
 bash -c '
     for module_file in modules/*.sh; do

@@ -1,4 +1,4 @@
-name: Finalize v7.2.0
+name: Finalize stable release
 
 on:
   workflow_run:
@@ -11,7 +11,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: finalize-v720
+  group: finalize-stable-release
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,19 @@ jobs:
           current=$(gh api "$api/git/ref/heads/main" --jq '.object.sha')
           [ "$current" = "$EXPECTED_SHA" ] || exit 0
           version=$(gh api "$api/contents/version?ref=$EXPECTED_SHA" --jq '.content' | base64 -d | head -n 1)
-          [ "$version" = 'RR-vps 7.2.0' ] || exit 0
+          [[ "$version" =~ ^RR-vps\ ((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] || {
+            echo 'Version must be a canonical RR-vps MAJOR.MINOR.PATCH line.' >&2
+            exit 1
+          }
+          release_tag="v${BASH_REMATCH[1]}"
+          # Documentation-only main commits must not republish an existing
+          # immutable version. Drafts remain eligible for publisher recovery.
+          published_tags=$(gh api --paginate "$api/releases?per_page=100" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          if grep -Fxq -- "$release_tag" <<<"$published_tags"; then
+            echo "${release_tag} is already published; waiting for a new version."
+            exit 0
+          fi
           for workflow in ci.yml vps-stability.yml; do
             runs=$(gh api "$api/actions/workflows/$workflow/runs?branch=main&event=push&head_sha=$EXPECTED_SHA&per_page=100")
             if ! jq -e --arg sha "$EXPECTED_SHA" '

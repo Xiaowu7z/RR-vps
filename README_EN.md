@@ -8,7 +8,11 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.2** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.2: Debian renewal-readiness compatibility
+
+Fixes HTTPS renewal-readiness checks that rejected the calendar output used by Debian 12 / systemd 252. Renewal, transaction, and identity checks remain in place, with the observed output covered by release regressions. Existing 7.2.1 installations, including the Debian compatibility build, can use stable hot updates; legacy Nginx renewal layouts still require preparation before upgrading.
 
 ### 7.2.0: rebuilt trust boundaries, hardened recovery, and verifiable releases
 
@@ -117,7 +121,7 @@ Direct restore to a blank destination is supported only when NaiveProxy is disab
 - Target-scoped UFW/IPv4/IPv6 firewall transactions: a durable cross-boot gate is established and managed ingress is stopped before the first write; the gate is removed only after every participating backend's live and persistent state validates. Unprovable writes, saves, or compensation retain fail-closed evidence until a complete repair is revalidated
 - Menu, CLI, background-sync, health-repair, and certificate-deploy writers share a root-only transaction lock domain. Naive/Sing-box and public Nexus certificate pairs remain gated until atomic publication, effective systemd policy, and the actually served certificate are proved; durable pending evidence makes failures idempotently recoverable
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push, VPS push, and VPS workflow_dispatch evidence for one exact SHA before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
+- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push and three-host stability push evidence for one exact SHA before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
 - `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
 - Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and automatic local rollback attempts on health failure; it is not a full-machine backup
 - No forced reservation of local port 443 for Argo
