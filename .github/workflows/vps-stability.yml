@@ -1,0 +1,80 @@
+name: Three-host stability smoke test
+
+on:
+  push:
+    branches: [audit/stability-20260907]
+    paths: [.github/workflows/vps-stability.yml, scripts/audit-stability-host.sh]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vps-release-audit
+  cancel-in-progress: false
+
+jobs:
+  stability:
+    if: github.ref == 'refs/heads/audit/stability-20260907'
+    name: Stability · ${{ matrix.role }} · ${{ matrix.os }} ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: A
+            os: debian
+            version: '12'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
+          - role: B
+            os: ubuntu
+            version: '22.04'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
+          - role: C
+            os: ubuntu
+            version: '24.04'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate candidate and prepare SSH
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/rebuild-bundle.py --check
+          bash -n scripts/audit-stability-host.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass netcat-openbsd
+      - name: Reset disposable host and run stability check
+        env:
+          HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
+          SSHPASS: ${{ secrets[format('RR_{0}_PASS', matrix.role)] }}
+          HOST_KEY: ${{ matrix.key }}
+          ROLE: ${{ matrix.role }}
+          EXPECTED_OS: ${{ matrix.os }}
+          EXPECTED_OS_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$HOST"
+          test -n "$SSHPASS"
+          known_hosts="$RUNNER_TEMP/rr-stability-known-hosts"
+          (umask 077; printf '%s %s\n' "$HOST" "$HOST_KEY" > "$known_hosts")
+          ssh_opts=(-o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
+            -o UserKnownHostsFile="$known_hosts" -o HostKeyAlgorithms=ssh-ed25519
+            -o PreferredAuthentications=password -o PubkeyAuthentication=no
+            -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" 'install -d -m 700 /root/rr-stability-candidate'
+          sha256sum rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh scripts/audit-stability-host.sh |
+            sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
+          sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
+            scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
+          expected_version=$(sed -n '1s/^RR-vps //p' version)
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash /root/rr-stability-candidate/audit-stability-host.sh \
+            "$ROLE" "$EXPECTED_OS" "$EXPECTED_OS_VERSION" "$expected_version" | tee "$RUNNER_TEMP/result.txt"
+          for port in 24443 21443 22443; do nc -z -w 10 "$HOST" "$port"; done
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" true
+          printf 'STABILITY role=%s external_tcp=pass ssh=pass\n' "$ROLE" | tee -a "$RUNNER_TEMP/result.txt"
+          cat "$RUNNER_TEMP/result.txt" >> "$GITHUB_STEP_SUMMARY"
