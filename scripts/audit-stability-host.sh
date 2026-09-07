@@ -49,11 +49,14 @@ phase=runtime-install
 candidate=$(mktemp -d /root/rr-stability-payload.XXXXXX)
 tar -xzf "$stage/rr-bundle.tar.gz" -C "$candidate"
 (cd "$candidate/rr-bundle"; sha256sum -c manifest.sha256 >/dev/null)
-if [ -f /usr/local/lib/rr/modules/09-systemd.sh ]; then
-  for module in 09-systemd.sh 10-system.sh 30-singbox.sh; do
-    install -m 755 "$candidate/rr-bundle/modules/$module" "/usr/local/lib/rr/modules/$module"
-  done
-  install -m 644 "$candidate/rr-bundle/manifest.sha256" /usr/local/lib/rr/manifest.sha256
+if [ "$role" = C ]; then
+  bash "$stage/audit-upgrade-702.sh" "$candidate/rr-bundle" 3>&-
+fi
+if [ -f /usr/local/lib/rr/modules/09-systemd.sh ] || [ "$role" = C ]; then
+  # Exercise the complete transaction, including the manifest-verified helper.
+  # Copying selected modules cannot prove that a released upgrade succeeds.
+  RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
+    bash "$stage/install-core.sh" --upgrade 3>&-
 else
   # A's old installer retained failed rollback evidence. Keep it as a private
   # backup before installing the candidate on this never-completed test host.
@@ -73,6 +76,10 @@ rm -rf -- "$candidate"
 install -m 755 "$stage/update-guard.sh" /usr/local/lib/rr/modules/61-update-guard.sh
 cmp -s "$stage/update-guard.sh" /usr/local/lib/rr/modules/61-update-guard.sh
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
+if [ "$role" = C ]; then
+  python3 "$stage/verify-upgrade-identities.py" /root/rr-702-identities.json
+  printf 'STABILITY role=C upgrade_from=7.0.2 identities=preserved\n' >&3
+fi
 (cd /usr/local/lib/rr; awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null)
 if ! grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf; then
 phase=finish-protocol-install
