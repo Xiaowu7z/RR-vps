@@ -3,7 +3,7 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
-RR_RELEASE_TAG="v7.2.0"
+RR_RELEASE_TAG="v7.2.1"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_SOURCE_REF="$RR_RELEASE_TAG"
@@ -1477,12 +1477,14 @@ rr_clear_update_maintenance_marker() {
 
 rr_freeze_update_writers() {
     RR_UPDATE_WRITERS_FROZEN=true
+    # 7.0.2's health worker predates the shared lock and can revive Sing-box.
+    # Quiesce the scheduler and an in-flight worker before stopping its writers.
+    rr_freeze_health_monitor || { rr_error "DIAG freeze_gate=health"; return 1; }
     rr_freeze_ip_acme_update_writer || return 1
     systemctl stop rr-nexus sing-box >/dev/null 2>&1 || true
-    rr_wait_unit_state rr-nexus inactive || return 1
-    rr_wait_unit_state sing-box inactive || return 1
-    rr_stop_subscription_servers || return 1
-    rr_freeze_health_monitor || return 1
+    rr_wait_unit_state rr-nexus inactive || { rr_error "DIAG freeze_gate=nexus"; return 1; }
+    rr_wait_unit_state sing-box inactive || { rr_error "DIAG freeze_gate=singbox"; return 1; }
+    rr_stop_subscription_servers || { rr_error "DIAG freeze_gate=subscription"; return 1; }
 }
 
 rr_installer_managed_service_start_is_safe() {
@@ -1544,12 +1546,19 @@ rr_restore_unit_state() {
 }
 
 rr_resume_subscription_bounded() {
-    local status=0
+    local status=0 legacy_version=""
     if [ ! -f "$RR_LAUNCHER" ] || [ ! -x "$RR_LAUNCHER" ] || [ -L "$RR_LAUNCHER" ]; then
         rr_stop_subscription_servers >/dev/null 2>&1 || true
         rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
         return 1
     fi
+    legacy_version=$(rr_trusted_installed_runtime_version 2>/dev/null) || legacy_version=""
+    if [ "$legacy_version" = 7.0.2 ]; then
+        # The manifest-verified helper validates a pre-mutation transaction and
+        # uses the old installed read/start functions; 7.0.2 has no refresh CLI.
+        rr_run_with_delegated_update_lock "$RR_RECOVERY_HELPER" \
+            refresh-subscription >/dev/null 2>&1 || status=$?
+    else
     (
         # Close both flock descriptors before exec so a surviving managed
         # subscription worker can never retain the install transaction locks.
@@ -1559,6 +1568,7 @@ rr_resume_subscription_bounded() {
             RR_RESTORE_LOCK_HELD=1 \
             "$RR_LAUNCHER" --refresh-subscription
     ) >/dev/null 2>&1 || status=$?
+    fi
     if [ "$status" -ne 0 ] || ! rr_subscription_running; then
         rr_stop_subscription_servers >/dev/null 2>&1 || true
         rr_quiesce_health_monitor_for_rollback >/dev/null 2>&1 || true
@@ -2636,6 +2646,15 @@ rr_recovery_helper_is_owned_or_absent() {
     rr_recovery_helper_file_is_safe "$target" || return 1
     rr_recovery_helper_source_is_safe "$candidate" || return 1
     cmp -s -- "$target" "$candidate" && return 0
+    # v7.2.0 copied its standalone helper before taking a snapshot. An aborted
+    # 7.0.2 upgrade can therefore retain this exact published helper without a
+    # matching source in the still-old runtime. Recognize only that pinned file.
+    if [ "$target" = "$RR_RECOVERY_HELPER" ] && \
+       [ "$(rr_trusted_installed_runtime_version 2>/dev/null)" = 7.0.2 ] && \
+       [ "$(sha256sum -- "$target" | cut -d ' ' -f1)" = \
+         e2e0b855c8bcd295daf2741c2e58cbf011263aabdedb535066df5ff14ac7b893 ]; then
+        return 0
+    fi
     [ -n "$installed_source" ] || return 1
     rr_recovery_helper_source_is_safe "$installed_source" || return 1
     cmp -s -- "$target" "$installed_source"
@@ -3391,7 +3410,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "0ef273dfa26f621d672f75439e7d96d3c05ca66a8db7a95e4772a87fa8b2cb3e" ] && \
+        if [ "$actual" = "f00fc713dc63e43ca60da1c5f936d17263d58776445567b0dc8f3a2af7f8f9d3" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \

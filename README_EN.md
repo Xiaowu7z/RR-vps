@@ -8,11 +8,11 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.0** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.1** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
 ### 7.2.0: rebuilt trust boundaries, hardened recovery, and verifiable releases
 
-7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. The server core used for RR Nexus real-time traffic accounting is fixed to **sing-box 1.14.0**, built from one pinned upstream source commit. Stable consumes only an immutable GitHub Release whose exact current-`main` commit passed CI `push`, the three-host audit `push`, and the public-IP ACME `workflow_dispatch`; Beta remains isolated on its own branch.
+7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. The server core used for RR Nexus real-time traffic accounting is fixed to **sing-box 1.14.0**, built from one pinned upstream source commit. Stable consumes only an immutable GitHub Release whose exact current-`main` commit passed CI `push` and the three-host stability check `push`; Beta remains isolated on its own branch.
 
 This release also removes public cleartext HTTP subscriptions. A standalone endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Users without a domain can select Nexus trusted public-IP mode: RR obtains a short-lived Let's Encrypt IP certificate for a globally routable public IPv4 or IPv6 address and serves personal subscriptions through the same trusted HTTPS endpoint. Legacy public HTTP URLs stop working after the upgrade.
 

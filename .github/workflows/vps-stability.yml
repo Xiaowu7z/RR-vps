@@ -46,6 +46,11 @@ jobs:
           bash -n scripts/audit-stability-host.sh
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass netcat-openbsd
+      - name: Prepare pinned 7.0.2 fixture for the Ubuntu 24.04 upgrade check
+        if: matrix.role == 'C'
+        run: |
+          git fetch --depth=1 origin f28d5b11958588554777ee2c4d326d42c471ee08
+          git archive --format=tar.gz f28d5b11958588554777ee2c4d326d42c471ee08 rr modules nexus manifest.sha256 > legacy-702.tar.gz
       - name: Resume installed hosts and run stability check
         env:
           HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
@@ -66,10 +71,12 @@ jobs:
             -o PreferredAuthentications=password -o PubkeyAuthentication=no
             -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
           sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" 'install -d -m 700 /root/rr-stability-candidate'
-          sha256sum rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh scripts/audit-stability-host.sh |
+          extra=()
+          if [ "$ROLE" = C ]; then extra=(legacy-702.tar.gz scripts/audit-upgrade-702.sh scripts/verify-upgrade-identities.py); fi
+          sha256sum rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh scripts/audit-stability-host.sh "${extra[@]}" |
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
-            scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
+            scripts/audit-stability-host.sh "${extra[@]}" "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
           expected_version=$(sed -n '1s/^RR-vps //p' version)
           sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash /root/rr-stability-candidate/audit-stability-host.sh \
             "$ROLE" "$EXPECTED_OS" "$EXPECTED_OS_VERSION" "$expected_version" | tee "$RUNNER_TEMP/result.txt"
@@ -77,4 +84,3 @@ jobs:
           sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" true
           printf 'STABILITY role=%s external_tcp=pass ssh=pass\n' "$ROLE" | tee -a "$RUNNER_TEMP/result.txt"
           cat "$RUNNER_TEMP/result.txt" >> "$GITHUB_STEP_SUMMARY"
-

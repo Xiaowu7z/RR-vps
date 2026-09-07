@@ -8,11 +8,11 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.2.0** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.2.1** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
 
 ### 7.2.0：安全边界重构、事务恢复加固与可信发布
 
-7.2.0 是一次覆盖订阅与管理面安全、持久热更新、跨版本回滚、加密迁移、供应链和正式发布链路的系统性工程升级。RR Nexus 实时流量统计使用的服务端核心固定到经指定上游源码提交构建的 **sing-box 1.14.0**。Stable 更新只消费当前 `main` 同一提交已通过 CI `push`、三机审计 `push` 和公网 IP ACME `workflow_dispatch` 三类成功证据后生成的不可变 GitHub Release，并固定到同版本 Tag；Beta 与 Stable 分离。
+7.2.0 是一次覆盖订阅与管理面安全、持久热更新、跨版本回滚、加密迁移、供应链和正式发布链路的系统性工程升级。RR Nexus 实时流量统计使用的服务端核心固定到经指定上游源码提交构建的 **sing-box 1.14.0**。Stable 更新只消费当前 `main` 同一提交已通过 CI `push` 与三机稳定性检查 `push` 两类成功证据后生成的不可变 GitHub Release，并固定到同版本 Tag；Beta 与 Stable 分离。
 
 本版同时移除公网明文 HTTP 订阅。独立订阅端点要么使用可信域名 TLS，要么只监听 `127.0.0.1` 并经 SSH 隧道访问；没有域名的用户可在 Nexus 选择“公网 IP 可信模式”，直接为全球可路由的公网 IPv4 或 IPv6 签发 Let's Encrypt 短期 IP 证书，并在同一可信 HTTPS 入口使用个人订阅。旧公网 HTTP 地址升级后不再可用。
 

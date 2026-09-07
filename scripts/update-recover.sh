@@ -2311,6 +2311,34 @@ if (
 PY
 }
 
+rr_recovery_unit_conditions_are_empty() {
+    local unit="$1" property="" raw="" object="" payload=""
+    case "$unit" in
+        sing-box.service) object=sing_2dbox_2eservice ;;
+        rr-nexus.service) object=rr_2dnexus_2eservice ;;
+        *) return 1 ;;
+    esac
+    for property in Conditions Asserts; do
+        raw=$(systemctl show --property="$property" --value "$unit" 2>/dev/null) || return 1
+        case "$raw" in
+            '') continue ;;
+            '[unprintable]'|"$property=[unprintable]") ;;
+            *) return 1 ;;
+        esac
+        # Read the real typed array; an unformattable value is not proof that
+        # a unit has no conditions. Recovery cannot depend on the old runtime.
+        payload=$(busctl --system --json=short get-property org.freedesktop.systemd1 \
+            "/org/freedesktop/systemd1/unit/$object" org.freedesktop.systemd1.Unit \
+            "$property") || return 1
+        python3 - "$payload" <<'PY' || return 1
+import json, sys
+value = json.loads(sys.argv[1])
+raise SystemExit(0 if isinstance(value, dict) and value.get('type') == 'a(sbbsi)'
+                 and value.get('data') == [] else 1)
+PY
+    done
+}
+
 rr_managed_service_start_is_safe() {
     local requested="${1:-}" unit="" service_file="" variant=""
     local restore_dropin="" firewall_dropin="" guard_dropin=""
@@ -2320,7 +2348,7 @@ rr_managed_service_start_is_safe() {
     local exec_start_pre="" exec_reload="" exec_condition=""
     local user="" group="" working_directory="" dynamic_user=""
     local private_network="" root_directory="" root_image=""
-    local conditions="" asserts="" interval="" burst="" restart_prevent=""
+    local interval="" burst="" restart_prevent=""
     local path="" index=0
     local -a expected_dropins=() effective_dropins=() condition_spec=()
     case "$requested" in
@@ -2443,15 +2471,11 @@ rr_managed_service_start_is_safe() {
         2>/dev/null) || return 1
     root_image=$(systemctl show --property=RootImage --value "$unit" 2>/dev/null) || \
         return 1
-    conditions=$(systemctl show --property=Conditions --value "$unit" 2>/dev/null) || \
-        return 1
-    asserts=$(systemctl show --property=Asserts --value "$unit" 2>/dev/null) || return 1
+    rr_recovery_unit_conditions_are_empty "$unit" || return 1
     [ "$dynamic_user" = no ] && [ "$private_network" = no ] && \
         [ -z "${root_directory//[[:space:]]/}" ] && \
         { [ -z "${root_image//[[:space:]]/}" ] || \
-          [ "${root_image//[[:space:]]/}" = n/a ]; } && \
-        [ -z "${conditions//[[:space:]]/}" ] && \
-        [ -z "${asserts//[[:space:]]/}" ] || return 1
+          [ "${root_image//[[:space:]]/}" = n/a ]; } || return 1
     interval=$(systemctl show --property=StartLimitIntervalUSec --value "$unit" \
         2>/dev/null) || return 1
     burst=$(systemctl show --property=StartLimitBurst --value "$unit" 2>/dev/null) || \
@@ -2677,8 +2701,42 @@ rr_finalize_committed_candidate() {
     rr_run_delegated_without_lock_fds 60 "$RR_LAUNCHER" --post-update-finalize
 }
 
+rr_prepare_subscription_refresh_command() {
+    local version="" tx="" phase="" module="" file="" owner="" group="" mode="" links=""
+    RR_SUBSCRIPTION_REFRESH_COMMAND=("$RR_LAUNCHER" --refresh-subscription)
+    version=$(rr_trusted_runtime_version "$RR_LIB_DIR" 2>/dev/null) || version=""
+    [ "$version" = 7.0.2 ] || return 0
+    grep -Fq -- '--refresh-subscription' "$RR_LAUNCHER" && return 0
+    # Only an abort before any runtime mutation may revive this legacy public
+    # server. Post-switch rollback must continue through the quarantine policy.
+    tx=$(rr_transaction_path) || return 1
+    phase=$(rr_read_trusted_phase "$tx") || return 1
+    case "$phase" in freezing|snapshotting|prepared) ;; *) return 1 ;; esac
+    rr_transaction_v2_control_metadata_is_safe "$tx" || return 1
+    rr_transaction_v2_backup_metadata_is_safe "$tx" || return 1
+    rr_update_maintenance_marker_state "$tx" || return 1
+    [ ! -e "$RR_QUARANTINE_FILE" ] && [ ! -L "$RR_QUARANTINE_FILE" ] || return 1
+    [ ! -e "$RR_QUARANTINE_GUARD_STATE" ] && [ ! -L "$RR_QUARANTINE_GUARD_STATE" ] || return 1
+    for module in 00-runtime.sh 10-system.sh 20-config.sh; do
+        file="$RR_LIB_DIR/modules/$module"
+        rr_quarantine_source_ancestors_are_trusted "$file" || return 1
+        [ -f "$file" ] && [ ! -L "$file" ] || return 1
+        IFS=: read -r owner group mode links < <(stat -c '%u:%g:%a:%h' -- "$file") || return 1
+        [ "$owner:$group:$links" = 0:0:1 ] || return 1
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 07022) == 0 )) || return 1
+    done
+    RR_SUBSCRIPTION_REFRESH_COMMAND=(bash -c '
+        for module in 00-runtime.sh 10-system.sh 20-config.sh; do
+            source "$1/modules/$module" || exit 1
+        done
+        select_entry_ip || exit 1
+        start_subscription_server
+    ' rr-legacy-subscription "$RR_LIB_DIR")
+}
+
 rr_resume_subscription_from_recovery_service() {
     local transient_unit="" attempt=0
+    rr_prepare_subscription_refresh_command || return 1
     command -v systemd-run >/dev/null 2>&1 || return 1
     transient_unit="rr-subscription-recovery-$$-${RANDOM}.scope"
     # A worker forked directly by rr-update-recovery.service remains in that
@@ -2690,7 +2748,7 @@ rr_resume_subscription_from_recovery_service() {
     # service, the scope never owns or removes the application's shared PID file.
     if ! rr_run_delegated_without_lock_fds 30 systemd-run \
         --quiet --scope --collect --unit="$transient_unit" -- \
-        "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1; then
+        "${RR_SUBSCRIPTION_REFRESH_COMMAND[@]}" </dev/null >/dev/null 2>&1; then
         systemctl stop "$transient_unit" >/dev/null 2>&1 || true
         return 1
     fi
@@ -2718,8 +2776,9 @@ rr_resume_subscription_bounded() {
             rr_resume_subscription_from_recovery_service || status=$?
         fi
     else
+        rr_prepare_subscription_refresh_command || return 1
         rr_run_delegated_without_lock_fds 30 \
-            "$RR_LAUNCHER" --refresh-subscription >/dev/null 2>&1 || status=$?
+            "${RR_SUBSCRIPTION_REFRESH_COMMAND[@]}" </dev/null >/dev/null 2>&1 || status=$?
     fi
     if [ "$status" -ne 0 ] || ! rr_subscription_running; then
         rr_stop_subscription_servers >/dev/null 2>&1 || true
@@ -4613,15 +4672,16 @@ main() {
     local mode="${1:-recover}" argument="${2:-}" tx="" phase="" format_state=0
     local settled_state=0 maintenance_state=0 publish_state=0 quarantine_json='{"active":false}'
     case "$mode" in
-        recover|rollback|status|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine|quarantine-guard|verify-service-start) ;;
+        recover|rollback|status|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine|quarantine-guard|verify-service-start|refresh-subscription) ;;
         *) echo "usage: rr-update-recover [recover|rollback|status|snapshot-metadata TX|apply-rollback-policy TX|suspend-quarantine|clear-quarantine|quarantine-guard|verify-service-start UNIT]" >&2; return 2 ;;
     esac
     case "$mode" in
-        recover|rollback|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine)
+        recover|rollback|snapshot-metadata|apply-rollback-policy|suspend-quarantine|clear-quarantine|refresh-subscription)
             rr_acquire_update_lock || return 1
             ;;
     esac
     case "$mode" in
+        refresh-subscription) rr_resume_subscription_bounded; return ;;
         snapshot-metadata) [ -n "$argument" ] || return 2; rr_snapshot_rollback_metadata "$argument"; return ;;
         apply-rollback-policy) [ -n "$argument" ] || return 2; rr_apply_rollback_subscription_policy "$argument"; return ;;
         suspend-quarantine) rr_suspend_subscription_quarantine; return ;;

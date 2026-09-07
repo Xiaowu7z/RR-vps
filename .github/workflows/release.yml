@@ -1032,7 +1032,7 @@ jobs:
               }
               verified=false
               for attempt in 1 2 3 4 5 6; do
-                if api -H 'Accept: application/octet-stream' \
+                if gh api -H 'Accept: application/octet-stream' \
                   "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
                   > "$published_dir/${asset}.part" &&
                   [ "$(stat -c %s "$published_dir/${asset}.part")" = "$asset_size" ] &&
