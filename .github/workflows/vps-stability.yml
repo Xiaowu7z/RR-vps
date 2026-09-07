@@ -2,7 +2,7 @@ name: Three-host stability smoke test
 
 on:
   push:
-    branches: [main, audit/stability-20260907]
+    branches: [main]
     paths: [.github/workflows/vps-stability.yml, scripts/audit-stability-host.sh]
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   stability:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/audit/stability-20260907'
+    if: github.ref == 'refs/heads/main'
     name: Stability · ${{ matrix.role }} · ${{ matrix.os }} ${{ matrix.version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25

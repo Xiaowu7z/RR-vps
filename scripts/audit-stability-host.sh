@@ -25,7 +25,7 @@ for line in Path(sys.argv[1]).read_text(errors='replace').splitlines()[-18:]:
     print(line[:240])
 PYLOG
   fi
-  printf "STABILITY role=%s phase=%s result=%s\n" "$role" "$phase" "$rc" >&3
+  printf "STABILITY role=%s phase=%s result=%s\n" "$role" "$phase" "$rc" | tee /root/rr-stability-result >&3
   exit "$rc"
 }
 trap finish EXIT
@@ -67,9 +67,11 @@ else
   done
   systemctl daemon-reload
   RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
-    bash "$stage/install-core.sh" --upgrade
+    bash "$stage/install-core.sh" --upgrade 3>&-
 fi
 rm -rf -- "$candidate"
+install -m 755 "$stage/update-guard.sh" /usr/local/lib/rr/modules/61-update-guard.sh
+cmp -s "$stage/update-guard.sh" /usr/local/lib/rr/modules/61-update-guard.sh
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 (cd /usr/local/lib/rr; awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null)
 if ! grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf; then
@@ -108,7 +110,7 @@ timeout 600 bash -c '
       safe_sed INSTALL_COMPLETE true
     }
     rr_menu_run_writer finish_protocol_install
-  '
+  ' 3>&-
 fi
 grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -131,7 +133,7 @@ printf '%s\n' 1 17900 auditadmin "$panel_pass" "$panel_pass" '' | \
     trap trace_line DEBUG
     for module in /usr/local/lib/rr/modules/*.sh; do source "$module"; done
     rr_menu_run_writer nexus_install
-  '
+  ' 3>&-
 unset panel_pass
 fi
 test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
@@ -145,7 +147,7 @@ with sqlite3.connect('/var/lib/rr-nexus/nexus.db', timeout=30) as db:
     db.execute('INSERT OR IGNORE INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         ('dev_a11ce0000001','stability-audit',str(uuid.uuid4()),secrets.token_hex(24),1,1073741824,0,0,0,now,None,'2030-12-31','2030-09-30',30,36,0,now,now))
 PY
-timeout 90 /usr/local/bin/rr --sync-devices
+timeout 90 /usr/local/bin/rr --sync-devices 3>&-
 test -s /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
 grep -q '^vless://' /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
 test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
