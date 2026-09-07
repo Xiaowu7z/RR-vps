@@ -1,4 +1,4 @@
-name: Read current stability progress
+name: Finish existing stability sessions
 
 on:
   push:
@@ -23,10 +23,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - role: A
+            os: debian
+            version: '12'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
           - role: B
             os: ubuntu
             version: '22.04'
             key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
+          - role: C
+            os: ubuntu
+            version: '24.04'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -59,13 +67,18 @@ jobs:
             -o PreferredAuthentications=password -o PubkeyAuthentication=no
             -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
           sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash -s <<'SH'
-          tail -8 /root/rr-stability-lines.log
-          systemctl show sing-box.service rr-nexus.service -p ActiveState -p SubState -p MainPID
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-          for line in Path('/root/rr-stability.log').read_text(errors='replace').splitlines()[-10:]:
-              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
-              print(re.sub(r'[!-~]{8,}', '[redacted]', line)[:220])
-          PY
+          for module in /usr/local/lib/rr/modules/*.sh; do source "$module"; done
+          release_test_channel() {
+            load_config_with_defaults || return 1
+            pid=$(cat "$SUB_PID_FILE") || return 1
+            is_subscription_pid "$pid" || return 1
+            if [ -e "/proc/$pid/fd/3" ]; then
+              stop_subscription_servers || return 1
+              SUB_BIND_ADDRESS=127.0.0.1
+              start_subscription_server || return 1
+              echo 'Closed inherited audit output descriptor by restarting the owned subscription worker.'
+            fi
+          }
+          rr_menu_run_writer release_test_channel
+          systemctl show sing-box.service rr-nexus.service -p ActiveState -p SubState
           SH
