@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# shellcheck source=09-systemd.sh
+source "${BASH_SOURCE[0]%/*}/09-systemd.sh"
 # RR-vps 7.1 diagnostics, encrypted migration backups and update preflight.
 
 RR_DIAGNOSTIC_DIR="/var/lib/rr/diagnostics"
@@ -2602,9 +2604,9 @@ rr_restore_effective_marker_view_is_safe() {
     # Conditions and Asserts can only prevent a start. Query them so a bus or
     # property failure remains fatal, but never treat their current result as
     # proof that the marker ExecCondition observed the host namespace.
-    systemctl show --property=Conditions --value "$unit" \
+    rr_systemd_show --property=Conditions --value "$unit" \
         >/dev/null 2>&1 || return 1
-    systemctl show --property=Asserts --value "$unit" \
+    rr_systemd_show --property=Asserts --value "$unit" \
         >/dev/null 2>&1 || return 1
 }
 

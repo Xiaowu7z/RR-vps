@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# shellcheck source=09-systemd.sh
+source "${BASH_SOURCE[0]%/*}/09-systemd.sh"
 # 本文件由 RR-vps 主入口加载，请勿单独执行。
 
 # ==========================================
@@ -480,9 +482,9 @@ rr_firewall_quarantine_supervisor_effective() {
         dropins=$(systemctl show --property=DropInPaths --value \
             "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1
         [ -z "$dropins" ] || return 1
-        conditions=$(systemctl show --property=Conditions --value \
+        conditions=$(rr_systemd_show --property=Conditions --value \
             "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1
-        asserts=$(systemctl show --property=Asserts --value \
+        asserts=$(rr_systemd_show --property=Asserts --value \
             "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1
         [ -z "$conditions" ] && [ -z "$asserts" ] || return 1
     done
@@ -976,9 +978,9 @@ rr_firewall_effective_root_marker_view_is_safe() {
     # skip/fail a start before ExecCondition; they cannot make a service start
     # while bypassing it.  Query them so bus/property failures still propagate,
     # but deliberately never infer gate success from their current result.
-    systemctl show --property=Conditions --value "$unit" \
+    rr_systemd_show --property=Conditions --value "$unit" \
         >/dev/null 2>&1 || return 1
-    systemctl show --property=Asserts --value "$unit" \
+    rr_systemd_show --property=Asserts --value "$unit" \
         >/dev/null 2>&1 || return 1
 }
 

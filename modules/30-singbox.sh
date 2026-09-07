@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# shellcheck source=09-systemd.sh
+source "${BASH_SOURCE[0]%/*}/09-systemd.sh"
 # 本文件由 RR-vps 主入口加载，请勿单独执行。
 
 # ==========================================
@@ -606,8 +608,8 @@ PY
     root_directory=$(systemctl show --property=RootDirectory --value \
         "$unit" 2>/dev/null) || return 1
     root_image=$(systemctl show --property=RootImage --value "$unit" 2>/dev/null) || return 1
-    conditions=$(systemctl show --property=Conditions --value "$unit" 2>/dev/null) || return 1
-    asserts=$(systemctl show --property=Asserts --value "$unit" 2>/dev/null) || return 1
+    conditions=$(rr_systemd_show --property=Conditions --value "$unit" 2>/dev/null) || return 1
+    asserts=$(rr_systemd_show --property=Asserts --value "$unit" 2>/dev/null) || return 1
     [ "$user" = root ] && [ "$working_directory" = /etc/sing-box ] && \
         [ "$dynamic_user" = no ] && [ "$private_network" = no ] && \
         [ -z "$root_directory" ] && [ -z "$root_image" ] && \
@@ -1059,9 +1061,9 @@ rr_health_effective_namespace_is_exact() {
 
 rr_health_effective_conditions_are_exact() {
     local raw="" asserts=""
-    raw=$(systemctl show --property=Conditions --value \
+    raw=$(rr_systemd_show --property=Conditions --value \
         argo-rr-health.service 2>/dev/null) || return 1
-    asserts=$(systemctl show --property=Asserts --value \
+    asserts=$(rr_systemd_show --property=Asserts --value \
         argo-rr-health.service 2>/dev/null) || return 1
     [ -z "$asserts" ] || return 1
     python3 - "$raw" <<'PY'
@@ -1309,10 +1311,10 @@ rr_health_monitor_unit_definitions_are_current() {
         "${condition_spec[@]}" || return 1
     rr_health_effective_conditions_are_exact || return 1
     rr_health_effective_namespace_is_exact || return 1
-    value=$(systemctl show --property=Conditions --value \
+    value=$(rr_systemd_show --property=Conditions --value \
         argo-rr-health.timer 2>/dev/null) || return 1
     [ -z "$value" ] || return 1
-    value=$(systemctl show --property=Asserts --value \
+    value=$(rr_systemd_show --property=Asserts --value \
         argo-rr-health.timer 2>/dev/null) || return 1
     [ -z "$value" ] || return 1
     rr_health_timer_schedule_is_exact
