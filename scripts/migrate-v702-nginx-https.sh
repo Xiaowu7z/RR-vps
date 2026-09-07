@@ -62,8 +62,13 @@ candidate="$work/rr-bundle"
 curl -fsSL --retry 2 --connect-timeout 15 --max-time 90 \
     https://raw.githubusercontent.com/Xiaowu7z/RR-vps/0f415d2a446b33287a004836cbf918d74497810d/scripts/legacy-nginx-702.py -o "$work/check-site.py"
 printf '%s  %s\n' 7efdac51d258afb79a75bd76f8605a3a9e7a0c5816b4624c1bba1a594a3eea82 "$work/check-site.py" | sha256sum -c -
-curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
-    https://github.com/Xiaowu7z/RR-vps/releases/download/v7.2.1/install.sh -o "$work/install.sh"
+# This immutable source file is byte-identical to the v7.2.1 release asset.
+# Prefer raw to avoid a failing release redirect; both use the same hash below.
+if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
+    https://raw.githubusercontent.com/Xiaowu7z/RR-vps/c7de4b412b2bd90d45fea733a0d62ede37918aab/install.sh -o "$work/install.sh"; then
+    curl -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
+        https://github.com/Xiaowu7z/RR-vps/releases/download/v7.2.1/install.sh -o "$work/install.sh"
+fi
 printf '%s  %s\n' 171b6f1fd2df445b5837c87b6744f9d38ff7ac2a0ca82b6fe41dd6d905995bb0 \
     "$work/install.sh" | sha256sum -c -
 # Acquire the normal recovery lock before inspecting or editing managed paths.
