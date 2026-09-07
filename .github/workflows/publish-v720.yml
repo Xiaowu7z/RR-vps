@@ -44,4 +44,4 @@ jobs:
           done
           # The publisher independently rechecks main, complete run inventories,
           # immutable-release settings and asset ownership before every mutation.
-          gh workflow run release.yml --ref main -f "sha=$EXPECTED_SHA"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main -f "sha=$EXPECTED_SHA"
