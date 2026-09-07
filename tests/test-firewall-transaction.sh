@@ -298,7 +298,7 @@ systemctl() {
                     ;;
                 Paths)
                     [ "$unit" = rr-firewall-quarantine-guard.path ] || return 2
-                    printf 'PathExists=%s\n' "$RR_FIREWALL_QUARANTINE_FILE"
+                    printf '%s (PathExists)\n' "$RR_FIREWALL_QUARANTINE_FILE"
                     ;;
                 Triggers)
                     case "$unit" in
@@ -319,7 +319,7 @@ systemctl() {
                     ;;
                 TimersMonotonic)
                     [ "$unit" = rr-firewall-quarantine-guard.timer ] || return 2
-                    printf '{ OnBootSec=2s ; } { OnUnitActiveSec=2s ; }\n'
+                    printf '{ OnUnitActiveUSec=2s ; next_elapse=0 } { OnBootUSec=2s ; next_elapse=0 }\n'
                     ;;
                 TimersCalendar)
                     [ "$unit" = rr-firewall-quarantine-guard.timer ] || return 2
@@ -1106,7 +1106,7 @@ printf '%s\n' '[0b/9] durable quarantine guard is exact, idle when clear, and sy
     assert_supervisor_effective_mutation_rejected Unit hostile.service \
         'path/timer target override'
     assert_supervisor_effective_mutation_rejected TimersMonotonic \
-        '{ OnBootSec=2s ; } { OnUnitActiveSec=2s ; } { OnUnitInactiveSec=1s ; }' \
+        '{ OnUnitActiveUSec=2s ; next_elapse=0 } { OnBootUSec=2s ; next_elapse=0 } { OnUnitInactiveSec=1s ; }' \
         'extra monotonic supervisor schedule'
     assert_supervisor_effective_mutation_rejected TimersCalendar '*-*-* *:*:00' \
         'extra calendar supervisor schedule'

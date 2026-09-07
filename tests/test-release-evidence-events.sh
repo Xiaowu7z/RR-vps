@@ -64,14 +64,11 @@ expect_reject() {
     fi
 }
 
-printf '%s\n' '[1/7] CI push and both VPS audit event classes are independently required'
+printf '%s\n' '[1/7] CI push and three-host stability push are independently required'
 write_single_success ci.yml push 1001 10
-write_single_success vps-audit.yml push 2001 20
-write_single_success vps-audit.yml workflow_dispatch 3001 30
+write_single_success vps-stability.yml push 2001 20
 rr_update_guard_assert_workflow_gate ci.yml push "$fixture_sha" || fail 'CI push rejected'
-rr_update_guard_assert_workflow_gate vps-audit.yml push "$fixture_sha" || fail 'VPS push rejected'
-rr_update_guard_assert_workflow_gate vps-audit.yml workflow_dispatch "$fixture_sha" || \
-    fail 'VPS workflow_dispatch rejected'
+rr_update_guard_assert_workflow_gate vps-stability.yml push "$fixture_sha" || fail 'VPS push rejected'
 
 printf '%s\n' '[2/7] complete page/per_page traversal accepts 101 exact runs'
 jq -cn --arg sha "$fixture_sha" '
@@ -152,11 +149,9 @@ guard = Path('scripts/update-guard.sh').read_text()
 
 for fragment in (
     'require_workflow_success_for_sha ci.yml push "CI push"',
-    'require_workflow_success_for_sha vps-audit.yml push "VPS audit push"',
-    'require_workflow_success_for_sha vps-audit.yml workflow_dispatch',
+    'require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"',
     'assert_workflow_gate ci.yml push "CI push"',
-    'assert_workflow_gate vps-audit.yml push "VPS audit push"',
-    'assert_workflow_gate vps-audit.yml workflow_dispatch',
+    'assert_workflow_gate vps-stability.yml push "Three-host stability push"',
     'branch=main&event=${expected_event}&head_sha=${REQUESTED_SHA}&per_page=100&page=${page}',
     'branch=main&event=${expected_event}&head_sha=${EXPECTED_SHA}&per_page=100&page=${page}',
     'assert_release_gate || return 1\n                  upload_template=',
@@ -168,8 +163,7 @@ for fragment in (
 
 for fragment in (
     'rr_update_guard_assert_workflow_gate ci.yml push "$initial_commit"',
-    'rr_update_guard_assert_workflow_gate vps-audit.yml push "$initial_commit"',
-    'rr_update_guard_assert_workflow_gate vps-audit.yml workflow_dispatch "$initial_commit"',
+    'rr_update_guard_assert_workflow_gate vps-stability.yml push "$initial_commit"',
 ):
     if guard.count(fragment) != 2:
         raise SystemExit(f'updater gate is not checked both before and after download: {fragment}')

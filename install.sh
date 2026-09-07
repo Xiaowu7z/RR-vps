@@ -19,8 +19,8 @@ RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"
 RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"
-RR_CORE_SHA256="cf174e7f0f101111a870b272107d3938531122f38bdab2178cf7bb8f30d871cd"
-RR_GUARD_SHA256="45594e1bfae7e90790a906de361682ac147d2996d171cf1619e099c3a601160c"
+RR_CORE_SHA256="777292e242c069e37cb841235262bd0318ba927d61b56339bb70c046f227ccf5"
+RR_GUARD_SHA256="2bbfdd8d80773cb48c19f11f91bbeb7ebd156f9419c30c5d81b3565aa346e64c"
 RR_MODE="${1:-install}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
 
@@ -224,7 +224,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "9496982b8f8466db612b293e1b7521cabfa7e277269eb6e95a04bab92d407c0e" ]
+# [ "$actual" = "0ef273dfa26f621d672f75439e7d96d3c05ca66a8db7a95e4772a87fa8b2cb3e" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

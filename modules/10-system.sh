@@ -532,7 +532,8 @@ PY
         rr-firewall-quarantine-guard.service no || return 1
     value=$(systemctl show --property=Paths --value \
         rr-firewall-quarantine-guard.path 2>/dev/null) || return 1
-    [ "$value" = "PathExists=${marker}" ] || return 1
+    [ "$value" = "PathExists=${marker}" ] || \
+        [ "$value" = "${marker} (PathExists)" ] || return 1
     value=$(systemctl show --property=Unit --value \
         rr-firewall-quarantine-guard.path 2>/dev/null) || return 1
     [ "$value" = rr-firewall-quarantine-guard.service ] || return 1
@@ -576,7 +577,7 @@ for match in matches:
     if item_value not in {"2s", "2000000us", "2000000"}:
         raise SystemExit(1)
     schedule.append(key)
-if schedule != ["OnBootSec", "OnUnitActiveSec"]:
+if sorted(schedule) != ["OnBootSec", "OnUnitActiveSec"]:
     raise SystemExit(1)
 PY
     value=$(systemctl show --property=TimersCalendar --value \

@@ -1,8 +1,8 @@
-name: Read systemd property formats
+name: Three-host stability smoke test
 
 on:
   push:
-    branches: [audit/stability-20260907]
+    branches: [main, audit/stability-20260907]
     paths: [.github/workflows/vps-stability.yml, scripts/audit-stability-host.sh]
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   stability:
-    if: github.ref == 'refs/heads/audit/stability-20260907'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/audit/stability-20260907'
     name: Stability · ${{ matrix.role }} · ${{ matrix.os }} ${{ matrix.version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -23,10 +23,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - role: A
+            os: debian
+            version: '12'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
           - role: B
             os: ubuntu
             version: '22.04'
             key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
+          - role: C
+            os: ubuntu
+            version: '24.04'
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -63,10 +71,11 @@ jobs:
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
             scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash -s <<'SH'
-          systemctl show --property=Paths --value rr-firewall-quarantine-guard.path
-          systemctl show --property=TimersMonotonic --value rr-firewall-quarantine-guard.timer
-          systemctl show --property=TimersCalendar --value rr-firewall-quarantine-guard.timer
-          busctl --system --json=short get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/rr_2dfirewall_2dquarantine_2dguard_2epath org.freedesktop.systemd1.Path Paths
-          busctl --system --json=short get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/rr_2dfirewall_2dquarantine_2dguard_2etimer org.freedesktop.systemd1.Timer TimersMonotonic
-          SH
+          expected_version=$(sed -n '1s/^RR-vps //p' version)
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash /root/rr-stability-candidate/audit-stability-host.sh \
+            "$ROLE" "$EXPECTED_OS" "$EXPECTED_OS_VERSION" "$expected_version" | tee "$RUNNER_TEMP/result.txt"
+          for port in 24443 21443 22443; do nc -z -w 10 "$HOST" "$port"; done
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" true
+          printf 'STABILITY role=%s external_tcp=pass ssh=pass\n' "$ROLE" | tee -a "$RUNNER_TEMP/result.txt"
+          cat "$RUNNER_TEMP/result.txt" >> "$GITHUB_STEP_SUMMARY"
+

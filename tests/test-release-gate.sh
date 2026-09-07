@@ -7926,17 +7926,11 @@ for body, helper, sha in (
     ):
         assert token in body, f"missing {helper} inventory invariant: {token}"
 assert 'require_workflow_success_for_sha ci.yml push "CI push"' in verify
-assert 'require_workflow_success_for_sha vps-audit.yml push "VPS audit push"' in verify
-assert (
-    'require_workflow_success_for_sha vps-audit.yml workflow_dispatch \\\n'
-    '            "VPS audit workflow_dispatch"'
-) in verify
+assert 'require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"' in verify
 assert 'assert_workflow_gate ci.yml push "CI push"' in publish
-assert 'assert_workflow_gate vps-audit.yml push "VPS audit push"' in publish
-assert (
-    'assert_workflow_gate vps-audit.yml workflow_dispatch \\\n'
-    '              "VPS audit workflow_dispatch"'
-) in publish
+assert 'assert_workflow_gate vps-stability.yml push "Three-host stability push"' in publish
+assert 'require_workflow_success_for_sha vps-audit.yml' not in verify
+assert 'assert_workflow_gate vps-audit.yml' not in publish
 assert publish.count("assert_release_gate") >= 4
 assert publish.count("assert_verified_sha_gate") >= 2
 assert "assert_main_tip()" in publish

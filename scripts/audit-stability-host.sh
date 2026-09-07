@@ -50,7 +50,9 @@ candidate=$(mktemp -d /root/rr-stability-payload.XXXXXX)
 tar -xzf "$stage/rr-bundle.tar.gz" -C "$candidate"
 (cd "$candidate/rr-bundle"; sha256sum -c manifest.sha256 >/dev/null)
 if [ -f /usr/local/lib/rr/modules/09-systemd.sh ]; then
-  install -m 755 "$candidate/rr-bundle/modules/09-systemd.sh" /usr/local/lib/rr/modules/09-systemd.sh
+  for module in 09-systemd.sh 10-system.sh 30-singbox.sh; do
+    install -m 755 "$candidate/rr-bundle/modules/$module" "/usr/local/lib/rr/modules/$module"
+  done
   install -m 644 "$candidate/rr-bundle/manifest.sha256" /usr/local/lib/rr/manifest.sha256
 else
   # A's old installer retained failed rollback evidence. Keep it as a private
@@ -70,6 +72,7 @@ fi
 rm -rf -- "$candidate"
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 (cd /usr/local/lib/rr; awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null)
+if ! grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf; then
 phase=finish-protocol-install
 # The protocol wizard already generated all five inbounds and started Sing-box.
 # Owner-authorized test-host firewall cleanup; keep SSH before removing conflicts.
@@ -106,6 +109,7 @@ timeout 600 bash -c '
     }
     rr_menu_run_writer finish_protocol_install
   '
+fi
 grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json
 for tag in vmess-in vless-in hy2-in tuic5-in anytls-in; do
@@ -113,6 +117,7 @@ for tag in vmess-in vless-in hy2-in tuic5-in anytls-in; do
 done
 printf 'STABILITY role=%s protocols=pass\n' "$role" >&3
 
+if [ ! -f /etc/rr-nexus/nexus.json ]; then
 phase=panel-install
 panel_pass=$(openssl rand -hex 20)
 printf '%s\n' auditadmin "$panel_pass" >/root/rr-stability-panel-credentials
@@ -128,6 +133,7 @@ printf '%s\n' 1 17900 auditadmin "$panel_pass" "$panel_pass" '' | \
     rr_menu_run_writer nexus_install
   '
 unset panel_pass
+fi
 test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
 test "$(jq -r '.mode' /etc/rr-nexus/nexus.json)" = local
 
@@ -136,7 +142,7 @@ python3 - <<'PY'
 import datetime, secrets, sqlite3, uuid
 now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 with sqlite3.connect('/var/lib/rr-nexus/nexus.db', timeout=30) as db:
-    db.execute('INSERT INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    db.execute('INSERT OR IGNORE INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         ('dev_a11ce0000001','stability-audit',str(uuid.uuid4()),secrets.token_hex(24),1,1073741824,0,0,0,now,None,'2030-12-31','2030-09-30',30,36,0,now,now))
 PY
 timeout 90 /usr/local/bin/rr --sync-devices

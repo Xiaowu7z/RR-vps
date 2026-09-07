@@ -1095,7 +1095,7 @@ for match in matches:
     if path is None:
         raise SystemExit(1)
     paths.append(path)
-if paths != ["/etc/argo_vmess.conf", "/usr/local/bin/rr"]:
+if sorted(paths) != ["/etc/argo_vmess.conf", "/usr/local/bin/rr"]:
     raise SystemExit(1)
 PY
 }
@@ -1144,6 +1144,7 @@ for match in matches:
     schedule.append((keys[0].replace("USec", "Sec"), fields[keys[0]]))
 accepted_30 = {"30s", "30sec", "30000000us", "30000000"}
 accepted_5m = {"5min", "5m", "300s", "300000000us", "300000000"}
+schedule.sort()
 if schedule[0][0] != "OnBootSec" or schedule[0][1] not in accepted_30:
     raise SystemExit(1)
 if schedule[1][0] != "OnUnitActiveSec" or schedule[1][1] not in accepted_5m:
