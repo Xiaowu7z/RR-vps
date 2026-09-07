@@ -148,12 +148,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: ShellCheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
-          shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh
-
       - name: Resolve and verify release
         id: release
         shell: bash
@@ -168,7 +162,8 @@ jobs:
             exit 1
           }
           grep -Fq "## ${version} -" CHANGELOG.md
-          bash scripts/pre-push-test.sh
+          # Exact-SHA CI already ran ShellCheck and root-owned regressions.
+          python3 scripts/rebuild-bundle.py --check
           {
             printf 'version=%s\n' "$version"
             printf 'tag=v%s\n' "$version"
@@ -1037,7 +1032,7 @@ jobs:
               }
               verified=false
               for attempt in 1 2 3 4 5 6; do
-                if api -H 'Accept: application/octet-stream' \
+                if gh api -H 'Accept: application/octet-stream' \
                   "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
                   > "$published_dir/${asset}.part" &&
                   [ "$(stat -c %s "$published_dir/${asset}.part")" = "$asset_size" ] &&
