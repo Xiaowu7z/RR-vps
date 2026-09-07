@@ -3498,6 +3498,56 @@ rr_fetch_release() {
     fi
 }
 
+rr_existing_https_upgrade_is_prepared() {
+    local nexus_config="${1:-/etc/rr-nexus/nexus.json}"
+    local renewal_root="${2:-/etc/letsencrypt/renewal}"
+    [ -e "$nexus_config" ] || [ -L "$nexus_config" ] || return 0
+    if ! python3 - "$nexus_config" "$renewal_root" <<'PY'
+import configparser
+import json
+from pathlib import Path
+import re
+import sys
+
+try:
+    path = Path(sys.argv[1])
+    if not path.is_file() or path.stat().st_size > 131072:
+        raise ValueError('invalid Nexus config')
+    config = json.loads(path.read_text())
+    if not isinstance(config, dict):
+        raise ValueError('invalid Nexus config object')
+    if config.get('mode') == 'local':
+        raise SystemExit(0)
+    domain = config.get('domain', '')
+    # IP certificate migration follows its separate existing compatibility path.
+    import ipaddress
+    try:
+        ipaddress.ip_address(domain)
+        raise SystemExit(0)
+    except ValueError:
+        pass
+    if domain == 'ip':
+        raise SystemExit(0)
+    if config.get('mode') != 'public' or not re.fullmatch(
+            r'(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}', domain):
+        raise ValueError('invalid public Nexus domain')
+    renewal = Path(sys.argv[2]) / (domain + '.conf')
+    if not renewal.is_file() or renewal.stat().st_size > 131072:
+        raise ValueError('missing renewal configuration')
+    parsed = configparser.ConfigParser(interpolation=None, strict=True)
+    parsed.read_string('[paths]\n' + renewal.read_text())
+    if parsed['renewalparams'].get('authenticator') != 'webroot':
+        raise ValueError('legacy renewal requires preparation')
+except (OSError, ValueError, KeyError, TypeError, configparser.Error):
+    raise SystemExit(1)
+PY
+    then
+        rr_error '旧版公网 HTTPS 尚未完成续签兼容迁移；请先运行仓库的 migrate-v702-nginx-https.sh。当前未停止服务或修改安装。'
+        rr_error 'DIAG upgrade_preflight=legacy-domain-renewal'
+        return 1
+    fi
+}
+
 rr_install_release() {
     local release_version=""
     local installed_version=""
@@ -3516,6 +3566,10 @@ rr_install_release() {
             rr_error "已阻止降级：发布包 ${release_version} 低于已安装版本 ${installed_version}。"
             return 1
         fi
+    fi
+
+    if [ "$installed_version" = 7.0.2 ] && rr_version_ge "$release_version" 7.1.1; then
+        rr_existing_https_upgrade_is_prepared || return 1
     fi
 
     RR_UPDATE_CHECKPOINT=pre-snapshot
