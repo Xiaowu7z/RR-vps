@@ -12,9 +12,12 @@ saved=$(mktemp -d /root/rr-702-test-before.XXXXXX)
 systemctl stop argo-rr-health.timer argo-rr-health.service rr-nexus.service sing-box.service
 RR_UPDATE_RECOVER_SOURCE_ONLY=1 source "$candidate/scripts/update-recover.sh"
 rr_stop_subscription_servers
-for path in /usr/local/lib/rr /usr/local/bin/rr /var/lib/rr-nexus; do
+# The fixture is a deliberate downgrade on this disposable host. Preserve its
+# prior rollback history privately instead of presenting a newer committed
+# transaction to a 7.0.2 launcher that cannot finalize it.
+for path in /usr/local/lib/rr /usr/local/bin/rr /var/lib/rr-nexus /var/lib/rr-update /run/rr-vps/update-maintenance; do
     name=$(printf '%s' "$path" | tr / _)
-    mv "$path" "$saved/$name"
+    if [ -e "$path" ] || [ -L "$path" ]; then mv "$path" "$saved/$name"; fi
 done
 install -d -m 755 /usr/local/lib/rr
 tar --no-same-permissions --no-same-owner -xzf "$stage/legacy-702.tar.gz" -C /usr/local/lib/rr

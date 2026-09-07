@@ -208,6 +208,8 @@ jobs:
           for test_script in tests/test-*.sh; do
             echo "Running ${test_script}"
             case "${test_script##*/}" in
+              test-recovery-systemd-conditions.sh|\
+              test-upgrade-702-compat.sh|\
               test-installer-restore-gate.sh|\
               test-install-recovery-runtime.sh|\
               test-nexus-core-supply-chain.sh|\

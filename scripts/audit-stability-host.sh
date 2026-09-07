@@ -55,7 +55,7 @@ install_candidate() {
   while [ "$attempt" -lt 3 ]; do
     result=0
     RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
-      bash "$stage/install-core.sh" --upgrade >"$attempt_log" 2>&1 || result=$?
+      timeout --kill-after=15 600 bash "$stage/install-core.sh" --upgrade </dev/null >"$attempt_log" 2>&1 || result=$?
     cat "$attempt_log"
     [ "$result" != 0 ] || return 0
     # Retry only the explicit no-mutation busy-lock rejection. Never rerun a
