@@ -2311,6 +2311,34 @@ if (
 PY
 }
 
+rr_recovery_unit_conditions_are_empty() {
+    local unit="$1" property="" raw="" object="" payload=""
+    case "$unit" in
+        sing-box.service) object=sing_2dbox_2eservice ;;
+        rr-nexus.service) object=rr_2dnexus_2eservice ;;
+        *) return 1 ;;
+    esac
+    for property in Conditions Asserts; do
+        raw=$(systemctl show --property="$property" --value "$unit" 2>/dev/null) || return 1
+        case "$raw" in
+            '') continue ;;
+            '[unprintable]'|"$property=[unprintable]") ;;
+            *) return 1 ;;
+        esac
+        # Read the real typed array; an unformattable value is not proof that
+        # a unit has no conditions. Recovery cannot depend on the old runtime.
+        payload=$(busctl --system --json=short get-property org.freedesktop.systemd1 \
+            "/org/freedesktop/systemd1/unit/$object" org.freedesktop.systemd1.Unit \
+            "$property") || return 1
+        python3 - "$payload" <<'PY' || return 1
+import json, sys
+value = json.loads(sys.argv[1])
+raise SystemExit(0 if isinstance(value, dict) and value.get('type') == 'a(sbbsi)'
+                 and value.get('data') == [] else 1)
+PY
+    done
+}
+
 rr_managed_service_start_is_safe() {
     local requested="${1:-}" unit="" service_file="" variant=""
     local restore_dropin="" firewall_dropin="" guard_dropin=""
@@ -2320,7 +2348,7 @@ rr_managed_service_start_is_safe() {
     local exec_start_pre="" exec_reload="" exec_condition=""
     local user="" group="" working_directory="" dynamic_user=""
     local private_network="" root_directory="" root_image=""
-    local conditions="" asserts="" interval="" burst="" restart_prevent=""
+    local interval="" burst="" restart_prevent=""
     local path="" index=0
     local -a expected_dropins=() effective_dropins=() condition_spec=()
     case "$requested" in
@@ -2443,15 +2471,11 @@ rr_managed_service_start_is_safe() {
         2>/dev/null) || return 1
     root_image=$(systemctl show --property=RootImage --value "$unit" 2>/dev/null) || \
         return 1
-    conditions=$(systemctl show --property=Conditions --value "$unit" 2>/dev/null) || \
-        return 1
-    asserts=$(systemctl show --property=Asserts --value "$unit" 2>/dev/null) || return 1
+    rr_recovery_unit_conditions_are_empty "$unit" || return 1
     [ "$dynamic_user" = no ] && [ "$private_network" = no ] && \
         [ -z "${root_directory//[[:space:]]/}" ] && \
         { [ -z "${root_image//[[:space:]]/}" ] || \
-          [ "${root_image//[[:space:]]/}" = n/a ]; } && \
-        [ -z "${conditions//[[:space:]]/}" ] && \
-        [ -z "${asserts//[[:space:]]/}" ] || return 1
+          [ "${root_image//[[:space:]]/}" = n/a ]; } || return 1
     interval=$(systemctl show --property=StartLimitIntervalUSec --value "$unit" \
         2>/dev/null) || return 1
     burst=$(systemctl show --property=StartLimitBurst --value "$unit" 2>/dev/null) || \
