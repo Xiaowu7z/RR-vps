@@ -17,8 +17,9 @@ for path in /usr/local/lib/rr /usr/local/bin/rr /var/lib/rr-nexus; do
     mv "$path" "$saved/$name"
 done
 install -d -m 755 /usr/local/lib/rr
-tar -xzf "$stage/legacy-702.tar.gz" -C /usr/local/lib/rr
+tar --no-same-permissions --no-same-owner -xzf "$stage/legacy-702.tar.gz" -C /usr/local/lib/rr
 install -m 755 /usr/local/lib/rr/rr /usr/local/bin/rr
+test "$(rr_trusted_runtime_version /usr/local/lib/rr)" = 7.0.2
 # Restore the exact old service templates, keeping test-host network settings.
 rr_render_safe_singbox_unit_legacy_710 > /etc/systemd/system/sing-box.service
 rr_render_safe_nexus_unit > /etc/systemd/system/rr-nexus.service

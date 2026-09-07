@@ -180,7 +180,17 @@ with sqlite3.connect('/var/lib/rr-nexus/nexus.db', timeout=30) as db:
     db.execute('INSERT OR IGNORE INTO devices(id,name,credential,subscription_token,enabled,quota_bytes,used_bytes,uploaded_bytes,downloaded_bytes,traffic_updated_at,group_id,expires_at,next_reset_at,reset_anchor_day,reset_max,reset_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         ('dev_a11ce0000001','stability-audit',str(uuid.uuid4()),secrets.token_hex(24),1,1073741824,0,0,0,now,None,'2030-12-31','2030-09-30',30,36,0,now,now))
 PY
-timeout 90 /usr/local/bin/rr --sync-devices 3>&-
+sync_result=75
+for attempt in 1 2 3 4 5; do
+  sync_result=0
+  timeout 90 /usr/local/bin/rr --sync-devices 3>&- || sync_result=$?
+  [ "$sync_result" != 0 ] || break
+  [ "$sync_result" = 75 ] || exit "$sync_result"
+  # Nexus/health may briefly own the shared lock. A 75 result is a rejected
+  # entry with no mutation; wait for that owner without bypassing the lock.
+  flock -w 30 /run/rr-vps/locks/update.lock true
+done
+test "$sync_result" = 0
 test -s /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
 grep -q '^vless://' /var/lib/rr-nexus/subscriptions/dev_a11ce0000001.txt
 test "$(sqlite3 /var/lib/rr-nexus/nexus.db 'PRAGMA quick_check;')" = ok
