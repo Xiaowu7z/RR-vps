@@ -10,13 +10,10 @@ curl -fsSL --retry 2 --connect-timeout 15 --max-time 90 \
 printf '%s  %s\n' bbf520a15a4d520d7b724e5abcc2341bd00c54f73c2cacf79c243fc3a50fb3a3 \
     "$work/recover.sh" | sha256sum -c -
 RR_UPDATE_RECOVER_SOURCE_ONLY=1 source "$work/recover.sh"
-exec 3>&1
 probe() {
     local name="$1" rc=0
     shift
     if (
-        set -T
-        trap 'probe_status=$?; if [ "$probe_status" -ne 0 ]; then printf "RETURN function=%s line=%s rc=%s\n" "${FUNCNAME[0]:-main}" "${BASH_LINENO[0]:-0}" "$probe_status" >&3; fi' RETURN
         "$@" >/dev/null 2>&1
     ); then rc=0; else rc=$?; fi
     printf 'CHECK %s rc=%s\n' "$name" "$rc"
