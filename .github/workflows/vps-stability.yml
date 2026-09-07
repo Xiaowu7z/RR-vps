@@ -27,14 +27,6 @@ jobs:
             os: debian
             version: '12'
             key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
-          - role: B
-            os: ubuntu
-            version: '22.04'
-            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
-          - role: C
-            os: ubuntu
-            version: '24.04'
-            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -47,7 +39,7 @@ jobs:
           bash -n scripts/audit-stability-host.sh
           sudo apt-get update -qq
           sudo apt-get install -y -qq sshpass netcat-openbsd
-      - name: Read previous installation log (no installation)
+      - name: Locate shared failure without reinstalling
         env:
           HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
           SSHPASS: ${{ secrets[format('RR_{0}_PASS', matrix.role)] }}
@@ -71,16 +63,20 @@ jobs:
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
             scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" python3 - <<'PY'
-          import re
-          from pathlib import Path
-          lines = Path('/root/rr-stability.log').read_text(errors='replace').splitlines()
-          for line in lines[-75:]:
-              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
-              line = re.sub(r'(?:\d{1,3}\.){3}\d{1,3}', '[IP]', line)
-              line = re.sub(r'https?://\S+', '[URL]', line)
-              line = re.sub(r'[!-~]{8,}', '[redacted]', line)
-              if line.strip(): print(line[:240])
-          for path in ('/etc/argo_vmess.conf','/usr/local/bin/sing-box'):
-              print('exists',path,Path(path).exists())
-          PY
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash -s <<'SH'
+          umask 077
+          exec 3>&1
+          exec >/root/rr-stability-function.log 2>&1
+          for module in /usr/local/lib/rr/modules/*.sh; do source "$module"; done
+          for step in build_singbox_config setup_systemd; do
+            exec 4>/root/rr-stability-lines.log
+            set -T
+            trap 'printf "%s:%s:%s\n" "${BASH_SOURCE[0]##*/}" "$LINENO" "${FUNCNAME[0]}" >&4' DEBUG
+            "$step"
+            rc=$?
+            trap - DEBUG
+            set +T
+            printf 'DIAGNOSTIC %s rc=%s\n' "$step" "$rc" >&3
+            if [ "$rc" != 0 ]; then tail -35 /root/rr-stability-lines.log >&3; break; fi
+          done
+          SH
