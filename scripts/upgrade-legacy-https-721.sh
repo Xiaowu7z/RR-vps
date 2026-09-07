@@ -2,6 +2,7 @@
 # RR 7.0.2 -> 7.2.1, existing public HTTPS, VMess-only inspected layout.
 # Usage: bash SCRIPT EXPECTED_HOST EXPECTED_DOMAIN VMESS_PORT SUB_PORT
 # No blanket firewall rewrites; released installer owns the update transaction.
+# Debian calendar compatibility candidate; all installed payload bytes are pinned.
 set -eo pipefail
 umask 077
 export PYTHONDONTWRITEBYTECODE=1 SYSTEMD_PAGER=cat
@@ -78,12 +79,16 @@ download() {
         --connect-timeout 15 --max-time 180 "$url" -o "$destination" || return 1
     printf '%s  %s\n' "$digest" "$destination" | sha256sum -c -
 }
-download https://github.com/Xiaowu7z/RR-vps/releases/download/v7.2.1/rr-bundle.tar.gz \
-    "$work/bundle.tar.gz" f00fc713dc63e43ca60da1c5f936d17263d58776445567b0dc8f3a2af7f8f9d3
+candidate_ref=91cba8eca3c06eb571ff2c60fe2cb3eb88b20c51
+candidate_base="https://raw.githubusercontent.com/Xiaowu7z/RR-vps/$candidate_ref"
+download "$candidate_base/rr-bundle.tar.gz" \
+    "$work/bundle.tar.gz" 60617fce382b901ce1e5d2784aecad694839ea067d06723407cf3e0b34a29f1a
 tar --no-same-owner -xzf "$work/bundle.tar.gz" -C "$work"
 candidate="$work/rr-bundle"
-download https://raw.githubusercontent.com/Xiaowu7z/RR-vps/c7de4b412b2bd90d45fea733a0d62ede37918aab/install.sh \
-    "$work/install.sh" 171b6f1fd2df445b5837c87b6744f9d38ff7ac2a0ca82b6fe41dd6d905995bb0
+download "$candidate_base/scripts/install-core.sh" \
+    "$work/install-core.sh" 3afa87943a89b7800d7f50cbb62d04394bf11eb5964f1e85cb733aa788a9a5a5
+download "$candidate_base/scripts/update-guard.sh" \
+    "$work/update-guard.sh" 2bbfdd8d80773cb48c19f11f91bbeb7ebd156f9419c30c5d81b3565aa346e64c
 download https://raw.githubusercontent.com/Xiaowu7z/RR-vps/v7.2.1/scripts/verify-upgrade-identities.py \
     "$work/verify.py" d33dca31a1cfb295491561bd8e77c106a103e8211b8cdf7e6c9f1f21e91924f3
 download https://raw.githubusercontent.com/Xiaowu7z/RR-vps/0f415d2a446b33287a004836cbf918d74497810d/scripts/legacy-nginx-702.py \
@@ -556,6 +561,14 @@ for path in /var/www "$webroot" "$webroot/.well-known" "$webroot/.well-known/acm
 done
 timeout 15 nginx -t
 test "$(command -v nginx)" = /usr/sbin/nginx
+if [ "$renewal_mode" = webroot ]; then
+    phase=verify-existing-renewal-runtime
+    rr_certbot_renewal_runtime_is_ready "$domain" || {
+        echo 'PRECHECK_FAILED: existing Webroot renewal runtime is not ready'
+        exit 1
+    }
+    printf 'HTTPS_ALREADY_PREPARED: 已验证现有续签配置，本次跳过证书迁移。\n'
+fi
 
 phase=backup
 paths=()
@@ -573,6 +586,8 @@ free_kb=$(df -Pk /root | awk 'NR==2 {print $4}')
 test "$free_kb" -ge "$((size_kb * 2 + 524288))" || { echo 'PRECHECK_FAILED: insufficient backup space'; exit 1; }
 backup=$(mktemp -d /root/rr-before-7.2.1.XXXXXX)
 printf '备份目录：%s；开始备份与 HTTPS 兼容迁移。\n' "$backup"
+printf 'candidate_commit=%s\ncandidate_bundle_sha256=%s\n' "$candidate_ref" \
+    60617fce382b901ce1e5d2784aecad694839ea067d06723407cf3e0b34a29f1a > "$backup/candidate-build.txt"
 printf '%s\n' "${paths[@]}" > "$backup/backup-paths.txt"
 printf 'health_active=%s\nhealth_enabled=%s\ncertbot_timer_active=%s\n' \
     "$health_was_active" "$health_was_enabled" "$cert_timer_was_active" > "$backup/writer-states.txt"
@@ -647,8 +662,13 @@ sha256sum -c "$backup/preparation-unchanged.sha256"
 /usr/bin/python3 "$work/extra-identities.py" "$backup/extra-identities.json"
 rr_certbot_acme_http_route_is_ready "$domain"
 prep_committed=true
+phase=resume-writers
 resume_writers
-rr_certbot_renewal_runtime_is_ready "$domain"
+phase=verify-renewal-runtime
+rr_certbot_renewal_runtime_is_ready "$domain" || {
+    echo 'RENEWAL_RUNTIME_NOT_READY: Certbot service/timer readiness check failed'
+    exit 1
+}
 printf 'LEGACY_HTTPS_PREPARED: 生产证书和用户身份未变，续签配置已验证。\n'
 
 # From this point, only the published installer decides rollback/quarantine.
@@ -656,9 +676,25 @@ rr_close_inherited_recovery_lock_fds
 unset RR_UPDATE_LOCK_HELD RR_RESTORE_LOCK_HELD RR_UPDATE_LOCK_OWNER RR_UPDATE_LOCK_FDS_CLOSED
 phase=upgrade
 installer_started=true
-bash "$work/install.sh" --upgrade
+RR_BUNDLE_FILE="$work/bundle.tar.gz" RR_GUARD_FILE="$work/update-guard.sh" \
+    bash "$work/install-core.sh" --upgrade
 phase=verify-upgrade
 test "$(/usr/local/bin/rr --version)" = 'RR-vps 7.2.1'
+/usr/bin/python3 - "$candidate/manifest.sha256" "$work/update-guard.sh" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+manifest = Path(sys.argv[1]).read_bytes()
+runtime = Path('/usr/local/lib/rr')
+assert (runtime / 'manifest.sha256').read_bytes() == manifest, 'Installed manifest differs from candidate'
+for line in manifest.decode('ascii').splitlines():
+    digest, relative = line.split()
+    path = Path('/usr/local/bin/rr') if relative == 'rr' else runtime / relative
+    assert path.is_file() and not path.is_symlink(), 'Invalid installed file: ' + relative
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, 'Installed hash mismatch: ' + relative
+assert (runtime / 'modules/61-update-guard.sh').read_bytes() == Path(sys.argv[2]).read_bytes()
+print('INSTALLED_CANDIDATE_FILES_VERIFIED')
+PY
 /usr/bin/python3 "$work/verify.py" "$backup/identities.json"
 /usr/bin/python3 "$work/extra-identities.py" "$backup/extra-identities.json"
 for unit in sing-box.service rr-nexus.service nginx.service; do systemctl is-active --quiet "$unit"; done
@@ -677,5 +713,6 @@ print("UPDATE_COMMITTED_SETTLED_OK")
 rr_health_monitor_unit_definitions_are_current
 if [ "$health_was_enabled" = true ]; then systemctl is-enabled --quiet argo-rr-health.timer; fi
 if [ "$health_was_active" = true ]; then systemctl is-active --quiet argo-rr-health.timer; fi
+rr_certbot_renewal_runtime_is_ready "$domain"
 phase=complete
-printf 'UPGRADE_COMPLETE: RR-vps 7.2.1；用户、节点、订阅和隧道身份核对一致。\n备份：%s\n' "$backup"
+printf 'UPGRADE_COMPLETE: RR-vps 7.2.1 Debian 兼容修正版；安装文件、用户、节点、订阅和隧道身份核对一致。\n备份：%s\n' "$backup"
