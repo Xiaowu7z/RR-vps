@@ -1,0 +1,42 @@
+name: Inspect upgrade test C
+on:
+  push:
+    branches: [audit/stability-20260907]
+    paths: [.github/workflows/inspect-upgrade-c.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect the running disposable Ubuntu test host
+        env:
+          HOST: ${{ secrets.RR_C_HOST }}
+          SSHPASS: ${{ secrets.RR_C_PASS }}
+        run: |
+          set -euo pipefail
+          set +x
+          sudo apt-get install -y -qq sshpass
+          known="$RUNNER_TEMP/known-c"
+          printf '%s ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3\n' "$HOST" > "$known"
+          sshpass -e ssh -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="$known" -o HostKeyAlgorithms=ssh-ed25519 \
+            -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            -o ConnectTimeout=15 "root@$HOST" 'bash -s' <<'REMOTE'
+          /usr/local/sbin/rr-update-recover status
+          /usr/local/bin/rr --version
+          systemctl show sing-box.service rr-nexus.service argo-rr-health.service \
+            argo-rr-health.timer rr-update-recovery.service -p Id -p ActiveState -p SubState -p Job --no-pager
+          ps -eo pid,ppid,comm,etimes,wchan:24 | awk '/bash|python|curl|systemctl|sing-box|cloudflared|PID/'
+          lslocks -n -o PID,COMMAND,PATH | awk '$3 == "/run/rr-vps/locks/update.lock"'
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          for line in Path('/root/rr-stability.log').read_text(errors='replace').splitlines()[-35:]:
+              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+              if ' DIAG ' not in line:
+                  line = re.sub(r'[!-~]{8,}', '[redacted]', line)
+              print(line[:240])
+          PY
+          REMOTE
