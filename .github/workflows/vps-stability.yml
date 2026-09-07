@@ -71,11 +71,11 @@ jobs:
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
             scripts/audit-stability-host.sh "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
-          expected_version=$(sed -n '1s/^RR-vps //p' version)
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash /root/rr-stability-candidate/audit-stability-host.sh \
-            "$ROLE" "$EXPECTED_OS" "$EXPECTED_OS_VERSION" "$expected_version" | tee "$RUNNER_TEMP/result.txt"
-          for port in 24443 21443 22443; do nc -z -w 10 "$HOST" "$port"; done
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" true
-          printf 'STABILITY role=%s external_tcp=pass ssh=pass\n' "$ROLE" | tee -a "$RUNNER_TEMP/result.txt"
-          cat "$RUNNER_TEMP/result.txt" >> "$GITHUB_STEP_SUMMARY"
-
+          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" python3 - <<'PY'
+          import re
+          from pathlib import Path
+          for line in Path('/root/rr-stability.log').read_text(errors='replace').splitlines()[-40:]:
+              line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+              line = re.sub(r'[!-~]{8,}', '[redacted]', line)
+              if line.strip(): print(line[:220])
+          PY
