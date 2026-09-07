@@ -1,4 +1,4 @@
-name: Retry busy stability job
+name: Verify published v7.2.0 downloads
 on:
   push:
     branches: [audit/stability-20260907]
@@ -7,24 +7,37 @@ permissions:
   contents: read
   actions: write
 jobs:
-  retry:
+  verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 6
+    timeout-minutes: 5
     steps:
-      - name: Retry only failed jobs after the current matrix completes
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7
+          persist-credentials: false
+      - name: Verify exact public files using a single binary Accept header
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           api="/repos/$GITHUB_REPOSITORY"
-          for attempt in {1..20}; do
-            run=$(gh api "$api/actions/runs/34087070629")
-            jq -e '.head_sha == "fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7" and .event == "push"' <<<"$run" >/dev/null
-            if [ "$(jq -r .status <<<"$run")" = completed ]; then
-              [ "$(jq -r .conclusion <<<"$run")" = failure ] || exit 0
-              gh api --method POST "$api/actions/runs/34087070629/rerun-failed-jobs"
-              exit 0
-            fi
-            sleep 15
+          sha=fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7
+          gh api "$api/releases/latest" > "$RUNNER_TEMP/release.json"
+          jq -e --arg sha "$sha" '.tag_name == "v7.2.0" and .target_commitish == $sha and .immutable == true and .draft == false and .prerelease == false and (.assets|length) == 5' "$RUNNER_TEMP/release.json"
+          dir="$RUNNER_TEMP/published-v720"
+          mkdir "$dir"
+          for asset in install.sh manifest.sha256 rr-bundle.tar.gz RELEASE_INFO SHA256SUMS; do
+            id=$(jq -r --arg name "$asset" '.assets[]|select(.name==$name)|.id' "$RUNNER_TEMP/release.json")
+            expected_size=$(jq -r --arg name "$asset" '.assets[]|select(.name==$name)|.size' "$RUNNER_TEMP/release.json")
+            expected_digest=$(jq -r --arg name "$asset" '.assets[]|select(.name==$name)|.digest' "$RUNNER_TEMP/release.json")
+            gh api -H 'Accept: application/octet-stream' "$api/releases/assets/$id" > "$dir/$asset"
+            [ "$(stat -c %s "$dir/$asset")" = "$expected_size" ]
+            [ "sha256:$(sha256sum "$dir/$asset" | cut -d' ' -f1)" = "$expected_digest" ]
           done
-          exit 1
+          (cd "$dir"; sha256sum -c SHA256SUMS)
+          for asset in install.sh manifest.sha256 rr-bundle.tar.gz; do cmp "$asset" "$dir/$asset"; done
+          printf 'VERSION=7.2.0\nTAG=v7.2.0\nCOMMIT=%s\n' "$sha" | cmp - "$dir/RELEASE_INFO"
+          [ "$(gh api "$api/git/ref/heads/main" --jq .object.sha)" = "$sha" ]
+          [ "$(git ls-remote origin 'refs/tags/v7.2.0^{}' | cut -f1)" = "$sha" ]
+          echo 'All five immutable public downloads match the verified release commit.' | tee -a "$GITHUB_STEP_SUMMARY"
+          gh api --method PUT "$api/actions/workflows/publish-v720.yml/disable"
