@@ -285,8 +285,13 @@ jobs:
           set -euo pipefail
 
           api() {
+            local accept='Accept: application/vnd.github+json'
+            if [ "${1:-}" = -H ] && [[ "${2:-}" = Accept:* ]]; then
+              accept="$2"
+              shift 2
+            fi
             gh api \
-              -H 'Accept: application/vnd.github+json' \
+              -H "$accept" \
               -H 'X-GitHub-Api-Version: 2026-03-10' \
               "$@"
           }
@@ -1032,7 +1037,7 @@ jobs:
               }
               verified=false
               for attempt in 1 2 3 4 5 6; do
-                if gh api -H 'Accept: application/octet-stream' \
+                if api -H 'Accept: application/octet-stream' \
                   "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
                   > "$published_dir/${asset}.part" &&
                   [ "$(stat -c %s "$published_dir/${asset}.part")" = "$asset_size" ] &&

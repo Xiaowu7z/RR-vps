@@ -432,4 +432,15 @@ fi
 grep -Fq "GET  /repos/${GITHUB_REPOSITORY}/releases/latest" "$API_LOG" ||
     fail 'Latest was not revalidated after the asset downloads'
 
+(
+    # Binary requests replace the JSON default with one Accept header.
+    eval "$(awk '/^          api\(\) \{/{copy=1} copy{sub(/^          /, ""); print} copy && /^}$/{exit}' "$REPO_ROOT/.github/workflows/release.yml")"
+    gh() { printf '%s\n' "$@"; }
+    headers=$(api -H 'Accept: application/octet-stream' /repos/owner/repo/releases/assets/1)
+    [ "$(printf '%s\n' "$headers" | grep -c '^Accept:')" = 1 ]
+    printf '%s\n' "$headers" | grep -Fxq 'Accept: application/octet-stream'
+    headers=$(api /repos/owner/repo/releases/latest)
+    [ "$(printf '%s\n' "$headers" | grep -c '^Accept:')" = 1 ]
+    printf '%s\n' "$headers" | grep -Fxq 'Accept: application/vnd.github+json'
+)
 printf '%s\n' 'release publication race regression: PASS'

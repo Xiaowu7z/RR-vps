@@ -51,6 +51,9 @@ jobs:
         run: |
           git fetch --depth=1 origin f28d5b11958588554777ee2c4d326d42c471ee08
           git archive --format=tar.gz f28d5b11958588554777ee2c4d326d42c471ee08 rr modules nexus manifest.sha256 > legacy-702.tar.gz
+          git fetch --depth=1 origin fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7
+          git show fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7:scripts/update-recover.sh > v720-update-recover.sh
+          git show fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7:scripts/update-external-state.py > v720-update-external-state.py
       - name: Resume installed hosts and run stability check
         env:
           HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
@@ -72,7 +75,7 @@ jobs:
             -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
           sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" 'install -d -m 700 /root/rr-stability-candidate'
           extra=()
-          if [ "$ROLE" = C ]; then extra=(legacy-702.tar.gz scripts/audit-upgrade-702.sh scripts/verify-upgrade-identities.py); fi
+          if [ "$ROLE" = C ]; then extra=(legacy-702.tar.gz v720-update-recover.sh v720-update-external-state.py scripts/audit-upgrade-702.sh scripts/verify-upgrade-identities.py); fi
           sha256sum rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh scripts/audit-stability-host.sh "${extra[@]}" |
             sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
           sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \

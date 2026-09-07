@@ -2850,13 +2850,17 @@ rr_prepare_recovery_runtime() {
     # A previous RR release is accepted only when the installed helper is an
     # exact root-owned copy of that release's runtime source.
     rr_recovery_helper_is_owned_or_absent "$RR_RECOVERY_HELPER" \
-        "$recovery_source" "$RR_LIB_DIR/scripts/update-recover.sh" || return 1
+        "$recovery_source" "$RR_LIB_DIR/scripts/update-recover.sh" || {
+        rr_error "DIAG recovery_runtime_gate=recovery-helper-owner"; return 1;
+    }
     rr_recovery_helper_is_owned_or_absent "$RR_UPDATE_EXTERNAL_HELPER" \
         "$external_source" "$RR_LIB_DIR/scripts/update-external-state.py" || \
-        return 1
+        { rr_error "DIAG recovery_runtime_gate=external-helper-owner"; return 1; }
     # An unrelated service using this name (or any effective drop-in) remains
     # untouched and is never enabled by the updater.
-    rr_update_recovery_unit_is_owned_or_absent || return 1
+    rr_update_recovery_unit_is_owned_or_absent || {
+        rr_error "DIAG recovery_runtime_gate=recovery-unit-owner"; return 1;
+    }
     mkdir -p /usr/local/sbin /etc/systemd/system "$RR_TX_ROOT/transactions" || return 1
     chmod 700 "$RR_TX_ROOT"
     external_tmp=$(mktemp /usr/local/sbin/.rr-update-external-state.XXXXXX) || return 1
@@ -2890,7 +2894,9 @@ rr_prepare_recovery_runtime() {
         return 1
     fi
     systemctl daemon-reload >/dev/null 2>&1 || return 1
-    rr_update_recovery_effective_identity_is_exact || return 1
+    rr_update_recovery_effective_identity_is_exact || {
+        rr_error "DIAG recovery_runtime_gate=recovery-unit-effective"; return 1;
+    }
     systemctl enable rr-update-recovery.service >/dev/null 2>&1 || return 1
 }
 

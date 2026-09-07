@@ -38,7 +38,7 @@ finish() {
 trap finish EXIT
 curl -fL --retry 2 --connect-timeout 15 --max-time 180 \
     https://github.com/Xiaowu7z/RR-vps/releases/download/v7.2.1/install.sh -o "$work/install.sh"
-printf '%s  %s\n' 0cdc1900d7066bd421735ab56848a5b464e7dfe20c8e7187c8fca052dfc4e50c \
+printf '%s  %s\n' 171b6f1fd2df445b5837c87b6744f9d38ff7ac2a0ca82b6fe41dd6d905995bb0 \
     "$work/install.sh" | sha256sum -c -
 curl -fsSL --retry 2 --connect-timeout 15 --max-time 90 \
     https://raw.githubusercontent.com/Xiaowu7z/RR-vps/v7.2.1/scripts/verify-upgrade-identities.py \

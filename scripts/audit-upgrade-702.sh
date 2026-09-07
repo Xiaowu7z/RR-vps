@@ -26,6 +26,16 @@ for path in /etc/systemd/system/sing-box.service.d /etc/systemd/system/rr-nexus.
     if [ -d "$path" ]; then mv "$path" "$saved/$(basename "$path")"; fi
 done
 systemctl daemon-reload
+# Reproduce the published 7.2.0 helpers retained by the user's aborted upgrade,
+# rather than retaining an arbitrary older helper from previous audit runs.
+printf '%s  %s\n' e2e0b855c8bcd295daf2741c2e58cbf011263aabdedb535066df5ff14ac7b893 \
+    "$stage/v720-update-recover.sh" | sha256sum -c -
+install -m 755 "$stage/v720-update-recover.sh" /usr/local/sbin/rr-update-recover
+install -m 755 "$stage/v720-update-external-state.py" /usr/local/sbin/rr-update-external-state
+eval "$(awk '/^rr_render_update_recovery_unit\(\) \{/{copy=1} copy{print} copy && /^}$/{exit}' "$stage/install-core.sh")"
+rr_render_update_recovery_unit > /etc/systemd/system/rr-update-recovery.service
+chmod 644 /etc/systemd/system/rr-update-recovery.service
+systemctl daemon-reload
 python3 - <<'PY'
 import datetime, importlib.util, secrets, sqlite3, sys, uuid
 from pathlib import Path
