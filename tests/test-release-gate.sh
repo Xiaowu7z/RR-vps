@@ -5857,7 +5857,7 @@ def nexus_firewall_lifecycle_contract(candidate):
         # observation laundering, or a swallowed final parser status cannot pass
         # merely by leaving the required tokens in place.
         and hashlib.sha256(effective_identity.encode()).hexdigest()
-        == "7f5d448780f77a1d13c8b78269881dd31003436304833818206d2bb826984155"
+        == "ffeff0351d132b3db24a6a46c60c2745f591e1c9277e74cee1f6c28048b33041"
         and 'raw.count("{") != len(expected)' in effective_identity
         and 'raw.count("}") != len(expected)' in effective_identity
         and 'raw.count("path=") != len(expected)' in effective_identity

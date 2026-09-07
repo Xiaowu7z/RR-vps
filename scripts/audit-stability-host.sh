@@ -9,7 +9,27 @@ phase=preflight
 exec 3>&1
 exec >>"$log" 2>&1
 chmod 600 "$log"
-trap 'rc=$?; if [ "$rc" != 0 ] && [ -f /root/rr-stability-lines.log ]; then tail -25 /root/rr-stability-lines.log >&3; fi; trap - EXIT; printf "STABILITY role=%s phase=%s result=%s\n" "$role" "$phase" "$rc" >&3; exit "$rc"' EXIT
+finish() {
+  rc=$?
+  trap - EXIT
+  if [ "$rc" != 0 ]; then
+    test ! -f /root/rr-stability-lines.log || tail -25 /root/rr-stability-lines.log >&3
+    python3 - "$log" <<'PYLOG' >&3
+import re, sys
+from pathlib import Path
+for line in Path(sys.argv[1]).read_text(errors='replace').splitlines()[-18:]:
+    line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line)
+    if ' DIAG ' not in line:
+        line = re.sub(r'[!-~]{8,}', '[redacted]', line)
+    print(line[:240])
+PYLOG
+  fi
+  printf "STABILITY role=%s phase=%s result=%s\n" "$role" "$phase" "$rc" >&3
+  exit "$rc"
+}
+trap finish EXIT
+: >/root/rr-stability-lines.log
+
 export LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb
 test "$(id -u)" = 0
 . /etc/os-release
@@ -27,6 +47,17 @@ test -f /etc/argo_vmess.conf
 test -x /usr/local/bin/sing-box
 printf "STABILITY role=%s reset=reused\n" "$role" >&3
 
+phase=retire-incomplete-install
+# These disposable hosts have never completed installation. Preserve the failed
+# runtime and configuration; use the normal installer from a clean RR state.
+grep -qx INSTALL_COMPLETE=false /etc/argo_vmess.conf
+systemctl disable --now sing-box.service
+test "$(systemctl show -p ActiveState --value sing-box.service)" = inactive
+failed_install=$(mktemp -d /root/rr-stability-incomplete.XXXXXX)
+for path in /etc/argo_vmess.conf /etc/systemd/system/sing-box.service /usr/local/lib/rr /usr/local/bin/rr; do
+  if [ -e "$path" ]; then mv -- "$path" "$failed_install/$(basename "$path").$(printf %s "$path" | sha256sum | cut -c1-8)"; fi
+done
+systemctl daemon-reload
 phase=runtime-install
 RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
   bash "$stage/install-core.sh" --upgrade
