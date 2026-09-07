@@ -2651,8 +2651,9 @@ for spec in calendar_specs:
     ) is None:
         continue
     first_match = re.search(rf"^\s*Next elapse:\s+({stamp})\s*$", result.stdout, re.M)
+    # systemd 252 uses "Iter. #2:"; newer releases spell out "Iteration #2:".
     second_match = re.search(
-        rf"^\s*Iteration #2:\s+({stamp})\s*$", result.stdout, re.M
+        rf"^\s*(?:Iteration|Iter\.) #2:\s+({stamp})\s*$", result.stdout, re.M
     )
     if first_match is None or second_match is None:
         continue
