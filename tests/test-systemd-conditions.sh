@@ -11,8 +11,10 @@ busctl() {
     printf '%s\n' "$condition_fixture"
 }
 read_conditions() { rr_systemd_show --property=Conditions --value sing-box.service; }
-result=$(read_conditions)
-[ -z "$result" ]
+for shown in "[unprintable]" "Conditions=[unprintable]"; do
+  result=$(read_conditions)
+  [ -z "$result" ]
+done
 condition_fixture='{"type":"a(sbbsi)","data":[["ConditionPathExists",false,false,"/etc/argo_vmess.conf",0]]}'
 result=$(read_conditions)
 [[ "$result" == *'parameter=/etc/argo_vmess.conf;'* && -n "$result" ]]

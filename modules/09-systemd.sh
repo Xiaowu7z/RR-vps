@@ -3,10 +3,10 @@
 rr_systemd_show() {
     local raw="" unit="" property="" argument="" object="" payload=""
     raw=$(systemctl show "$@") || return 1
-    if [ "$raw" != '[unprintable]' ]; then
-        printf '%s\n' "$raw"
-        return 0
-    fi
+    case "$raw" in
+        '[unprintable]'|'Conditions=[unprintable]'|'Asserts=[unprintable]') ;;
+        *) printf '%s\n' "$raw"; return 0 ;;
+    esac
     for argument in "$@"; do
         case "$argument" in
             --property=Conditions|--property=Asserts) property="${argument#*=}" ;;

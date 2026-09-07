@@ -42,25 +42,31 @@ sha256sum -c transfer.sha256
 read -r _ _ _ ssh_port <<<"${SSH_CONNECTION:?}"
 [[ "$ssh_port" =~ ^[0-9]+$ ]]
 
-# Resume the owner-authorized reset already completed on these hosts.
-test -f /etc/argo_vmess.conf
-test -x /usr/local/bin/sing-box
-printf "STABILITY role=%s reset=reused\n" "$role" >&3
-
-phase=retire-incomplete-install
-# These disposable hosts have never completed installation. Preserve the failed
-# runtime and configuration; use the normal installer from a clean RR state.
-grep -qx INSTALL_COMPLETE=false /etc/argo_vmess.conf
-systemctl disable --now sing-box.service
-test "$(systemctl show -p ActiveState --value sing-box.service)" = inactive
-failed_install=$(mktemp -d /root/rr-stability-incomplete.XXXXXX)
-for path in /etc/argo_vmess.conf /etc/systemd/system/sing-box.service /usr/local/lib/rr /usr/local/bin/rr; do
-  if [ -e "$path" ]; then mv -- "$path" "$failed_install/$(basename "$path").$(printf %s "$path" | sha256sum | cut -c1-8)"; fi
-done
-systemctl daemon-reload
+# Reuse completed dependency/firewall setup. Install only the corrected helper
+# on hosts whose candidate runtime is already deployed; verify every file.
 phase=runtime-install
-RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
-  bash "$stage/install-core.sh" --upgrade
+candidate=$(mktemp -d /root/rr-stability-payload.XXXXXX)
+tar -xzf "$stage/rr-bundle.tar.gz" -C "$candidate"
+(cd "$candidate/rr-bundle"; sha256sum -c manifest.sha256 >/dev/null)
+if [ -f /usr/local/lib/rr/modules/09-systemd.sh ]; then
+  install -m 755 "$candidate/rr-bundle/modules/09-systemd.sh" /usr/local/lib/rr/modules/09-systemd.sh
+  install -m 644 "$candidate/rr-bundle/manifest.sha256" /usr/local/lib/rr/manifest.sha256
+else
+  # A's old installer retained failed rollback evidence. Keep it as a private
+  # backup before installing the candidate on this never-completed test host.
+  failed_install=$(mktemp -d /root/rr-stability-incomplete.XXXXXX)
+  for unit in argo-rr-health.timer rr-update-recovery.service rr-restore-recovery.service rr-firewall-quarantine-guard.path rr-firewall-quarantine-guard.timer sing-box.service; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done
+  test "$(systemctl show -p ActiveState --value sing-box.service)" = inactive
+  for path in /etc/argo_vmess.conf /etc/systemd/system/sing-box.service /usr/local/lib/rr /usr/local/bin/rr /var/lib/rr-update /etc/rr-update /var/lib/rr-vps /run/rr-vps; do
+    if [ -e "$path" ]; then mv -- "$path" "$failed_install/$(basename "$path").$(printf %s "$path" | sha256sum | cut -c1-8)"; fi
+  done
+  systemctl daemon-reload
+  RR_BUNDLE_FILE="$stage/rr-bundle.tar.gz" RR_GUARD_FILE="$stage/update-guard.sh" \
+    bash "$stage/install-core.sh" --upgrade
+fi
+rm -rf -- "$candidate"
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 (cd /usr/local/lib/rr; awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null)
 phase=protocol-install
