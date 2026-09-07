@@ -14,6 +14,7 @@ finish() {
   trap - EXIT
   if [ "$rc" != 0 ]; then
     test ! -f /root/rr-stability-lines.log || tail -25 /root/rr-stability-lines.log >&3
+    test ! -f /root/rr-stability-return.log || tail -20 /root/rr-stability-return.log >&3
     python3 - "$log" <<'PYLOG' >&3
 import re, sys
 from pathlib import Path
@@ -69,19 +70,41 @@ fi
 rm -rf -- "$candidate"
 /usr/local/bin/rr --version | grep -F "RR-vps $expected_version"
 (cd /usr/local/lib/rr; awk '$2 != "rr"' manifest.sha256 | sha256sum -c - >/dev/null)
-phase=protocol-install
-# Preserve the exact failed function/line without exporting credential-bearing xtrace.
-for port in 24443 18081 21443 22443 7900; do test -z "$(ss -H -ltn "sport = :$port")"; done
-for port in 23443 25443; do test -z "$(ss -H -lun "sport = :$port")"; done
-printf '%s\n' '1,2,3,4,5' 24443 18081 21443 22443 23443 25443 n '' '' | \
-  timeout 600 bash -c '
-    set -o pipefail
-    exec 4>/root/rr-stability-lines.log
-    set -T
-    trace_line() { printf "%s:%s:%s\n" "${BASH_SOURCE[1]##*/}" "${BASH_LINENO[0]}" "${FUNCNAME[1]}" >&4; }
-    trap trace_line DEBUG
+phase=finish-protocol-install
+# The protocol wizard already generated all five inbounds and started Sing-box.
+# Owner-authorized test-host firewall cleanup; keep SSH before removing conflicts.
+for backend in iptables ip6tables; do
+  if command -v "$backend" >/dev/null && "$backend" -w 5 -t filter -S >/dev/null; then
+    "$backend-save" >"/root/rr-stability-before-finish-$backend.rules"
+    for chain in INPUT FORWARD OUTPUT; do "$backend" -w 5 -P "$chain" ACCEPT; done
+    "$backend" -w 5 -F
+    "$backend" -w 5 -X
+    "$backend" -w 5 -I INPUT 1 -p tcp --dport "$ssh_port" -j ACCEPT
+  fi
+done
+netfilter-persistent save
+: >/root/rr-stability-return.log
+timeout 600 bash -c '
     for module in /usr/local/lib/rr/modules/*.sh; do source "$module"; done
-    install_main
+    exec 4>/root/rr-stability-lines.log
+    exec 5>/root/rr-stability-return.log
+    set -T
+    trace_line() {
+      printf "%s:%s:%s\n" "${BASH_SOURCE[1]##*/}" "${BASH_LINENO[0]}" "${FUNCNAME[1]}" >&4
+      case "$BASH_COMMAND" in return\ 1|return\ 2|return\ 3) printf "RETURN %s:%s:%s\n" "${BASH_SOURCE[1]##*/}" "${BASH_LINENO[0]}" "${FUNCNAME[1]}" >&5 ;; esac
+    }
+    trap trace_line DEBUG
+    finish_protocol_install() {
+      load_config_with_defaults || return 1
+      build_singbox_config || return 1
+      setup_systemd || return 1
+      open_configured_firewall || return 1
+      generate_node_and_sub || return 1
+      setup_health_monitor || return 1
+      rr_health_monitor_units_are_current || return 1
+      safe_sed INSTALL_COMPLETE true
+    }
+    rr_menu_run_writer finish_protocol_install
   '
 grep -qx INSTALL_COMPLETE=true /etc/argo_vmess.conf
 /usr/local/bin/sing-box check -c /etc/sing-box/config.json
@@ -102,7 +125,7 @@ printf '%s\n' 1 17900 auditadmin "$panel_pass" "$panel_pass" '' | \
     trace_line() { printf "%s:%s:%s\n" "${BASH_SOURCE[1]##*/}" "${BASH_LINENO[0]}" "${FUNCNAME[1]}" >&4; }
     trap trace_line DEBUG
     for module in /usr/local/lib/rr/modules/*.sh; do source "$module"; done
-    nexus_install
+    rr_menu_run_writer nexus_install
   '
 unset panel_pass
 test "$(jq -r '.listen' /etc/rr-nexus/nexus.json)" = 127.0.0.1
