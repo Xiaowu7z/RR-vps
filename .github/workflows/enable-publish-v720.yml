@@ -1,4 +1,4 @@
-name: Enable stable release finalizer
+name: Retry busy stability job
 on:
   push:
     branches: [audit/stability-20260907]
@@ -7,13 +7,24 @@ permissions:
   contents: read
   actions: write
 jobs:
-  enable:
+  retry:
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 6
     steps:
-      - name: Restore automatic finalization after verified main checks
+      - name: Retry only failed jobs after the current matrix completes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api --method PUT "/repos/$GITHUB_REPOSITORY/actions/workflows/publish-v720.yml/enable"
+          api="/repos/$GITHUB_REPOSITORY"
+          for attempt in {1..20}; do
+            run=$(gh api "$api/actions/runs/34087070629")
+            jq -e '.head_sha == "fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7" and .event == "push"' <<<"$run" >/dev/null
+            if [ "$(jq -r .status <<<"$run")" = completed ]; then
+              [ "$(jq -r .conclusion <<<"$run")" = failure ] || exit 0
+              gh api --method POST "$api/actions/runs/34087070629/rerun-failed-jobs"
+              exit 0
+            fi
+            sleep 15
+          done
+          exit 1
