@@ -1,0 +1,60 @@
+name: Read cross audit progress
+on:
+  push:
+    branches: [codex/cross-os-progress-20260908]
+permissions:
+  contents: read
+jobs:
+  progress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: A
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
+          - role: B
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
+          - role: C
+            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
+      - name: Read fixed-stage state without credentials
+        env:
+          HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
+          SSHPASS: ${{ secrets[format('RR_{0}_PASS', matrix.role)] }}
+          KEY: ${{ matrix.key }}
+          ROLE: ${{ matrix.role }}
+        run: |
+          set -euo pipefail
+          set +x
+          known="$RUNNER_TEMP/cross-progress-known"
+          (umask 077; printf '%s %s\n' "$HOST" "$KEY" > "$known")
+          sshpass -e ssh -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+            -o UserKnownHostsFile="$known" -o HostKeyAlgorithms=ssh-ed25519 \
+            -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+            -o ConnectTimeout=15 "root@$HOST" python3 - "$ROLE" <<'PY'
+          import json, pathlib, platform, subprocess, sys, time
+          assert platform.node() not in {'DMIT-4AcBKDwTCc','DMIT-8J8LiVPoNa'}
+          role=sys.argv[1]; assert role in 'ABC' and len(role)==1
+          run='cross-34176210216'
+          result={'role':role,'stage_files':[],'backup':None,'processes':{},'services':{}}
+          stage=pathlib.Path('/root/rr-cross-stage-'+run)/role
+          if stage.exists(): result['stage_files']=sorted(p.name for p in stage.iterdir())
+          state=pathlib.Path('/root/rr-cross-backup-'+run+'-'+role)/'state.json'
+          if state.is_file():
+              d=json.loads(state.read_text()); result['backup']={k:d.get(k) for k in ('phase','restored','restore_failures')}
+          log=stage/'install.log'
+          if log.is_file():
+              data=log.read_text(errors='replace')
+              result['install_log']={'bytes':log.stat().st_size,'age_seconds':int(time.time()-log.stat().st_mtime),'complete_marker':'模块化热更新完成' in data,'failure_marker':'[失败]' in data or 'STOP phase=' in data}
+          for p in pathlib.Path('/proc').glob('[0-9]*/cmdline'):
+              try: a=p.read_bytes().split(b'\0')
+              except OSError: continue
+              for marker in ('--sync-devices','install-core.sh','audit-cross-management.py','audit-cross-host.py'):
+                  if any(marker.encode() in v for v in a): result['processes'][marker]=result['processes'].get(marker,0)+1
+          for unit in ('sing-box','rr-nexus','nginx','argo-rr-health.timer'):
+              q=subprocess.run(['systemctl','is-active',unit],capture_output=True,text=True,timeout=10); result['services'][unit]=q.stdout.strip()
+          print('CROSS_PROGRESS '+json.dumps(result,sort_keys=True))
+          PY
