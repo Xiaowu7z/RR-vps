@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import platform
+import shutil
 import subprocess
 import sys
 
@@ -17,7 +18,10 @@ for line in Path('/etc/os-release').read_text().splitlines():
         os_release[k] = v.strip('"')
 assert (os_release['ID'], os_release['VERSION_ID']) == expected[role]
 def run(args):
-    p = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except FileNotFoundError:
+        return 127, 'not-installed'
     return p.returncode, p.stdout.strip()
 out = {'role': role, 'os': os_release['ID'], 'os_version': os_release['VERSION_ID'],
        'python': platform.python_version()}
@@ -34,5 +38,6 @@ for cert in Path('/etc/letsencrypt/live').glob('*/fullchain.pem'):
     status, detail = run(['openssl', 'x509', '-in', str(cert), '-noout', '-subject', '-enddate'])
     out['certificates'].append({'lineage': cert.parent.name, 'parsed': status == 0, 'detail': detail})
 out['nginx_test_ok'] = run(['nginx', '-t'])[0] == 0
+out['nginx_installed'] = shutil.which('nginx') is not None
 out['health'] = run(['curl', '-fsS', '--max-time', '5', 'http://127.0.0.1:7900/healthz'])[0] == 0
 print('CROSS_INVENTORY ' + json.dumps(out, ensure_ascii=False, sort_keys=True))

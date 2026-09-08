@@ -275,6 +275,7 @@ function showLogin() {
   if (totpSecret) totpSecret.textContent = "";
   clearInterval(state.refreshTimer);
   state.refreshTimer = null;
+  rsClearDetail();
   $("#console").classList.add("hidden");
   $("#login-screen").classList.remove("hidden");
 }
@@ -485,6 +486,7 @@ function renderServerPlan(plan, prefix = "") {
 
 async function saveServerPlan(event, remote = false) {
   event.preventDefault();
+  const context = remote ? rsDetailContext() : null;
   const prefix = remote ? "rs-" : "";
   const currentInput = $(`#${prefix}server-plan-current`);
   const currentUsed = Number(currentInput.value);
@@ -500,8 +502,10 @@ async function saveServerPlan(event, remote = false) {
   if (currentInput.value !== (currentInput.dataset.original || "")) payload.current_used_gb = currentUsed;
   try {
     const result = remote
-      ? await rsRemoteApi("PATCH", "/api/server/traffic-policy", payload)
+      ? await rsRemoteApi("PATCH", "/api/server/traffic-policy", payload, context)
       : await api("/api/server/traffic-policy", { method: "PATCH", body: payload });
+    if (remote && !rsDetailIsCurrent(context)) return;
+    if (remote) state.remotePlanApplied = ++state.remotePlanRequest;
     if (Object.prototype.hasOwnProperty.call(payload, "current_used_gb")) {
       currentInput.dataset.original = currentInput.value;
     }
@@ -513,6 +517,7 @@ async function saveServerPlan(event, remote = false) {
 }
 
 async function resetServerPlan(remote = false) {
+  const context = remote ? rsDetailContext() : null;
   const value = prompt("开始新的运营商计费周期。\n若运营商面板已经产生用量，可填写当前已用 GB；否则填 0：", "0");
   if (value === null) return;
   const initial = Number(value);
@@ -522,8 +527,10 @@ async function resetServerPlan(remote = false) {
   }
   try {
     const result = remote
-      ? await rsRemoteApi("POST", "/api/server/traffic-policy/reset", { initial_used_gb: initial })
+      ? await rsRemoteApi("POST", "/api/server/traffic-policy/reset", { initial_used_gb: initial }, context)
       : await api("/api/server/traffic-policy/reset", { method: "POST", body: { initial_used_gb: initial } });
+    if (remote && !rsDetailIsCurrent(context)) return;
+    if (remote) state.remotePlanApplied = ++state.remotePlanRequest;
     renderServerPlan(result.policy || {}, remote ? "rs-" : "");
     toast("新计费周期已经开始。");
   } catch (error) { toast(error.message, true); }
@@ -674,10 +681,12 @@ async function refreshLive(notify = false) {
 
 function openCreate(remote = false) {
   $("#device-form").reset();
+  $("#device-form").querySelector("button[type=submit]").disabled = false;
   $("#device-org-fields").classList.toggle("hidden", remote);
   $("#device-form-group").disabled = remote;
   $("#device-form-template").disabled = remote;
   $("#device-dialog").dataset.remote = remote ? "1" : "0";
+  $("#device-dialog").remoteContext = remote ? rsDetailContext() : null;
   $("#device-dialog h2").textContent = remote ? "远程添加设备" : "添加设备";
   $("#device-form-error").textContent = "";
   $("#device-dialog").showModal();
@@ -688,6 +697,9 @@ async function createDevice(event) {
   const form = event.currentTarget;
   const submit = form.querySelector("button[type=submit]");
   const values = new FormData(form);
+  const dialog = $("#device-dialog");
+  const remote = dialog.dataset.remote === "1";
+  const context = dialog.remoteContext;
   submit.disabled = true;
   $("#device-form-error").textContent = "";
   try {
@@ -701,18 +713,19 @@ async function createDevice(event) {
       template_id: values.get("template_id") || null,
       template_values_applied: Boolean(values.get("template_id")),
     };
-    const remote = $("#device-dialog").dataset.remote === "1";
-    if (remote) await rsRemoteApi("POST", "/api/devices", payload);
+    if (remote) await rsRemoteApi("POST", "/api/devices", payload, context);
     else await api("/api/devices", { method: "POST", body: payload });
-    $("#device-dialog").close();
-    if (remote) await rsLoadDevices();
+    if (remote && (dialog.remoteContext !== context || !rsDetailIsCurrent(context))) return;
+    dialog.close();
+    if (remote) await rsLoadDevices(context);
     else {
       await refreshLive();
       await window.RRAdmin?.loadOrganization?.();
     }
+    if (remote && (dialog.remoteContext !== context || !rsDetailIsCurrent(context))) return;
     toast(remote ? "远程设备已创建，副服务器正在同步。" : "设备已创建，节点配置正在后台同步（不影响现有用户在线）。");
-  } catch (error) { $("#device-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message; }
-  finally { submit.disabled = false; }
+  } catch (error) { if (remote && dialog.remoteContext !== context) return; $("#device-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message; }
+  finally { if (!remote || dialog.remoteContext === context) submit.disabled = false; }
 }
 
 async function toggleDevice(device) {
@@ -727,8 +740,10 @@ function openRenameDialog(device, remote = false) {
   const dialog = $("#rename-dialog");
   dialog.dataset.deviceId = device.id;
   dialog.dataset.remote = remote ? "1" : "0";
+  dialog.remoteContext = remote ? rsDetailContext() : null;
   $("#rename-input").value = device.name || "";
   $("#rename-form-error").textContent = "";
+  $("#rename-submit").disabled = false;
   dialog.showModal();
   requestAnimationFrame(() => $("#rename-input").focus());
 }
@@ -737,6 +752,8 @@ async function submitRename(event) {
   event.preventDefault();
   const dialog = $("#rename-dialog");
   const deviceId = dialog.dataset.deviceId || "";
+  const remote = dialog.dataset.remote === "1";
+  const context = dialog.remoteContext;
   const name = $("#rename-input").value.trim();
   if (!deviceId || !name) {
     $("#rename-form-error").textContent = "设备备注不能为空。";
@@ -746,19 +763,21 @@ async function submitRename(event) {
   submit.disabled = true;
   $("#rename-form-error").textContent = "";
   try {
-    if (dialog.dataset.remote === "1") {
-      await rsRemoteApi("PATCH", `/api/devices/${deviceId}`, { name });
-      await rsLoadDevices();
+    if (remote) {
+      await rsRemoteApi("PATCH", `/api/devices/${deviceId}`, { name }, context);
+      await rsLoadDevices(context);
     } else {
       await api(`/api/devices/${deviceId}`, { method: "PATCH", body: { name } });
       await loadDevices(false);
       await loadTraffic(false);
     }
+    if (remote && (dialog.remoteContext !== context || !rsDetailIsCurrent(context))) return;
     dialog.close();
     toast("设备备注已保存，不影响订阅和节点名称。");
   } catch (error) {
+    if (remote && dialog.remoteContext !== context) return;
     $("#rename-form-error").textContent = error.message || "备注保存失败。";
-  } finally { submit.disabled = false; }
+  } finally { if (!remote || dialog.remoteContext === context) submit.disabled = false; }
 }
 
 async function resetDevice(device) {
@@ -777,6 +796,8 @@ async function submitReset(event) {
   event.preventDefault();
   const dialog = $("#reset-dialog");
   const deviceId = dialog.dataset.deviceId;
+  const remote = dialog.dataset.remote === "1";
+  const context = dialog.remoteContext;
   if (!deviceId) return;
   const submit = $("#reset-submit");
   const value = $("#reset-quota-input").value;
@@ -797,21 +818,25 @@ async function submitReset(event) {
       expires_at: $("#reset-expiry-input").value || "",
     };
     if (quotaGb !== null) body.quota_gb = quotaGb;
-    const remote = dialog.dataset.remote === "1";
-    if (remote) await rsRemoteApi("POST", `/api/devices/${deviceId}/reset`, body);
+    if (remote) await rsRemoteApi("POST", `/api/devices/${deviceId}/reset`, body, context);
     else await api(`/api/devices/${deviceId}/reset`, { method: "POST", body });
+    if (remote && (dialog.remoteContext !== context || !rsDetailIsCurrent(context))) return;
     dialog.close();
-    if (remote) await rsLoadDevices();
+    if (remote) await rsLoadDevices(context);
     else await refreshLive();
+    if (remote && (dialog.remoteContext !== context || !rsDetailIsCurrent(context))) return;
     toast(remote ? "副服务器设备流量及计划已更新。" : "流量已重置，设备恢复可用。");
   } catch (error) {
+    if (remote && dialog.remoteContext !== context) return;
     $("#reset-form-error").textContent = error.detail ? `${error.message} ${error.detail}` : error.message;
-  } finally { submit.disabled = false; }
+  } finally { if (!remote || dialog.remoteContext === context) submit.disabled = false; }
 }
 
 function openResetDialog(device, remote = false) {
+  $("#reset-submit").disabled = false;
   $("#reset-dialog").dataset.deviceId = device.id;
   $("#reset-dialog").dataset.remote = remote ? "1" : "0";
+  $("#reset-dialog").remoteContext = remote ? rsDetailContext() : null;
   resetDevice(device);
 }
 
@@ -1226,9 +1251,38 @@ new MutationObserver(mutations => {
 }).observe(document.body, { childList: true, subtree: true });
 state._rsPrevTraffic = {};
 state.remoteTimer = null;
+state.remoteEpoch = 0;
+state.remoteListRequest = 0;
+state.remoteListApplied = 0;
+state.remoteStatusApplied = 0;
+state.remoteDevicesRequest = 0;
+state.remoteDevicesApplied = 0;
+state.remotePlanRequest = 0;
+state.remotePlanApplied = 0;
 
-function rsRemoteApi(method, path, body) {
-  return api("/api/remote/proxy", { method: "POST", body: { server_id: state.remoteActive, method, path, body } });
+function rsDetailContext() {
+  return { serverId: state.remoteActive, epoch: state.remoteEpoch, authEpoch: state.authEpoch };
+}
+
+function rsDetailIsCurrent(context) {
+  return Boolean(context?.serverId) && context.serverId === state.remoteActive
+    && context.epoch === state.remoteEpoch && context.authEpoch === state.authEpoch;
+}
+
+async function rsRemoteApi(method, path, body, context = rsDetailContext()) {
+  if (!rsDetailIsCurrent(context)) throw new Error("远程服务器已切换，请在当前服务器重新操作。");
+  return api("/api/remote/proxy", { method: "POST", body: { server_id: context.serverId, method, path, body } });
+}
+
+function rsClearDetail() {
+  if (state.remoteTimer) clearInterval(state.remoteTimer);
+  state.remoteTimer = null;
+  state.remoteEpoch += 1;
+  state.remoteActive = null;
+  state.remoteDevices = [];
+  state._rsPrevTraffic = {};
+  $("#rs-detail").classList.add("hidden");
+  $("#view-remote .section-toolbar").classList.remove("hidden");
 }
 
 function rsServerById(id) {
@@ -1236,8 +1290,13 @@ function rsServerById(id) {
 }
 
 async function loadRemoteServers() {
+  const request = ++state.remoteListRequest;
+  const authEpoch = state.authEpoch, epoch = state.remoteEpoch;
+  const current = () => !state.remoteActive && authEpoch === state.authEpoch && epoch === state.remoteEpoch;
   try {
     const list = await api("/api/remote-servers");
+    if (!current() || request < state.remoteListApplied) return;
+    state.remoteListApplied = request;
     state.remoteServers = list.servers || [];
     const empty = state.remoteServers.length === 0;
     $("#rs-empty").classList.toggle("hidden", !empty);
@@ -1245,9 +1304,19 @@ async function loadRemoteServers() {
     if (empty) return;
     try {
       const st = await api("/api/remote-servers/status", { method: "POST", body: {} });
-      renderRemoteServers(st.servers || []);
-    } catch (e) { renderRemoteServers(state.remoteServers.map(s => ({ ...s, online: false, ping: 0 }))); }
-  } catch (e) { toast(e.message, true); }
+      if (!current() || request < state.remoteStatusApplied) return;
+      state.remoteStatusApplied = request;
+      // Slow status calls remain useful while a newer poll is in flight. Use
+      // the latest membership/names so older replies cannot undo remove/rename.
+      const statuses = new Map((st.servers || []).map(server => [String(server.id), server]));
+      renderRemoteServers(state.remoteServers.map(server => ({ ...server, ...statuses.get(String(server.id)), id: server.id, name: server.name, addr: server.addr })));
+    } catch (e) {
+      if (current() && request >= state.remoteStatusApplied) {
+        state.remoteStatusApplied = request;
+        renderRemoteServers(state.remoteServers.map(server => ({ ...server, online: false, ping: 0 })));
+      }
+    }
+  } catch (e) { if (current() && request >= state.remoteListApplied) toast(e.message, true); }
 }
 
 function renderRemoteServers(servers) {
@@ -1310,12 +1379,14 @@ async function rsRenameServer(id) {
 }
 
 async function rsCheckUpdate() {
-  if (!state.remoteActive) return;
+  const context = rsDetailContext();
+  if (!rsDetailIsCurrent(context)) return;
   const box = $("#rs-update-box");
   box.classList.remove("hidden");
   box.innerHTML = `<div class="rs-update-row"><span>⏳ 正在检查远程版本…</span></div>`;
   try {
-    const r = await rsRemoteApi("POST", "/api/update/check", {});
+    const r = await rsRemoteApi("POST", "/api/update/check", {}, context);
+    if (!rsDetailIsCurrent(context)) return;
     if (r.error) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ ${escapeHtml(r.message || r.error)}</span></div>`; return; }
     if (r.manifest_checked === false) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ 检查失败：无法连接更新源，请稍后重试</span></div>`; return; }
     const cur = r.current || "未知";
@@ -1327,28 +1398,33 @@ async function rsCheckUpdate() {
       box.innerHTML = `<div class="rs-update-row ok"><span>✅ 已是最新版本（v${escapeHtml(cur)}）</span></div>`;
     }
   } catch (e) {
+    if (!rsDetailIsCurrent(context)) return;
     box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ 检查失败：${escapeHtml(e.message)}</span></div>`;
   }
 }
 
 async function rsRunUpdate() {
-  if (!state.remoteActive) return;
+  const context = rsDetailContext();
+  if (!rsDetailIsCurrent(context)) return;
   if (!confirm("确认远程升级这台服务器吗？\n\n升级过程约 1-3 分钟：下载校验新版本 → 原子替换 → 自动重启节点服务与面板。全程不需要你登录该服务器。")) return;
   const box = $("#rs-update-box");
   box.innerHTML = `<div class="rs-update-row"><span>🚀 已下发升级任务，正在执行…</span></div>`;
   try {
-    const run = await rsRemoteApi("POST", "/api/update/run", {});
+    const run = await rsRemoteApi("POST", "/api/update/run", {}, context);
+    if (!rsDetailIsCurrent(context)) return;
     if (!run.started) { box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ ${escapeHtml(run.message || "升级任务未启动")}</span></div>`; return; }
     // 轮询状态（升级中副面板会重启，请求失败=仍在升级）
     for (let i = 0; i < 72; i++) {
       await sleep(5000);
+      if (!rsDetailIsCurrent(context)) return;
       try {
-        const st = await rsRemoteApi("POST", "/api/update/status", {});
+        const st = await rsRemoteApi("POST", "/api/update/status", {}, context);
+        if (!rsDetailIsCurrent(context)) return;
         if (st.state === "done") {
           box.innerHTML = `<div class="rs-update-row ok"><span>✅ ${escapeHtml(st.detail || "升级完成")}。正在刷新状态…</span></div>`;
           toast("远程升级完成，副面板已自动切换到新版本");
           await sleep(3000);
-          rsOpenDetail(state.remoteActive);
+          if (rsDetailIsCurrent(context)) rsOpenDetail(context.serverId);
           return;
         }
         if (st.state === "failed") {
@@ -1365,8 +1441,10 @@ async function rsRunUpdate() {
         }
       } catch (e) { /* 副面板重启中，连接失败属预期 */ }
     }
+    if (!rsDetailIsCurrent(context)) return;
     box.innerHTML = `<div class="rs-update-row warn"><span>⚠️ 升级超过 6 分钟仍在进行，请稍后点「检查更新」查看版本确认结果</span></div>`;
   } catch (e) {
+    if (!rsDetailIsCurrent(context)) return;
     box.innerHTML = `<div class="rs-update-row warn"><span>❌ 下发失败：${escapeHtml(e.message)}</span></div>`;
   }
 }
@@ -1465,7 +1543,9 @@ async function rsDeleteServer(id) {
 async function rsOpenDetail(id) {
   const server = rsServerById(id);
   if (!server) return;
+  rsClearDetail();
   state.remoteActive = id;
+  const context = rsDetailContext();
   $("#view-remote .section-toolbar").classList.add("hidden");
   $("#rs-grid").classList.add("hidden");
   $("#rs-empty").classList.add("hidden");
@@ -1473,49 +1553,61 @@ async function rsOpenDetail(id) {
   $("#rs-detail-title").textContent = server.name;
   $("#rs-detail-sub").textContent = `${server.addr} · 远程管理（副面板全权限）`;
   $("#rs-update-box").classList.add("hidden");
-  await Promise.all([rsLoadDevices(), rsLoadServerPlan()]);
-  if (state.remoteTimer) clearInterval(state.remoteTimer);
+  renderRemoteDevices([]);
+  renderServerPlan({}, "rs-");
+  $$("#rs-server-traffic-form input, #rs-server-traffic-form select, #rs-server-traffic-form button").forEach(input => { input.disabled = true; });
+  await Promise.all([rsLoadDevices(context), rsLoadServerPlan(true, context)]);
+  if (!rsDetailIsCurrent(context)) return;
   state.remoteTimer = setInterval(() => {
-    rsLoadDevices();
-    rsLoadServerPlan(false);
+    if (!rsDetailIsCurrent(context) || document.hidden || !state.csrf) return;
+    rsLoadDevices(context);
+    rsLoadServerPlan(false, context);
   }, 3000);
 }
 
 function rsBack() {
-  if (state.remoteTimer) { clearInterval(state.remoteTimer); state.remoteTimer = null; }
-  state._rsPrevTraffic = {};
-  state.remoteActive = null;
-  $("#rs-detail").classList.add("hidden");
-  $("#view-remote .section-toolbar").classList.remove("hidden");
+  rsClearDetail();
   loadRemoteServers();
 }
 
-async function rsLoadDevices() {
+async function rsLoadDevices(context = rsDetailContext()) {
+  if (!rsDetailIsCurrent(context)) return;
+  const request = ++state.remoteDevicesRequest;
   try {
-    const data = await rsRemoteApi("GET", "/api/devices");
+    const data = await rsRemoteApi("GET", "/api/devices", undefined, context);
+    if (!rsDetailIsCurrent(context) || request < state.remoteDevicesApplied) return;
+    state.remoteDevicesApplied = request;
     state.remoteDevices = data.devices || [];
-    renderRemoteDevices(data.devices || []);
-  } catch (e) { toast(e.message, true); }
+    renderRemoteDevices(state.remoteDevices);
+  } catch (e) { if (rsDetailIsCurrent(context) && request >= state.remoteDevicesApplied) toast(e.message, true); }
 }
 
-async function rsLoadServerPlan(notify = true) {
-  if (!state.remoteActive) return;
+async function rsLoadServerPlan(notify = true, context = rsDetailContext()) {
+  if (!rsDetailIsCurrent(context)) return;
+  const request = ++state.remotePlanRequest;
   try {
-    const data = await rsRemoteApi("GET", "/api/server/traffic-policy", {});
+    const data = await rsRemoteApi("GET", "/api/server/traffic-policy", {}, context);
+    if (!rsDetailIsCurrent(context) || request < state.remotePlanApplied) return;
+    state.remotePlanApplied = request;
     renderServerPlan(data.policy || {}, "rs-");
-  } catch (error) { if (notify) toast(error.message, true); }
+    $$("#rs-server-traffic-form input, #rs-server-traffic-form select, #rs-server-traffic-form button").forEach(input => { input.disabled = false; });
+  } catch (error) { if (notify && rsDetailIsCurrent(context) && request >= state.remotePlanApplied) toast(error.message, true); }
 }
 
 function renderRemoteDevices(devices) {
   const grid = $("#rs-device-grid");
   $("#rs-device-empty").classList.toggle("hidden", devices.length > 0);
   grid.classList.toggle("hidden", devices.length === 0);
+  const nowTs = Date.now();
+  const ids = new Set(devices.map(device => String(device.id)));
+  Object.keys(state._rsPrevTraffic).forEach(id => { if (!ids.has(id)) delete state._rsPrevTraffic[id]; });
   grid.innerHTML = devices.map(device => {
+    const rate = rsRatesOf(device, nowTs);
     const quota = Number(device.quota_bytes || 0);
     const used = Number(device.used_bytes || 0);
     const percent = quota ? Math.min(100, used / quota * 100) : 0;
     const enabled = device.enabled === 1 || device.enabled === true;
-    const active = device.active === true || device.active === 1 || enabled;
+    const active = device.active === true || device.active === 1;
     const quotaLabel = quota ? `${formatBytes(used)} / ${formatBytes(quota)}` : `${formatBytes(used)} · 不限`;
     const expiry = device.expires_at || "长期有效";
     const resetPlan = device.next_reset_at
@@ -1526,7 +1618,7 @@ function renderRemoteDevices(devices) {
       <div class="device-top"><span class="device-avatar">◇</span><span class="status-pill ${active ? "" : "off"}"><i></i>${statusLabel(device)}</span></div>
       <h3 class="device-name">${escapeHtml(device.name)}</h3><span class="device-id">${escapeHtml(device.id)}</span>
       <div class="device-traffic"><div><small>上传</small><b>↑ ${formatBytes(device.uploaded_bytes)}</b></div><div><small>下载</small><b>↓ ${formatBytes(device.downloaded_bytes)}</b></div><div class="traffic-total"><small>总流量</small><b>${formatBytes(used)}</b></div></div>
-      <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rsRateOf(device.id, device.uploaded_bytes))}</span><span class="r-down">↓ ${formatRate(rsRateOf(device.id, device.downloaded_bytes, true))}</span></div>
+      <div class="device-rate"><small>实时速率</small><span class="r-up">↑ ${formatRate(rate.up)}</span><span class="r-down">↓ ${formatRate(rate.down)}</span></div>
       <div class="quota-block"><div><small>${quota ? "流量额度" : "流量额度不限"}</small><span>${quotaLabel}</span></div>${quota ? `<div class="quota-track"><i data-w="${percent.toFixed(1)}"></i></div>` : ""}</div>
       <div class="device-meta"><span><small>到期时间</small><b>${escapeHtml(expiry)}</b></span><span><small>自动重置</small><b>${escapeHtml(resetPlan)}</b></span></div>
       <div class="device-actions">
@@ -1549,6 +1641,7 @@ function renderRemoteDevices(devices) {
 }
 
 async function rsOpenLinks(id) {
+  const context = rsDetailContext();
   const device = (state.remoteDevices || []).find(d => String(d.id) === String(id));
   if (!device) { toast("未找到该设备，请刷新重试", true); return; }
   const generation = ++linksDialogGeneration;
@@ -1559,13 +1652,13 @@ async function rsOpenLinks(id) {
   list.innerHTML = '<p class="form-hint">正在生成…</p>';
   dialog.showModal();
   try {
-    const data = await rsRemoteApi("GET", `/api/devices/${id}/links`);
-    if (generation !== linksDialogGeneration || !dialog.open) return;
+    const data = await rsRemoteApi("GET", `/api/devices/${id}/links`, undefined, context);
+    if (generation !== linksDialogGeneration || !dialog.open || !rsDetailIsCurrent(context)) return;
     const box = $("#subscription-box");
     const urls = data.subscription_urls || [];
     box.classList.remove("hidden");
     $("#subscription-empty").classList.toggle("hidden", urls.length !== 0);
-    const qrUrlOf = (params) => `/api/remote/qr?server_id=${state.remoteActive}&device_id=${encodeURIComponent(id)}&${params}`;
+    const qrUrlOf = (params) => `/api/remote/qr?server_id=${encodeURIComponent(context.serverId)}&device_id=${encodeURIComponent(id)}&${params}`;
     $("#subscription-urls").innerHTML = urls.map((item, index) => {
       const qrUrl = qrUrlOf(`sub_index=${index}`);
       return `<div class="sub-url-row"><b>${escapeHtml(item.format)}</b><small>${escapeHtml(item.name)}</small><code>${escapeHtml(item.url)}</code><img class="sub-qr" data-auth-src="${escapeHtml(qrUrl)}" alt="订阅二维码"><button class="copy-button" data-copy-sub-url="${escapeHtml(item.url)}">复制</button><button class="copy-button" data-remote-open-sub-qr="${encodeURIComponent(qrUrl)}">打开二维码</button></div>`;
@@ -1579,33 +1672,35 @@ async function rsOpenLinks(id) {
     list.dataset.device = id;
     list.dataset.remote = "1";
   } catch (error) {
-    if (generation === linksDialogGeneration && dialog.open) {
+    if (generation === linksDialogGeneration && dialog.open && rsDetailIsCurrent(context)) {
       list.innerHTML = `<p class="form-error">${escapeHtml(error.message)}</p>`;
     }
   }
 }
 
-function rsRateOf(id, bytes, isDown) {
-  // 远程设备实时速率：与 local 面板同款差分算法，独立命名空间
-  const nowTs = Date.now();
-  const prev = (state._rsPrevTraffic[id] || { up: 0, down: 0, ts: nowTs - 3000 });
-  const elapsed = Math.max(1, (nowTs - prev.ts) / 1000);
-  const rate = Math.max(0, ((bytes || 0) - (isDown ? prev.down : prev.up)) / elapsed);
-  if (isDown) state._rsPrevTraffic[id] = { up: prev.up, down: bytes || 0, ts: nowTs };
-  else state._rsPrevTraffic[id] = { up: bytes || 0, down: prev.down, ts: nowTs };
-  return rate;
+function rsRatesOf(device, nowTs) {
+  // One sample updates both counters and their shared timestamp together.
+  // The first sample (including after switching servers) is only a baseline.
+  const current = { up: Number(device.uploaded_bytes || 0), down: Number(device.downloaded_bytes || 0), ts: nowTs };
+  const prev = state._rsPrevTraffic[device.id];
+  state._rsPrevTraffic[device.id] = current;
+  if (!prev || nowTs <= prev.ts) return { up: 0, down: 0 };
+  const elapsed = (nowTs - prev.ts) / 1000;
+  return { up: Math.max(0, (current.up - prev.up) / elapsed), down: Math.max(0, (current.down - prev.down) / elapsed) };
 }
 
 async function rsToggleDevice(id) {
+  const context = rsDetailContext();
   const device = (state.remoteDevices || []).find(d => String(d.id) === String(id));
   if (!device) { toast("未找到该设备，请刷新重试", true); return; }
   const enabled = device.enabled === 1 || device.enabled === true;
   try {
-    await rsRemoteApi("PATCH", `/api/devices/${id}`, { enabled: !enabled });
+    await rsRemoteApi("PATCH", `/api/devices/${id}`, { enabled: !enabled }, context);
+    if (!rsDetailIsCurrent(context)) return;
     toast(enabled ? "设备已停用（断网）" : "设备已启用");
     delete state._rsPrevTraffic[id];
-    rsLoadDevices();
-  } catch (e) { toast(e.message, true); }
+    await rsLoadDevices(context);
+  } catch (e) { if (rsDetailIsCurrent(context)) toast(e.message, true); }
 }
 
 async function rsResetDevice(id) {
@@ -1615,13 +1710,15 @@ async function rsResetDevice(id) {
 }
 
 async function rsDeleteDevice(id) {
-  const name = $(`[data-rs-dev="${id}"] b`)?.textContent || id;
+  const context = rsDetailContext();
+  const name = (state.remoteDevices || []).find(device => String(device.id) === String(id))?.name || id;
   if (!confirm(`确定删除设备「${name}」吗？其订阅将立即失效。`)) return;
   try {
-    await rsRemoteApi("DELETE", `/api/devices/${id}`);
+    await rsRemoteApi("DELETE", `/api/devices/${id}`, undefined, context);
+    if (!rsDetailIsCurrent(context)) return;
     toast("设备已删除");
-    rsLoadDevices();
-  } catch (e) { toast(e.message, true); }
+    await rsLoadDevices(context);
+  } catch (e) { if (rsDetailIsCurrent(context)) toast(e.message, true); }
 }
 
 async function rsCreateDevice() {

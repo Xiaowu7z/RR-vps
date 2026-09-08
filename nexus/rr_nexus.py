@@ -4266,11 +4266,36 @@ class Handler(BaseHTTPRequestHandler):
         if status != 200 or not isinstance(result, dict) or result.get("error"):
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "cred_rejected", "message": "副面板拒绝该钥匙：{}".format((result or {}).get("message") or (result or {}).get("error") or "HTTP {}".format(status))})
             return
+        rejection = None
         with STATE.store.connect() as db:
-            db.execute(
-                "INSERT INTO remote_servers(name,cred,addr,port,last_seen,created_at) VALUES(?,?,?,?,?,?)",
-                (name[:64], cred, addr[:128], port, utc_now(), utc_now()),
-            )
+            # Network verification above must not hold a SQLite writer lock.
+            # Recheck its potentially stale preflight after reserving the
+            # writer: concurrent controllers cannot duplicate a target or
+            # consume the same final capacity slot.
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute(
+                "SELECT id FROM remote_servers WHERE addr=? AND port=?",
+                (addr, port),
+            ).fetchone()
+            count = db.execute("SELECT COUNT(*) FROM remote_servers").fetchone()
+            if exists:
+                rejection = (
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": "already_exists", "message": "该服务器已添加（{}），请勿重复添加".format(addr), "server_id": exists["id"]},
+                )
+            elif int(count[0]) >= REMOTE_MAX_SERVERS:
+                rejection = (
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "limit_reached", "message": "已达上限 {} 台".format(REMOTE_MAX_SERVERS)},
+                )
+            else:
+                db.execute(
+                    "INSERT INTO remote_servers(name,cred,addr,port,last_seen,created_at) VALUES(?,?,?,?,?,?)",
+                    (name[:64], cred, addr, port, utc_now(), utc_now()),
+                )
+        if rejection is not None:
+            self.send_json(*rejection)
+            return
         STATE.store.audit(session["username"], "remote_server_add", name[:64], self.remote_ip, addr)
         self.send_json(HTTPStatus.OK, {"ok": True, "verified": True})
 
