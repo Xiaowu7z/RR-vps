@@ -3652,7 +3652,7 @@ grep -Fq '当前没有可用的个人订阅地址。' nexus/static/index.html
 grep -Fq '公网 IP 模式还必须确保 TCP/80 可从公网访问' nexus/static/index.html
 grep -Fq '$("#public-guide").classList.toggle("hidden", !isPublic)' nexus/static/app.js
 ! grep -Fq '$("#public-guide").classList.remove("hidden")' nexus/static/app.js
-grep -Fq '/app.js?v=27' nexus/static/index.html
+grep -Fq '/app.js?v=28' nexus/static/index.html
 grep -Fq '/admin.js?v=4' nexus/static/index.html
 if grep -Fq '?raw=' nexus/static/app.js || \
    grep -Fq 'qr_query["raw"]' nexus/rr_nexus.py; then

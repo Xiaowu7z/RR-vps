@@ -6165,6 +6165,47 @@ stop_subscription_servers() {
 # ==========================================
 # 面板防火墙辅助（rr --fw-* 子命令，端口白名单内操作）
 # ==========================================
+rr_ssh_protected_ports() {
+    # 同时保护实际监听、socket activation、当前连接与 sshd 配置的端口。
+    # 只读取明确属于 SSH 的证据；不能将其他 systemd socket 当作 SSH。
+    local ports="" peer_ip="" peer_port="" server_ip="" server_port="" extra=""
+    ports=$(
+        {
+            printf '%s\n' "${SSH_PORT:-}"
+            if [ -n "${SSH_CONNECTION:-}" ]; then
+                read -r peer_ip peer_port server_ip server_port extra <<< "$SSH_CONNECTION"
+                [ -n "$peer_ip" ] && [ -n "$peer_port" ] && [ -n "$server_ip" ] && \
+                    [ -z "$extra" ] && printf '%s\n' "$server_port"
+            fi
+            ss -H -lntp 2>/dev/null | awk '
+                /users:/ && /\("sshd(-session|-auth)?",/ {
+                    port=$4; sub(/^.*:/, "", port); print port
+                }' || true
+            systemctl show ssh.socket sshd.socket -p Listen --value --no-pager \
+                2>/dev/null | awk '
+                {
+                    for (i=1; i<NF; i++) if ($(i+1) == "(Stream)") {
+                        port=$i; sub(/^.*:/, "", port); print port
+                    }
+                }' || true
+            sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' || true
+        } | awk '/^[0-9]+$/ && $0 + 0 >= 1 && $0 + 0 <= 65535 { print $0 + 0 }' | sort -nu
+    )
+    if [ -n "$ports" ]; then
+        printf '%s\n' "$ports"
+    else
+        printf '%s\n' 22
+    fi
+}
+
+rr_port_is_ssh_protected() {
+    local port="$1" ssh_port=""
+    while IFS= read -r ssh_port; do
+        [ "$ssh_port" = "$port" ] && return 0
+    done < <(rr_ssh_protected_ports)
+    return 1
+}
+
 nexus_fw_known_ports() {
     # 输出白名单端口清单："port:proto:name" 每行
     load_config_with_defaults || return 1
@@ -6179,7 +6220,10 @@ nexus_fw_known_ports() {
     fi
     [ "$VM_ENABLED" = "true" ] && [ "$VM_TLS_ENABLED" = "true" ] && [ "$PORT" != "0" ] && echo "${PORT}:tcp:VMess-TLS 直连节点"
     [ "${SUB_PORT:-0}" != "0" ] && echo "${SUB_PORT}:tcp:订阅服务"
-    [ -n "${SSH_PORT:-22}" ] && echo "${SSH_PORT}:tcp:SSH 管理端口（保护）"
+    local ssh_port=""
+    while IFS= read -r ssh_port; do
+        printf '%s:tcp:SSH 管理端口（保护）\n' "$ssh_port"
+    done < <(rr_ssh_protected_ports)
     if [ -f /etc/rr-nexus/nexus.json ]; then
         local panel_port=""
         panel_port=$(jq -r '.public_port // .port // empty' /etc/rr-nexus/nexus.json 2>/dev/null)
@@ -6189,40 +6233,84 @@ nexus_fw_known_ports() {
 }
 
 nexus_fw_port_open() {
-    # $1=port $2=proto；0=放行 1=关闭
-    # 真实状态：端口实际被监听（节点协议已开启）即视为放行；
-    # 防火墙 ACCEPT 规则存在也算放行（任一满足）
-    case "$2" in
-        tcp) ss -H -ltn "sport = :$1" 2>/dev/null | grep -q LISTEN && return 0 ;;
-        udp) ss -H -lun "sport = :$1" 2>/dev/null | grep -qE "UNCONN|ESTAB" && return 0 ;;
-    esac
-    iptables -C INPUT -p "$2" --dport "$1" -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT >/dev/null 2>&1
+    # RR 受管规则状态，不代表监听状态或整条公网防火墙路径可达。
+    # 0=open，1=closed，2=indeterminate，3=unmanaged。
+    # 必须按现有写事务的 authority 查询全部受管平面及启用的 IP 协议族；
+    # 部分规则、相互冲突或查询失败不能冒充“关闭”并触发一次反向写入。
+    local port="$1" proto="$2" mode="" backend="" state=0
+    local allow=0 deny=0 allow_any=0 deny_any=0 result=-1 current=0
+    is_valid_port "$port" || return 2
+    case "$proto" in tcp|udp) ;; *) return 2 ;; esac
+    rr_firewall_filter_authority_mode mode || return 2
+    if [ "$mode" = ufw ] || [ "$mode" = dual ]; then
+        if rr_ufw_rule_state "$port" "$proto" ALLOW "$FIREWALL_COMMENT"; then allow=0; else allow=$?; fi
+        if rr_ufw_rule_state "$port" "$proto" DENY "$FIREWALL_BLOCK_COMMENT"; then deny=0; else deny=$?; fi
+        if rr_ufw_rule_state "$port" "$proto" ALLOW "$FIREWALL_COMMENT" any; then allow_any=0; else allow_any=$?; fi
+        if rr_ufw_rule_state "$port" "$proto" DENY "$FIREWALL_BLOCK_COMMENT" any; then deny_any=0; else deny_any=$?; fi
+        case "$allow:$deny:$allow_any:$deny_any" in
+            0:1:0:1) result=0 ;;
+            1:0:1:0) result=1 ;;
+            1:1:1:1) result=3 ;;
+            *) return 2 ;;
+        esac
+    fi
+    if [ "$mode" = netfilter ] || [ "$mode" = dual ]; then
+        for backend in iptables ip6tables; do
+            if rr_netfilter_backend_state "$backend"; then state=0; else state=$?; fi
+            case "$state" in
+                0) ;;
+                1) continue ;; # authority 已证明缺失的 IPv6 平面在内核禁用。
+                *) return 2 ;;
+            esac
+            if rr_netfilter_rule_state "$backend" "$port" "$proto" "$FIREWALL_COMMENT" ACCEPT; then allow=0; else allow=$?; fi
+            if rr_netfilter_rule_state "$backend" "$port" "$proto" "$FIREWALL_BLOCK_COMMENT" DROP; then deny=0; else deny=$?; fi
+            case "$allow:$deny" in
+                0:1) current=0 ;;
+                1:0) current=1 ;;
+                1:1) current=3 ;;
+                *) return 2 ;;
+            esac
+            if [ "$result" -eq -1 ]; then
+                result="$current"
+            elif [ "$result" -ne "$current" ]; then
+                return 2
+            fi
+        done
+    fi
+    [ "$result" -ge 0 ] || return 2
+    return "$result"
 }
 
 nexus_fw_ports_json() {
-    # 输出 JSON：白名单端口 + 状态
-    local line="" port="" proto="" name="" open="0"
+    # open 保留 1/0 兼容值；缺少或无法判定受管规则时为 null，不推断公网可达性。
+    local port="" proto="" name="" open="null" state=0 managed_state=""
     local first=true
     printf '['
     while IFS=: read -r port proto name; do
         [ -n "$port" ] || continue
-        nexus_fw_port_open "$port" "$proto" && open="1" || open="0"
+        if nexus_fw_port_open "$port" "$proto"; then state=0; else state=$?; fi
+        case "$state" in
+            0) open=1; managed_state=open ;;
+            1) open=0; managed_state=closed ;;
+            3) open=null; managed_state=unmanaged ;;
+            *) open=null; managed_state=indeterminate ;;
+        esac
         [ "$first" = true ] && first=false || printf ','
-        printf '{"port":%s,"proto":"%s","name":"%s","open":%s}' "$port" "$proto" "$name" "$open"
+        printf '{"port":%s,"proto":"%s","name":"%s","open":%s,"managed_state":"%s"}' \
+            "$port" "$proto" "$name" "$open" "$managed_state"
     done < <(nexus_fw_known_ports)
-    printf ']
-'
+    printf ']\n'
 }
 
 nexus_fw_toggle() {
     # $1=port $2=proto；只允许白名单内端口；SSH 端口受保护不可关
-    local port="$1" proto="$2" firewall_status=0
+    local port="$1" proto="$2" firewall_status=0 port_state=0
     if rr_firewall_fail_closed_quarantine_active; then
         echo '{"ok":false,"error":"firewall_quarantine_active"}'
         return 1
     fi
     is_valid_port "$port" || { echo '{"ok":false,"error":"invalid_port"}'; return 1; }
-    if [ "$port" = "${SSH_PORT:-22}" ] && [ "$proto" = "tcp" ]; then
+    if [ "$proto" = tcp ] && rr_port_is_ssh_protected "$port"; then
         echo '{"ok":false,"error":"ssh_port_protected"}'
         return 1
     fi
@@ -6233,7 +6321,15 @@ nexus_fw_toggle() {
         [ "$p" = "$port" ] && [ "$pr" = "$proto" ] && allowed=true
     done < <(nexus_fw_known_ports)
     [ "$allowed" = true ] || { echo '{"ok":false,"error":"not_allowed_port"}'; return 1; }
-    if nexus_fw_port_open "$port" "$proto"; then
+    if nexus_fw_port_open "$port" "$proto"; then port_state=0; else port_state=$?; fi
+    case "$port_state" in
+        0|1|3) ;;
+        *)
+            echo '{"ok":false,"error":"firewall_state_unavailable"}'
+            return 1
+            ;;
+    esac
+    if [ "$port_state" -eq 0 ]; then
         close_protocol_firewall "$port" "$proto" || firewall_status=$?
         if [ "$firewall_status" -ne 0 ]; then
             if [ "$firewall_status" -ge 2 ]; then

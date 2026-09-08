@@ -1,8 +1,6 @@
 name: Cross OS multi-server management
 
 on:
-  push:
-    branches: [codex/cross-os-management-20260908]
   workflow_dispatch:
 
 permissions:

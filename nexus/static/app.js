@@ -1177,11 +1177,18 @@ function renderFirewallPermission(perm) {
 function renderFirewallPorts(ports) {
   const list = $("#fw-port-list");
   if (!list) return;
-  list.innerHTML = (ports || []).map(p => `
+  list.innerHTML = (ports || []).map(p => {
+    const managedState = p.managed_state || (p.open === 1 ? "open" : p.open === 0 ? "closed" : "indeterminate");
+    const unknown = !["open", "closed", "unmanaged"].includes(managedState);
+    const protectedPort = p.name.includes("SSH");
+    const opened = managedState === "open";
+    const label = protectedPort ? "🔒 保护" : unknown ? "状态未知" : managedState === "unmanaged" ? "未设置" : opened ? "放行中" : "已关闭";
+    return `
     <div class="srv-device-row">
       <div class="srv-device-info"><b>${escapeHtml(p.name)}</b><small>${p.port} / ${p.proto.toUpperCase()}</small></div>
-      <button class="fw-toggle ${p.open === 1 ? "fw-on" : "fw-off"}${p.name.includes("SSH") ? " fw-locked" : ""}" data-fw-port="${p.port}" data-fw-proto="${p.proto}" ${p.name.includes("SSH") ? "disabled" : ""}>${p.name.includes("SSH") ? "🔒 保护" : (p.open === 1 ? "放行中" : "已关闭")}</button>
-    </div>`).join("") || '<p class="form-hint">暂无端口</p>';
+      <button class="fw-toggle ${opened ? "fw-on" : "fw-off"}${protectedPort ? " fw-locked" : ""}" data-fw-port="${p.port}" data-fw-proto="${p.proto}" ${protectedPort || unknown ? "disabled" : ""}>${label}</button>
+    </div>`;
+  }).join("") || '<p class="form-hint">暂无端口</p>';
   $$("#fw-port-list .fw-toggle").forEach(btn => {
     btn.addEventListener("click", async () => {
       const action = btn.classList.contains("fw-on") ? "关闭" : "放行";

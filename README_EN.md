@@ -8,7 +8,11 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.2** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.3: multi-server management and server-script fixes
+
+Fixes stale state during remote server switches and asynchronous operations, corrects traffic-rate sampling, and enforces duplicate and capacity checks when servers are added concurrently. Also fixes reopening firewall ports and protects detected SSH ports in firewall controls and Fail2Ban configuration. Preserves 7.2.1 upgrade compatibility, transaction recovery, and release verification. Remote management passed all six directions across Debian 12, Ubuntu 22.04, and Ubuntu 24.04; these results are not a complete acceptance test of all server functions.
 
 ### 7.2.2: Debian renewal-readiness compatibility
 

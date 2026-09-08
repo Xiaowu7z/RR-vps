@@ -4121,6 +4121,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def remote_dispatch(self, method: str, path: str, payload: dict, inner: dict) -> None:
         """白名单分发：只暴露管理员能力，逐项对应本地 handler。"""
+        # Authentication and auditing above retain the original request path.
+        # Match the local router when separating a route from its query string.
+        parsed = urllib.parse.urlsplit(path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         segments = [urllib.parse.unquote(v) for v in path.split("/") if v]
         if method == "GET":
             if path == "/api/overview":
@@ -4132,9 +4137,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/device-templates":
                 self.handle_device_templates(); return
             if path == "/api/metrics":
-                self.handle_metrics({}); return
+                self.handle_metrics(query); return
             if path == "/api/traffic":
-                self.handle_traffic(); return
+                self.handle_traffic(query); return
             if path == "/api/server/traffic-policy":
                 self.handle_server_traffic_policy(); return
             if path == "/api/audit":
@@ -5189,9 +5194,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 value = float(payload.get(key, 0)) if key == "quota_gb" else int(payload.get(key, 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return {}, "invalid_template_value"
-            if value < minimum or value > maximum:
+            if value < minimum or value > maximum or not math.isfinite(value):
                 return {}, "invalid_template_value"
             values["quota_bytes" if key == "quota_gb" else key] = (
                 int(value * 1024**3) if key == "quota_gb" else int(value)
@@ -5420,7 +5425,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json() or {}
         try:
             quota_gb = float(payload.get("quota_gb", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_server_quota"})
             return
         mode = str(payload.get("count_mode", "both") or "both")
@@ -5430,13 +5435,13 @@ class Handler(BaseHTTPRequestHandler):
         if calibrate_usage:
             try:
                 current_used_gb = float(payload.get("current_used_gb"))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_current_usage"})
                 return
-        if quota_gb < 0 or quota_gb > MAX_SERVER_TRAFFIC_GB:
+        if not math.isfinite(quota_gb) or quota_gb < 0 or quota_gb > MAX_SERVER_TRAFFIC_GB:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_server_quota"})
             return
-        if calibrate_usage and (current_used_gb < 0 or current_used_gb > MAX_SERVER_TRAFFIC_GB):
+        if calibrate_usage and (not math.isfinite(current_used_gb) or current_used_gb < 0 or current_used_gb > MAX_SERVER_TRAFFIC_GB):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_current_usage"})
             return
         if mode not in SERVER_TRAFFIC_MODES:
@@ -5485,10 +5490,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json() or {}
         try:
             initial_gb = float(payload.get("initial_used_gb", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_initial_usage"})
             return
-        if initial_gb < 0 or initial_gb > MAX_SERVER_TRAFFIC_GB:
+        if not math.isfinite(initial_gb) or initial_gb < 0 or initial_gb > MAX_SERVER_TRAFFIC_GB:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_initial_usage"})
             return
         now = utc_now()
@@ -5523,9 +5528,9 @@ class Handler(BaseHTTPRequestHandler):
         if "quota_gb" in payload or not partial:
             try:
                 quota_gb = float(payload.get("quota_gb", 0))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return {}, "invalid_quota"
-            if quota_gb < 0 or quota_gb > 10240:
+            if not math.isfinite(quota_gb) or quota_gb < 0 or quota_gb > 10240:
                 return {}, "invalid_quota"
             values["quota_bytes"] = int(quota_gb * 1024**3)
         if "expires_at" in payload:
@@ -5750,10 +5755,10 @@ class Handler(BaseHTTPRequestHandler):
         if "quota_gb" in payload and payload["quota_gb"] not in (None, ""):
             try:
                 quota_gb = float(payload["quota_gb"])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_quota"})
                 return
-            if quota_gb < 0 or quota_gb > 10240:
+            if not math.isfinite(quota_gb) or quota_gb < 0 or quota_gb > 10240:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_quota"})
                 return
             new_quota = int(quota_gb * 1024**3)
