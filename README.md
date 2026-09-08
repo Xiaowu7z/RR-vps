@@ -8,7 +8,11 @@ RR-vps 是面向 Debian / Ubuntu VPS 的多协议 Sing-box 管理脚本。它保
 
 > **免责声明：本项目仅供技术交流、理论学习和自有服务器管理研究使用，不提供任何网络访问服务。请勿将本项目用于任何违反当地法律法规、VPS 服务商条款或 Cloudflare 使用政策的用途；使用者需自行承担全部责任，项目作者不对任何不当使用造成的后果负责。**
 
-> 当前版本：**7.2.2** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> 当前版本：**7.2.3** · [完整更新日志](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.3：多服务器管理与服务器脚本修复
+
+修复远程服务器切换、异步操作和实时速率采样中的状态竞争，以及并发添加服务器时的重复记录和数量限制问题。同时修复防火墙端口关闭后无法再次打开、非标准 SSH 端口保护和 Fail2Ban 端口配置。保留 7.2.1 升级兼容检查、事务恢复与可信发布链路；已完成 Debian 12、Ubuntu 22.04、Ubuntu 24.04 六个方向的远程管理联测，联测范围不等同于服务器全部功能验收。
 
 ### 7.2.2：Debian 自动续签检查兼容修复
 

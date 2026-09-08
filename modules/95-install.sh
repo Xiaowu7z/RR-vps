@@ -6,6 +6,9 @@
 # ==========================================
 install_f2b() {
     check_supported_os >/dev/null 2>&1 || return 1
+    local f2b_ports=""
+    f2b_ports=$(rr_ssh_protected_ports | paste -sd, -) || return 1
+    [[ "$f2b_ports" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
     clear
     echo -e "=================================================="
     echo -e "${GREEN}        Fail2Ban (F2B) SSH 安全防护盾${RESET}"
@@ -47,7 +50,7 @@ install_f2b() {
     if ! cat > "$f2b_tmp" <<EOF
 [sshd]
 enabled = true
-port = ssh
+port = ${f2b_ports}
 filter = sshd
 backend = ${f2b_backend}
 ${f2b_logpath}

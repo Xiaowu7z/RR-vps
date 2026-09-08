@@ -48,7 +48,7 @@ protocol_menu() {
         echo -e "  ${PURPLE}0.${RESET} 返回主菜单"
         echo ""
         echo -e "${CYAN}=================================================================================${RESET}"
-        read -p "请输入数字选择操作 [0-10]: " proto_choice
+        read -p "请输入数字选择操作 [0-12]: " proto_choice
 
         case "$proto_choice" in
             1) toggle_single_protocol "VL" "Vless-reality" "tcp" ;;
@@ -2396,7 +2396,7 @@ rr_firewall_protocol_tuple_needed_after_updates() {
     # RR never owns SSH reachability, but a legacy/shared protocol tuple must
     # not be converted to an RR DROP when it aliases the administrative port.
     if [ "$proto_type" = tcp ] && \
-       [ "$proto_port" = "${SSH_PORT:-22}" ]; then
+       rr_port_is_ssh_protected "$proto_port"; then
         return 0
     fi
     if [ "$proto_type" = tcp ] && [ "$proto_port" = 80 ]; then
