@@ -21,7 +21,11 @@
 
 已完成的本地检查：相关 Shell 语法与确定性发布包核验通过；22 项所有权回归通过，其中 foreign-owner 一项因容器不能改变 UID，使用了明确报告的元数据注入。恢复工具的成功退出、前期失败、后期失败三个 EXIT 生命周期 fixture 通过。没有执行恢复工具的真实写操作。
 
-被恢复工具加载的候选模块来自提交 `cfeda272431beaffd03568c7a80c6934927f826a`，`modules/30-singbox.sh` SHA256 为 `dfd6929c22576a49eff09a4c931a958c410225b009f9d96a5679371d8c3ee566`。恢复工具 SHA256 为 `ef03c674ded75ecdcf68fae819c6e880df007acd4a6c7a8a983077a1e3ebceef`。终端输出 `CANDIDATE_OWNERSHIP_CHECK_OK` 只证明候选检查在该状态通过，完整恢复还须得到 `REPAIR_COMPLETE` 并由用户确认节点使用正常。
+被恢复工具加载的候选模块来自提交 `cfeda272431beaffd03568c7a80c6934927f826a`，`modules/30-singbox.sh` SHA256 为 `dfd6929c22576a49eff09a4c931a958c410225b009f9d96a5679371d8c3ee566`。更新说明后的恢复工具 SHA256 为 `0cc6cfde2cfd9c439a4e03c2b6639a07e770fc26732fc3b1de382f8c75715c15`。终端输出 `CANDIDATE_OWNERSHIP_CHECK_OK` 只证明候选检查在该状态通过，完整恢复还须得到 `REPAIR_COMPLETE` 并由用户确认节点使用正常。
+
+2026-09-10 用户首次执行 `d9a220cd9e6625a81929f9a42584097c4f7e8d03` 中的恢复工具（SHA256 `ef03c674ded75ecdcf68fae819c6e880df007acd4a6c7a8a983077a1e3ebceef`），回报 `REPAIR_STOP phase=writer_lock rc=75`。该回执说明未进入恢复回调，未备份配置或创建服务，不能计入修复成功。75 是 flock 获取失败的映射，通常占锁，但具体占用进程或系统调用错误仍待只读诊断确认。
+
+新增 `scripts/diagnose-rr-writer-lock.py` 按设备号与 inode 读取内核锁和匹配 FD，不读取进程命令参数或环境，不获取/删除锁、不操作服务。使用真实 flock 的本地 fixture 验证匹配及锁文件属性/内容保持；没有连接远程主机。恢复工具现在明确区分日志目录创建与实际配置备份，并直接显示锁获取失败的说明；没有改变或绕过锁机制。
 
 旧三台云测试机已由用户删除，不得再次连接。候选仅推独立分支；本提交不改变 main、Latest 或现有正式发布校验。正式发布前须处理退役主机门禁，并如实记录用户执行的候选摘要和结果，不能将未运行的测试记为通过。
 

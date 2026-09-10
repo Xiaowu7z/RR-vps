@@ -18,7 +18,7 @@ chmod 700 "$repair_stage" || exit 1
 repair_phase=preflight
 exec 3>&1
 exec >"$repair_stage/repair.log" 2>&1
-printf '备份及日志：%s\n' "$repair_stage" >&3
+printf '日志目录（配置备份须取得写锁后才开始）：%s\n' "$repair_stage" >&3
 
 repair_verify_runtime() {
     python3 - "$repair_stage" "$1" <<'PY'
@@ -392,6 +392,9 @@ repair_exit() {
 rr_menu_run_writer repair_locked </dev/null
 repair_result=$?
 if [ "$repair_result" -ne 0 ] && [ ! -f "$repair_stage/phase" ]; then
+    if [ "$repair_result" -eq 75 ]; then
+        printf '未取得 RR 写入锁；通常是其他任务占用，也可能是 flock 错误。尚未备份配置或执行恢复，请先定位锁与进程。\n' >&3
+    fi
     printf 'REPAIR_STOP phase=writer_lock rc=%s backup=%s\n' "$repair_result" "$repair_stage" >&3
 fi
 exit "$repair_result"
