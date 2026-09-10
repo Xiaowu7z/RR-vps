@@ -3561,12 +3561,18 @@ _install_prompt_identity || return 1
         generate_certs_and_keys || { echo -e "${RED}证书/密钥生成失败，安装中止${RESET}"; return 1; }
         if [ "$INSTALL_NAIVE_ENABLED" = true ]; then
             ensure_naive_certificate "$NAIVE_DOMAIN" "$LE_EMAIL" || {
-                echo -e "${RED}NaiveProxy 真证书申请失败，安装已停止；其他协议配置保留为未完成状态。${RESET}"
+                echo -e "${RED}[停止] NaiveProxy 证书准备未完成（包括 ACME 服务、防火墙和续签检查）；不代表现有证书失效。配置已保留为未完成状态。${RESET}"
                 return 1
             }
         fi
-        build_singbox_config || return 1
-        setup_systemd || return 1
+        build_singbox_config || {
+            echo -e "${RED}[停止] Sing-box 配置生成或校验失败；现有配置保留，请检查上方错误。${RESET}"
+            return 1
+        }
+        setup_systemd || {
+            echo -e "${RED}[停止] Sing-box 服务创建、保护配置核验或启动失败；安装尚未完成，请检查上方错误。${RESET}"
+            return 1
+        }
     fi
     if [ "$INSTALL_ARGO_SELECTED" = true ]; then
         echo -e "\n${YELLOW}正在拉起 Argo 隧道...${RESET}"

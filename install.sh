@@ -7,7 +7,7 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="2"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
-RR_RELEASE_TAG="v7.2.3"
+RR_RELEASE_TAG="v7.2.4"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_SOURCE_REF="$RR_RELEASE_TAG"
@@ -19,7 +19,7 @@ RR_API_BASE="https://api.github.com/repos/${RR_REPOSITORY}/contents"
 RR_CDN_BASE="https://cdn.jsdelivr.net/gh/${RR_REPOSITORY}@${RR_SOURCE_REF}"
 RR_CORE_URL="${RR_RAW_BASE}/scripts/install-core.sh"
 RR_GUARD_URL="${RR_RAW_BASE}/scripts/update-guard.sh"
-RR_CORE_SHA256="04f257aaa34295ff6410c6883f633495738e7615bdf21082d5afadb8e3f490a0"
+RR_CORE_SHA256="03e0e3c728885adc11050b5b72ddc16588122c5155334555f2535ae6cd62d0f5"
 RR_GUARD_SHA256="2bbfdd8d80773cb48c19f11f91bbeb7ebd156f9419c30c5d81b3565aa346e64c"
 RR_MODE="${1:-install}"
 RR_GITHUB_MIRROR="${RR_GITHUB_MIRROR:-}"
@@ -224,7 +224,7 @@ echo "请输入 rr 打开管理面板。"
 # -----------------------------------------------------------------------------
 # 发布/回归兼容锚点：以下仅供 scripts/rebuild-bundle.py 与 validate.sh 确认
 # 冻结核心仍具备这些安全能力；真实实现位于 scripts/install-core.sh。
-# [ "$actual" = "8312faf9c9058f5566c883a3aaaf1645eb83f5261c3722dd2e880dfe1e682db0" ]
+# [ "$actual" = "ce0bf118c367cfd9d89270e1885df5ac4c7fa87ce943d711d9eaf2d5956e257f" ]
 # rr_bundle_tree_is_valid "$PAYLOAD_DIR"
 # rr_backup_sqlite /var/lib/rr-nexus/nexus.db nexus.db
 # rr_restore_sqlite nexus.db /var/lib/rr-nexus/nexus.db

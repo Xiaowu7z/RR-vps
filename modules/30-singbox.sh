@@ -482,7 +482,10 @@ EOF
 write_singbox_systemd_unit() {
     local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
     local unit_tmp="" unit_dir=""
-    rr_singbox_service_is_owned_or_absent || return 1
+    if ! rr_singbox_service_is_owned_or_absent; then
+        printf '%s\n' '[安全拒绝] Sing-box 服务或附加配置无法确认为 RR 自有；未覆盖服务文件。' >&2
+        return 1
+    fi
     unit_dir=$(dirname -- "$service_file") || return 1
     install -d -o 0 -g 0 -m 755 "$unit_dir" || return 1
     [ -d "$unit_dir" ] && [ ! -L "$unit_dir" ] || return 1
@@ -795,7 +798,7 @@ rr_singbox_legacy_service_is_owned() {
 rr_singbox_service_is_owned_or_absent() {
     local service_file="${RR_SINGBOX_SERVICE_FILE:-/etc/systemd/system/sing-box.service}"
     local dropin_dir="${RR_RESTORE_SYSTEMD_DIR:-/etc/systemd/system}/sing-box.service.d"
-    local load_state="" fragment="" dropins=""
+    local load_state="" fragment="" dropins="" dropin=""
     if [ -e "$service_file" ] || [ -L "$service_file" ]; then
         if cmp -s -- "$service_file" <(rr_render_singbox_systemd_unit); then
             rr_singbox_service_guards_are_effective
@@ -805,9 +808,31 @@ rr_singbox_service_is_owned_or_absent() {
         return
     fi
     if [ -e "$dropin_dir" ] || [ -L "$dropin_dir" ]; then
-        [ -d "$dropin_dir" ] && [ ! -L "$dropin_dir" ] && \
-            [ -z "$(find "$dropin_dir" -mindepth 1 -maxdepth 1 -print -quit \
-                2>/dev/null)" ] || return 1
+        # Naive's first HTTP-01 firewall transaction installs its persistent
+        # start gate before the Sing-box unit exists.  Preserve that exact RR
+        # gate (and the equivalent restore gate), instead of treating our own
+        # freshly created directory as evidence of a foreign service.  Hidden
+        # entries, unknown files and subdirectories remain a hard refusal.
+        declare -F rr_firewall_root_directory_chain_is_safe >/dev/null 2>&1 || \
+            return 1
+        rr_firewall_root_directory_chain_is_safe "$dropin_dir" || return 1
+        for dropin in "$dropin_dir"/* "$dropin_dir"/.[!.]* "$dropin_dir"/..?*; do
+            [ -e "$dropin" ] || [ -L "$dropin" ] || continue
+            case "$dropin" in
+                "$dropin_dir/zzzzz-rr-firewall-quarantine.conf")
+                    declare -F rr_firewall_fail_closed_dropin_is_exact \
+                        >/dev/null 2>&1 || return 1
+                    rr_firewall_fail_closed_dropin_is_exact "$dropin" \
+                        /var/lib/rr-vps/firewall-quarantine || return 1
+                    ;;
+                "$dropin_dir/zzzz-rr-restore-gate.conf")
+                    declare -F rr_firewall_restore_dropin_is_exact \
+                        >/dev/null 2>&1 || return 1
+                    rr_firewall_restore_dropin_is_exact "$dropin" || return 1
+                    ;;
+                *) return 1 ;;
+            esac
+        done
     fi
     load_state=$(systemctl show --property=LoadState --value \
         sing-box.service 2>/dev/null) || return 1

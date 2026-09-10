@@ -241,6 +241,7 @@ jobs:
               test-nexus-sync.sh|\
               test-restore-watchdog.sh|\
               test-singbox-credential-atomicity.sh|\
+              test-singbox-absent-owned-dropins.sh|\
               test-update-external-state.sh|\
               test-update-external-transaction.sh|\
               test-update-firewall-finalize.sh|\
