@@ -533,19 +533,22 @@ mode, record_name, port, pid_name, log_name, discovered = sys.argv[1:]
 record = Path(record_name)
 def report(**fields):
     print(json.dumps(dict(event='ARGO_PROCESS', **fields), ensure_ascii=True), flush=True)
-def refuse(reason):
-    report(result='FAIL', reason=reason)
+def refuse(reason, **fields):
+    report(result='FAIL', reason=reason, **fields)
     raise SystemExit(1)
 def safe_file(path, private=False):
     for parent in list(reversed(path.parents)):
         s = parent.lstat()
         if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
-            refuse('unsafe_file_parent')
+            refuse('unsafe_file_parent', path=str(parent), uid=s.st_uid,
+                   gid=s.st_gid, mode=oct(stat.S_IMODE(s.st_mode)), links=s.st_nlink)
     s = path.lstat()
+    fields = dict(path=str(path), uid=s.st_uid, gid=s.st_gid,
+                  mode=oct(stat.S_IMODE(s.st_mode)), links=s.st_nlink)
     if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_nlink != 1 or s.st_mode & 0o022:
-        refuse('unsafe_file_metadata')
+        refuse('unsafe_file_metadata', **fields)
     if private and stat.S_IMODE(s.st_mode) != 0o600:
-        refuse('private_file_mode')
+        refuse('private_file_mode', expected_mode='0o600', **fields)
     return s
 
 def cgroup_owned(data):
@@ -598,13 +601,25 @@ def optional_file(name, pid_file=False):
         refuse('runtime_file_path')
     path = Path(name)
     try:
-        s = safe_file(path, private=True)
+        # Menu refresh inherits the login umask: the original PID writer can
+        # legitimately produce 0644 or 0640. These files are read as data, never
+        # executed; ownership and write protection establish their integrity.
+        # The private fingerprint record and sealed config/evidence retain
+        # their separate exact-0600 checks.
+        s = safe_file(path)
     except FileNotFoundError:
+        report(role='pid_file' if pid_file else 'log_file', path=str(path), exists=False)
         return None
+    fields = dict(role='pid_file' if pid_file else 'log_file', path=str(path),
+                  uid=s.st_uid, gid=s.st_gid, mode=oct(stat.S_IMODE(s.st_mode)), links=s.st_nlink)
+    report(exists=True, **fields)
+    if stat.S_IMODE(s.st_mode) not in (0o400, 0o440, 0o444, 0o600, 0o640, 0o644):
+        refuse('runtime_data_file_mode', **fields)
     data = path.read_bytes() if pid_file else b''
     if pid_file and (s.st_size > 32 or re.fullmatch(rb'[1-9][0-9]*\n?', data) is None):
-        refuse('pid_file_schema')
+        refuse('pid_file_schema', **fields)
     return dict(path=str(path), device=s.st_dev, inode=s.st_ino,
+                mode=stat.S_IMODE(s.st_mode),
                 sha256=hashlib.sha256(data).hexdigest() if pid_file else None,
                 pid=int(data) if pid_file else None)
 

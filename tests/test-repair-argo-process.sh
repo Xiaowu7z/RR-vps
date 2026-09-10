@@ -45,6 +45,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 import subprocess
 import sys
 
@@ -83,6 +84,8 @@ binary = root / 'cloudflared'
 snapshot = root / 'argo-process-before.json'
 pidfile = root / 'argo.pid'
 logfile = root / 'argo.log'
+linked_target = root / 'linked-target'
+log_sentinel = 'RR_PRIVATE_LOG_CONTENT_MUST_NOT_APPEAR_IN_DIAGNOSTICS'
 port = '30677'
 processes = []
 cases = 0
@@ -117,7 +120,7 @@ def cleanup():
         if process.stdout:
             process.stdout.close()
     processes.clear()
-    for path in (snapshot, pidfile, logfile):
+    for path in (snapshot, pidfile, logfile, linked_target):
         path.unlink(missing_ok=True)
 
 def check(action, pids, success):
@@ -128,7 +131,33 @@ def check(action, pids, success):
     if (result.returncode == 0) != success:
         raise AssertionError(f'{action} expected success={success}: '
                              f'rc={result.returncode} {result.stdout} {result.stderr}')
+    assert log_sentinel not in result.stdout + result.stderr
     return result
+
+def runtime_files(process, pid_mode=0o600, log_mode=0o600):
+    pidfile.write_text(str(process.pid) + '\n')
+    logfile.write_text(log_sentinel + '\n')
+    os.chmod(pidfile, pid_mode)
+    os.chmod(logfile, log_mode)
+
+def file_state(path):
+    metadata = path.lstat()
+    # Reads may change atime. All ownership, permission, identity and write
+    # timestamps must remain unchanged; no repair-time chmod is permitted.
+    return (path.read_bytes(), metadata.st_uid, metadata.st_gid,
+            stat.S_IMODE(metadata.st_mode), metadata.st_dev, metadata.st_ino,
+            metadata.st_nlink, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def metadata_rejection(result, path):
+    actual = path.lstat()
+    reports = [json.loads(line) for line in result.stdout.splitlines()]
+    matches = [row for row in reports if row.get('path') == str(path)]
+    assert matches, result.stdout
+    assert any(row.get('mode') == oct(stat.S_IMODE(actual.st_mode)) and
+               row.get('uid') == actual.st_uid and
+               row.get('gid') == actual.st_gid and
+               row.get('links') == actual.st_nlink for row in matches), result.stdout
 
 def passed(name):
     global cases
@@ -155,6 +184,64 @@ try:
     check('stop', [process.pid], True)
     assert process.wait(timeout=2) == -signal.SIGTERM
     passed('exact_origin_real_pidfd_sigterm')
+
+    process = launch()
+    runtime_files(process, 0o644, 0o644)
+    before = {path: file_state(path) for path in (pidfile, logfile)}
+    check('inspect', [process.pid], True)
+    check('stop', [process.pid], True)
+    assert process.wait(timeout=2) == -signal.SIGTERM
+    assert before == {path: file_state(path) for path in before}
+    passed('legacy_644_pid_log_real_pidfd_preserves_files')
+
+    process = launch()
+    runtime_files(process, 0o640, 0o440)
+    before = {path: file_state(path) for path in (pidfile, logfile)}
+    check('inspect', [process.pid], True)
+    check('stop', [process.pid], True)
+    assert process.wait(timeout=2) == -signal.SIGTERM
+    assert before == {path: file_state(path) for path in before}
+    passed('readable_640_pid_440_log_preserves_files')
+
+    for unsafe, mode in ((pidfile, 0o620), (logfile, 0o602)):
+        process = launch()
+        runtime_files(process)
+        os.chmod(unsafe, mode)
+        before = {path: file_state(path) for path in (pidfile, logfile)}
+        result = check('inspect', [process.pid], False)
+        metadata_rejection(result, unsafe)
+        assert process.poll() is None
+        assert before == {path: file_state(path) for path in before}
+        role = 'pid_file' if unsafe == pidfile else 'log_file'
+        passed(f'writable_{role}_rejected_without_signal')
+
+    for link_kind in ('symlink', 'hardlink'):
+        for unsafe in (pidfile, logfile):
+            process = launch()
+            runtime_files(process)
+            unsafe.rename(linked_target)
+            if link_kind == 'symlink':
+                unsafe.symlink_to(linked_target)
+            else:
+                os.link(linked_target, unsafe)
+            before = file_state(linked_target)
+            result = check('inspect', [process.pid], False)
+            metadata_rejection(result, unsafe)
+            assert process.poll() is None
+            assert file_state(linked_target) == before
+            cleanup()
+        passed(f'{link_kind}_pid_and_log_rejected_without_signal')
+
+    process = launch()
+    runtime_files(process)
+    check('inspect', [process.pid], True)
+    os.chmod(snapshot, 0o644)
+    before = {path: file_state(path) for path in (snapshot, pidfile, logfile)}
+    result = check('stop', [process.pid], False)
+    metadata_rejection(result, snapshot)
+    assert process.poll() is None
+    assert before == {path: file_state(path) for path in before}
+    passed('fingerprint_record_644_still_rejected_without_signal')
 
     process = launch(origin=port + '1')
     check('inspect', [process.pid], False)

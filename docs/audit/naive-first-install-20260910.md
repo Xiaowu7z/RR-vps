@@ -69,13 +69,25 @@
 
 已向用户明确告知：正常补建会重新建立临时 Argo，临时域名将更新；原有端口、UUID、密码和证书继续核验。尚无此次修改后的实机恢复成功回执。
 
-当前恢复工具 SHA256 为 `b3a4db1bd196b0a8eaf6ec919238a0e00e7678aaec36ca02dd7f6e2217ef3947`。新增运行状态报告会列出全部 unit 的 ActiveState、三个探针及 PID 枚举返回码，不再仅打印阶段名。允许的 quick 必须处于未完成安装、VMess 无 TLS、临时隧道、无 previous port 的配置；共享 Cloudflared 服务必须停止。进程必须符合原版完整启动参数，来自 root SSH session scope 或 ssh/sshd 服务的登录进程树，使用可信 `/usr/bin/cloudflared`。有候选时，存在的 PID 文件必须匹配该候选；没有候选时可保留合规的陈旧 PID 文件，不信任其中 PID 去发送信号。
+首次加入精确 Argo 停止的工具 SHA256 为 `b3a4db1bd196b0a8eaf6ec919238a0e00e7678aaec36ca02dd7f6e2217ef3947`，提交为 `2f235a7b0c7848cfd0172cac015a1e905d170ecb`。新增运行状态报告会列出全部 unit 的 ActiveState、三个探针及 PID 枚举返回码，不再仅打印阶段名。允许的 quick 必须处于未完成安装、VMess 无 TLS、临时隧道、无 previous port 的配置；共享 Cloudflared 服务必须停止。进程必须符合原版完整启动参数，来自 root SSH session scope 或 ssh/sshd 服务的登录进程树，使用可信 `/usr/bin/cloudflared`。有候选时，存在的 PID 文件必须匹配该候选；没有候选时可保留合规的陈旧 PID 文件，不信任其中 PID 去发送信号。
 
 停止使用 pidfd，重新核对启动时间、exe inode、UID、完整参数和 cgroup 指纹后发送一次 TERM，等待上限 5 秒，不升级为 SIGKILL。指纹及现有 PID/日志文件随私有备份保存；停止后再次确认所有节点 runtime 空闲、配置原始 SHA 不变，才进入原生规则恢复。失败报告新增 `argo_stop_attempted`，明确区分停止尝试与防火墙恢复尝试。停止阶段不删除或回写 PID、日志、域名、配置及封存证据；正常补建由原 quick 启动事务更新临时域名。
 
 独立代码审查未发现阻断项。新增 `tests/test-repair-argo-process.sh` 的 10 个受控进程场景通过，使用本地编译的无网络暂停程序，真实 root UID、启动时间、exe inode 和 pidfd 信号；覆盖精确停止、端口前缀拒绝、多候选、PID 文件不符/漂移、指纹启动时间变化、已退出、TERM 超时及陈旧 PID 文件。此工作区的命令 PID namespace 与 procfs 挂载视图不一致，因此测试只对自己创建、由子进程自报宿主 PID 的进程做只读 proc 路径映射，pidfd 仍使用该子进程在调用者命名空间中的 PID；该映射和容器 cgroup 策略替换均明确报告，普通 CI 环境不启用 proc 映射。这不是实际 Cloudflared 公网测试。
 
 防火墙编排 fixture 原 18 项加 3 项 Argo 场景共 21 项通过，验证备份失败前不停止、停止失败后不调用规则恢复且配置/证据/PID/日志保持、成功时停止一次后调用原恢复入口一次。这里的 systemd、内核规则和原生防火墙执行仍为模拟；原 31 项前置报告回归也通过。Shell 语法、嵌入 Python 语法及 CI YAML 解析通过；没有连接远程主机，也没有把这些结果记为实机验收。
+
+## 2026-09-10 Argo 数据文件权限兼容
+
+用户执行 `2f235a7b0c7848cfd0172cac015a1e905d170ecb` 后，记录的节点状态及 Argo PID 枚举通过，但在检查 PID/日志文件时返回 `private_file_mode`。日志目录为 `/root/rr-repair-naive723.sEMO4W`，`firewall_recovery_attempted=false`、`argo_stop_attempted=false`，尚未停止 Argo、执行配置备份或修改防火墙。旧诊断没有输出失败路径，所以不能把具体文件或权限值写成现场已确认事实。
+
+源码复核确认恢复工具的精确 0600 要求过严：原 quick PID 写入只是 `printf > "$ARGO_PID_FILE"`，没有显式 chmod；初次安装设置的 umask 077 不能覆盖新登录会话的菜单刷新路径，该路径合法地继承 umask 022/027 并生成 0644/0640 PID。之前的受控进程 fixture 全部使用 umask 077，未覆盖这一差异。
+
+仅对被当作数据读取的 PID/日志文件，明确接受 0400、0440、0444、0600、0640、0644；仍要求 root:root、普通文件、单链接、安全父目录链，无组或其他用户写权限，无特殊或执行权限。不对服务器文件执行 chmod，也不放宽配置、隔离证据和指纹记录的精确 0600 校验。进程 argv、UID、exe inode、启动时间、cgroup 和 pidfd 校验保持；PID 文件权限也进入前后比较，期间变化会拒绝。错误现在输出具体 path、uid、gid、mode、links，成功的 PID/日志检查输出 role 和属性，不输出文件内容。
+
+独立只读复核确认这属于原程序合法路径的权限兼容修复，无需先修改现场权限。尚未收到修改后实机回执，不能记录为恢复成功。
+
+本次工具 SHA256 为 `856c59bb0e3ac4c73f04ee38961fb5a4987f6e5097e4283db0f4f40d43787116`。进程 fixture 原 10 项及新增 7 项共 17 项通过：644 PID/日志和 640 PID/440 日志允许原样检查并通过真实 pidfd 停止受控进程；组或其他用户可写的 PID/日志、软链接、硬链接以及变成 644 的私有指纹记录均拒绝发送信号。比较 PID/日志字节、权限、属主、inode、链接数、大小及 mtime/ctime 保持；所有输出不包含日志哨兵内容。仍采用前述明确披露的无网络二进制、容器 cgroup fixture 和必要的测试子进程 proc 路径映射，不能算用户 VPS 或实际 Cloudflared 测试。相关 Bash 语法检查通过。
 
 ## 现场操作边界
 
