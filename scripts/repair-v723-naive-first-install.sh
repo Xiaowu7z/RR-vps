@@ -3,12 +3,19 @@
 # Keeps the installed release bytes and all existing protection drop-ins.
 set -o pipefail
 if [ "${1:-}" != --internal ]; then
-    [ "$#" -eq 0 ] || { echo 'Usage: bash repair-v723-naive-first-install.sh'; exit 2; }
+    if [ "$#" -ne 0 ] && { [ "$#" -ne 1 ] || [ "$1" != --check ]; }; then
+        echo 'Usage: bash repair-v723-naive-first-install.sh [--check]'; exit 2
+    fi
     exec env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb SSH_CONNECTION="${SSH_CONNECTION:-}" \
-        /bin/bash --noprofile --norc "$0" --internal
+        /bin/bash --noprofile --norc "$0" --internal "$@"
 fi
-[ "$#" -eq 1 ] || exit 2
+repair_check_only=false
+case "$#:${2:-}" in
+    1:) ;;
+    2:--check) repair_check_only=true ;;
+    *) exit 2 ;;
+esac
 umask 077
 [ "$(id -u)" = 0 ] && [ "$(hostname)" = VM8334-82 ] || {
     echo 'REPAIR_STOP phase=host_identity'; exit 1;
@@ -115,6 +122,154 @@ repair_nexus_absent() {
     done
     state=$(systemctl show rr-nexus.service -p LoadState --value) || return 1
     [ "$state" = not-found ]
+}
+
+# This diagnostic uses exactly the predicates required by recovery. It neither
+# reads configuration values nor runs the configuration/certificate builders.
+# Every independent check is reported before a failing preflight returns.
+repair_preflight_path_metadata() {
+    python3 - "$1" >&3 <<'PY'
+import json, os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+for item in list(reversed(path.parents)) + [path]:
+    record = {'event': 'REPAIR_PATH', 'path': str(item)}
+    try:
+        info = item.lstat()
+        record.update(uid=info.st_uid, gid=info.st_gid,
+                      mode=oct(stat.S_IMODE(info.st_mode)), links=info.st_nlink,
+                      exists=item.exists(), symlink=stat.S_ISLNK(info.st_mode),
+                      type=('directory' if stat.S_ISDIR(info.st_mode) else
+                            'regular' if stat.S_ISREG(info.st_mode) else
+                            'symlink' if stat.S_ISLNK(info.st_mode) else 'other'),
+                      realpath=os.path.realpath(item))
+    except OSError as error:
+        record.update(error=type(error).__name__, errno=error.errno)
+    print(json.dumps(record, ensure_ascii=True))
+PY
+}
+
+repair_preflight_check() {
+    local name="$1" result=0 outcome=PASS
+    shift
+    "$@" || result=$?
+    if [ "$result" -ne 0 ]; then
+        outcome=FAIL
+        repair_preflight_failed=$((repair_preflight_failed + 1))
+    fi
+    repair_preflight_total=$((repair_preflight_total + 1))
+    printf 'REPAIR_CHECK name=%s result=%s rc=%s\n' "$name" "$outcome" "$result" >&3
+}
+
+repair_preflight_absent() {
+    local path="$1"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+    repair_preflight_path_metadata "$path" || true
+    return 1
+}
+
+repair_preflight_directory() {
+    local path="$1" result=0
+    rr_firewall_root_directory_chain_is_safe "$path" || result=$?
+    [ "$result" -eq 0 ] || repair_preflight_path_metadata "$path" || true
+    return "$result"
+}
+
+repair_preflight_config_metadata() {
+    local path="$1"
+    if [ -f "$path" ] && [ ! -L "$path" ] && \
+       [ "$(stat -c '%u:%g:%a:%h' -- "$path")" = 0:0:600:1 ]; then
+        return 0
+    fi
+    repair_preflight_path_metadata "$path" || true
+    return 1
+}
+
+repair_preflight_systemd() {
+    local unit="$1" property="$2" predicate="$3" expected="$4"
+    local require_success="$5" value="" command_rc=0
+    # Only non-secret unit metadata may enter the terminal report.
+    case "$unit" in
+        sing-box.service|rr-nexus.service|rr-subscription.service|\
+        argo-rr-health.timer|argo-rr-health.service) ;;
+        *) return 2 ;;
+    esac
+    case "$property" in LoadState|ActiveState|FragmentPath|DropInPaths) ;; *) return 2 ;; esac
+    value=$(systemctl show "$unit" -p "$property" --value) || command_rc=$?
+    printf 'REPAIR_UNIT unit=%s property=%s value=%q command_rc=%s\n' \
+        "$unit" "$property" "$value" "$command_rc" >&3
+    # The original predicates differ: some compare command output only, while
+    # others also require systemctl to succeed. Preserve that distinction.
+    if [ "$require_success" = true ] && [ "$command_rc" -ne 0 ]; then
+        return 1
+    fi
+    case "$predicate" in
+        equal) [ "$value" = "$expected" ] ;;
+        idle) case "$value" in inactive|failed) return 0 ;; *) return 1 ;; esac ;;
+        *) return 2 ;;
+    esac
+}
+
+repair_preflight_dropin_members() {
+    local directory=/etc/systemd/system/sing-box.service.d members="" command_rc=0
+    members=$(find "$directory" -mindepth 1 -maxdepth 1 -printf '%f\n') || command_rc=$?
+    printf 'REPAIR_DROPINS directory=%s members=%q command_rc=%s\n' \
+        "$directory" "$members" "$command_rc" >&3
+    if [ "$members" = zzzzz-rr-firewall-quarantine.conf ]; then
+        return 0
+    fi
+    repair_preflight_path_metadata "$directory" || true
+    return 1
+}
+
+repair_preflight_dropin_exact() {
+    local path=/etc/systemd/system/sing-box.service.d/zzzzz-rr-firewall-quarantine.conf result=0
+    rr_firewall_fail_closed_dropin_is_exact "$path" /var/lib/rr-vps/firewall-quarantine || result=$?
+    [ "$result" -eq 0 ] || repair_preflight_path_metadata "$path" || true
+    return "$result"
+}
+
+repair_preflight_checks() {
+    local path="" name=""
+    repair_preflight_total=0
+    repair_preflight_failed=0
+    repair_preflight_check runtime_identity repair_verify_runtime check
+    for path in /var/lib/rr-vps/firewall-quarantine /var/lib/rr-backup/active \
+        /run/rr-vps/restore-live /run/rr-vps/restore-watch-request \
+        /etc/sing-box/.pair-pending /etc/rr-naive/.pair-pending; do
+        name=${path//\//_}
+        repair_preflight_check "absent${name}" repair_preflight_absent "$path"
+    done
+    for path in /etc/systemd/system /etc/systemd/system/sing-box.service.d /var/lib/rr-vps \
+        /etc/sing-box /etc/rr-naive /etc/letsencrypt /run/rr-vps; do
+        name=${path//\//_}
+        repair_preflight_check "directory${name}" repair_preflight_directory "$path"
+    done
+    for path in /etc/argo_vmess.conf /etc/sing-box/config.json; do
+        name=${path//\//_}
+        repair_preflight_check "metadata${name}" repair_preflight_config_metadata "$path"
+    done
+    repair_preflight_check singbox_unit_file_absent repair_preflight_absent /etc/systemd/system/sing-box.service
+    repair_preflight_check singbox_load_state repair_preflight_systemd sing-box.service LoadState equal not-found false
+    repair_preflight_check singbox_fragment_absent repair_preflight_systemd sing-box.service FragmentPath equal '' false
+    repair_preflight_check singbox_effective_dropins_absent repair_preflight_systemd sing-box.service DropInPaths equal '' false
+    repair_preflight_check singbox_dropin_members repair_preflight_dropin_members
+    repair_preflight_check singbox_dropin_exact repair_preflight_dropin_exact
+    # Keep all three predicates from repair_nexus_absent, but report them
+    # separately so a file, database or manager-state mismatch is distinguishable.
+    repair_preflight_check nexus_config_absent repair_preflight_absent "$NEXUS_CONFIG_FILE"
+    repair_preflight_check nexus_database_absent repair_preflight_absent "$NEXUS_DB_FILE"
+    repair_preflight_check nexus_load_state repair_preflight_systemd rr-nexus.service LoadState equal not-found true
+    repair_preflight_check subscription_load_state repair_preflight_systemd rr-subscription.service LoadState equal not-found false
+    for path in sing-box.service rr-nexus.service rr-subscription.service \
+        argo-rr-health.timer argo-rr-health.service; do
+        repair_preflight_check "inactive_${path}" repair_preflight_systemd "$path" ActiveState idle '' true
+    done
+    printf 'REPAIR_PREFLIGHT total=%s failed=%s recovery_performed=false\n' \
+        "$repair_preflight_total" "$repair_preflight_failed" >&3
+    [ "$repair_preflight_failed" -eq 0 ]
 }
 
 # Reject inputs that the stock builder would silently regenerate. This is a
@@ -246,36 +401,18 @@ repair_locked() {
     repair_mutation_started=false
     repair_finished=false
     repair_health_started=false
-    local path="" load_state="" dropin=/etc/systemd/system/sing-box.service.d/zzzzz-rr-firewall-quarantine.conf
     # This trap runs in rr_run_with_update_locks' isolated, lock-held callback.
     trap 'repair_exit $?' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     repair_note locked_preflight || return 1
-    repair_verify_runtime check || return 1
-    repair_no_markers || return 1
-    for path in /etc/systemd/system /etc/systemd/system/sing-box.service.d /var/lib/rr-vps \
-        /etc/sing-box /etc/rr-naive /etc/letsencrypt /run/rr-vps; do
-        rr_firewall_root_directory_chain_is_safe "$path" || return 1
-    done
-    for path in /etc/argo_vmess.conf /etc/sing-box/config.json; do
-        [ -f "$path" ] && [ ! -L "$path" ] && \
-            [ "$(stat -c '%u:%g:%a:%h' -- "$path")" = 0:0:600:1 ] || return 1
-    done
-    [ ! -e /etc/systemd/system/sing-box.service ] && [ ! -L /etc/systemd/system/sing-box.service ] || return 1
-    [ "$(systemctl show sing-box.service -p LoadState --value)" = not-found ] || return 1
-    [ -z "$(systemctl show sing-box.service -p FragmentPath --value)" ] || return 1
-    [ -z "$(systemctl show sing-box.service -p DropInPaths --value)" ] || return 1
-    [ "$(find /etc/systemd/system/sing-box.service.d -mindepth 1 -maxdepth 1 -printf '%f\n')" = zzzzz-rr-firewall-quarantine.conf ] || return 1
-    rr_firewall_fail_closed_dropin_is_exact "$dropin" /var/lib/rr-vps/firewall-quarantine || return 1
-    repair_nexus_absent || return 1
-    [ "$(systemctl show rr-subscription.service -p LoadState --value)" = not-found ] || return 1
-    for path in sing-box.service rr-nexus.service rr-subscription.service \
-        argo-rr-health.timer argo-rr-health.service; do
-        load_state=$(systemctl show "$path" -p ActiveState --value) || return 1
-        case "$load_state" in inactive|failed) ;; *) return 1 ;; esac
-    done
+    repair_preflight_checks || return 1
+    if [ "$repair_check_only" = true ]; then
+        printf 'PREFLIGHT_ONLY_OK recovery_performed=false\n' >&3 || return 1
+        repair_finished=true
+        return 0
+    fi
     repair_note existing_configuration || return 1
     load_config_with_defaults || return 1
     [ "$SCRIPT_VERSION" = 7.2.3 ] && [ "$INSTALL_COMPLETE" = false ] || return 1
