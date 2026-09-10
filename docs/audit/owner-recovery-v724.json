@@ -1,6 +1,6 @@
 {
   "schema": "rr-owner-recovery-evidence-v1",
-  "policy_status": "proposal-awaiting-owner-confirmation",
+  "policy_status": "owner-approved",
   "source": "owner-provided-terminal-output",
   "reported_on": "2026-09-10",
   "scope": {
