@@ -1,4 +1,4 @@
-name: Three-host stability smoke test
+name: Release recovery evidence
 
 on:
   push:
@@ -9,81 +9,31 @@ permissions:
   contents: read
 
 concurrency:
-  group: vps-release-audit
+  group: release-recovery-evidence
   cancel-in-progress: false
 
+# Keep this workflow path for installed 7.2.1 update guards. Its declared
+# scope is owner-reported Debian recovery evidence bound to this candidate;
+# the three deleted VPS hosts are no longer an available validation target.
 jobs:
-  stability:
+  evidence:
     if: github.ref == 'refs/heads/main'
-    name: Stability · ${{ matrix.role }} · ${{ matrix.os }} ${{ matrix.version }}
+    name: Verify approved owner recovery evidence and candidate hashes
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - role: A
-            os: debian
-            version: '12'
-            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICmpYE2GN+xGyCxDQW1e/NrwzmApHDMz+zLigsrhXhRm
-          - role: B
-            os: ubuntu
-            version: '22.04'
-            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJWJw40hog64SpnWDcp4mvlSJIZ1qspCoOhNrn0L/B5A
-          - role: C
-            os: ubuntu
-            version: '24.04'
-            key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPNn4M3kE0+DoV//4xOYwweoLnTrwS+bJmmD6pK4ios3
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Validate candidate and prepare SSH
+      - name: Verify this commit's bundle and approved recovery evidence
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/rebuild-bundle.py --check
-          bash -n scripts/audit-stability-host.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq sshpass netcat-openbsd
-      - name: Prepare pinned 7.0.2 fixture for the Ubuntu 24.04 upgrade check
-        if: matrix.role == 'C'
-        run: |
-          git fetch --depth=1 origin f28d5b11958588554777ee2c4d326d42c471ee08
-          git archive --format=tar.gz f28d5b11958588554777ee2c4d326d42c471ee08 rr modules nexus manifest.sha256 > legacy-702.tar.gz
-          git fetch --depth=1 origin fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7
-          git show fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7:scripts/update-recover.sh > v720-update-recover.sh
-          git show fb2d0d3fa0e75d23c3441e408b1fcaf7a9259ad7:scripts/update-external-state.py > v720-update-external-state.py
-      - name: Resume installed hosts and run stability check
-        env:
-          HOST: ${{ secrets[format('RR_{0}_HOST', matrix.role)] }}
-          SSHPASS: ${{ secrets[format('RR_{0}_PASS', matrix.role)] }}
-          HOST_KEY: ${{ matrix.key }}
-          ROLE: ${{ matrix.role }}
-          EXPECTED_OS: ${{ matrix.os }}
-          EXPECTED_OS_VERSION: ${{ matrix.version }}
-        run: |
-          set -euo pipefail
-          set +x
-          test -n "$HOST"
-          test -n "$SSHPASS"
-          known_hosts="$RUNNER_TEMP/rr-stability-known-hosts"
-          (umask 077; printf '%s %s\n' "$HOST" "$HOST_KEY" > "$known_hosts")
-          ssh_opts=(-o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null
-            -o UserKnownHostsFile="$known_hosts" -o HostKeyAlgorithms=ssh-ed25519
-            -o PreferredAuthentications=password -o PubkeyAuthentication=no
-            -o ConnectTimeout=20 -o ServerAliveInterval=20 -o ServerAliveCountMax=6)
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" 'install -d -m 700 /root/rr-stability-candidate'
-          extra=()
-          if [ "$ROLE" = C ]; then extra=(legacy-702.tar.gz v720-update-recover.sh v720-update-external-state.py scripts/audit-upgrade-702.sh scripts/verify-upgrade-identities.py); fi
-          sha256sum rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh scripts/audit-stability-host.sh "${extra[@]}" |
-            sed 's@  scripts/@  @' > "$RUNNER_TEMP/transfer.sha256"
-          sshpass -e scp "${ssh_opts[@]}" -q rr-bundle.tar.gz scripts/install-core.sh scripts/update-guard.sh \
-            scripts/audit-stability-host.sh "${extra[@]}" "$RUNNER_TEMP/transfer.sha256" "root@$HOST:/root/rr-stability-candidate/"
-          expected_version=$(sed -n '1s/^RR-vps //p' version)
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" bash /root/rr-stability-candidate/audit-stability-host.sh \
-            "$ROLE" "$EXPECTED_OS" "$EXPECTED_OS_VERSION" "$expected_version" | tee "$RUNNER_TEMP/result.txt"
-          for port in 24443 21443 22443; do nc -z -w 10 "$HOST" "$port"; done
-          sshpass -e ssh "${ssh_opts[@]}" "root@$HOST" true
-          printf 'STABILITY role=%s external_tcp=pass ssh=pass\n' "$ROLE" | tee -a "$RUNNER_TEMP/result.txt"
-          cat "$RUNNER_TEMP/result.txt" >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/verify-owner-recovery-evidence.py --require-approved-policy \
+            | tee "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
+          {
+            printf 'Candidate commit: `%s`\n\n' "$GITHUB_SHA"
+            printf '%s\n\n' 'Scope: owner-reported Debian 12 repair, identity preservation and no Nexus installation; candidate artifacts are verified against that recorded evidence. This workflow does not run a three-host VPS test or establish client connectivity.'
+            cat "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
+          } >> "$GITHUB_STEP_SUMMARY"

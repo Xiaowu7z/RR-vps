@@ -3,7 +3,10 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-VPS_WORKFLOW="$REPO_ROOT/.github/workflows/vps-audit.yml"
+# Keep the historical VPS implementation under contract without exposing an
+# Actions entry point for deleted test hosts. Current release evidence is
+# checked separately by test-release-evidence-events.sh.
+VPS_WORKFLOW="$REPO_ROOT/docs/audit/retired-workflows/vps-audit.yml"
 CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 TEST_ROOT=$(mktemp -d)
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -7926,9 +7929,9 @@ for body, helper, sha in (
     ):
         assert token in body, f"missing {helper} inventory invariant: {token}"
 assert 'require_workflow_success_for_sha ci.yml push "CI push"' in verify
-assert 'require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"' in verify
+assert 'require_workflow_success_for_sha vps-stability.yml push "Release recovery evidence push"' in verify
 assert 'assert_workflow_gate ci.yml push "CI push"' in publish
-assert 'assert_workflow_gate vps-stability.yml push "Three-host stability push"' in publish
+assert 'assert_workflow_gate vps-stability.yml push "Release recovery evidence push"' in publish
 assert 'require_workflow_success_for_sha vps-audit.yml' not in verify
 assert 'assert_workflow_gate vps-audit.yml' not in publish
 assert publish.count("assert_release_gate") >= 4

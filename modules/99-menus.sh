@@ -645,7 +645,11 @@ main_menu() {
         echo -e "${CYAN}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${RESET}"
         echo -e " ${WHITE}RR-vps 多协议管理脚本 v${SCRIPT_VERSION}${RESET}"
         if [ -f "$CONFIG_FILE" ]; then
-            echo -e " 面板状态: ${GREEN}已安装${RESET}  |  Sing-box: $SB_STATUS  |  Argo隧道: $CF_STATUS  |  自动优选: $AUTO_STATUS  |  脚本版本: $SCRIPT_VER_STATUS"
+            local install_status="${GREEN}已完成${RESET}"
+            if [ "${INSTALL_COMPLETE:-false}" != true ]; then
+                install_status="${YELLOW}未完成（配置已保留）${RESET}"
+            fi
+            echo -e " 脚本安装: $install_status  |  Sing-box: $SB_STATUS  |  Argo隧道: $CF_STATUS  |  自动优选: $AUTO_STATUS  |  脚本版本: $SCRIPT_VER_STATUS"
             echo -e " IP模式  : ${CYAN}${IP_ENTRY_STATUS}${RESET}  |  ${CYAN}${IP_OUTBOUND_STATUS}${RESET}"
             if command -v nexus_panel_url >/dev/null 2>&1 && nexus_is_installed 2>/dev/null; then
                 local nexus_addr=""
@@ -658,7 +662,7 @@ main_menu() {
                 echo -e " ${YELLOW}兼容提示：旧配置仍在 127.0.0.1:443 运行；可到 9 → 5 → 2 无损改为其他本地端口。${RESET}"
             fi
         else
-            echo -e " 面板状态: ${RED}未安装 (请选择 1 进行安装)${RESET}"
+            echo -e " 脚本安装: ${RED}未安装 (请选择 1 进行安装)${RESET}"
         fi
         if [ "$UPDATE_AVAILABLE" = true ]; then
             echo -e " ${YELLOW}═════════════════════════════════════════════════════════════════════════════════${RESET}"

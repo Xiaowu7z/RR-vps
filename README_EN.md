@@ -8,7 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.4** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.4: Naive first installation and firewall quarantine recovery
+
+Fixes rejection of RR-owned systemd protection files when creating the missing Sing-box service after Naive certificate preparation, and conflicting transaction-marker creation when quarantine recovery rebuilds protocol or port-hopping rules. The owner reported successful two-stage recovery on Debian 12 without Nexus, with identities preserved. The targeted helper keeps the installed version at 7.2.3; this is not a full 7.2.4 upgrade test.
+
+The three previous test VPS instances have been retired. On 2026-09-10, the owner approved the [release verification policy](docs/audit/release-v724-plan.md): complete CI for all three distribution containers, plus consistency checks of this single-host recovery report and the release files. Both gates must pass on the final main commit before publication. Real-host evidence covers the targeted Debian 12 recovery; it does not establish new three-host testing or public-protocol connectivity. Local compatibility fixtures for both official 7.2.1 and the Debian compatibility build passed against the new release format; neither primary server was modified.
 
 ### 7.2.3: multi-server management and server-script fixes
 
@@ -20,7 +26,7 @@ Fixes HTTPS renewal-readiness checks that rejected the calendar output used by D
 
 ### 7.2.0: rebuilt trust boundaries, hardened recovery, and verifiable releases
 
-7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. The server core used for RR Nexus real-time traffic accounting is fixed to **sing-box 1.14.0**, built from one pinned upstream source commit. Stable consumes only an immutable GitHub Release whose exact current-`main` commit passed CI `push` and the three-host stability check `push`; Beta remains isolated on its own branch.
+7.2.0 is a system-wide engineering release spanning subscription and management security, durable hot updates, cross-version rollback, encrypted migration, supply-chain controls, and the release pipeline itself. The server core used for RR Nexus real-time traffic accounting is fixed to **sing-box 1.14.0**, built from one pinned upstream source commit. Releases 7.2.0–7.2.3 required CI `push` and three-host stability `push` results for the same main commit. From 7.2.4, the second gate verifies recovery evidence under the approved policy. Stable still consumes only an immutable GitHub Release bound to the exact current-`main` commit and matching version tag; Beta remains isolated on its own branch.
 
 This release also removes public cleartext HTTP subscriptions. A standalone endpoint must either use TLS on a trusted domain or listen only on `127.0.0.1` and be reached through an SSH tunnel. Users without a domain can select Nexus trusted public-IP mode: RR obtains a short-lived Let's Encrypt IP certificate for a globally routable public IPv4 or IPv6 address and serves personal subscriptions through the same trusted HTTPS endpoint. Legacy public HTTP URLs stop working after the upgrade.
 
@@ -28,17 +34,17 @@ Trusted public-IP mode is not a self-signed bypass. The IP must be globally rout
 
 Restore validates mount topology, object type, root ownership, write permissions, and hard-link/symlink boundaries before it queries target service state or changes RR-managed paths, then repeats that proof after freezing writers, after completing the rollback snapshot, and before recursive cleanup. If a late check fails after services have crossed the READY gate, restore clears READY, re-isolates Nginx and the managed runtime, and preserves recovery evidence. After acquiring both the shared update lock and the legacy compatibility lock, direct installation and update fail closed before release download or runtime preparation whenever the restore-marker path contains any object, including a dangling symlink; the installer does not remove that evidence.
 
-Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 remain available. See the prerequisites below for 7.2.0 `.rrbak` and NaiveProxy restore requirements, and see the changelog for the trust-boundary, recovery, multi-distribution CI, and real-host audit evidence.
+Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts, batch management, and NaiveProxy HTTP/3 remain available. See the prerequisites below for 7.2.0 `.rrbak` and NaiveProxy restore requirements, and see the changelog for the trust-boundary, recovery, multi-distribution CI, and historical real-host audit evidence for 7.2.0.
 
 ## One-command installation
 
-Target systems are listed below. CI covers containers for all three distributions; a release is not considered real-VPS verified until the current release report records all three machine gates:
+Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. Version 7.2.4 uses the owner-approved policy of three-distribution container CI plus single-host recovery-evidence verification; unperformed real-host checks must not be reported as passed:
 
 | System | Support | Notes |
 | --- | --- | --- |
-| **Debian 12 (bookworm)** | ⭐ Recommended | Primary target; must pass the per-release VPS gate |
-| Ubuntu 22.04 (jammy) | ✅ Targeted | Covers legacy upgrade and data-retention gates |
-| Ubuntu 24.04 (noble) | ✅ Targeted | Covers current-system and fault-injection gates |
+| **Debian 12 (bookworm)** | ⭐ Recommended | Container CI target; one targeted recovery report for this release |
+| Ubuntu 22.04 (jammy) | ✅ Targeted | Container CI target; no new real-host report for this release |
+| Ubuntu 24.04 (noble) | ✅ Targeted | Container CI target; no new real-host report for this release |
 
 Other Debian/Ubuntu derivatives are untested and not guaranteed.
 
@@ -125,7 +131,7 @@ Direct restore to a blank destination is supported only when NaiveProxy is disab
 - Target-scoped UFW/IPv4/IPv6 firewall transactions: a durable cross-boot gate is established and managed ingress is stopped before the first write; the gate is removed only after every participating backend's live and persistent state validates. Unprovable writes, saves, or compensation retain fail-closed evidence until a complete repair is revalidated
 - Menu, CLI, background-sync, health-repair, and certificate-deploy writers share a root-only transaction lock domain. Naive/Sing-box and public Nexus certificate pairs remain gated until atomic publication, effective systemd policy, and the actually served certificate are proved; durable pending evidence makes failures idempotently recoverable
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push and three-host stability push evidence for one exact SHA before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
+- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push and release-verification push evidence for one exact SHA (with verification scope stated in each release report) before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
 - `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
 - Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and automatic local rollback attempts on health failure; it is not a full-machine backup
 - No forced reservation of local port 443 for Argo

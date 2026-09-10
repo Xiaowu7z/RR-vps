@@ -3,7 +3,8 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-WORKFLOW="$REPO_ROOT/.github/workflows/vps-audit.yml"
+# This is a historical source/fixture contract, not a live VPS execution.
+WORKFLOW="$REPO_ROOT/docs/audit/retired-workflows/vps-audit.yml"
 
 python3 - "$WORKFLOW" <<'PY'
 from __future__ import annotations

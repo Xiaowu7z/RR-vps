@@ -2,7 +2,7 @@ name: Finalize stable release
 
 on:
   workflow_run:
-    workflows: [CI, Three-host stability smoke test]
+    workflows: [CI, Release recovery evidence]
     types: [completed]
     branches: [main]
 
