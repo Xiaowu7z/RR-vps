@@ -98,6 +98,26 @@ if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --connect-timeout 15 \
     echo 'REPAIR_STOP phase=candidate_identity' >&3
     exit 1
 fi
+# The v2 recovery already owns a proved firewall writer gate. The corrected
+# system module reuses it instead of trying to create a conflicting v1 marker.
+# Only the private copy is replaced; the installed 7.2.3 manifest stays intact.
+repair_firewall_candidate_commit='32404ee182bb19a8084ab2423d336e8ec90994e0'
+repair_firewall_candidate_sha256='76dd751658ab07ed5c009dcd25899bd2fc96b94cb442a2a0db7543483a4d7055'
+if [[ ! "$repair_firewall_candidate_commit" =~ ^[0-9a-f]{40}$ ]] || \
+   [[ ! "$repair_firewall_candidate_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo 'REPAIR_STOP phase=firewall_candidate_not_pinned' >&3
+    exit 1
+fi
+repair_firewall_candidate_file="$repair_stage/candidate-10-system.sh"
+if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 2 --connect-timeout 15 \
+    --max-time 90 --output "$repair_firewall_candidate_file" \
+    "https://raw.githubusercontent.com/Xiaowu7z/RR-vps/$repair_firewall_candidate_commit/modules/10-system.sh" || \
+   ! printf '%s  %s\n' "$repair_firewall_candidate_sha256" "$repair_firewall_candidate_file" | sha256sum -c - || \
+   ! /bin/bash -n "$repair_firewall_candidate_file" || \
+   ! mv -- "$repair_firewall_candidate_file" "$repair_stage/modules/10-system.sh"; then
+    echo 'REPAIR_STOP phase=firewall_candidate_identity' >&3
+    exit 1
+fi
 for repair_module in "$repair_stage"/modules/*.sh; do
     # shellcheck disable=SC1090
     source "$repair_module" || { echo 'REPAIR_STOP phase=load_runtime' >&3; exit 1; }

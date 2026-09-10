@@ -89,6 +89,22 @@
 
 本次工具 SHA256 为 `856c59bb0e3ac4c73f04ee38961fb5a4987f6e5097e4283db0f4f40d43787116`。进程 fixture 原 10 项及新增 7 项共 17 项通过：644 PID/日志和 640 PID/440 日志允许原样检查并通过真实 pidfd 停止受控进程；组或其他用户可写的 PID/日志、软链接、硬链接以及变成 644 的私有指纹记录均拒绝发送信号。比较 PID/日志字节、权限、属主、inode、链接数、大小及 mtime/ctime 保持；所有输出不包含日志哨兵内容。仍采用前述明确披露的无网络二进制、容器 cgroup fixture 和必要的测试子进程 proc 路径映射，不能算用户 VPS 或实际 Cloudflared 测试。相关 Bash 语法检查通过。
 
+## 2026-09-10 原生隔离恢复的重复事务标记冲突
+
+用户执行 `4b2cadf05bf2a81609ac7ed4a984e60ddc285315` 的恢复工具后，31 项前置检查、证据绑定、当前规则核对及备份通过；PID 44406 已经由经过身份复核的 pidfd 成功发送 TERM 并确认退出。随后原生恢复返回 `REPAIR_STOP phase=firewall_reconcile rc=1`，目录为 `/root/rr-repair-naive723.mu4TTX`。第二条默认恢复命令没有执行。这次确实停止了孤立 Argo，不能再称为没有进行服务器变更。
+
+后续只读回执确认：检查时两份配置仍与恢复前哈希一致；IPv4、IPv6 的 filter/nat 四张当前完整规则表都与封存证据及备份归档中的证据逐字节相同。netfilter-persistent 可用且服务为 enabled/active/exited。保护 service 为 activating/start、path 为 enabled/active/running、timer 为 disabled/inactive/dead。私有日志只有候选模块和配置哈希检查通过的信息，没有原生失败分支说明。这些结果证明检查时的规则及配置仍为备份状态，但单凭它们不能区分变更前拒绝与变更后补偿，也不能把 `cleanup_uncertain=false` 当作防火墙补偿证明；该字段只报告外层锁清理。
+
+源码确认一处独立于操作系统和面板的冲突：原生 v2 恢复保留隔离标记，并在完整证据核验及真实防火墙锁内设置恢复上下文；但 `rr_reconcile_protocol_firewall_locked` 和 `rr_firewall_batch_install_hop_rules` 无条件再次调用 `rr_firewall_inflight_begin_locked`。后者在没有本进程持有的 v1 事务时要求标记路径不存在，必然拒绝当前的 v2 标记。端口规则因此不能重建，外层恢复走失败路径。这与现场停止位置及原态规则回执一致。
+
+修正只在上述两处沿用已有的 `rr_firewall_writer_gate_is_held` 检查：已有经过认证的写权限时加入当前事务，否则仍调用原来的 inflight begin。没有修改 marker/evidence、所有者标志、锁检查或恢复入口的完整证据校验；普通安装仍建立自己的 v1 事务。后续 batch commit/abort 只结束本进程真正拥有的 v1；v2 仍由最外层恢复完成全部后验后解除。两处拒绝分支增加不含配置值的明确错误提示。
+
+新增 `tests/test-firewall-quarantine-writer-gate.sh` 的 15 项回归全部通过：回放旧条件时，两处入口在合法 v2 标记下均拒绝且没有后端写入；修正后真实协议及 hop 事务可复用写权限；普通事务仍发布标记，已有 inflight 不重复创建，延迟提交保持标记与锁直至 finish；无锁、错误 owner、孤立 v1、未知或可写标记及缺少恢复上下文均拒绝。使用生产协议/hop 控制流程、flock、marker 写入与解析、writer gate、begin/finish、batch 生命周期及 save 包装器；内核规则、持久化后端、快照内容和 systemd 为显式 fixture。这不是 VPS 防火墙或完整原生恢复的实机验收。
+
+既有恢复编排的 21 项 fixture 再次通过。相关 Bash 语法、CI YAML 解析及候选确定性发布包核验通过。候选运行时代码提交为 `32404ee182bb19a8084ab2423d336e8ec90994e0`，`modules/10-system.sh` SHA256 为 `76dd751658ab07ed5c009dcd25899bd2fc96b94cb442a2a0db7543483a4d7055`；发布包 SHA256 更新为 `288b4977295cf8de08be08c22a0f678e584a25bb0c0c8218190002eeaf28bbba`。固定提交的 raw 模块已下载并与本地候选逐字节核对。
+
+定向工具现在额外下载并校验该 system 模块，仅替换日志目录下的私有模块副本；已安装的不可变 7.2.3 文件继续前后核对，不直接覆盖。模块 30 仍来自此前固定提交。新版工具 SHA256 为 `5d3ee4294126212aac54b532ca5165cb0ee8a1757483f69aa88d4cf0cd24ba0e`。仍需用户执行后取得 `FIREWALL_RECOVERY_COMPLETE`、`REPAIR_COMPLETE` 并确认节点可用；正式版尚未发布，不能将这次本地复现计为故障机恢复成功。
+
 ## 现场操作边界
 
 默认恢复仅适用于已核对的 Debian 12、7.2.3、无 Nexus、Naive 证书已就绪且 Sing-box 主 unit 缺失的状态。存在隔离/恢复标记、文件不一致、证书或身份前置条件不符时停止并报告阶段；不直接删除保护标记、不清空防火墙、不重新运行安装向导。显式隔离恢复模式的额外条件和操作范围见上节。
