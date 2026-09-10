@@ -247,7 +247,7 @@ repair_locked() {
     repair_finished=false
     repair_health_started=false
     local path="" load_state="" dropin=/etc/systemd/system/sing-box.service.d/zzzzz-rr-firewall-quarantine.conf
-    # This trap runs in rr_run_mutating_entrypoint's isolated, lock-held callback.
+    # This trap runs in rr_run_with_update_locks' isolated, lock-held callback.
     trap 'repair_exit $?' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
@@ -389,11 +389,17 @@ repair_exit() {
     exit "$result"
 }
 
-rr_menu_run_writer repair_locked </dev/null
+# The environment was cleared before any runtime module was loaded. Enter the
+# original lock API once, with its supported bounded wait; never retry a
+# callback that may already have changed the host.
+printf 'REPAIR_WAIT phase=writer_lock max_wait_seconds=20\n' >&3
+rr_run_with_update_locks isolated 20 repair_locked </dev/null
 repair_result=$?
 if [ "$repair_result" -ne 0 ] && [ ! -f "$repair_stage/phase" ]; then
     if [ "$repair_result" -eq 75 ]; then
-        printf '未取得 RR 写入锁；通常是其他任务占用，也可能是 flock 错误。尚未备份配置或执行恢复，请先定位锁与进程。\n' >&3
+        printf '未取得 RR 写入锁（新写锁最多等待 20 秒）；通常是其他任务占用，也可能是 flock 错误。尚未备份配置或执行恢复。\n' >&3
+    elif [ "$repair_result" -eq 76 ]; then
+        printf 'RR 事务锁的可信性检查未通过；尚未备份配置或执行恢复。\n' >&3
     fi
     printf 'REPAIR_STOP phase=writer_lock rc=%s backup=%s\n' "$repair_result" "$repair_stage" >&3
 fi
