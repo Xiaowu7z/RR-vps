@@ -4492,10 +4492,14 @@ rr_reconcile_protocol_firewall_locked() {
         return 1
     fi
 
-    if rr_firewall_inflight_begin_locked; then
+    # Explicit quarantine recovery already owns a verified v2 writer gate.
+    # Only ordinary writers need to publish a new v1 in-flight marker here.
+    if rr_firewall_writer_gate_is_held || rr_firewall_inflight_begin_locked; then
         arm_status=0
     else
         arm_status=$?
+        printf '%s\n' \
+            '协议规则未取得受保护的防火墙写权限；未开始该规则写入。' >&2
         rm -rf "$snapshot"
         [ "$arm_status" -ge 2 ] && return 2
         return 1
@@ -4917,10 +4921,14 @@ rr_firewall_batch_install_hop_rules() {
         printf '无法建立 %s 端口跳跃防火墙事务快照；未修改规则。\n' "$label" >&2
         return 1
     fi
-    if rr_firewall_inflight_begin_locked; then
+    # Join the existing authenticated recovery/batch gate when present;
+    # a new transaction still has to publish its own v1 in-flight marker.
+    if rr_firewall_writer_gate_is_held || rr_firewall_inflight_begin_locked; then
         arm_status=0
     else
         arm_status=$?
+        printf '%s\n' \
+            '端口跳跃规则未取得受保护的防火墙写权限；未开始该规则写入。' >&2
         rm -rf "$snapshot"
         [ "$arm_status" -ge 2 ] && return 2
         return 1

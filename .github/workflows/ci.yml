@@ -231,6 +231,7 @@ jobs:
               test-cert-reload-pending.sh|\
               test-cloudflared-supply-chain.sh|\
               test-firewall-transaction.sh|\
+              test-firewall-quarantine-writer-gate.sh|\
               test-health-transaction-lock.sh|\
               test-install-core-rollback-boundary.sh|\
               test-ip-acme-restore-update.sh|\
