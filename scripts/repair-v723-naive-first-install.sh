@@ -519,37 +519,257 @@ except OSError as error:
 PY
 }
 
+# This is the only process stop performed by firewall recovery. The process
+# handle and complete launch identity are checked again immediately before TERM.
+# No PID file, domain, configuration, unit or installed runtime is rewritten.
+repair_argo_process() {
+    python3 - "$1" "$repair_stage/argo-process-before.json" "${PORT:-}" \
+        "${ARGO_PID_FILE:-}" "${ARGO_LOG_FILE:-}" "${repair_argo_pids:-}" >&3 <<'PY'
+import hashlib, json, os, re, select, signal, stat, sys
+from pathlib import Path
+PROC_ROOT = Path('/proc')
+BINARY = Path('/usr/bin/cloudflared')
+mode, record_name, port, pid_name, log_name, discovered = sys.argv[1:]
+record = Path(record_name)
+def report(**fields):
+    print(json.dumps(dict(event='ARGO_PROCESS', **fields), ensure_ascii=True), flush=True)
+def refuse(reason):
+    report(result='FAIL', reason=reason)
+    raise SystemExit(1)
+def safe_file(path, private=False):
+    for parent in list(reversed(path.parents)):
+        s = parent.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
+            refuse('unsafe_file_parent')
+    s = path.lstat()
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_nlink != 1 or s.st_mode & 0o022:
+        refuse('unsafe_file_metadata')
+    if private and stat.S_IMODE(s.st_mode) != 0o600:
+        refuse('private_file_mode')
+    return s
+
+def cgroup_owned(data):
+    # RR's original nohup launch remains in its SSH login cgroup. With PAM
+    # this is a root session scope; without PAM it can be ssh[d].service.
+    paths = []
+    for line in data.decode('ascii').splitlines():
+        fields = line.split(':', 2)
+        if len(fields) != 3:
+            return False
+        paths.append(fields[2])
+    allowed = re.compile(r'/user\.slice/user-0\.slice/session-[A-Za-z0-9_-]+\.scope|/system\.slice/(?:ssh|sshd)\.service')
+    return bool(paths) and any(allowed.fullmatch(p) for p in paths) and all(p == '/' or allowed.fullmatch(p) for p in paths)
+
+def fingerprint(pid):
+    p = PROC_ROOT / str(pid)
+    process_stat = p.joinpath('stat').read_text()
+    # comm is parenthesized and may itself contain spaces or parentheses.
+    tail = process_stat[process_stat.rfind(')') + 2:].split()
+    if len(tail) < 20 or tail[0] == 'Z':
+        raise ProcessLookupError('exited')
+    starttime = int(tail[19])
+    status = p.joinpath('status').read_text().splitlines()
+    uid = next((line.split()[1:] for line in status if line.startswith('Uid:')), [])
+    if uid != ['0', '0', '0', '0']:
+        refuse('process_uid')
+    binary = safe_file(BINARY)
+    resolved = os.readlink(p / 'exe')
+    if resolved != str(BINARY) or not binary.st_mode & 0o111:
+        refuse('process_executable')
+    actual = p.joinpath('exe').stat()
+    if (actual.st_dev, actual.st_ino) != (binary.st_dev, binary.st_ino):
+        refuse('process_executable_inode')
+    raw = p.joinpath('cmdline').read_bytes()
+    if not raw.endswith(b'\0'):
+        refuse('process_argv_encoding')
+    argv = raw[:-1].split(b'\0')
+    valid_origin = {('http://127.0.0.1:' + port).encode(), ('http://localhost:' + port).encode()}
+    if len(argv) != 8 or argv[0] not in (b'cloudflared', str(BINARY).encode()) or argv[1:3] != [b'tunnel', b'--url'] or argv[3] not in valid_origin or argv[4:] != [b'--edge-ip-version', b'auto', b'--protocol', b'http2']:
+        refuse('process_argv_not_exact_rr_launch')
+    cgroup = p.joinpath('cgroup').read_bytes()
+    if not cgroup_owned(cgroup):
+        refuse('process_cgroup_not_ssh_login')
+    return dict(pid=pid, starttime=starttime, exe_device=binary.st_dev,
+                exe_inode=binary.st_ino, argv_sha256=hashlib.sha256(raw).hexdigest(),
+                cgroup_sha256=hashlib.sha256(cgroup).hexdigest(), uids=uid)
+
+def optional_file(name, pid_file=False):
+    if not name or not Path(name).is_absolute():
+        refuse('runtime_file_path')
+    path = Path(name)
+    try:
+        s = safe_file(path, private=True)
+    except FileNotFoundError:
+        return None
+    data = path.read_bytes() if pid_file else b''
+    if pid_file and (s.st_size > 32 or re.fullmatch(rb'[1-9][0-9]*\n?', data) is None):
+        refuse('pid_file_schema')
+    return dict(path=str(path), device=s.st_dev, inode=s.st_ino,
+                sha256=hashlib.sha256(data).hexdigest() if pid_file else None,
+                pid=int(data) if pid_file else None)
+
+try:
+    if not re.fullmatch(r'[1-9][0-9]{0,4}', port) or int(port) > 65535:
+        refuse('current_port')
+    if mode == 'inspect':
+        if discovered and re.fullmatch(r'[1-9][0-9]*(?:\n[1-9][0-9]*)*', discovered) is None:
+            refuse('candidate_pid_schema')
+        pids = [int(x) for x in discovered.splitlines()]
+        if len(pids) > 1:
+            refuse('multiple_candidate_processes')
+        pid_info = optional_file(pid_name, pid_file=True)
+        log_info = optional_file(log_name)
+        pid = pids[0] if pids else None
+        if pid is not None and pid_info is not None and pid_info['pid'] != pid:
+            refuse('pid_file_does_not_match_candidate')
+        fp = fingerprint(pid) if pid is not None else None
+        data = dict(schema='rr-orphan-quick-argo-v1', port=port, pid=pid,
+                    fingerprint=fp, pid_file=pid_info, log_file=log_info)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open(record, flags, 0o600)
+        with os.fdopen(fd, 'w') as out:
+            json.dump(data, out, sort_keys=True)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        report(result='PASS', mode=mode, pid=pid, current_port=int(port),
+               pid_file_present=pid_info is not None,
+               pid_file_stale=pid is None and pid_info is not None, stop_required=pid is not None)
+    elif mode == 'stop':
+        safe_file(record, private=True)
+        data = json.loads(record.read_text())
+        if data.get('schema') != 'rr-orphan-quick-argo-v1' or data.get('port') != port:
+            refuse('fingerprint_record_schema')
+        pid = data.get('pid')
+        if pid is None:
+            report(result='PASS', mode=mode, state='no_process', signal_sent=False)
+            raise SystemExit(0)
+        if type(pid) is not int or pid <= 0 or not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            refuse('pidfd_not_available_or_record_invalid')
+        try:
+            handle = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            report(result='PASS', mode=mode, pid=pid, state='already_exited', signal_sent=False)
+            raise SystemExit(0)
+        try:
+            # An fd ready for polling references an exited process, even if
+            # the numeric PID has since been reused. Never send a PID signal.
+            poller = select.poll()
+            poller.register(handle, select.POLLIN)
+            if poller.poll(0):
+                report(result='PASS', mode=mode, pid=pid, state='already_exited', signal_sent=False)
+                raise SystemExit(0)
+            try:
+                if fingerprint(pid) != data.get('fingerprint'):
+                    refuse('process_identity_changed')
+                if optional_file(pid_name, pid_file=True) != data.get('pid_file'):
+                    refuse('pid_file_changed')
+                if fingerprint(pid) != data.get('fingerprint'):
+                    refuse('process_identity_changed')
+                signal.pidfd_send_signal(handle, signal.SIGTERM)
+            except (FileNotFoundError, ProcessLookupError):
+                if not poller.poll(0):
+                    refuse('process_snapshot_unavailable_while_alive')
+                report(result='PASS', mode=mode, pid=pid, state='already_exited', signal_sent=False)
+                raise SystemExit(0)
+            report(mode=mode, pid=pid, signal_sent=True, signal='SIGTERM')
+            if not poller.poll(5000):
+                refuse('process_did_not_exit_within_5_seconds')
+            report(result='PASS', mode=mode, pid=pid, state='exited', signal_sent=True)
+        finally:
+            os.close(handle)
+    else:
+        refuse('unsupported_mode')
+except (FileNotFoundError, ProcessLookupError):
+    refuse('process_or_file_disappeared_during_inspection')
+except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+    report(result='FAIL', reason=type(error).__name__)
+    raise SystemExit(1)
+PY
+}
+
+repair_firewall_runtime_idle() {
+    local mode="${1:-require-idle}" probe="" finder="" pids="" probe_rc=0 finder_rc=0
+    local state="" query_rc=0 failed=false
+    repair_argo_pids=""
+    for probe in managed_singbox_running subscription_server_running quick_argo_running; do
+        case "$probe" in
+            managed_singbox_running) finder=managed_singbox_pids ;;
+            subscription_server_running) finder=managed_subscription_pids ;;
+            quick_argo_running) finder=quick_argo_pids ;;
+        esac
+        probe_rc=0; "$probe" || probe_rc=$?
+        finder_rc=0; pids=$("$finder") || finder_rc=$?
+        printf 'FIREWALL_RUNTIME probe=%s rc=%s finder=%s finder_rc=%s pids=%q\n' \
+            "$probe" "$probe_rc" "$finder" "$finder_rc" "${pids:-none}" >&3 || return 1
+        if [ "$probe_rc" -gt 1 ] || [ "$finder_rc" -gt 1 ] || \
+           { [ "$probe_rc" -eq 0 ] && [ -z "$pids" ]; } || \
+           { [ "$probe_rc" -ne 0 ] && [ -n "$pids" ]; }; then
+            failed=true
+        elif [ -n "$pids" ]; then
+            if [ "$mode" = allow-quick ] && [ "$probe" = quick_argo_running ]; then
+                repair_argo_pids="$pids"
+            else
+                failed=true
+            fi
+        fi
+    done
+    state=$(systemctl show cloudflared.service -p ActiveState --value) || query_rc=$?
+    printf 'FIREWALL_UNIT unit=cloudflared.service property=ActiveState value=%q command_rc=%s\n' \
+        "$state" "$query_rc" >&3 || return 1
+    case "$query_rc:$state" in 0:inactive|0:failed) ;; *) failed=true ;; esac
+    [ "$failed" = false ] || return 1
+    if [ "$mode" = allow-quick ]; then
+        if [ -n "$repair_argo_pids" ]; then
+            [ "$SCRIPT_VERSION" = 7.2.3 ] && [ "$INSTALL_COMPLETE" = false ] && \
+                [ "$VM_ENABLED" = true ] && [ "$VM_TLS_ENABLED" = false ] && \
+                [ "$TUNNEL_MODE" = 1 ] && [ -z "${VM_PREVIOUS_PORT:-}" ] || {
+                printf 'ARGO_PROCESS result=FAIL reason=configuration_not_incomplete_quick_install\n' >&3
+                return 1
+            }
+        fi
+        repair_argo_process inspect || return 1
+    fi
+}
+
 repair_firewall_recorded_units_idle() {
-    local index=0 unit="" expected_load="" expected_file="" value="" state=""
+    local index=0 unit="" expected_load="" expected_file="" value="" state="" command_rc=0
+    local failed=false
     [ "${#RR_FIREWALL_QUARANTINE_UNITS[@]}" -eq 5 ] || return 1
-    [ "$RR_FIREWALL_QUARANTINE_SINGBOX_RUNTIME" = false ] && \
-        [ "$RR_FIREWALL_QUARANTINE_SUBSCRIPTION_RUNTIME" = false ] || return 1
+    if [ "$RR_FIREWALL_QUARANTINE_SINGBOX_RUNTIME" != false ] || \
+       [ "$RR_FIREWALL_QUARANTINE_SUBSCRIPTION_RUNTIME" != false ]; then
+        printf 'FIREWALL_RUNTIME recorded_nodes_idle=false\n' >&3 || return 1
+        failed=true
+    fi
     for ((index=0; index<5; index++)); do
         unit="${RR_FIREWALL_QUARANTINE_UNITS[index]}"
         expected_load="${RR_FIREWALL_QUARANTINE_LOAD_STATES[index]}"
         expected_file="${RR_FIREWALL_QUARANTINE_FILE_STATES[index]}"
         case "${RR_FIREWALL_QUARANTINE_ACTIVE_STATES[index]}" in
             inactive|failed) ;;
-            *) return 1 ;;
+            *) failed=true ;;
         esac
-        value=$(systemctl show "$unit" -p LoadState --value) || return 1
-        printf 'FIREWALL_UNIT unit=%s property=LoadState value=%q expected=%q\n' \
-            "$unit" "$value" "$expected_load" >&3 || return 1
-        [ "$value" = "$expected_load" ] || return 1
-        value=$(systemctl show "$unit" -p UnitFileState --value) || return 1
+        command_rc=0
+        value=$(systemctl show "$unit" -p LoadState --value) || command_rc=$?
+        printf 'FIREWALL_UNIT unit=%s property=LoadState value=%q expected=%q command_rc=%s\n' \
+            "$unit" "$value" "$expected_load" "$command_rc" >&3 || return 1
+        [ "$command_rc" -eq 0 ] && [ "$value" = "$expected_load" ] || failed=true
+        command_rc=0
+        value=$(systemctl show "$unit" -p UnitFileState --value) || command_rc=$?
         if [ "$expected_load" = not-found ] && [ -z "$value" ]; then
             value=not-found
         fi
-        printf 'FIREWALL_UNIT unit=%s property=UnitFileState value=%q expected=%q\n' \
-            "$unit" "$value" "$expected_file" >&3 || return 1
-        [ "$value" = "$expected_file" ] || return 1
-        state=$(systemctl show "$unit" -p ActiveState --value) || return 1
-        case "$state" in inactive|failed) ;; *) return 1 ;; esac
+        printf 'FIREWALL_UNIT unit=%s property=UnitFileState value=%q expected=%q command_rc=%s\n' \
+            "$unit" "$value" "$expected_file" "$command_rc" >&3 || return 1
+        [ "$command_rc" -eq 0 ] && [ "$value" = "$expected_file" ] || failed=true
+        command_rc=0
+        state=$(systemctl show "$unit" -p ActiveState --value) || command_rc=$?
+        printf 'FIREWALL_UNIT unit=%s property=ActiveState value=%q expected=inactive_or_failed command_rc=%s\n' \
+            "$unit" "$state" "$command_rc" >&3 || return 1
+        case "$command_rc:$state" in 0:inactive|0:failed) ;; *) failed=true ;; esac
     done
-    managed_singbox_running && return 1
-    subscription_server_running && return 1
-    quick_argo_running && return 1
-    return 0
+    repair_firewall_runtime_idle "${1:-require-idle}" || failed=true
+    [ "$failed" = false ]
 }
 
 repair_firewall_desired_namespace_matches() {
@@ -588,6 +808,10 @@ repair_firewall_capture() {
         usr/local/sbin/rr-firewall-quarantine-guard; do
         [ ! -e "/$path" ] && [ ! -L "/$path" ] || paths+=("$path")
     done
+    for path in "${ARGO_PID_FILE:-}" "${ARGO_LOG_FILE:-}"; do
+        [ -n "$path" ] && [[ "$path" = /* ]] || return 1
+        [ ! -e "$path" ] && [ ! -L "$path" ] || paths+=("${path#/}")
+    done
     sha256sum /etc/argo_vmess.conf /etc/sing-box/config.json \
         >"$repair_stage/firewall-config-before.sha256" || return 1
     tar -C / -czf "$repair_stage/firewall-before.tar.gz" -- "${paths[@]}" || return 1
@@ -609,6 +833,7 @@ repair_firewall_capture() {
         "$repair_stage/firewall-before.ip6tables.rules" \
         "$repair_stage/firewall-units-before.txt" \
         "$repair_stage/firewall-journal-before.txt" \
+        "$repair_stage/argo-process-before.json" \
         >"$repair_stage/firewall-backup.sha256" || return 1
     sync -f "$repair_stage/firewall-before.tar.gz" && \
         sync -f "$repair_stage/firewall-backup.sha256" && sync -f "$repair_stage"
@@ -641,9 +866,9 @@ repair_firewall_exit() {
         return 0
     fi
     [ "$result" -ne 0 ] || result=1
-    printf 'REPAIR_STOP phase=%s rc=%s cleanup_uncertain=%s backup=%s firewall_recovery_attempted=%s\n' \
+    printf 'REPAIR_STOP phase=%s rc=%s cleanup_uncertain=%s backup=%s firewall_recovery_attempted=%s argo_stop_attempted=%s\n' \
         "$repair_phase" "$result" "${repair_firewall_lock_release_uncertain:-false}" \
-        "$repair_stage" "${repair_firewall_attempted:-false}" >&3
+        "$repair_stage" "${repair_firewall_attempted:-false}" "${repair_argo_stop_attempted:-false}" >&3
     exit "$result"
 }
 
@@ -653,6 +878,7 @@ repair_firewall_locked() {
     repair_firewall_lock_acquired=false
     repair_firewall_lock_release_uncertain=false
     repair_firewall_attempted=false
+    repair_argo_stop_attempted=false
     trap 'repair_firewall_exit $?' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
@@ -671,7 +897,7 @@ repair_firewall_locked() {
     repair_note firewall_evidence_binding || return 1
     rr_firewall_load_fail_closed_quarantine || return 1
     repair_note firewall_recorded_idle_state || return 1
-    repair_firewall_recorded_units_idle || return 1
+    repair_firewall_recorded_units_idle allow-quick || return 1
     repair_note firewall_live_snapshot || return 1
     rr_restore_verify_firewall_pre_mutation_snapshot /var/lib/rr-vps/firewall-evidence || return 1
     repair_note firewall_guard_effective || return 1
@@ -680,6 +906,12 @@ repair_firewall_locked() {
     repair_firewall_guard_path_enabled || return 1
     repair_note firewall_preserve_evidence || return 1
     repair_firewall_capture || return 1
+    sha256sum -c "$repair_stage/firewall-config-before.sha256" || return 1
+    repair_note firewall_stop_incomplete_quick_argo || return 1
+    [ -z "$repair_argo_pids" ] || repair_argo_stop_attempted=true
+    repair_argo_process stop || return 1
+    repair_note firewall_confirm_nodes_idle || return 1
+    repair_firewall_recorded_units_idle require-idle || return 1
     sha256sum -c "$repair_stage/firewall-config-before.sha256" || return 1
     repair_note firewall_reconcile || return 1
     repair_firewall_attempted=true
@@ -729,7 +961,10 @@ repair_locked() {
     [ "$SCRIPT_VERSION" = 7.2.3 ] && [ "$INSTALL_COMPLETE" = false ] || return 1
     [ "$NAIVE_ENABLED" = true ] && [ "$NAIVE_DOMAIN" = lam.188199201.xyz ] || return 1
     [ "$VM_ENABLED" = true ] && [ "$VM_TLS_ENABLED" = false ] && [ "$TUNNEL_MODE" = 1 ] || return 1
-    [ -z "$ARGO_DOMAIN" ] || return 1
+    if [ -n "$ARGO_DOMAIN" ]; then
+        [[ "$ARGO_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.trycloudflare\.com$ ]] && \
+            is_valid_domain "$ARGO_DOMAIN" || return 1
+    fi
     managed_singbox_running && return 1
     quick_argo_running && return 1
     subscription_server_running && return 1

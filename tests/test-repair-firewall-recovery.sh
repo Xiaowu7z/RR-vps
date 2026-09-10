@@ -25,6 +25,11 @@ for prefix in ('/etc/', '/var/lib/', '/run/rr-vps'):
 assert '"/$path"' in definitions and 'tar -C / -czf' in definitions
 definitions = definitions.replace('"/$path"', '"' + str(root) + '/$path"')
 definitions = definitions.replace('tar -C / -czf', 'tar -C "' + str(root) + '" -czf')
+# PID/log file arguments are absolute fixture paths, but archive members are
+# relative to its root just like production paths are relative to /.
+assert 'paths+=("${path#/}")' in definitions
+definitions = definitions.replace('paths+=("${path#/}")',
+                                  'paths+=("${path#' + str(root) + '/}")')
 (root / 'functions.sh').write_text(definitions)
 PY
 # shellcheck disable=SC1091
@@ -52,6 +57,8 @@ NEXUS_DB_FILE="$fixture/var/lib/rr-nexus/nexus.db"
 marker="$RR_FIREWALL_QUARANTINE_FILE"
 evidence="$RR_FIREWALL_QUARANTINE_DIR/firewall-evidence"
 node_config="$fixture/etc/sing-box/config.json"
+ARGO_PID_FILE="$fixture/run/rr-vps-argo-cloudflared.pid"
+ARGO_LOG_FILE="$fixture/var/log/rr-argo.log"
 gate="$fixture/etc/systemd/system/sing-box.service.d/zzzzz-rr-firewall-quarantine.conf"
 repair_recover_firewall=true
 repair_check_only=false
@@ -61,7 +68,10 @@ forbidden() { printf '%s\n' "$*" >>"$fixture/forbidden"; return 90; }
 repair_verify_runtime() { [ "$1" = check ]; }
 managed_singbox_running() { return 1; }
 subscription_server_running() { return 1; }
-quick_argo_running() { return 1; }
+managed_singbox_pids() { return 0; }
+managed_subscription_pids() { return 0; }
+quick_argo_running() { [ "${argo_pending:-false}" = true ]; }
+quick_argo_pids() { [ "${argo_pending:-false}" != true ] || printf '12345\n'; }
 load_config_with_defaults() { forbidden load_config_with_defaults; }
 repair_capture() { forbidden repair_capture; }
 repair_add_missing_unit() { forbidden repair_add_missing_unit; }
@@ -70,6 +80,36 @@ build_config() { forbidden build_config; }
 start_singbox() { forbidden start_singbox; }
 start_subscription_server() { forbidden start_subscription_server; }
 start_quick_argo() { forbidden start_quick_argo; }
+
+# Only process identity and signal delivery are mocked here; those operations
+# have a separate /proc + pidfd test. All orchestration, backup, idle probes,
+# marker/evidence verification and reentrant firewall locking remain real.
+eval "$(declare -f repair_argo_process | sed '1s/repair_argo_process/fixture_original_argo_process/')"
+repair_argo_process() {
+    if [[ "$scenario" != argo_* ]]; then
+        fixture_original_argo_process "$@"
+        return $?
+    fi
+    case "$1" in
+        inspect)
+            printf 'argo_inspect\n' >>"$fixture/events"
+            printf '{"schema":"fixture-only","pid":12345}\n' >"$repair_stage/argo-process-before.json"
+            chmod 600 "$repair_stage/argo-process-before.json"
+            ;;
+        stop)
+            [ -f "$repair_stage/firewall-backup.sha256" ] || { forbidden argo_stop_before_backup; return 90; }
+            sha256sum -c "$repair_stage/firewall-backup.sha256" >/dev/null || return 92
+            command tar -xOzf "$repair_stage/firewall-before.tar.gz" run/rr-vps-argo-cloudflared.pid |
+                cmp -s "$ARGO_PID_FILE" - || return 92
+            command tar -xOzf "$repair_stage/firewall-before.tar.gz" var/log/rr-argo.log |
+                cmp -s "$ARGO_LOG_FILE" - || return 92
+            printf 'argo_stop_after_backup\n' >>"$fixture/events"
+            [ "$scenario" != argo_stop_failure ] || return 1
+            argo_pending=false
+            ;;
+        *) forbidden argo_process_mode; return 90 ;;
+    esac
+}
 
 systemctl() {
     [ "${1:-}" = show ] || { forbidden systemctl_mutation; return 90; }
@@ -101,7 +141,7 @@ function ip6tables-save() { printf '*filter\n:INPUT ACCEPT [0:0]\nCOMMIT\n'; }
 tar() {
     if [ "${1:-}" = -C ]; then
         [ "${2:-}" = "$fixture" ] || { forbidden tar_nonfixture_root; return 90; }
-        [ "$scenario" != backup_tar_failure ] || return 72
+        case "$scenario" in backup_tar_failure|argo_backup_tar_failure) return 72 ;; esac
     fi
     command tar "$@"
 }
@@ -146,17 +186,26 @@ rr_firewall_repair_fail_closed_quarantine() {
     # Simulate a native function that fails before releasing its nested depth;
     # the wrapper's EXIT cleanup must release only the same BASHPID's real lock.
     [ "$scenario" != native_failure_nested_lock ] || return 38
-    [ "$scenario" = success ] || { forbidden unexpected_native_apply; return 90; }
+    case "$scenario" in success|argo_success) ;; *) forbidden unexpected_native_apply; return 90 ;; esac
     rm -- "$marker" && rm -r -- "$evidence" || return 93
     rr_firewall_lock_release
 }
 
 reset_fixture() {
     scenario="$1"
+    argo_pending=false
+    [[ "$scenario" != argo_* ]] || argo_pending=true
+    PORT=30677
+    SCRIPT_VERSION=7.2.3
+    INSTALL_COMPLETE=false
+    VM_ENABLED=true
+    VM_TLS_ENABLED=false
+    TUNNEL_MODE=1
+    VM_PREVIOUS_PORT=''
     rm -rf -- "$fixture/etc" "$fixture/var" "$fixture/run" "$fixture/stage"
     rm -f -- "$fixture/events" "$fixture/forbidden" "$fixture/archive-members"
     for path in etc/systemd/system/sing-box.service.d var/lib/rr-vps \
-        etc/sing-box etc/rr-naive etc/letsencrypt run/rr-vps; do
+        etc/sing-box etc/rr-naive etc/letsencrypt run/rr-vps var/log; do
         install -d -m 755 -- "$fixture/$path"
     done
     chmod 700 "$RR_FIREWALL_QUARANTINE_DIR"
@@ -181,11 +230,19 @@ reset_fixture() {
     printf 'firewall-evidence-v1\n' >"$evidence/evidence.complete"
     printf 'fixture-snapshot-v2\n' >"$evidence/snapshot.fixture"
     chmod 600 "$marker" "$evidence"/*
+    if [ "$argo_pending" = true ]; then
+        printf '12345\n' >"$ARGO_PID_FILE"
+        printf 'SENSITIVE_ARGO_LOG_SENTINEL\n' >"$ARGO_LOG_FILE"
+        chmod 600 "$ARGO_PID_FILE" "$ARGO_LOG_FILE"
+    fi
 }
 
 run_case() {
     local expected_rc="$1" expected_reason="$2" result=0
     sha256sum "$CONFIG_FILE" "$node_config" "$gate" >"$fixture/config-before.sha256"
+    if [ "$argo_pending" = true ]; then
+        sha256sum "$ARGO_PID_FILE" "$ARGO_LOG_FILE" >>"$fixture/config-before.sha256"
+    fi
     sha256sum "$marker" "$evidence"/* >"$fixture/evidence-before.sha256"
     (exec 3>"$fixture/$scenario.out"; repair_locked) >"$fixture/$scenario.private.log" 2>&1 || result=$?
     if [ "$result" -ne "$expected_rc" ]; then
@@ -198,7 +255,7 @@ run_case() {
     [ ! -e "$fixture/etc/systemd/system/sing-box.service" ]
     ! grep -q 'SENSITIVE_' "$fixture/$scenario.out"
     sha256sum -c "$fixture/config-before.sha256" >/dev/null
-    if [ "$scenario" = success ]; then
+    if [ "$scenario" = success ] || [ "$scenario" = argo_success ]; then
         [ ! -e "$marker" ] && [ ! -e "$evidence" ]
     else
         sha256sum -c "$fixture/evidence-before.sha256" >/dev/null
@@ -211,11 +268,31 @@ run_case() {
         grep -Fxq 'lock_released depth=0 descriptor=' "$fixture/events"
     fi
     case "$scenario" in
-        success|native_failure|native_failure_nested_lock)
+        success|argo_success|native_failure|native_failure_nested_lock)
             [ "$(grep -Fc native_apply "$fixture/events")" -eq 1 ]
             grep -Fq backup_verified_before_simulated_mutation "$fixture/events"
             ;;
         *) [ ! -e "$fixture/events" ] || ! grep -q native_apply "$fixture/events" ;;
+    esac
+    case "$scenario" in
+        argo_success)
+            [ "$(grep -Fxc argo_stop_after_backup "$fixture/events")" -eq 1 ]
+            [ "$(grep -Fxc argo_inspect "$fixture/events")" -eq 1 ]
+            python3 - "$fixture/events" <<'PY'
+from pathlib import Path
+import sys
+events = Path(sys.argv[1]).read_text().splitlines()
+assert events.index('argo_stop_after_backup') < events.index('native_apply')
+PY
+            ;;
+        argo_stop_failure)
+            [ "$(grep -Fxc argo_stop_after_backup "$fixture/events")" -eq 1 ]
+            grep -Fq 'firewall_recovery_attempted=false argo_stop_attempted=true' "$fixture/$scenario.out"
+            ;;
+        argo_backup_tar_failure)
+            ! grep -Fq argo_stop_after_backup "$fixture/events"
+            grep -Fq 'firewall_recovery_attempted=false argo_stop_attempted=false' "$fixture/$scenario.out"
+            ;;
     esac
     cases=$((cases + 1))
 }
@@ -282,4 +359,13 @@ run_case 38 'cleanup_uncertain=false'
 reset_fixture success
 run_case 0 'FIREWALL_RECOVERY_COMPLETE configuration=unchanged nodes=inactive nexus=not_installed'
 
-printf 'REPAIR_FIREWALL_RECOVERY_PASS cases=%s marker_parser=production evidence_metadata_and_config_hash=production flock=production systemd=fixture snapshot=fixture native_apply=fixture actual_firewall_changes=false\n' "$cases"
+reset_fixture argo_backup_tar_failure
+run_case 1 'REPAIR_STOP phase=firewall_preserve_evidence'
+
+reset_fixture argo_stop_failure
+run_case 1 'REPAIR_STOP phase=firewall_stop_incomplete_quick_argo'
+
+reset_fixture argo_success
+run_case 0 'FIREWALL_RECOVERY_COMPLETE configuration=unchanged nodes=inactive nexus=not_installed'
+
+printf 'REPAIR_FIREWALL_RECOVERY_PASS cases=%s marker_parser=production evidence_metadata_and_config_hash=production flock=production systemd=fixture snapshot=fixture native_apply=fixture argo_signal=fixture actual_firewall_changes=false\n' "$cases"

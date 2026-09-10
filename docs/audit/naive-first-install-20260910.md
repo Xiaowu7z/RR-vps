@@ -51,11 +51,31 @@
 
 隔离模式成功只输出 `FIREWALL_RECOVERY_COMPLETE`，不会创建 Sing-box 主服务、安装面板或启动节点。必须在它成功退出后，另起默认恢复模式完成节点安装；否则不能算本次故障已修复。先解除已验证的隔离再创建主服务，是因为原恢复要求当前 LoadState 与封存时的 not-found 状态一致。
 
-本版恢复工具 SHA256 为 `b763f88705fb43abf9d65ca586b9072fec05a71f157e9f5104a3a745ae429bfd`。调用形式为 `bash /root/rr-repair-naive.sh --recover-firewall && bash /root/rr-repair-naive.sh`；只有前一步成功才继续。它保持安装版本 7.2.3，不能将该回执等同于整套 7.2.4 热更新验证。
+首次接入隔离恢复的工具 SHA256 为 `b763f88705fb43abf9d65ca586b9072fec05a71f157e9f5104a3a745ae429bfd`，提交为 `fefa2eabc0abe7abf9315e00e119a810fe09a0a6`。调用形式为 `bash /root/rr-repair-naive.sh --recover-firewall && bash /root/rr-repair-naive.sh`；只有前一步成功才继续。它保持安装版本 7.2.3，不能将该回执等同于整套 7.2.4 热更新验证。
 
 聚焦回归 `tests/test-repair-firewall-recovery.sh` 的 18 个场景通过：inflight、不可用证据、错误格式、记录的活动节点/runtime、配置哈希或期望规则不符、证据格式或权限不符、当前加载状态或规则不符、保护服务不符/path 未启用、两种备份失败、原入口返回失败及未释放嵌套锁的失败，以及成功路径。使用真实文件、生产 marker/证据元数据及配置哈希检查、生产可重入 flock；systemd、进程探测、快照布局/当前内核规则和原恢复执行由显式 fixture 代替。没有调用真实防火墙或远程服务。
 
 成功场景验证归档中封存了实际配置、marker 和证据，且备份完成之后才调用一次模拟恢复入口；失败场景验证配置和证据原样保留。真实锁释放在持锁进程尚存活时验证，避免把进程退出自然关闭 FD 当成退出处理正确的证据。原 31 项检查/同时报告三项失败的回归也通过；Shell 语法与 CI YAML 解析通过。用户故障机尚无 `FIREWALL_RECOVERY_COMPLETE` 或 `REPAIR_COMPLETE` 回执。
+
+## 2026-09-10 孤立 Argo 进程回执
+
+用户执行 `fefa2eabc0abe7abf9315e00e119a810fe09a0a6` 后，31 项前置检查、v2 标记结构、v1 证据元数据、配置原始哈希、期望规则集合和原证据加载器全部通过；在 `firewall_recorded_idle_state` 停止。日志目录为 `/root/rr-repair-naive723.pAumCa`，`firewall_recovery_attempted=false`。这次没有进入当前内核规则快照核验、备份或防火墙恢复，不能写成防火墙恢复成功。
+
+随后用户执行只读诊断：五个 unit 均 not-found/inactive/dead，`PORT=30677`、previous port 为空；Sing-box 和订阅探针均返回 1、匹配 PID 为空；quick Argo 探针返回 0，匹配 PID 为 44406，四项 UID 均为 0，实际 executable 为 `/usr/bin/cloudflared`，完整 origin 参数中的本地端口为 30677，与当前配置一致。这证明本次具体阻断项是仍在运行的 quick Argo。PID 属于这次用户上报的瞬时快照，后续停止操作不能直接信任或硬编码它。
+
+原隔离记录及恢复只管理五个 unit、Sing-box 和订阅 runtime，没有记录或停止 quick Argo。恢复工具额外要求 quick 不运行，因此拒绝了这个现场状态；正常恢复又要求 `ARGO_DOMAIN` 为空，仅移除隔离阶段的拒绝仍可能在正常阶段停止。原 quick 启动流程会创建新域名，并通过原配置事务更新订阅。身份比较列表没有包含临时域名，不应将这个正常轮换误报为 UUID、密码或证书变化。
+
+本次处理采用持锁并备份后精确停止单一已核验 quick 进程，再使用原防火墙恢复和节点补建流程。停止前需要完整 NUL argv、精确当前 origin 端口、root UID、可信 executable、进程启动时间与归属证据；使用同一进程的 pidfd 发送 TERM，拒绝模糊端口前缀、多个候选、指纹漂移或 PID 复用。不会凭旧 PID 执行宽泛停止，也不会在解除隔离前改配置中的域名或封存证据。
+
+已向用户明确告知：正常补建会重新建立临时 Argo，临时域名将更新；原有端口、UUID、密码和证书继续核验。尚无此次修改后的实机恢复成功回执。
+
+当前恢复工具 SHA256 为 `b3a4db1bd196b0a8eaf6ec919238a0e00e7678aaec36ca02dd7f6e2217ef3947`。新增运行状态报告会列出全部 unit 的 ActiveState、三个探针及 PID 枚举返回码，不再仅打印阶段名。允许的 quick 必须处于未完成安装、VMess 无 TLS、临时隧道、无 previous port 的配置；共享 Cloudflared 服务必须停止。进程必须符合原版完整启动参数，来自 root SSH session scope 或 ssh/sshd 服务的登录进程树，使用可信 `/usr/bin/cloudflared`。有候选时，存在的 PID 文件必须匹配该候选；没有候选时可保留合规的陈旧 PID 文件，不信任其中 PID 去发送信号。
+
+停止使用 pidfd，重新核对启动时间、exe inode、UID、完整参数和 cgroup 指纹后发送一次 TERM，等待上限 5 秒，不升级为 SIGKILL。指纹及现有 PID/日志文件随私有备份保存；停止后再次确认所有节点 runtime 空闲、配置原始 SHA 不变，才进入原生规则恢复。失败报告新增 `argo_stop_attempted`，明确区分停止尝试与防火墙恢复尝试。停止阶段不删除或回写 PID、日志、域名、配置及封存证据；正常补建由原 quick 启动事务更新临时域名。
+
+独立代码审查未发现阻断项。新增 `tests/test-repair-argo-process.sh` 的 10 个受控进程场景通过，使用本地编译的无网络暂停程序，真实 root UID、启动时间、exe inode 和 pidfd 信号；覆盖精确停止、端口前缀拒绝、多候选、PID 文件不符/漂移、指纹启动时间变化、已退出、TERM 超时及陈旧 PID 文件。此工作区的命令 PID namespace 与 procfs 挂载视图不一致，因此测试只对自己创建、由子进程自报宿主 PID 的进程做只读 proc 路径映射，pidfd 仍使用该子进程在调用者命名空间中的 PID；该映射和容器 cgroup 策略替换均明确报告，普通 CI 环境不启用 proc 映射。这不是实际 Cloudflared 公网测试。
+
+防火墙编排 fixture 原 18 项加 3 项 Argo 场景共 21 项通过，验证备份失败前不停止、停止失败后不调用规则恢复且配置/证据/PID/日志保持、成功时停止一次后调用原恢复入口一次。这里的 systemd、内核规则和原生防火墙执行仍为模拟；原 31 项前置报告回归也通过。Shell 语法、嵌入 Python 语法及 CI YAML 解析通过；没有连接远程主机，也没有把这些结果记为实机验收。
 
 ## 现场操作边界
 

@@ -77,7 +77,7 @@ jobs:
       - name: ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck python3-cryptography python3-argon2 python3-yaml
+          sudo apt-get install -y shellcheck python3-cryptography python3-argon2 python3-yaml build-essential
           shellcheck --severity=error rr install.sh modules/*.sh scripts/*.sh \
             tests/*.sh assets/cf-optimizer/*.sh
 
@@ -245,6 +245,7 @@ jobs:
               test-repair-writer-wait.sh|\
               test-repair-preflight-report.sh|\
               test-repair-firewall-recovery.sh|\
+              test-repair-argo-process.sh|\
               test-update-external-state.sh|\
               test-update-external-transaction.sh|\
               test-update-firewall-finalize.sh|\
