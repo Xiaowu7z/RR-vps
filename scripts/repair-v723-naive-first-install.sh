@@ -3,17 +3,20 @@
 # Keeps the installed release bytes and all existing protection drop-ins.
 set -o pipefail
 if [ "${1:-}" != --internal ]; then
-    if [ "$#" -ne 0 ] && { [ "$#" -ne 1 ] || [ "$1" != --check ]; }; then
-        echo 'Usage: bash repair-v723-naive-first-install.sh [--check]'; exit 2
-    fi
+    case "$#:${1:-}" in
+        0:|1:--check|1:--recover-firewall) ;;
+        *) echo 'Usage: bash repair-v723-naive-first-install.sh [--check|--recover-firewall]'; exit 2 ;;
+    esac
     exec env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
         LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=dumb SSH_CONNECTION="${SSH_CONNECTION:-}" \
         /bin/bash --noprofile --norc "$0" --internal "$@"
 fi
 repair_check_only=false
+repair_recover_firewall=false
 case "$#:${2:-}" in
     1:) ;;
     2:--check) repair_check_only=true ;;
+    2:--recover-firewall) repair_recover_firewall=true ;;
     *) exit 2 ;;
 esac
 umask 077
@@ -231,6 +234,76 @@ repair_preflight_dropin_exact() {
     return "$result"
 }
 
+# A regular marker is not enough to authorize recovery. Report only the
+# bounded, non-secret journal schema here; the stock loader verifies its
+# evidence and configuration binding again under the firewall lock below.
+repair_firewall_marker_v2() {
+    python3 - >&3 <<'PY'
+import json, stat
+from pathlib import Path
+path = Path('/var/lib/rr-vps/firewall-quarantine')
+def report(**fields):
+    print(json.dumps(dict(event='FIREWALL_MARKER', **fields), ensure_ascii=True))
+def refuse(reason):
+    report(result='FAIL', reason=reason)
+    raise SystemExit(1)
+try:
+    for parent in reversed(path.parents):
+        s = parent.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
+            refuse('unsafe_parent')
+    if stat.S_IMODE(path.parent.lstat().st_mode) != 0o700:
+        refuse('marker_directory_mode')
+    s = path.lstat()
+    report(path=str(path), uid=s.st_uid, gid=s.st_gid, mode=oct(stat.S_IMODE(s.st_mode)),
+           links=s.st_nlink, size=s.st_size, regular=stat.S_ISREG(s.st_mode))
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_nlink != 1 or stat.S_IMODE(s.st_mode) != 0o600:
+        refuse('unsafe_marker')
+    if not 0 < s.st_size <= 4096:
+        refuse('marker_size')
+    data = path.read_bytes()
+    if len(data) != s.st_size or b'\r' in data or b'\0' in data:
+        refuse('marker_bytes')
+    lines = data.decode('ascii').splitlines()
+    version = lines[0] if lines and lines[0] in ('firewall-inflight-v1', 'firewall-quarantine-v2') else 'unsupported'
+    report(version=version, lines=len(lines))
+    if version != 'firewall-quarantine-v2':
+        refuse('orphan_inflight_requires_inspection' if version == 'firewall-inflight-v1' else 'unsupported_version')
+    if len(lines) != 9:
+        refuse('marker_line_count')
+    names = ('sing-box.service', 'rr-nexus.service', 'rr-subscription.service',
+             'argo-rr-health.service', 'argo-rr-health.timer')
+    for line, name in zip(lines[1:6], names):
+        fields = line.split('\t')
+        if len(fields) != 5 or fields[:2] != ['unit', name]:
+            refuse('unit_record_schema')
+        load, active, enabled = fields[2:]
+        supported = (load == 'loaded' and active in ('active', 'inactive', 'failed') and enabled in ('enabled', 'enabled-runtime', 'disabled', 'static')) or (load == 'masked' and active in ('inactive', 'failed') and enabled == 'masked') or (load, active, enabled) == ('not-found', 'inactive', 'not-found')
+        if not supported:
+            refuse('unsupported_unit_state')
+        report(unit=name, load_state=load, active_state=active, unit_file_state=enabled)
+        if active not in ('inactive', 'failed'):
+            refuse('recorded_unit_would_start')
+    for line, name in zip(lines[6:8], ('singbox', 'subscription')):
+        fields = line.split('\t')
+        if len(fields) != 3 or fields[:2] != ['runtime', name] or fields[2] not in ('true', 'false'):
+            refuse('runtime_record_schema')
+        report(runtime=name, running=fields[2] == 'true')
+        if fields[2] != 'false':
+            refuse('recorded_runtime_would_start')
+    fields = lines[8].split('\t')
+    if len(fields) != 2 or fields[0] != 'evidence' or fields[1] not in ('firewall-evidence-v1', 'unavailable'):
+        refuse('evidence_record_schema')
+    report(evidence=fields[1])
+    if fields[1] != 'firewall-evidence-v1':
+        refuse('evidence_unavailable')
+    report(result='PASS')
+except (OSError, UnicodeError) as error:
+    report(result='FAIL', reason=type(error).__name__)
+    raise SystemExit(1)
+PY
+}
+
 repair_preflight_checks() {
     local path="" name=""
     repair_preflight_total=0
@@ -240,7 +313,12 @@ repair_preflight_checks() {
         /run/rr-vps/restore-live /run/rr-vps/restore-watch-request \
         /etc/sing-box/.pair-pending /etc/rr-naive/.pair-pending; do
         name=${path//\//_}
-        repair_preflight_check "absent${name}" repair_preflight_absent "$path"
+        if [ "${repair_recover_firewall:-false}" = true ] && \
+           [ "$path" = /var/lib/rr-vps/firewall-quarantine ]; then
+            repair_preflight_check firewall_marker_v2 repair_firewall_marker_v2
+        else
+            repair_preflight_check "absent${name}" repair_preflight_absent "$path"
+        fi
     done
     for path in /etc/systemd/system /etc/systemd/system/sing-box.service.d /var/lib/rr-vps \
         /etc/sing-box /etc/rr-naive /etc/letsencrypt /run/rr-vps; do
@@ -394,7 +472,240 @@ repair_add_missing_unit() {
     rr_singbox_service_guards_are_effective
 }
 
+# This mode only reconciles a supported, sealed quarantine. It deliberately
+# finishes before the missing unit is created: the original recovery must
+# still observe the journal's recorded not-found LoadState.
+repair_firewall_evidence_report() {
+    python3 - >&3 <<'PY'
+import hashlib, json, re, stat
+from pathlib import Path
+root = Path('/var/lib/rr-vps/firewall-evidence')
+def report(**fields):
+    print(json.dumps(dict(event='FIREWALL_EVIDENCE', **fields), ensure_ascii=True))
+def refuse(reason):
+    report(result='FAIL', reason=reason)
+    raise SystemExit(1)
+try:
+    for parent in list(reversed(root.parents)) + [root]:
+        s = parent.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_mode & 0o022:
+            refuse('unsafe_evidence_parent')
+    if stat.S_IMODE(root.lstat().st_mode) != 0o700:
+        refuse('evidence_directory_mode')
+    report(path=str(root), uid=0, gid=0, mode='0o700', directory=True)
+    for name in ('config.sha256', 'desired.namespace', 'evidence.complete'):
+        p = root / name
+        s = p.lstat()
+        report(path=str(p), uid=s.st_uid, gid=s.st_gid, mode=oct(stat.S_IMODE(s.st_mode)),
+               links=s.st_nlink, size=s.st_size, regular=stat.S_ISREG(s.st_mode))
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_gid != 0 or s.st_nlink != 1 or stat.S_IMODE(s.st_mode) != 0o600:
+            refuse('unsafe_evidence_file')
+    with (root / 'evidence.complete').open('rb') as f:
+        complete = f.read(128)
+    if complete != b'firewall-evidence-v1\n':
+        refuse('evidence_kind')
+    with (root / 'config.sha256').open('rb') as f:
+        expected = f.read(128)
+    if re.fullmatch(rb'[0-9a-f]{64}\n', expected) is None:
+        refuse('config_digest_schema')
+    actual = hashlib.sha256(Path('/etc/argo_vmess.conf').read_bytes()).hexdigest().encode()
+    matches = actual == expected.rstrip(b'\n')
+    report(evidence='firewall-evidence-v1', config_digest_matches=matches)
+    if not matches:
+        refuse('configuration_changed_since_snapshot')
+except OSError as error:
+    report(result='FAIL', reason=type(error).__name__)
+    raise SystemExit(1)
+PY
+}
+
+repair_firewall_recorded_units_idle() {
+    local index=0 unit="" expected_load="" expected_file="" value="" state=""
+    [ "${#RR_FIREWALL_QUARANTINE_UNITS[@]}" -eq 5 ] || return 1
+    [ "$RR_FIREWALL_QUARANTINE_SINGBOX_RUNTIME" = false ] && \
+        [ "$RR_FIREWALL_QUARANTINE_SUBSCRIPTION_RUNTIME" = false ] || return 1
+    for ((index=0; index<5; index++)); do
+        unit="${RR_FIREWALL_QUARANTINE_UNITS[index]}"
+        expected_load="${RR_FIREWALL_QUARANTINE_LOAD_STATES[index]}"
+        expected_file="${RR_FIREWALL_QUARANTINE_FILE_STATES[index]}"
+        case "${RR_FIREWALL_QUARANTINE_ACTIVE_STATES[index]}" in
+            inactive|failed) ;;
+            *) return 1 ;;
+        esac
+        value=$(systemctl show "$unit" -p LoadState --value) || return 1
+        printf 'FIREWALL_UNIT unit=%s property=LoadState value=%q expected=%q\n' \
+            "$unit" "$value" "$expected_load" >&3 || return 1
+        [ "$value" = "$expected_load" ] || return 1
+        value=$(systemctl show "$unit" -p UnitFileState --value) || return 1
+        if [ "$expected_load" = not-found ] && [ -z "$value" ]; then
+            value=not-found
+        fi
+        printf 'FIREWALL_UNIT unit=%s property=UnitFileState value=%q expected=%q\n' \
+            "$unit" "$value" "$expected_file" >&3 || return 1
+        [ "$value" = "$expected_file" ] || return 1
+        state=$(systemctl show "$unit" -p ActiveState --value) || return 1
+        case "$state" in inactive|failed) ;; *) return 1 ;; esac
+    done
+    managed_singbox_running && return 1
+    subscription_server_running && return 1
+    quick_argo_running && return 1
+    return 0
+}
+
+repair_firewall_desired_namespace_matches() {
+    local expected="$repair_stage/firewall-desired-check.namespace"
+    rr_firewall_write_desired_namespace "$expected" || return 1
+    if ! cmp -s /var/lib/rr-vps/firewall-evidence/desired.namespace "$expected"; then
+        printf 'FIREWALL_EVIDENCE desired_namespace_matches=false\n' >&3
+        return 1
+    fi
+    printf 'FIREWALL_EVIDENCE desired_namespace_matches=true\n' >&3
+}
+
+repair_firewall_guard_path_enabled() {
+    local value="" command_rc=0
+    value=$(systemctl show rr-firewall-quarantine-guard.path \
+        -p UnitFileState --value) || command_rc=$?
+    printf 'FIREWALL_GUARD unit=rr-firewall-quarantine-guard.path property=UnitFileState value=%q expected=enabled command_rc=%s\n' \
+        "$value" "$command_rc" >&3 || return 1
+    [ "$command_rc" -eq 0 ] && [ "$value" = enabled ]
+}
+
+repair_firewall_capture() {
+    local path="" backend=""
+    local -a paths=()
+    for path in var/lib/rr-vps/firewall-quarantine var/lib/rr-vps/firewall-evidence \
+        etc/argo_vmess.conf etc/sing-box/config.json etc/iptables \
+        etc/systemd/system/sing-box.service.d \
+        etc/systemd/system/rr-nexus.service.d \
+        etc/systemd/system/rr-subscription.service.d \
+        etc/systemd/system/argo-rr-health.service.d \
+        etc/systemd/system/argo-rr-health.service \
+        etc/systemd/system/argo-rr-health.timer \
+        etc/systemd/system/rr-firewall-quarantine-guard.service \
+        etc/systemd/system/rr-firewall-quarantine-guard.path \
+        etc/systemd/system/rr-firewall-quarantine-guard.timer \
+        usr/local/sbin/rr-firewall-quarantine-guard; do
+        [ ! -e "/$path" ] && [ ! -L "/$path" ] || paths+=("$path")
+    done
+    sha256sum /etc/argo_vmess.conf /etc/sing-box/config.json \
+        >"$repair_stage/firewall-config-before.sha256" || return 1
+    tar -C / -czf "$repair_stage/firewall-before.tar.gz" -- "${paths[@]}" || return 1
+    for backend in iptables ip6tables; do
+        "$backend-save" >"$repair_stage/firewall-before.$backend.rules" || return 1
+    done
+    systemctl show sing-box.service nginx.service rr-nexus.service rr-subscription.service \
+        argo-rr-health.service argo-rr-health.timer \
+        rr-firewall-quarantine-guard.service rr-firewall-quarantine-guard.path \
+        rr-firewall-quarantine-guard.timer \
+        -p Id -p LoadState -p ActiveState -p UnitFileState -p Result \
+        -p ExecMainCode -p ExecMainStatus -p FragmentPath -p DropInPaths \
+        --no-pager >"$repair_stage/firewall-units-before.txt" || return 1
+    journalctl -u rr-firewall-quarantine-guard.service -u sing-box.service \
+        -n 100 --no-pager -o short-iso >"$repair_stage/firewall-journal-before.txt" || return 1
+    sha256sum "$repair_stage/firewall-before.tar.gz" \
+        "$repair_stage/firewall-config-before.sha256" \
+        "$repair_stage/firewall-before.iptables.rules" \
+        "$repair_stage/firewall-before.ip6tables.rules" \
+        "$repair_stage/firewall-units-before.txt" \
+        "$repair_stage/firewall-journal-before.txt" \
+        >"$repair_stage/firewall-backup.sha256" || return 1
+    sync -f "$repair_stage/firewall-before.tar.gz" && \
+        sync -f "$repair_stage/firewall-backup.sha256" && sync -f "$repair_stage"
+}
+
+repair_firewall_release_outer_lock() {
+    [ "${repair_firewall_lock_acquired:-false}" = true ] || return 0
+    # The original API is reentrant. Only release descriptors authenticated
+    # as owned by this BASHPID; never change ownership/depth flags by hand.
+    while rr_firewall_lock_is_held; do
+        if ! rr_firewall_lock_release; then
+            repair_firewall_lock_release_uncertain=true
+            return 1
+        fi
+    done
+    if [ -n "${RR_FIREWALL_LOCK_FD:-}" ]; then
+        repair_firewall_lock_release_uncertain=true
+        return 1
+    fi
+    repair_firewall_lock_acquired=false
+}
+
+repair_firewall_exit() {
+    local result="$1"
+    trap - EXIT HUP INT TERM
+    # This mode has not created an installation unit. Leave marker/evidence,
+    # configuration and service state to the stock recovery's compensation.
+    repair_firewall_release_outer_lock || result=1
+    if [ "${repair_finished:-false}" = true ] && [ "$result" -eq 0 ]; then
+        return 0
+    fi
+    [ "$result" -ne 0 ] || result=1
+    printf 'REPAIR_STOP phase=%s rc=%s cleanup_uncertain=%s backup=%s firewall_recovery_attempted=%s\n' \
+        "$repair_phase" "$result" "${repair_firewall_lock_release_uncertain:-false}" \
+        "$repair_stage" "${repair_firewall_attempted:-false}" >&3
+    exit "$result"
+}
+
+repair_firewall_locked() {
+    # EXIT runs after this callback returns, so trap state must not be local.
+    repair_finished=false
+    repair_firewall_lock_acquired=false
+    repair_firewall_lock_release_uncertain=false
+    repair_firewall_attempted=false
+    trap 'repair_firewall_exit $?' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    repair_note firewall_locked_preflight || return 1
+    repair_preflight_checks || return 1
+    repair_note firewall_lock || return 1
+    rr_firewall_lock_acquire || return 1
+    repair_firewall_lock_acquired=true
+    repair_note firewall_marker_under_lock || return 1
+    repair_firewall_marker_v2 || return 1
+    repair_note firewall_evidence_metadata || return 1
+    repair_firewall_evidence_report || return 1
+    repair_note firewall_desired_namespace || return 1
+    repair_firewall_desired_namespace_matches || return 1
+    repair_note firewall_evidence_binding || return 1
+    rr_firewall_load_fail_closed_quarantine || return 1
+    repair_note firewall_recorded_idle_state || return 1
+    repair_firewall_recorded_units_idle || return 1
+    repair_note firewall_live_snapshot || return 1
+    rr_restore_verify_firewall_pre_mutation_snapshot /var/lib/rr-vps/firewall-evidence || return 1
+    repair_note firewall_guard_effective || return 1
+    rr_firewall_quarantine_supervisor_effective || return 1
+    repair_note firewall_guard_path_enabled || return 1
+    repair_firewall_guard_path_enabled || return 1
+    repair_note firewall_preserve_evidence || return 1
+    repair_firewall_capture || return 1
+    sha256sum -c "$repair_stage/firewall-config-before.sha256" || return 1
+    repair_note firewall_reconcile || return 1
+    repair_firewall_attempted=true
+    rr_firewall_repair_fail_closed_quarantine || return $?
+    repair_note firewall_postverify || return 1
+    rr_firewall_lock_is_held && [ "${RR_FIREWALL_LOCK_DEPTH:-0}" -eq 1 ] || return 1
+    repair_no_markers || return 1
+    sha256sum -c "$repair_stage/firewall-config-before.sha256" || return 1
+    repair_firewall_recorded_units_idle || return 1
+    repair_verify_runtime check || return 1
+    repair_nexus_absent || return 1
+    rr_firewall_quarantine_supervisor_effective || return 1
+    repair_note firewall_unlock || return 1
+    repair_firewall_release_outer_lock || return 1
+    repair_note firewall_complete || return 1
+    printf 'FIREWALL_RECOVERY_COMPLETE configuration=unchanged nodes=inactive nexus=not_installed backup=%s\n' \
+        "$repair_stage" >&3 || return 1
+    repair_finished=true
+    return 0
+}
+
 repair_locked() {
+    if [ "${repair_recover_firewall:-false}" = true ]; then
+        repair_firewall_locked
+        return $?
+    fi
     # These are deliberately NOT local. The wrapper's isolated shell invokes
     # EXIT after this callback has returned and its locals have gone away.
     repair_unit_created=false

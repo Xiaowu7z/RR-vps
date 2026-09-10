@@ -244,6 +244,7 @@ jobs:
               test-singbox-absent-owned-dropins.sh|\
               test-repair-writer-wait.sh|\
               test-repair-preflight-report.sh|\
+              test-repair-firewall-recovery.sh|\
               test-update-external-state.sh|\
               test-update-external-transaction.sh|\
               test-update-firewall-finalize.sh|\
