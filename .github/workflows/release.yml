@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: Full main commit SHA that already passed CI and three-host stability
+        description: Full main commit SHA that passed CI and approved recovery-evidence verification
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       sha: ${{ steps.release.outputs.sha }}
     steps:
-      - name: Require the current main tip and successful CI and VPS gates
+      - name: Require the current main tip and successful CI and recovery-evidence gates
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -120,13 +120,13 @@ jobs:
           )
 
           require_workflow_success_for_sha ci.yml push "CI push"
-          require_workflow_success_for_sha vps-stability.yml push "Three-host stability push"
+          require_workflow_success_for_sha vps-stability.yml push "Release recovery evidence push"
           main_sha=$(gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2026-03-10' \
             "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
           [ "$main_sha" = "$REQUESTED_SHA" ] || {
-            echo "Main advanced while the CI and VPS gates were being checked." >&2
+            echo "Main advanced while the CI and recovery-evidence gates were being checked." >&2
             exit 1
           }
 
@@ -360,7 +360,7 @@ jobs:
 
           assert_verified_sha_gate() {
             assert_workflow_gate ci.yml push "CI push"
-            assert_workflow_gate vps-stability.yml push "Three-host stability push"
+            assert_workflow_gate vps-stability.yml push "Release recovery evidence push"
           }
 
           assert_main_tip() {

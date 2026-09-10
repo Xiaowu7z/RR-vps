@@ -15,58 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unchanged-runtime:
-    runs-on: ubuntu-latest
-    outputs:
-      reuse: ${{ steps.proof.outputs.reuse }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Reuse passing checks only when product and tests are unchanged
-        id: proof
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          [ "$GITHUB_EVENT_NAME:$GITHUB_REF" = push:refs/heads/main ] || exit 0
-          parent=$(git rev-parse HEAD^)
-          git diff --name-only -z "$parent" HEAD > /tmp/rr-ci-changes
-          if ! python3 - <<'PY'
-          from pathlib import Path
-          allowed = {b'.github/workflows/ci.yml', b'.github/workflows/release.yml',
-                     b'.github/workflows/publish-v720.yml', b'.github/workflows/vps-stability.yml'}
-          changed = set(Path('/tmp/rr-ci-changes').read_bytes().split(b'\0')) - {b''}
-          raise SystemExit(0 if changed and changed <= allowed else 1)
-          PY
-          then exit 0; fi
-          for workflow in ci.yml vps-stability.yml; do
-            if ! gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?branch=main&event=push&head_sha=$parent&per_page=100" \
-              --jq '.workflow_runs[]' > /tmp/rr-ci-parent-runs; then exit 0; fi
-            if ! jq -se --arg sha "$parent" '
-              map(select(.head_sha == $sha and .head_branch == "main" and .event == "push"))
-              | sort_by([.run_number,.run_attempt]) | last
-              | .status == "completed" and .conclusion == "success"
-            ' /tmp/rr-ci-parent-runs >/dev/null; then exit 0; fi
-          done
-          python3 scripts/rebuild-bundle.py --check
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess, yaml
-          for path in Path('.github/workflows').glob('*.yml'):
-              workflow = yaml.safe_load(path.read_text())
-              for job in workflow.get('jobs', {}).values():
-                  for step in job.get('steps', []):
-                      if 'run' in step:
-                          subprocess.run(['bash', '-n'], input=step['run'], text=True, check=True)
-          PY
-          printf 'Product and tests unchanged; reused successful CI and VPS checks for %s. Publishing workflow syntax and package checked.\n' "$parent" >> "$GITHUB_STEP_SUMMARY"
-          echo reuse=true >> "$GITHUB_OUTPUT"
-
   validate:
-    needs: unchanged-runtime
-    if: needs.unchanged-runtime.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -267,8 +216,6 @@ jobs:
           done
 
   os-matrix:
-    needs: unchanged-runtime
-    if: needs.unchanged-runtime.outputs.reuse != 'true'
     name: ${{ matrix.name }} clean install / hot update / rollback / uninstall
     runs-on: ubuntu-latest
     timeout-minutes: 25

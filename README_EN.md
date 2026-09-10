@@ -8,7 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.4** (candidate, unreleased; verification policy awaiting owner approval) · Current stable release: **7.2.3** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.4 candidate: Naive first installation and firewall quarantine recovery
+
+Fixes rejection of RR-owned systemd protection files when creating the missing Sing-box service after Naive certificate preparation, and conflicting transaction-marker creation when quarantine recovery rebuilds protocol or port-hopping rules. The owner reported successful two-stage recovery on Debian 12 without Nexus, with identities preserved. The targeted helper keeps the installed version at 7.2.3; this is not a full 7.2.4 upgrade test.
+
+The three previous test VPS instances have been retired. The [proposed verification policy](docs/audit/release-v724-plan.md) uses complete CI for the three distribution containers plus consistency checks of this single-host recovery report and the candidate files. The scope change awaits owner approval, and the proposed release gate rejects an unapproved policy. No new three-host or public-protocol acceptance is claimed. Local compatibility fixtures for both official 7.2.1 and the Debian compatibility build passed against the new release format; neither primary server was modified.
 
 ### 7.2.3: multi-server management and server-script fixes
 
@@ -32,13 +38,13 @@ Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts
 
 ## One-command installation
 
-Target systems are listed below. CI covers containers for all three distributions; a release is not considered real-VPS verified until the current release report records all three machine gates:
+Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. The replacement policy for 7.2.4 awaits approval, and unperformed real-host checks must not be reported as passed:
 
 | System | Support | Notes |
 | --- | --- | --- |
-| **Debian 12 (bookworm)** | ⭐ Recommended | Primary target; must pass the per-release VPS gate |
-| Ubuntu 22.04 (jammy) | ✅ Targeted | Covers legacy upgrade and data-retention gates |
-| Ubuntu 24.04 (noble) | ✅ Targeted | Covers current-system and fault-injection gates |
+| **Debian 12 (bookworm)** | ⭐ Recommended | Container CI target; one targeted recovery report for this candidate |
+| Ubuntu 22.04 (jammy) | ✅ Targeted | Container CI target; no new real-host report for this candidate |
+| Ubuntu 24.04 (noble) | ✅ Targeted | Container CI target; no new real-host report for this candidate |
 
 Other Debian/Ubuntu derivatives are untested and not guaranteed.
 
@@ -125,7 +131,7 @@ Direct restore to a blank destination is supported only when NaiveProxy is disab
 - Target-scoped UFW/IPv4/IPv6 firewall transactions: a durable cross-boot gate is established and managed ingress is stopped before the first write; the gate is removed only after every participating backend's live and persistent state validates. Unprovable writes, saves, or compensation retain fail-closed evidence until a complete repair is revalidated
 - Menu, CLI, background-sync, health-repair, and certificate-deploy writers share a root-only transaction lock domain. Naive/Sing-box and public Nexus certificate pairs remain gated until atomic publication, effective systemd policy, and the actually served certificate are proved; durable pending evidence makes failures idempotently recoverable
 - Synchronized share links, Base64, Sing-box client JSON, and Clash Meta YAML
-- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push and three-host stability push evidence for one exact SHA before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
+- Durable updates: Stable verifies an immutable product Release, the exact five assets, Tag/Commit, publication ownership, and the latest successful CI push and release-verification push evidence for one exact SHA (with verification scope stated in each release report) before execution, while Beta remains branch-isolated; persistent journals, boot recovery, consistent database snapshots, health gates, automatic rollback attempts, and explicit manual recovery remain in place
 - `rr doctor` checks system, DNS, clock, public networking, core, ports, firewall, certificates, console, subscriptions, database, disk, and update sources; safe repair and redacted reports are available
 - Password-encrypted `.rrbak` backup/migration of RR-managed data with authenticated encryption, scoped restore, and automatic local rollback attempts on health failure; it is not a full-machine backup
 - No forced reservation of local port 443 for Argo

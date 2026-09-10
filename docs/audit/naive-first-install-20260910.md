@@ -1,6 +1,6 @@
 # 7.2.4 候选：Naive 首次安装中断修复
 
-状态：待用户实机验收，尚未发布正式版。
+状态：已收到用户的 Debian 12 服务端定向恢复成功回执；7.2.4 正式发布及验证范围变更待确认。尚未收到客户端公网协议连通测试回执。
 
 ## 已确认的问题
 
@@ -104,6 +104,16 @@
 既有恢复编排的 21 项 fixture 再次通过。相关 Bash 语法、CI YAML 解析及候选确定性发布包核验通过。候选运行时代码提交为 `32404ee182bb19a8084ab2423d336e8ec90994e0`，`modules/10-system.sh` SHA256 为 `76dd751658ab07ed5c009dcd25899bd2fc96b94cb442a2a0db7543483a4d7055`；发布包 SHA256 更新为 `288b4977295cf8de08be08c22a0f678e584a25bb0c0c8218190002eeaf28bbba`。固定提交的 raw 模块已下载并与本地候选逐字节核对。
 
 定向工具现在额外下载并校验该 system 模块，仅替换日志目录下的私有模块副本；已安装的不可变 7.2.3 文件继续前后核对，不直接覆盖。模块 30 仍来自此前固定提交。新版工具 SHA256 为 `5d3ee4294126212aac54b532ca5165cb0ee8a1757483f69aa88d4cf0cd24ba0e`。仍需用户执行后取得 `FIREWALL_RECOVERY_COMPLETE`、`REPAIR_COMPLETE` 并确认节点可用；正式版尚未发布，不能将这次本地复现计为故障机恢复成功。
+
+## 2026-09-10 用户回报两阶段恢复完成
+
+用户执行固定提交 `87ba6798b229c57b5434f7ac16d6e161d326f64d` 中的恢复工具（SHA256 `5d3ee4294126212aac54b532ca5165cb0ee8a1757483f69aa88d4cf0cd24ba0e`），完整回报两阶段成功。防火墙阶段通过原生 reconcile、配置与停止状态后验、保护服务及安装文件核对并释放锁，输出 `FIREWALL_RECOVERY_COMPLETE configuration=unchanged nodes=inactive nexus=not_installed`。旧 Argo 已不存在，陈旧但可信的 PID 文件被正确识别，本轮没有发送进程信号。
+
+随后默认恢复再次通过 31 项前置检查、原有身份与证书检查，创建缺失的 Sing-box 主服务并输出 `CANDIDATE_OWNERSHIP_CHECK_OK source=cfeda272431beaffd03568c7a80c6934927f826a`。日志依次通过 guard 收敛、既有配置生成、防火墙协调、Sing-box、Argo、订阅与健康检查，最后输出 `REPAIR_COMPLETE version=7.2.3 identities=preserved nexus=not_installed`。
+
+这是用户上报的 Debian 12 真实服务端定向恢复完成证据：两处候选模块在原版 7.2.3 安装上运行成功，身份保留且没有安装 Nexus。不能把它记作整包升级至 7.2.4、两个主力服务器升级、三系统实机测试或客户端公网协议连通验收。脱敏成功行及被执行模块的摘要绑定另存于 `owner-recovery-v724.json`。
+
+现成的 `tests/test-upgrade-721-release.sh` 已使用当前真实候选产物完成本地兼容回归：官方 7.2.1 及 Debian 兼容版两份旧清单均通过旧 guard 的更新发现与 bootstrap 获取；main 移动、缺少 push 证据、非 immutable Release 和 bootstrap 篡改均拒绝。测试中的 GitHub 响应为 fixture，不执行安装器或访问主力服务器。当前候选仍需完成发布所需 CI 及用户对验证范围变更的确认，具体方案见 `release-v724-plan.md`。
 
 ## 现场操作边界
 

@@ -1,0 +1,54 @@
+{
+  "schema": "rr-owner-recovery-evidence-v1",
+  "policy_status": "proposal-awaiting-owner-confirmation",
+  "source": "owner-provided-terminal-output",
+  "reported_on": "2026-09-10",
+  "scope": {
+    "kind": "targeted-first-install-recovery",
+    "operating_system": "Debian GNU/Linux 12",
+    "host_count": 1,
+    "installed_version_before": "7.2.3",
+    "installed_version_after": "7.2.3",
+    "nexus": "not_installed",
+    "public_protocol_connectivity": "not_reported",
+    "ci_executed_live_test": false,
+    "not_claimed": [
+      "three-host-live-tests",
+      "complete-7.2.4-fresh-install",
+      "complete-hot-update-to-7.2.4",
+      "public-end-to-end-protocol-tests",
+      "primary-server-hot-update-tests"
+    ]
+  },
+  "candidate": {
+    "target_version": "7.2.4",
+    "bundle_sha256": "288b4977295cf8de08be08c22a0f678e584a25bb0c0c8218190002eeaf28bbba",
+    "modules": {
+      "modules/10-system.sh": {
+        "source_commit": "32404ee182bb19a8084ab2423d336e8ec90994e0",
+        "sha256": "76dd751658ab07ed5c009dcd25899bd2fc96b94cb442a2a0db7543483a4d7055"
+      },
+      "modules/30-singbox.sh": {
+        "source_commit": "cfeda272431beaffd03568c7a80c6934927f826a",
+        "sha256": "dfd6929c22576a49eff09a4c931a958c410225b009f9d96a5679371d8c3ee566"
+      }
+    }
+  },
+  "recovery_helper": {
+    "path": "scripts/repair-v723-naive-first-install.sh",
+    "source_commit": "87ba6798b229c57b5434f7ac16d6e161d326f64d",
+    "sha256": "5d3ee4294126212aac54b532ca5165cb0ee8a1757483f69aa88d4cf0cd24ba0e",
+    "required_installed_manifest_sha256": "87d5f85a0a4232882c97b54adbd49dfdc93b79beeca77fb59ee873aee366ce64"
+  },
+  "receipt": {
+    "format": "ordered-final-success-lines",
+    "redaction": "Only the private backup path on the firewall completion line is replaced with <redacted>.",
+    "lines": [
+      "FIREWALL_RECOVERY_COMPLETE configuration=unchanged nodes=inactive nexus=not_installed backup=<redacted>",
+      "CANDIDATE_OWNERSHIP_CHECK_OK source=cfeda272431beaffd03568c7a80c6934927f826a",
+      "REPAIR_PATCH_SOURCE commit=cfeda272431beaffd03568c7a80c6934927f826a module_sha256=dfd6929c22576a49eff09a4c931a958c410225b009f9d96a5679371d8c3ee566 installed_version=7.2.3",
+      "REPAIR_COMPLETE version=7.2.3 identities=preserved nexus=not_installed"
+    ]
+  },
+  "limitation": "This validates an owner-reported receipt and source/artifact consistency, not a CI-executed VPS test."
+}
