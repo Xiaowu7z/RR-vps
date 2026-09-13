@@ -270,11 +270,12 @@ class Recovery:
                                 stdin=subprocess.DEVNULL if input_data is None else None,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=ENV, close_fds=True, timeout=timeout, check=False)
-        if self.stage is not None and (result.stdout or result.stderr):
+        label = " ".join(args) if args[0] == "systemctl" else args[0]
+        if self.stage is not None and (result.stdout or result.stderr or args[0] == "systemctl"):
             with (self.stage / "commands.log").open("ab") as log:
-                log.write(("\nPHASE " + self.phase + " COMMAND " + args[0] + "\n").encode())
+                log.write(("\nPHASE " + self.phase + " COMMAND " + label + "\n").encode())
                 log.write(result.stdout + result.stderr)
-        require(result.returncode == 0, "command_failed:" + args[0] + ":rc=" + str(result.returncode))
+        require(result.returncode == 0, "command_failed:" + label + ":rc=" + str(result.returncode))
         return result.stdout
 
     def unit(self, name):
@@ -285,6 +286,28 @@ class Recovery:
         if result.get("LoadState") == "not-found" and not result.get("UnitFileState"):
             result["UnitFileState"] = "not-found"
         return result
+
+    def reset_failed_if_needed(self, name):
+        # ResetFailedUnit intentionally does not load units in systemd. An
+        # inactive, disabled timer may be garbage-collected after stop; a
+        # batch reset then fails despite that timer having no failed state.
+        # Reset only actual failures, individually, and prove the result.
+        require(name in {*GUARD_NAMES, "sing-box.service", "rr-nexus.service"},
+                "unsupported_failure_reset_unit")
+        value = self.unit(name)
+        require(value.get("LoadState") == "loaded" and
+                value.get("ActiveState") in {"inactive", "failed"},
+                "unexpected_reset_state:" + name)
+        limits = {"start-limit-hit", "unit-start-limit-hit"}
+        if value.get("ActiveState") != "failed" and value.get("Result") not in limits:
+            self.note("UNIT_FAILURE_RESET", unit=name, action="not_needed", state="inactive")
+            return
+        self.command(["systemctl", "reset-failed", name])
+        value = self.unit(name)
+        require(value.get("LoadState") == "loaded" and
+                value.get("ActiveState") == "inactive" and value.get("Result") not in limits,
+                "unit_failure_not_cleared:" + name)
+        self.note("UNIT_FAILURE_RESET", unit=name, action="cleared", state="inactive")
 
     def verify_host(self):
         require(os.geteuid() == 0 and os.uname().nodename == HOST, "host_or_uid")
@@ -598,12 +621,14 @@ rr_local_subscription_loopback_ready || exit 1
         self.marker_removed = True
         sync_directory(MARKER.parent)
         self.note("ORPHAN_ABORTED", marker_archive=str(archive), firewall_unchanged=True)
-        self.command(["systemctl", "reset-failed", *GUARD_NAMES])
+        for name in GUARD_NAMES:
+            self.reset_failed_if_needed(name)
         self.command(["systemctl", "start", "rr-firewall-quarantine-guard.path"])
         require(self.unit("rr-firewall-quarantine-guard.path").get("ActiveState") == "active", "idle_guard_not_active")
 
     def start_services(self):
-        self.command(["systemctl", "reset-failed", "sing-box.service", "rr-nexus.service"])
+        for name in ("sing-box.service", "rr-nexus.service"):
+            self.reset_failed_if_needed(name)
         self.command(["systemctl", "start", "sing-box.service"], timeout=60)
         self.helper("start_subscription")
         self.command(["systemctl", "start", "rr-nexus.service"], timeout=60)

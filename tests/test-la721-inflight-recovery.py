@@ -249,7 +249,7 @@ subscription_server_running() { return 1; }
         r = self.recovery()
         r.stage = stage
         calls = []
-        states = {name: {"ActiveState": "inactive"} for name in m.GUARD_NAMES}
+        states = {name: {"ActiveState": "inactive", "LoadState": "loaded", "Result": "success"} for name in m.GUARD_NAMES}
         for name in ("sing-box.service", "rr-nexus.service"):
             states[name] = {"ActiveState": "inactive", "UnitFileState": "disabled"}
         def command(args, **kwargs):
@@ -277,6 +277,50 @@ subscription_server_running() { return 1; }
         self.assertEqual(len(archived), 1)
         self.assertEqual(archived[0].read_bytes(), m.EXPECTED_MARKER)
         self.assertTrue(r.marker_removed)
+
+    def test_reset_skips_normal_timer_and_resets_only_real_failures(self):
+        r = self.recovery()
+        timer = "rr-firewall-quarantine-guard.timer"
+        path = "rr-firewall-quarantine-guard.path"
+        service = "rr-firewall-quarantine-guard.service"
+        states = {
+            timer: {"LoadState": "loaded", "ActiveState": "inactive", "Result": "success"},
+            path: {"LoadState": "loaded", "ActiveState": "failed", "Result": "unit-start-limit-hit"},
+            service: {"LoadState": "loaded", "ActiveState": "failed", "Result": "start-limit-hit"},
+        }
+        calls = []
+        r.unit = lambda name: states[name].copy()
+        def command(args, **kwargs):
+            self.assertEqual(args[:2], ["systemctl", "reset-failed"])
+            self.assertEqual(len(args), 3)
+            calls.append(args[2])
+            if args[2] == timer:
+                raise m.Refused("Unit timer not loaded")
+            states[args[2]] = {"LoadState": "loaded", "ActiveState": "inactive", "Result": "success"}
+            return b""
+        r.command = command
+        for name in m.GUARD_NAMES:
+            r.reset_failed_if_needed(name)
+        self.assertEqual(calls, [path, service])
+        self.assertEqual(states[timer]["ActiveState"], "inactive")
+
+    def test_reset_failure_and_uncleared_start_limit_are_not_ignored(self):
+        r = self.recovery()
+        name = "rr-firewall-quarantine-guard.service"
+        state = {"LoadState": "loaded", "ActiveState": "failed", "Result": "start-limit-hit"}
+        r.unit = lambda unit: state.copy()
+        r.command = lambda *args, **kwargs: (_ for _ in ()).throw(m.Refused("real reset failure"))
+        with self.assertRaisesRegex(m.Refused, "real reset failure"):
+            r.reset_failed_if_needed(name)
+        r.command = lambda *args, **kwargs: b""
+        with self.assertRaisesRegex(m.Refused, "unit_failure_not_cleared"):
+            r.reset_failed_if_needed(name)
+        state.update(ActiveState="inactive")
+        with self.assertRaisesRegex(m.Refused, "unit_failure_not_cleared"):
+            r.reset_failed_if_needed(name)
+        state.update(ActiveState="active", Result="success")
+        with self.assertRaisesRegex(m.Refused, "unexpected_reset_state"):
+            r.reset_failed_if_needed(name)
 
     def test_failure_reinstates_marker_and_stops_subscription_even_when_systemctl_fails(self):
         marker = self.root / "marker"

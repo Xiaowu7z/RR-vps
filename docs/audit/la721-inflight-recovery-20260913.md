@@ -109,3 +109,26 @@ writer is called, and compare every TCP/UDP destination-port decision before
 and after the private transformation. Later read-only service checks are now
 reported together, so a separate unmet startup requirement is visible in the
 same output instead of being hidden behind the first failed predicate.
+
+## Additional evidence: systemd unloaded timer reset
+
+The owner's next attempt passed all policy and service preconditions and
+installed the health patch. After archiving the orphan marker, the batch
+`systemctl reset-failed` returned an error specifically for the disabled
+guard timer: the unit was not loaded. The recovery stopped before starting
+nodes and successfully reinstated isolation.
+
+Systemd v255's `method_reset_failed_unit` deliberately does not load units:
+an unloaded unit cannot carry failed state. The systemctl batch command
+accumulates an error for any named unit, including an ordinary inactive timer
+that systemd has garbage-collected. See the official
+[manager implementation](https://github.com/systemd/systemd/blob/v255/src/core/dbus-manager.c)
+and [reset command](https://github.com/systemd/systemd/blob/v255/src/systemctl/systemctl-reset-failed.c).
+
+The helper now queries each unit and resets only an actual failed or
+start-limit state, individually, with verification afterward. Normal inactive
+units need no reset. Reset errors and uncleared failures remain fatal, and
+real guard startup and service/listener readiness checks remain required.
+Command logs now identify the systemctl verb and unit names. Focused tests
+cover the normal timer being skipped, real failures being cleared, and reset
+errors or persisting limits still being rejected.
