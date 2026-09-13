@@ -1877,6 +1877,28 @@ raise SystemExit(0 if parts >= (2025, 4, 0) else 1)
 PY
 }
 
+rr_cloudflared_fallback_release() {
+    # Official stable release, verified against both the upstream release body
+    # and asset API digest. These pins travel in RR's verified release bundle;
+    # an unavailable API must never turn into an unchecked latest download.
+    local architecture="${1:-}"
+    local tag=2026.9.1 checksum="" size=""
+    case "$architecture" in
+        amd64)
+            checksum=3be76adc4185d36a0bfb4c2dd8663292f0ed363797f2180333b513b43c81d419
+            size=19160216
+            ;;
+        arm64)
+            checksum=2a870d5bf6ea74d16c0923b804eabbf4943f1fd7c63a5c20fd41cc66b629c725
+            size=17667370
+            ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$tag" \
+        "https://github.com/cloudflare/cloudflared/releases/download/${tag}/cloudflared-linux-${architecture}.deb" \
+        "$checksum" "$size"
+}
+
 install_cloudflared() {
     cloudflared_token_file_supported && return 0
 
@@ -1884,10 +1906,17 @@ install_cloudflared() {
         printf '%s\n' '[安全拒绝] 热更新候选缺少受支持的 Cloudflared；未下载或安装软件包。' >&2
         return 1
     fi
+    case "$SYS_ARCH" in
+        amd64|arm64) ;;
+        *) printf '%s\n' '[失败] Cloudflared 自动安装仅支持 amd64/arm64。' >&2; return 1 ;;
+    esac
 
     echo -e "${YELLOW}仅因已选择 Argo，正在下载并安装 Cloudflared ($SYS_ARCH)...${RESET}"
     local cf_tmp_dir=""
     local release_metadata=""
+    local release_headers=""
+    local metadata_available=true
+    local metadata_rc=0 http_status="" rate_remaining="" rate_reset="" retry_after=""
     local release_selection=""
     local release_tag=""
     local asset_url=""
@@ -1898,17 +1927,61 @@ install_cloudflared() {
     local -a cf_release_values=()
     cf_tmp_dir=$(mktemp -d /tmp/rr-cloudflared.XXXXXX) || return 1
     release_metadata="$cf_tmp_dir/release.json"
+    release_headers="$cf_tmp_dir/release.headers"
     release_selection="$cf_tmp_dir/selection"
-    if ! curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-all-errors \
+    # A denied/rate-limited metadata request cannot be repaired by retrying it
+    # immediately. Use the pinned official fallback once; do not consume tokens
+    # or depend on a third-party mirror or an unverified package repository.
+    if curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL --retry 0 \
         --connect-timeout 10 --max-time 60 --max-filesize 5242880 \
         -H 'Accept: application/vnd.github+json' \
         -H 'X-GitHub-Api-Version: 2022-11-28' \
-        --output "$release_metadata" "$release_api"; then
-        rm -rf "$cf_tmp_dir"
-        echo -e "${RED}[失败] 无法读取 Cloudflared 官方发布元数据。${RESET}"
-        return 1
+        --dump-header "$release_headers" --output "$release_metadata" "$release_api"; then
+        :
+    else
+        metadata_rc=$?
+        metadata_available=false
+        if [ -f "$release_headers" ]; then
+            http_status=$(awk '$1 ~ /^HTTP\// {status=$2} END {gsub(/\r/, "", status); print status}' "$release_headers")
+            rate_remaining=$(awk '$1 ~ /^HTTP\// {v=""} tolower($1)=="x-ratelimit-remaining:" {v=$2} END {gsub(/\r/, "", v); print v}' "$release_headers")
+            rate_reset=$(awk '$1 ~ /^HTTP\// {v=""} tolower($1)=="x-ratelimit-reset:" {v=$2} END {gsub(/\r/, "", v); print v}' "$release_headers")
+            retry_after=$(awk '$1 ~ /^HTTP\// {v=""} tolower($1)=="retry-after:" {v=$2} END {gsub(/\r/, "", v); print v}' "$release_headers")
+        fi
+        case "$metadata_rc:$http_status" in
+            22:403|22:429|22:5[0-9][0-9]|5:*|6:*|7:*|18:*|28:*|35:*|52:*|55:*|56:*|60:*) ;;
+            *)
+                rm -rf "$cf_tmp_dir"
+                printf '[安全拒绝] Cloudflared 元数据请求失败（curl=%s），不属于允许切换备用版本的网络或限流错误。\n' "$metadata_rc" >&2
+                return 1
+                ;;
+        esac
+        case "$http_status" in
+            403|429)
+                printf '[提示] Cloudflared 发布 API 返回 HTTP %s（访问受限或限流）；停止重复请求。\n' "$http_status" >&2
+                if [ "$rate_remaining" = 0 ] && [[ "$rate_reset" =~ ^[0-9]{1,12}$ ]]; then
+                    printf '[提示] GitHub API 配额已用尽，重置时间（Unix 秒）：%s。\n' "$rate_reset" >&2
+                elif [[ "$retry_after" =~ ^[0-9]{1,8}$ ]]; then
+                    printf '[提示] GitHub 要求等待 %s 秒后再请求 API；本次直接使用备用版本。\n' "$retry_after" >&2
+                fi
+                ;;
+            [1-5][0-9][0-9])
+                printf '[提示] Cloudflared 发布 API 暂不可用（HTTP %s，curl=%s）。\n' "$http_status" "$metadata_rc" >&2
+                ;;
+            *)
+                printf '[提示] Cloudflared 发布 API 网络请求失败（curl=%s）。\n' "$metadata_rc" >&2
+                ;;
+        esac
+        if ! rr_cloudflared_fallback_release "$SYS_ARCH" > "$release_selection"; then
+            rm -rf "$cf_tmp_dir"
+            echo -e "${RED}[失败] 当前架构没有经过校验的 Cloudflared 备用安装包。${RESET}" >&2
+            return 1
+        fi
+        printf '%s\n' '[提示] 改用 RR 内置的固定官方 Cloudflared 版本；仍核验 SHA256、大小和安装后版本。' >&2
     fi
-    if ! python3 - "$release_metadata" "$asset_name" > "$release_selection" <<'PY'
+    # A successful response with invalid metadata is a trust failure, not an
+    # availability failure: preserve the refusal instead of using the fallback.
+    if [ "$metadata_available" = true ]; then
+        if ! python3 - "$release_metadata" "$asset_name" > "$release_selection" <<'PY'
 import json
 import re
 import sys
@@ -1952,10 +2025,11 @@ print(url)
 print(checksum)
 print(size)
 PY
-    then
-        rm -rf "$cf_tmp_dir"
-        echo -e "${RED}[安全拒绝] Cloudflared 发布版本、资产或官方 SHA256 元数据无效。${RESET}"
-        return 1
+        then
+            rm -rf "$cf_tmp_dir"
+            echo -e "${RED}[安全拒绝] Cloudflared 发布版本、资产或官方 SHA256 元数据无效。${RESET}"
+            return 1
+        fi
     fi
     mapfile -t cf_release_values < "$release_selection"
     if [ "${#cf_release_values[@]}" -ne 4 ]; then
@@ -1966,7 +2040,7 @@ PY
     asset_url="${cf_release_values[1]}"
     expected_sha256="${cf_release_values[2]}"
     expected_size="${cf_release_values[3]}"
-    if ! curl --proto '=https' --tlsv1.2 -fL --retry 3 --retry-all-errors \
+    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fL --retry 2 \
         --connect-timeout 10 --max-time 120 --max-filesize "$expected_size" \
         --output "$cf_tmp_dir/cloudflared.deb" \
         "$asset_url"; then
