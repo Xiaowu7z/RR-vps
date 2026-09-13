@@ -188,3 +188,43 @@ test passes with the added loopback rule and still rejects a missing external
 DROP. `bash scripts/validate.sh` also passes. The packet-rule tests emulate
 kernel rule reads; no production host was accessed and actual recovery still
 requires the owner's execution and final result.
+
+## Owner-reported production recovery completed
+
+The owner subsequently returned the complete successful execution of
+`081a6d684a1da440306bb32fd2413c4b2a4e82fb` with `--repair-loopback` on
+`DMIT-4AcBKDwTCc`. Download SHA256 verification passed for
+`abafb5c2e652adf998213d9179f5b1c610417aa19c136928cabbedbf2f54b1df`.
+All phases passed, including `restore_recorded_services` and `postverify`.
+The final event was `LA721_RECOVERY_COMPLETE`, followed by the final
+`RECOVERY_CHECK` with `result=PASS`. This updates the incident from a local
+candidate awaiting execution to an owner-reported successful server recovery.
+
+The completed attempt's private backup is
+`/root/rr-recover-la721.dga5hdw2`; its original marker was archived as
+`/var/lib/rr-vps/.firewall-inflight-aborted-rr-recover-la721.dga5hdw2`.
+The helper verified Sing-box and Nexus running with positive main PIDs,
+their recorded enabled state, and actual TCP connections to the local
+subscription listener and configured Nexus listener. The subscription
+process/binding checks also passed. The quarantine marker was absent and
+the idle guard path was active/enabled at final verification.
+
+The result reports `identities=preserved`,
+`firewall=ipv4_loopback_20382_repaired`,
+`persistence=matching_loopback_repair`, `health_timer=disabled`, and
+`local_hotfix=readonly-health-hop`. Pinned configuration, the compared
+administrator/device identities, and the published subscription tree passed
+preservation checks. The other three complete filter/NAT programs remained
+byte-identical; the IPv4 filter and saved rules retained only the declared
+loopback exception. The previously unseen persisted filter passed the real
+preflight on this host, resolving that earlier uncertainty.
+
+Resume here: keep the recovered 7.2.1 with its local health patch and scoped
+loopback rule. Do not rerun the incident recovery against the now-running
+installation or recommend 7.2.5, which overwrites the health patch. The
+remaining owner-side acceptance is connection through an existing LA node
+and subscription use from the client. No reboot, public TLS/application
+request, all-protocol acceptance or sustained-stability result was supplied;
+those outcomes must not be inferred from the local service/port checks.
+Formal integration/release work remains separate from this completed
+server-side recovery. The implementer did not directly access the host.
