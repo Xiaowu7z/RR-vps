@@ -3,7 +3,7 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
-RR_RELEASE_TAG="v7.2.6"
+RR_RELEASE_TAG="v7.2.5"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_SOURCE_REF="$RR_RELEASE_TAG"
@@ -1337,7 +1337,7 @@ rr_snapshot_external_state() {
 }
 
 rr_install_restore_external_state_if_required() {
-    local guard_runtime="${1:-}" state=0
+    local state=0
     if rr_transaction_format_state "$TX_DIR"; then
         state=0
     else
@@ -1360,8 +1360,7 @@ rr_install_restore_external_state_if_required() {
     }
     [ -x "$RR_UPDATE_EXTERNAL_HELPER" ] && [ -f "$RR_UPDATE_EXTERNAL_HELPER" ] && \
         [ ! -L "$RR_UPDATE_EXTERNAL_HELPER" ] || return 1
-    RR_EXTERNAL_GUARD_RUNTIME="$guard_runtime" \
-        "$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_ROOT" || return 1
+    "$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_ROOT" || return 1
     "$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"
 }
 
@@ -3121,7 +3120,7 @@ rr_rollback() {
         return 1
     fi
     TRANSACTION_ACTIVE=false
-    local rollback_failed=false failed_runtime="" failed_runtime_suffix="" runtime_mode=""
+    local rollback_failed=false
     local subscription_policy="normal"
     rr_error "新版本校验失败，正在恢复升级前状态……"
 
@@ -3132,41 +3131,15 @@ rr_rollback() {
     # A catchable failure can occur before RUNTIME_REPLACED flips to true (for
     # example a failed candidate move), so keying restoration only on that flag
     # would discard the sole old runtime during cleanup.
-    if { [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; } || \
-       [ "$RUNTIME_REPLACED" = true ]; then
-        if [ -e "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ]; then
-            # Keep the verified candidate until external compensation is
-            # finished: its current+legacy guard verifier is required before
-            # safely stopping the migrated supervisor. The independent boot
-            # recovery path can discover this same retained directory after
-            # a crash between these two moves.
-            failed_runtime_suffix="$(date +%s)${BASHPID:-$$}"
-            failed_runtime="$TX_DIR/failed-runtime-$failed_runtime_suffix"
-            runtime_mode=$(stat -c %a -- "$RR_LIB_DIR" 2>/dev/null) || runtime_mode=""
-            if [[ ! "$failed_runtime_suffix" =~ ^[0-9]+$ ]] || \
-               [ ! -d "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ] || \
-               [ "$(readlink -f -- "$RR_LIB_DIR" 2>/dev/null)" != "$RR_LIB_DIR" ] || \
-               [ "$(stat -c '%u:%g' -- "$RR_LIB_DIR" 2>/dev/null)" != 0:0 ] || \
-               [[ ! "$runtime_mode" =~ ^[0-7]{3,4}$ ]] || \
-               (( (8#${runtime_mode:-0} & 0022) != 0 )) || \
-               [ -e "$failed_runtime" ] || [ -L "$failed_runtime" ] || \
-               ! mv -T -n -- "$RR_LIB_DIR" "$failed_runtime" || \
-               [ -e "$RR_LIB_DIR" ] || [ -L "$RR_LIB_DIR" ] || \
-               ! sync -f "$TX_DIR" || ! sync -f "$(dirname -- "$RR_LIB_DIR")"; then
-                ROLLBACK_FAILED=true
-                KEEP_TRANSACTION=true
-                rr_write_phase recovery_failed >/dev/null 2>&1 || true
-                rr_error "无法安全保留候选运行目录；旧版本及事务证据已保留，等待恢复重试。"
-                return 1
-            fi
-        fi
-    fi
     if [ -n "$OLD_RUNTIME" ] && [ -e "$OLD_RUNTIME" ]; then
-        if mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
+        if { [ ! -e "$RR_LIB_DIR" ] || rm -rf "$RR_LIB_DIR"; } && \
+           mv "$OLD_RUNTIME" "$RR_LIB_DIR"; then
             OLD_RUNTIME=""
         else
             rollback_failed=true
         fi
+    elif [ "$RUNTIME_REPLACED" = true ]; then
+        rm -rf "$RR_LIB_DIR" || rollback_failed=true
     fi
     RUNTIME_REPLACED=false
 
@@ -3196,7 +3169,7 @@ rr_rollback() {
     # boundary.
     rr_restore_ip_acme_update_directories || rollback_failed=true
 
-    rr_install_restore_external_state_if_required "$failed_runtime" || rollback_failed=true
+    rr_install_restore_external_state_if_required || rollback_failed=true
     systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=true
     if [ "$rollback_failed" = true ]; then
         ROLLBACK_FAILED=true
@@ -3443,7 +3416,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "aa1e5ca57dbc36e0ee860d75a9d59a42807db4de438740b10caa45b6fa6c9dd1" ] && \
+        if [ "$actual" = "a2bebc2da7d67dd1db90c5e9dd6df21b195c9a8b356c9ceee892a042cfb8170f" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \

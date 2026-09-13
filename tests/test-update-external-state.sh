@@ -32,7 +32,7 @@ for path in \
     etc/nginx/sites-available etc/nginx/sites-enabled \
     etc/systemd/system/nginx.service.d usr/local/lib/rr-vps \
     etc/letsencrypt/renewal-hooks/deploy etc/rr-cloudflared \
-    etc/systemd/system; do
+    etc/systemd/system usr/local/sbin; do
     mkdir -p "$ROOTFS/$path"
 done
 printf 'site-original\n' > "$ROOTFS/etc/nginx/sites-available/rr-nexus.conf"
@@ -49,6 +49,13 @@ printf 'user-site-must-survive\n' > "$ROOTFS/etc/nginx/sites-available/user-site
 
 printf 'enabled\nactive\n' > "$SERVICE_ROOT/nginx"
 printf 'disabled\ninactive\n' > "$SERVICE_ROOT/cloudflared"
+printf 'enabled\nactive\n' > "$SERVICE_ROOT/rr-firewall-quarantine-guard.path"
+for suffix in service path timer; do
+    printf 'legacy-guard-%s\n' "$suffix" > \
+        "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.$suffix"
+done
+printf 'legacy-guard-helper\n' > "$ROOTFS/usr/local/sbin/rr-firewall-quarantine-guard"
+chmod 755 "$ROOTFS/usr/local/sbin/rr-firewall-quarantine-guard"
 
 cat > "$MOCK_BIN/systemctl" <<'EOF'
 #!/bin/bash
@@ -67,6 +74,9 @@ case "$action" in
         ;;
     enable|disable|start|stop|reload)
         service=${1:?}
+        if [[ "$service" = rr-firewall-quarantine-guard.* ]] && [ -n "${MOCK_GUARD_ACTION_LOG:-}" ]; then
+            printf '%s %s\n' "$action" "$service" >> "$MOCK_GUARD_ACTION_LOG"
+        fi
         touch "$root/$service"
         case "$action" in
             enable) sed -i '/^disabled$/d' "$root/$service"; grep -qx enabled "$root/$service" || printf 'enabled\n' >> "$root/$service" ;;
@@ -173,6 +183,8 @@ export MOCK_FW_ROOT="$FW_ROOT"
 export MOCK_SERVICE_ROOT="$SERVICE_ROOT"
 export MOCK_UFW_STATE=inactive
 export MOCK_FW_MUTATION_LOG="$TEST_ROOT/firewall-mutations.log"
+export MOCK_GUARD_ACTION_LOG="$TEST_ROOT/guard-actions.log"
+: > "$MOCK_GUARD_ACTION_LOG"
 
 python3 "$HELPER" snapshot "$BACKUP" --tx-root "$TX_ROOT"
 [ -f "$BACKUP/external-state/complete" ] || fail 'snapshot did not publish complete marker'
@@ -197,6 +209,15 @@ rm -f "$ROOTFS/etc/letsencrypt/renewal-hooks/deploy/rr-naive-cert.sh"
 printf 'candidate-hook\n' > "$ROOTFS/etc/letsencrypt/renewal-hooks/deploy/rr-certificates.sh"
 printf 'candidate-token\n' > "$ROOTFS/etc/rr-cloudflared/token"
 printf 'candidate-unit\n' > "$ROOTFS/etc/systemd/system/cloudflared.service"
+for suffix in service path timer; do
+    printf 'candidate-guard-%s\n' "$suffix" > \
+        "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.$suffix"
+done
+printf 'candidate-guard-helper\n' > "$ROOTFS/usr/local/sbin/rr-firewall-quarantine-guard"
+printf '%s\n' '-A INPUT -i lo -s 127.0.0.1/32 -d 127.0.0.1/32 -p tcp --dport 20382 -m comment --comment rr-local-subscription -j ACCEPT' \
+    >> "$FW_ROOT/iptables.filter.INPUT"
+printf '%s\n' '-A INPUT -i lo -s ::1/128 -d ::1/128 -p tcp --dport 20382 -m comment --comment rr-local-subscription -j ACCEPT' \
+    >> "$FW_ROOT/ip6tables.filter.INPUT"
 printf 'candidate-gate-script\n' > \
     "$ROOTFS/usr/local/lib/rr-vps/nexus-ip-cert-gate"
 printf 'candidate-gate-dropin\n' > \
@@ -207,7 +228,40 @@ chmod 644 \
 printf 'disabled\ninactive\n' > "$SERVICE_ROOT/nginx"
 printf 'enabled\nactive\n' > "$SERVICE_ROOT/cloudflared"
 
-python3 "$HELPER" restore "$BACKUP" --tx-root "$TX_ROOT"
+# Isolate rollback orchestration from the separately tested full systemd
+# verifier. The candidate fixture is still confined to this transaction and
+# authenticated against its own manifest; refusal must precede guard stops.
+RR_EXTERNAL_GUARD_RUNTIME="$BACKUP/../failed-runtime-1"
+RR_EXTERNAL_GUARD_RUNTIME=$(realpath -m "$RR_EXTERNAL_GUARD_RUNTIME")
+export RR_EXTERNAL_GUARD_RUNTIME
+mkdir -p "$RR_EXTERNAL_GUARD_RUNTIME/modules"
+printf ':\n' > "$RR_EXTERNAL_GUARD_RUNTIME/modules/09-systemd.sh"
+cat > "$RR_EXTERNAL_GUARD_RUNTIME/modules/10-system.sh" <<'EOF'
+rr_firewall_quarantine_supervisor_preflight_is_safe() {
+    [ "${MOCK_GUARD_OWNER_REFUSE:-0}" != 1 ]
+}
+EOF
+(
+    cd "$RR_EXTERNAL_GUARD_RUNTIME"
+    sha256sum modules/09-systemd.sh modules/10-system.sh > manifest.sha256
+)
+cp "$SERVICE_ROOT/rr-firewall-quarantine-guard.path" "$TEST_ROOT/guard-path-before-refusal"
+if MOCK_GUARD_OWNER_REFUSE=1 python3 "$HELPER" restore "$BACKUP" --tx-root "$TX_ROOT" >/dev/null 2>&1; then
+    fail 'foreign effective guard was accepted during rollback'
+fi
+cmp -s "$SERVICE_ROOT/rr-firewall-quarantine-guard.path" "$TEST_ROOT/guard-path-before-refusal" || \
+    fail 'foreign guard was stopped before owner verification'
+pass 'rollback refuses foreign guard hooks before executing any guard stop'
+[ ! -s "$MOCK_GUARD_ACTION_LOG" ] || fail 'foreign guard rollback attempted a mutating unit action'
+cp "$RR_EXTERNAL_GUARD_RUNTIME/modules/10-system.sh" "$TEST_ROOT/guard-verifier-original"
+printf '# changed verifier\n' >> "$RR_EXTERNAL_GUARD_RUNTIME/modules/10-system.sh"
+if python3 "$HELPER" restore "$BACKUP" --tx-root "$TX_ROOT" >/dev/null 2>&1; then
+    fail 'tampered candidate verifier was executed'
+fi
+[ ! -s "$MOCK_GUARD_ACTION_LOG" ] || fail 'tampered candidate verifier allowed a guard stop'
+cp "$TEST_ROOT/guard-verifier-original" "$RR_EXTERNAL_GUARD_RUNTIME/modules/10-system.sh"
+
+RR_EXTERNAL_GUARD_RUNTIME= python3 "$HELPER" restore "$BACKUP" --tx-root "$TX_ROOT"
 cmp -s "$FW_ROOT/iptables.filter.INPUT" "$TEST_ROOT/original-filter" || fail 'IPv4 filter order was not exactly restored'
 cmp -s "$FW_ROOT/iptables.nat.PREROUTING" "$TEST_ROOT/original-nat" || fail 'IPv4 nat order was not exactly restored'
 grep -Fxq -- '-A PREROUTING -p udp --dport 19999 -m comment --comment argo-rr-custom -j REDIRECT --to-ports 442' \
@@ -224,6 +278,101 @@ grep -qx enabled "$SERVICE_ROOT/nginx" && grep -qx active "$SERVICE_ROOT/nginx" 
 grep -qx disabled "$SERVICE_ROOT/cloudflared" && grep -qx inactive "$SERVICE_ROOT/cloudflared" || fail 'cloudflared service state was not restored'
 python3 "$HELPER" verify "$BACKUP" --tx-root "$TX_ROOT"
 pass 'restore is exact and leaves unrelated Nginx/firewall state unchanged'
+for suffix in service path timer; do
+    assert_eq "$(cat "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.$suffix")" \
+        "legacy-guard-$suffix" 'old firewall guard unit was not restored'
+done
+assert_eq "$(cat "$ROOTFS/usr/local/sbin/rr-firewall-quarantine-guard")" \
+    legacy-guard-helper 'old firewall guard helper was not restored'
+grep -qx active "$SERVICE_ROOT/rr-firewall-quarantine-guard.path" || fail 'old guard path was not resumed'
+for suffix in service timer; do
+    grep -qx inactive "$SERVICE_ROOT/rr-firewall-quarantine-guard.$suffix" || fail 'old guard writer restarted'
+done
+pass 'candidate loopback rules roll back with original guard bytes and an idle writer'
+: > "$MOCK_GUARD_ACTION_LOG"
+guard_identity=$(stat -c '%d:%i' "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.service")
+MOCK_GUARD_OWNER_REFUSE=1 RR_EXTERNAL_GUARD_RUNTIME=/untrusted/path \
+    python3 "$HELPER" restore "$BACKUP" --tx-root "$TX_ROOT"
+[ ! -s "$MOCK_GUARD_ACTION_LOG" ] || fail 'unchanged rejected foreign guard received a stop or start'
+[ "$guard_identity" = "$(stat -c '%d:%i' "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.service")" ] || \
+    fail 'unchanged rejected foreign guard file was replaced'
+pass 'unchanged rejected guard is left untouched without invoking candidate code'
+
+run_inline_guard_rollback_case() (
+    local case_name="$1" collision="${2:-false}"
+    local candidate_fixture="$RR_EXTERNAL_GUARD_RUNTIME"
+    # Load the real installer functions without its CLI/bootstrap tail. Keep
+    # the real inline rollback, runtime moves, phase/control checks and real
+    # external restore. Unrelated database/certificate/service work is stubbed.
+    # shellcheck disable=SC1090
+    source <(sed '/^case "\$RR_MODE" in/,$d' "$REPO_ROOT/scripts/install-core.sh")
+    RR_TX_ROOT="$TX_ROOT"
+    RR_ACTIVE_TX="$RR_TX_ROOT/active"
+    TX_DIR="$RR_TX_ROOT/transactions/$case_name"
+    BACKUP_DIR="$TX_DIR/backup"
+    RR_LIB_DIR="$TEST_ROOT/$case_name-live"
+    OLD_RUNTIME="$TX_DIR/old-runtime"
+    RR_LAUNCHER="$TEST_ROOT/$case_name-launcher"
+    RR_RECOVERY_HELPER="$TEST_ROOT/$case_name-recovery"
+    RR_UPDATE_EXTERNAL_HELPER="$HELPER"
+    mkdir -p "$BACKUP_DIR" "$OLD_RUNTIME" "$RR_LIB_DIR"
+    chmod 700 "$TX_DIR" "$BACKUP_DIR"
+    cp -a "$candidate_fixture/modules" "$candidate_fixture/manifest.sha256" "$RR_LIB_DIR/"
+    printf 'original\n' > "$OLD_RUNTIME/sentinel"
+    printf 'candidate\n' > "$RR_LIB_DIR/sentinel"
+    printf '2\n' > "$TX_DIR/transaction-format"
+    printf 'migrating\n' > "$TX_DIR/phase"
+    printf '%s\n' "$TX_DIR" > "$RR_ACTIVE_TX"
+    : > "$BACKUP_DIR/external_state_required"
+    chmod 600 "$TX_DIR/transaction-format" "$TX_DIR/phase" "$RR_ACTIVE_TX" \
+        "$BACKUP_DIR/external_state_required"
+    python3 "$HELPER" snapshot "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"
+    cat > "$RR_RECOVERY_HELPER" <<'EOF'
+#!/bin/bash
+printf 'normal\n' > "$2/rollback-subscription-status"
+EOF
+    chmod 700 "$RR_RECOVERY_HELPER"
+    rr_quiesce_health_monitor_for_rollback() { :; }
+    rr_stop_subscription_servers() { :; }
+    rr_restore_file() { :; }
+    rr_restore_dir() { :; }
+    rr_restore_sqlite() { :; }
+    rr_restore_ip_acme_update_directories() { :; }
+    rr_clear_update_maintenance_marker() { :; }
+    rr_sync_host_state_before_terminal() { :; }
+    rr_restore_update_writer_state() {
+        [ "$(cat "$RR_LIB_DIR/sentinel")" = original ] || return 1
+        [ "$(cat "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.service")" = legacy-guard-service ] || return 1
+        : > "$TEST_ROOT/$case_name-writers-restored"
+    }
+    TRANSACTION_ACTIVE=true
+    RUNTIME_REPLACED=true
+    if [ "$collision" = true ]; then
+        date() { printf '123\n'; }
+        collision_dir="$TX_DIR/failed-runtime-123${BASHPID:-$$}"
+        mkdir "$collision_dir"
+        printf 'retain\n' > "$collision_dir/sentinel"
+        if rr_rollback >/dev/null 2>&1; then fail 'inline candidate destination collision accepted'; fi
+        [ "$(cat "$collision_dir/sentinel")" = retain ] || fail 'inline candidate collision overwrote evidence'
+        [ "$(cat "$RR_LIB_DIR/sentinel")" = candidate ] || fail 'collision consumed current runtime'
+        [ "$(cat "$OLD_RUNTIME/sentinel")" = original ] || fail 'collision consumed old runtime'
+        [ "$ROLLBACK_FAILED:$KEEP_TRANSACTION" = true:true ] || fail 'collision lost recovery state'
+    else
+        printf 'migrated-current-guard\n' > "$ROOTFS/etc/systemd/system/rr-firewall-quarantine-guard.service"
+        rr_rollback || fail 'inline rollback could not restore a migrated guard'
+        [ "$(cat "$TX_DIR/phase")" = rolled_back ] || fail 'inline rollback did not reach terminal success'
+        [ -e "$TEST_ROOT/$case_name-writers-restored" ] || fail 'inline rollback left original services frozen'
+        retained=("$TX_DIR"/failed-runtime-*)
+        [ "${#retained[@]}" -eq 1 ] && [ -d "${retained[0]}" ] || fail 'inline rollback discarded candidate verifier'
+        [ "$(cat "${retained[0]}/sentinel")" = candidate ] || fail 'inline retained runtime is not the candidate'
+        cmp -s "$candidate_fixture/modules/10-system.sh" "${retained[0]}/modules/10-system.sh" || fail 'inline rollback changed candidate verifier'
+        python3 "$HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"
+    fi
+)
+run_inline_guard_rollback_case tx-inline-guard
+pass 'real inline installer rollback retains candidate verifier and restores guard before writers'
+run_inline_guard_rollback_case tx-inline-collision true
+pass 'inline rollback refuses a retained-candidate collision without consuming either runtime'
 
 # A target that already owns the fixed gate paths receives the exact former
 # bytes and modes back, rather than only supporting the legacy-absent case.

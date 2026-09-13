@@ -85,6 +85,13 @@ jobs:
       - name: Deterministic release bundle
         run: python3 scripts/rebuild-bundle.py --check
 
+      - name: Historical LA recovery, loopback and guard lifecycle regressions
+        run: |
+          set -euo pipefail
+          for test_script in tests/test-la721-*.py tests/test-firewall-guard-lifecycle.py tests/test-local-subscription-loopback-726.py tests/test-resilience-loopback-726.py; do
+            sudo python3 -B "$test_script"
+          done
+
       - name: v7.2 core, public-IP ACME, rollback, and release trust regressions
         # Every fixture redirects or mocks systemd/Nginx/GitHub. Most remain
         # unprivileged; only tests whose production contract proves uid 0
@@ -180,6 +187,7 @@ jobs:
               test-cert-reload-pending.sh|\
               test-cloudflared-supply-chain.sh|\
               test-firewall-transaction.sh|\
+              test-firewall-guard-migration.sh|\
               test-firewall-quarantine-writer-gate.sh|\
               test-health-transaction-lock.sh|\
               test-install-core-rollback-boundary.sh|\
@@ -206,7 +214,9 @@ jobs:
               test-uninstall-cert-hook.sh|\
               test-uninstall-ip-acme.sh|\
               test-uninstall-quarantine.sh|\
-              test-update-writer-freeze.sh)
+              test-update-writer-freeze.sh|\
+              test-update-loopback-migration.sh|\
+              test-upgrade-721-hotfix-preflight.sh)
                 sudo -E bash "$test_script"
                 ;;
               *)

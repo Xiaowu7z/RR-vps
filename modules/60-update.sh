@@ -509,6 +509,61 @@ rr_current_ufw_state() {
     printf '%s\n' inactive
 }
 
+rr_update_firewall_migration_snapshot_is_current() {
+    local tx="$1" helper="${BASH_SOURCE[0]%/*}/../scripts/update-external-state.py"
+    # Authenticate the complete current snapshot schema, not only its UFW
+    # label. Older snapshots do not contain the supervisor rollback files.
+    python3 - "$helper" "$tx/backup" "$RR_FIREWALL_TX_ROOT" <<'PY'
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("rr_external_snapshot", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+backup = module.validate_backup_dir(sys.argv[2], sys.argv[3])
+_, saved = module.load_snapshot(backup)
+if "firewall_guard" not in saved:
+    raise SystemExit(1)
+PY
+}
+
+rr_update_loopback_migration_is_protected() {
+    local tx="" phase="" snapshot_ufw="" current_ufw=""
+    [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] || return 1
+    rr_firewall_lock_is_held || return 1
+    tx=$(rr_current_update_transaction) || return 1
+    phase=$(rr_update_transaction_phase "$tx") || return 1
+    [ "$phase" = migrating ] || return 1
+    rr_update_firewall_migration_snapshot_is_current "$tx" || return 1
+    snapshot_ufw=$(rr_snapshot_ufw_state "$tx") || return 1
+    case "$snapshot_ufw" in inactive|absent) ;; *) return 1 ;; esac
+    current_ufw=$(rr_current_ufw_state) || return 1
+    [ "$snapshot_ufw" = "$current_ufw" ]
+}
+
+rr_migrate_firewall_quarantine_supervisor() {
+    local tx="" phase="" result=0
+    [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] || return 0
+    tx=$(rr_current_update_transaction) || return 1
+    phase=$(rr_update_transaction_phase "$tx") || return 1
+    [ "$phase" = migrating ] || return 1
+    rr_update_firewall_migration_snapshot_is_current "$tx" || return 1
+    rr_firewall_lock_acquire || return 1
+    rr_firewall_install_fail_closed_supervisor || result=$?
+    rr_firewall_lock_release || result=1
+    return "$result"
+}
+
+rr_migrate_local_subscription_loopback() {
+    local result=0
+    [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ] || return 0
+    [ "${SUB_ACCESS_MODE:-local}" = local ] || return 0
+    is_valid_port "${SUB_PORT:-}" || return 1
+    rr_firewall_lock_acquire || return 1
+    rr_reconcile_local_subscription_loopback || result=$?
+    rr_firewall_lock_release || result=1
+    return "$result"
+}
+
 rr_finalize_committed_firewall() {
     local mode="${1:-normal}" tx="" phase="" port="" evidence=""
     local snapshot_ufw="" current_ufw="" result=0
@@ -746,6 +801,12 @@ post_update_migrate() {
     if [ "$INSTALL_COMPLETE" != "true" ] && ! any_node_protocol_enabled; then
         return 0
     fi
+
+    # The old local-only DROP can also block 127.0.0.1. Repair its exact
+    # loopback exception under the sealed update snapshot before generating
+    # subscriptions starts the candidate and performs its real TCP probe.
+    rr_migrate_firewall_quarantine_supervisor || return 1
+    rr_migrate_local_subscription_loopback || return 1
 
     local current_version=""
     if any_node_protocol_enabled; then
@@ -1241,7 +1302,6 @@ ensure_runtime_health() {
     fi
 
     local hop_label="" hop_enabled=false hop_port="" hop_specs=""
-    local hop_repair_status=0
     for hop_label in HY2 TU5; do
         case "$hop_label" in
             HY2)
@@ -1256,27 +1316,17 @@ ensure_runtime_health() {
                 ;;
         esac
         [ "$hop_enabled" = true ] && [ -n "$hop_specs" ] || continue
-        hop_repair_status=0
-        install_hop_rules "$hop_label" "$hop_port" "$hop_specs" \
-            >/dev/null 2>&1 || hop_repair_status=$?
-        case "$hop_repair_status" in
-            0) ;;
-            1)
-                rr_health_log \
-                    "${hop_label} 端口跳跃修复失败，但已证明 live 防火墙保持原态；本轮健康检查失败"
-                return 1
-                ;;
-            2)
-                rr_health_log \
-                    "${hop_label} 端口跳跃修复后的防火墙状态不确定；Sing-box 已停止并验证 inactive"
-                return 1
-                ;;
-            3|*)
-                rr_health_log \
-                    "紧急：${hop_label} 端口跳跃修复状态不确定，且无法验证 Sing-box 已停止"
-                return 1
-                ;;
-        esac
+        # An ordinary health pass must not arm an in-flight transaction merely
+        # to observe configured hops: that transaction deliberately stops ingress.
+        # The validator also checks effective first-match ordering. Contain the
+        # auto-address resolver's shell variables in this observation subprocess.
+        if ! declare -F rr_validate_hop_rules >/dev/null 2>&1 || \
+           ! ( rr_validate_hop_rules "$hop_label" "$hop_port" "$hop_specs" ) \
+                >/dev/null 2>&1; then
+            rr_health_log \
+                "${hop_label} 端口跳跃只读校验未通过；未自动改写防火墙或停止节点，请人工检查规则与后端状态"
+            return 1
+        fi
     done
 
     # 设备到期和额度状态可能在无人操作时变化；定时同步只会在用户列表

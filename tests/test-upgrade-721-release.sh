@@ -178,6 +178,9 @@ assert original.count(before) == 1
 candidate = original.replace(before, after)
 assert hashlib.sha256(candidate).hexdigest() == '98685d1dc37a7255aa3d139d57ea0daaf2e9dd776fd016512014eb0d02906042'
 (root / 'debian-721.manifest').write_bytes(candidate)
+# LA's incident patch intentionally leaves the complete official manifest
+# unchanged. The real old guard must still offer the new formal release.
+(root / 'la-hotfix-721.manifest').write_bytes(original)
 PYMANIFEST
 
 fixture_assets="$test_root/assets"
@@ -293,7 +296,7 @@ bash() {
     fail 'read-only compatibility test tried to execute an installer'
 }
 
-for profile in official-721 debian-721; do
+for profile in official-721 debian-721 la-hotfix-721; do
     printf 'Testing deployed %s guard with actual %s assets\n' "$profile" "$fixture_tag"
     RR_LOCAL_MANIFEST="$test_root/$profile.manifest"
     old_manifest_digest=$(sha256sum "$RR_LOCAL_MANIFEST" | awk '{print $1}')
@@ -330,4 +333,4 @@ for fixture_fault in moved-main dispatch-only mutable-release tampered-bootstrap
     rm -f "$target"
 done
 [ ! -e "$test_root/installer-execution-attempt" ] || fail 'installer was executed'
-printf '%s\n' 'official and Debian 7.2.1 old-client release compatibility: PASS'
+printf '%s\n' 'official, Debian and LA-hotfix 7.2.1 old-client release compatibility: PASS'

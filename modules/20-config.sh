@@ -2810,6 +2810,10 @@ start_subscription_server() {
             printf '%s\n' "$current_state" > "$SUB_BIND_STATE_FILE" || return 1
             rm -f /tmp/sub_server.pid /tmp/sub_server.bind
         fi
+        if [ "$access_mode" = local ] && ! rr_local_subscription_loopback_ready; then
+            printf '%s\n' '[错误] 订阅进程存在，但本机 TCP 连接失败；请修复本机订阅防火墙路径。' >&2
+            return 1
+        fi
         return 0
     fi
 
@@ -2835,4 +2839,8 @@ start_subscription_server() {
         return 1
     fi
     (umask 077; printf '%s\n' "$desired_state" > "$SUB_BIND_STATE_FILE") || return 1
+    if [ "$access_mode" = local ] && ! rr_local_subscription_loopback_ready; then
+        printf '%s\n' '[错误] 订阅已监听，但本机 TCP 连接失败；启动未通过验收。' >&2
+        return 1
+    fi
 }

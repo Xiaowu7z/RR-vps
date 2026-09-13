@@ -571,6 +571,21 @@ rr_doctor_repair_locked() {
                 '人工核对 live/持久规则后再次运行 rr doctor --repair'
         fi
     fi
+    if [ "$repair_failed" = false ] && [ "$nodes_enabled" = true ] && \
+       [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        # Subscription health now proves an actual TCP connection.  Repair
+        # the narrowly owned local path before attempting any service start.
+        repair_firewall_status=0
+        rr_reconcile_local_subscription_loopback >/dev/null 2>&1 || \
+            repair_firewall_status=$?
+        if [ "$repair_firewall_status" -ne 0 ]; then
+            repair_failed=true
+            rr_doctor_add fail repair_subscription_loopback \
+                '本机订阅访问规则修复未完成' \
+                "status=${repair_firewall_status}；尚未继续启动受管服务" \
+                '检查防火墙事务证据后再次运行 rr doctor --repair'
+        fi
+    fi
     if [ "$repair_failed" = false ]; then
         chmod 600 "$CONFIG_FILE" 2>/dev/null || repair_failed=true
         for repair_path in /etc/rr-nexus/nexus.json /var/lib/rr-nexus/nexus.db \
@@ -3439,12 +3454,14 @@ rr_restore_start_watchdog() {
 
 rr_restore_filter_managed_firewall_rules() {
     local table="$1" source="$2" target="$3" mode="${4:-managed}"
+    local backend="${5:-}"
     python3 - "$table" "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" \
-        "$source" "$mode" > "$target" <<'PY'
+        "$source" "$mode" "$backend" > "$target" <<'PY'
+import re
 import shlex
 import sys
 
-table, allow_comment, block_comment, source, mode = sys.argv[1:]
+table, allow_comment, block_comment, source, mode, backend = sys.argv[1:]
 if mode not in {"managed", "positioned", "unmanaged"}:
     raise SystemExit("unsupported firewall snapshot mode")
 if table == "filter":
@@ -3453,6 +3470,27 @@ elif table == "nat":
     chain = "PREROUTING"
 else:
     raise SystemExit("unsupported firewall table")
+
+
+def exact_local_subscription(tokens):
+    if len(tokens) < 2 or tokens[:2] != ["-A", "INPUT"] or len(tokens) % 2:
+        return False
+    pairs = list(zip(tokens[2::2], tokens[3::2]))
+    ports = [value for key, value in pairs if key == "--dport"]
+    if (len(ports) != 1 or re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]) is None
+            or int(ports[0]) > 65535):
+        return False
+    addresses = {"iptables": "127.0.0.1/32", "ip6tables": "::1/128"}
+    for family, address in addresses.items():
+        if backend and backend != family:
+            continue
+        expected = [("-i", "lo"), ("-s", address), ("-d", address),
+                    ("-p", "tcp"), ("--dport", ports[0]), ("-m", "comment"),
+                    ("--comment", "rr-local-subscription"), ("-j", "ACCEPT")]
+        if sorted(pairs) in [sorted(expected), sorted(expected + [("-m", "tcp")])]:
+            return True
+    return False
+
 
 position = 0
 for raw_line in open(source, encoding="utf-8"):
@@ -3474,6 +3512,12 @@ for raw_line in open(source, encoding="utf-8"):
         comment = None
     if table == "filter":
         managed = comment in {allow_comment, block_comment}
+        comments = [tokens[index + 1] for index, token in enumerate(tokens[:-1])
+                    if token == "--comment"]
+        if "rr-local-subscription" in comments:
+            if not exact_local_subscription(tokens):
+                raise SystemExit("unsupported tagged local subscription rule")
+            managed = True
     else:
         managed = comment is not None and comment.startswith("argo-rr-")
     if managed:
@@ -3493,7 +3537,8 @@ rr_restore_capture_netfilter_rules() {
         rm -f "$raw"
         return 1
     fi
-    if ! rr_restore_filter_managed_firewall_rules "$table" "$raw" "$target"; then
+    if ! rr_restore_filter_managed_firewall_rules "$table" "$raw" "$target" \
+        managed "$backend"; then
         rm -f "$raw" "$target"
         return 1
     fi
@@ -3509,9 +3554,9 @@ rr_restore_capture_netfilter_snapshot() {
         return 1
     fi
     if ! rr_restore_filter_managed_firewall_rules "$table" "$raw" \
-        "$rules_target" positioned || \
+        "$rules_target" positioned "$backend" || \
        ! rr_restore_filter_managed_firewall_rules "$table" "$raw" \
-        "$unmanaged_target" unmanaged; then
+        "$unmanaged_target" unmanaged "$backend"; then
         rm -f "$raw" "$rules_target" "$unmanaged_target"
         return 1
     fi
@@ -4652,11 +4697,13 @@ rr_restore_run_netfilter_saved_rule() {
     rr_firewall_writer_gate_is_held || return 1
     while IFS= read -r -d '' token; do
         arguments+=("$token")
-    done < <(python3 - "$table" "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" "$line" <<'PY'
+    done < <(python3 - "$table" "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" \
+        "$line" "$backend" <<'PY'
+import re
 import shlex
 import sys
 
-table, allow_comment, block_comment, line = sys.argv[1:]
+table, allow_comment, block_comment, line, backend = sys.argv[1:]
 try:
     tokens = shlex.split(line)
 except ValueError:
@@ -4669,6 +4716,24 @@ except (ValueError, IndexError):
     raise SystemExit("firewall rule is not tagged")
 if table == "filter":
     valid = tokens[1] == "INPUT" and comment in {allow_comment, block_comment}
+    comments = [tokens[index + 1] for index, token in enumerate(tokens[:-1])
+                if token == "--comment"]
+    if "rr-local-subscription" in comments:
+        # Saved-rule replay is a writer boundary: the dedicated tag alone
+        # cannot authorize broader addresses, another interface, or extras.
+        valid = False
+        address = {"iptables": "127.0.0.1/32", "ip6tables": "::1/128"}.get(backend)
+        pairs = list(zip(tokens[2::2], tokens[3::2]))
+        ports = [value for key, value in pairs if key == "--dport"]
+        if (tokens[1] == "INPUT" and not len(tokens) % 2 and address
+                and len(ports) == 1
+                and re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]) is not None
+                and int(ports[0]) <= 65535):
+            expected = [("-i", "lo"), ("-s", address), ("-d", address),
+                        ("-p", "tcp"), ("--dport", ports[0]), ("-m", "comment"),
+                        ("--comment", comment), ("-j", "ACCEPT")]
+            valid = sorted(pairs) in [sorted(expected),
+                                     sorted(expected + [("-m", "tcp")])]
 elif table == "nat":
     valid = tokens[1] == "PREROUTING" and comment.startswith("argo-rr-")
 else:
@@ -4933,6 +4998,17 @@ def exact_filter_owned(tokens):
     target, bad_target, negated_target = option(tokens, "-j", "--jump")
     protocol, bad_protocol, negated_protocol = option(tokens, "-p", "--protocol")
     port, bad_port, negated_port = option(tokens, "--dport")
+    if comment == "rr-local-subscription":
+        if (len(tokens) % 2 or re.fullmatch(r"[1-9][0-9]{0,4}", port or "") is None
+                or int(port) > 65535):
+            return False
+        address = "::1/128" if user_chain == "ufw6-user-input" else "127.0.0.1/32"
+        pairs = list(zip(tokens[2::2], tokens[3::2]))
+        expected = [("-i", "lo"), ("-s", address), ("-d", address),
+                    ("-p", "tcp"), ("--dport", port), ("-m", "comment"),
+                    ("--comment", comment), ("-j", "ACCEPT")]
+        return sorted(pairs) in [sorted(expected),
+                                 sorted(expected + [("-m", "tcp")])]
     if (bad_comment or negated_comment or bad_target or negated_target
             or bad_protocol or negated_protocol or bad_port or negated_port
             or comment not in managed_targets or target != managed_targets[comment]

@@ -2187,6 +2187,10 @@ echo "[6/13] Subscription URL control-character regression"
     sleep() { :; }
     is_subscription_pid() { return 0; }
     nohup() { : > "$rr_restart_tmp/launched"; }
+    # This signature/restart fixture mocks process creation. Require the mock
+    # launch before accepting readiness; real TCP success and refusal are
+    # exercised by test-local-subscription-loopback-726.py.
+    rr_local_subscription_loopback_ready() { [ -f "$rr_restart_tmp/launched" ]; }
     start_subscription_server
     rr_new_signature=$(sha256sum "$RR_LIB_DIR/nexus/sub_server.py" | awk '{print $1}')
     [ "$(cat "$rr_restart_tmp/killed")" = 4242 ]
@@ -3708,7 +3712,7 @@ grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" restore "$BACKUP_DIR" --tx-root "$RR_TX_R
     scripts/install-core.sh
 grep -Fq '"$RR_UPDATE_EXTERNAL_HELPER" verify "$BACKUP_DIR" --tx-root "$RR_TX_ROOT"' \
     scripts/install-core.sh
-grep -Fq 'if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP"; then' \
+grep -Fq 'if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP" "$failed_runtime"; then' \
     scripts/update-recover.sh
 # 完整卸载必须走捕获哈希后的精确 helper 删除路径；helper 已不再作为
 # 同一条 rm 命令的相邻参数出现，旧的相邻字符串断言会误报安全重构。
