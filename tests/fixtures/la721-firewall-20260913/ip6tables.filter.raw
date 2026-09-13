@@ -1,0 +1,16 @@
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-A INPUT -p tcp -m tcp --dport 14640 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p udp -m udp --dport 24747 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p udp -m udp --dport 15551 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 28759 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 443 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 80 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 22049 -m comment --comment argo-rr-managed -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 12609 -j ACCEPT
+-A INPUT -p udp -m udp --dport 29001 -j ACCEPT
+-A INPUT -p udp -m udp --dport 17252 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 10817 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 18035 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 20382 -m comment --comment argo-rr-managed-block -j DROP

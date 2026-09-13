@@ -1,0 +1,132 @@
+{
+  "schema": "rr-owner-la721-recovery-evidence-v1",
+  "source": "owner-provided-terminal-output",
+  "reported_on": "2026-09-13",
+  "scope": {
+    "kind": "targeted-primary-server-firewall-recovery",
+    "host_count": 1,
+    "host": "DMIT-4AcBKDwTCc",
+    "operating_system": "Ubuntu 24.04",
+    "installed_version_before": "7.2.1",
+    "installed_version_after": "7.2.1-with-local-health-hotfix",
+    "public_protocol_connectivity": "not_reported",
+    "client_subscription_use": "not_reported",
+    "ci_executed_live_test": false,
+    "not_claimed": [
+      "three-host-live-tests",
+      "complete-7.2.6-fresh-install",
+      "complete-hot-update-to-7.2.6",
+      "public-end-to-end-protocol-tests",
+      "reboot-acceptance",
+      "sustained-stability"
+    ]
+  },
+  "recovery_helper": {
+    "path": "scripts/recover-la721-firewall-inflight.py",
+    "source_commit": "081a6d684a1da440306bb32fd2413c4b2a4e82fb",
+    "sha256": "abafb5c2e652adf998213d9179f5b1c610417aa19c136928cabbedbf2f54b1df",
+    "arguments": [
+      "--repair-loopback"
+    ]
+  },
+  "receipt": {
+    "format": "ordered-phase-checks-and-final-completion",
+    "redaction": "The private backup path in the final completion event is replaced with <redacted>. Repeated informational events are omitted; all phase checks are retained in order.",
+    "phase_checks": [
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "host",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "writer_locks",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "installed_identity",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "transaction_state",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "unchanged_firewall_evidence",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "stopped_service_state",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "backup",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "prove_legacy_rule_equivalence",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "read_only_policy_and_service_preflight",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "stop_quarantine_guard",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "health_observation_hotfix",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "repair_subscription_loopback",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "abort_unchanged_orphan",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "restore_recorded_services",
+        "result": "PASS"
+      },
+      {
+        "event": "RECOVERY_CHECK",
+        "phase": "postverify",
+        "result": "PASS"
+      }
+    ],
+    "completion": {
+      "event": "LA721_RECOVERY_COMPLETE",
+      "phase": "postverify",
+      "backup": "<redacted>",
+      "identities": "preserved",
+      "firewall": "ipv4_loopback_20382_repaired",
+      "persistence": "matching_loopback_repair",
+      "health_timer": "disabled",
+      "local_hotfix": "readonly-health-hop"
+    },
+    "completion_order": "after_restore_recorded_services_check_before_postverify_check"
+  },
+  "limitation": "Owner-reported recovery of 7.2.1 with a local hotfix, not a CI-executed VPS test or a 7.2.6 installation/upgrade receipt.",
+  "release_policy_status": "owner-approved",
+  "release_authorization": {
+    "source": "owner-message-in-current-conversation",
+    "reported_on": "2026-09-13",
+    "quote": "整合修复发布7.2.6正式版。",
+    "target_version": "7.2.6"
+  }
+}

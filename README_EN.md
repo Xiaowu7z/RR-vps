@@ -8,7 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.5** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.6** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.6: Health checks, local subscriptions and quarantine supervision
+
+Port-hopping health checks now observe the configured rules without unconditionally starting firewall writes. Local subscription access receives a narrowly scoped loopback rule while the external block remains. Quarantine supervision handles a persistent marker without repeated path-trigger activation, with migration of owned older units and update rollback coverage.
+
+The owner reported successful targeted recovery of the LA 7.2.1 host: services and local connections passed, and existing identities and subscription content were preserved. Version 7.2.6 integrates the corrections into normal installation and upgrade paths, including compatibility with that locally patched state. See the [7.2.6 release verification record](docs/audit/release-v726-plan.md) for the exact scope; the recovery receipt is not a full 7.2.6 production upgrade or public protocol acceptance test.
 
 ### 7.2.5: Argo dependency download recovery
 
@@ -44,13 +50,13 @@ Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts
 
 ## One-command installation
 
-Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. Since 7.2.4, the owner-approved policy combines three-distribution container CI with recovery-evidence verification. Version 7.2.5 preserves the historical receipt and independently verifies the new download fix and its restricted payload changes; unperformed real-host checks must not be reported as passed:
+Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. Since 7.2.4, the owner-approved policy combines three-distribution container CI with recovery-evidence verification. Version 7.2.6 preserves the historical receipts and release bytes while independently verifying the current repair scope and candidate hashes. The LA targeted-recovery receipt does not establish a full-version upgrade or public acceptance:
 
 | System | Support | Notes |
 | --- | --- | --- |
-| **Debian 12 (bookworm)** | ⭐ Recommended | Container CI target; one targeted recovery report for this release |
+| **Debian 12 (bookworm)** | ⭐ Recommended | Container CI target; historical targeted recovery receipt retained |
 | Ubuntu 22.04 (jammy) | ✅ Targeted | Container CI target; no new real-host report for this release |
-| Ubuntu 24.04 (noble) | ✅ Targeted | Container CI target; no new real-host report for this release |
+| Ubuntu 24.04 (noble) | ✅ Targeted | Container CI target; LA 7.2.1 targeted recovery reported complete |
 
 Other Debian/Ubuntu derivatives are untested and not guaranteed.
 

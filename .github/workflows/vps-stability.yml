@@ -13,13 +13,13 @@ concurrency:
   cancel-in-progress: false
 
 # Keep this workflow path for installed 7.2.1 update guards. Its declared
-# scope preserves the pinned historical Debian recovery receipt and verifies
-# reviewed current-candidate hashes and restricted changes separately. It does
+# scope preserves the pinned historical Debian and LA 7.2.1 recovery receipts,
+# and verifies reviewed current-candidate hashes and restricted changes separately. It does
 # not claim a live VPS test for later versions or contact the deleted hosts.
 jobs:
   evidence:
     if: github.ref == 'refs/heads/main'
-    name: Verify approved historical recovery evidence and current candidate
+    name: Verify approved recovery receipts and bounded 7.2.6 candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -35,6 +35,6 @@ jobs:
             | tee "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
           {
             printf 'Candidate commit: `%s`\n\n' "$GITHUB_SHA"
-            printf '%s\n\n' 'Scope: the owner-reported Debian 12 repair receipt stays bound to its original 7.2.4 bundle and helper. Current release hashes and restricted Cloudflared-only changes are checked separately; full exact-commit CI is independently required. This workflow does not attest to a 7.2.5 AWS installation, run a VPS test or establish client connectivity.'
+            printf '%s\n\n' 'Scope: the historical Debian 12 repair receipt remains bound to its original 7.2.4 bundle and helper. The separate owner-reported LA recovery stays bound to its executed 7.2.1 helper and local hotfix. Neither receipt is a 7.2.6 installation or upgrade result. This commit must match the pinned 7.2.6 candidate and explicit health, loopback, guard and related upgrade/rollback source boundaries; full exact-commit CI is independently required. No VPS is contacted and no public client connectivity is attested.'
             cat "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
           } >> "$GITHUB_STEP_SUMMARY"

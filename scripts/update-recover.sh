@@ -479,7 +479,7 @@ rr_external_state_marker_is_safe() {
 }
 
 rr_restore_external_state_if_required() {
-    local tx="$1" backup="$2" state=0
+    local tx="$1" backup="$2" guard_runtime="${3:-}" state=0
     if rr_transaction_format_state "$tx"; then
         state=0
     else
@@ -505,6 +505,7 @@ rr_restore_external_state_if_required() {
         rr_recover_log "external-state recovery helper is unavailable or unsafe"
         return 1
     }
+    RR_EXTERNAL_GUARD_RUNTIME="$guard_runtime" \
     rr_run_delegated_without_lock_fds 0 "$RR_UPDATE_EXTERNAL_HELPER" \
         restore "$backup" --tx-root "$RR_TX_ROOT" || return 1
     rr_run_delegated_without_lock_fds 0 "$RR_UPDATE_EXTERNAL_HELPER" \
@@ -4588,7 +4589,7 @@ rr_restore_transaction() {
     rr_restore_dir sub_server /tmp/sub_server || failed=true
     rr_restore_database || failed=true
 
-    if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP"; then
+    if ! rr_restore_external_state_if_required "$tx" "$RR_BACKUP" "$failed_runtime"; then
         failed=true
         ip_external_ready=false
     fi

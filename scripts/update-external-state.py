@@ -58,12 +58,22 @@ NEXUS_IP_ACME_RUNTIME_PATHS = (
     "/usr/local/lib/rr-vps/lego",
     "/usr/local/lib/rr-vps/lego.install",
 )
-MANAGED_PATHS = (
+LEGACY_MANAGED_PATHS = (
     NGINX_PATHS
     + CERT_HOOK_PATHS
     + OTHER_PATHS
     + NEXUS_IP_CERT_GATE_PATHS
     + NEXUS_IP_ACME_RUNTIME_PATHS
+)
+FIREWALL_GUARD_PATHS = (
+    "/usr/local/sbin/rr-firewall-quarantine-guard",
+    "/etc/systemd/system/rr-firewall-quarantine-guard.service",
+    "/etc/systemd/system/rr-firewall-quarantine-guard.path",
+    "/etc/systemd/system/rr-firewall-quarantine-guard.timer",
+)
+MANAGED_PATHS = LEGACY_MANAGED_PATHS + FIREWALL_GUARD_PATHS
+FIREWALL_GUARD_UNITS = tuple(
+    "rr-firewall-quarantine-guard." + suffix for suffix in ("path", "timer", "service")
 )
 SERVICES = ("nginx", "cloudflared")
 TABLE_CHAINS = (("filter", "INPUT"), ("nat", "PREROUTING"))
@@ -321,6 +331,18 @@ def is_strict_rr_rule(tokens: list[str], table: str, chain: str) -> bool:
         modules.append(options[position + 1])
         del options[position : position + 2]
     if table == "filter":
+        if comment == "rr-local-subscription":
+            interface = consume_pair(options, ("-i", "--in-interface"))
+            source = consume_pair(options, ("-s", "--source"))
+            destination = consume_pair(options, ("-d", "--destination"))
+            return (
+                chain == "INPUT" and protocol == "tcp" and valid_port(dport)
+                and target == "ACCEPT" and interface == "lo"
+                and source == destination
+                and source in {"127.0.0.1/32", "::1/128"}
+                and "comment" in modules and len(modules) == len(set(modules))
+                and set(modules).issubset({"tcp", "comment"}) and not options
+            )
         managed = (
             chain == "INPUT"
             and protocol in {"tcp", "udp"}
@@ -411,6 +433,98 @@ def write_json(path: Path, value: Any) -> None:
         os.close(fd)
 
 
+def firewall_guard_state() -> dict[str, dict[str, bool]]:
+    result = {name: service_state(name) for name in FIREWALL_GUARD_UNITS}
+    # is-enabled succeeds for a static service too. The guard service has no
+    # [Install] section; its activation is controlled solely by the path unit.
+    result[FIREWALL_GUARD_UNITS[2]]["enabled"] = False
+    return result
+
+
+def require_firewall_guard_idle(saved: dict[str, Any]) -> None:
+    for marker in ("firewall-quarantine", ".firewall-inflight"):
+        path = root_path("/var/lib/rr-vps/" + marker)
+        if path.exists() or path.is_symlink():
+            raise StateError("firewall recovery marker exists; recover before updating guard")
+    for name in FIREWALL_GUARD_UNITS[1:]:
+        if saved[name]["active"] or saved[name]["enabled"]:
+            raise StateError("firewall guard is not idle; recover before updating guard")
+
+
+def firewall_guard_restore_required(directory: Path, saved: dict[str, Any]) -> bool:
+    entries = [entry for entry in saved["paths"] if entry["path"] in FIREWALL_GUARD_PATHS]
+    try:
+        compare_paths(directory, entries)
+    except StateError:
+        return True
+    return firewall_guard_state() != saved["firewall_guard"]
+
+
+def require_firewall_guard_owner(backup: Path) -> None:
+    # Recovery retains the failed manifest-verified candidate under this same
+    # transaction. Use its current+legacy effective systemd verifier before
+    # any stop that could invoke an unexpected ExecStop hook. A snapshot of
+    # same-named files alone is not permission to execute those units.
+    raw = os.environ.get("RR_EXTERNAL_GUARD_RUNTIME", "")
+    if not raw:
+        # A power loss can occur after the candidate was renamed but before
+        # rollback reached this helper. On that retry old-runtime is already
+        # restored, so recover the single retained candidate from the same
+        # root-owned transaction instead of requiring process-local state.
+        candidates = [path for path in backup.parent.iterdir()
+                      if re.fullmatch(r"failed-runtime-[0-9]+", path.name)]
+        if len(candidates) == 1:
+            raw = str(candidates[0])
+    runtime = Path(raw)
+    if (not raw or not runtime.is_absolute() or runtime.parent != backup.parent
+            or not re.fullmatch(r"failed-runtime-[0-9]+", runtime.name)):
+        raise StateError("trusted candidate guard verifier is unavailable")
+    require_secure_dir(runtime)
+    require_secure_dir(runtime / "modules")
+    if os.path.realpath(runtime) != str(runtime):
+        raise StateError("candidate guard verifier path is not canonical")
+    manifest_path = runtime / "manifest.sha256"
+    manifest_info = os.lstat(manifest_path)
+    if (not stat.S_ISREG(manifest_info.st_mode) or manifest_info.st_uid != 0
+            or manifest_info.st_nlink != 1 or stat.S_IMODE(manifest_info.st_mode) & 0o022):
+        raise StateError("candidate guard manifest metadata is unsafe")
+    lines = manifest_path.read_text().splitlines()
+    for name in ("modules/09-systemd.sh", "modules/10-system.sh"):
+        matches = [line.split() for line in lines if len(line.split()) == 2
+                   and line.split()[1] == name]
+        if len(matches) != 1 or not re.fullmatch(r"[0-9a-f]{64}", matches[0][0]):
+            raise StateError("candidate guard manifest entry is invalid")
+        path = runtime / name
+        info = os.lstat(path)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or hashlib.sha256(path.read_bytes()).hexdigest() != matches[0][0]):
+            raise StateError("candidate guard verifier differs from its manifest")
+    run(["bash", "-c", 'source "$1" && '
+         'RR_FIREWALL_SYSTEMD_DIR="$2" RR_FIREWALL_GUARD_SCRIPT="$3" '
+         'rr_firewall_quarantine_supervisor_preflight_is_safe "$2" "$3"',
+         "rr-guard-rollback", str(runtime / "modules/10-system.sh"),
+         str(root_path("/etc/systemd/system")), str(root_path(FIREWALL_GUARD_PATHS[0]))])
+
+
+def freeze_firewall_guard(backup: Path) -> None:
+    # The old path unit must not reactivate its old service while its files are
+    # restored. A retained marker is never silently removed or reinterpreted.
+    for marker in ("firewall-quarantine", ".firewall-inflight"):
+        path = root_path("/var/lib/rr-vps/" + marker)
+        if path.exists() or path.is_symlink():
+            raise StateError("firewall recovery marker prevents guard rollback")
+    systemctl = command("systemctl")
+    if systemctl is None:
+        raise StateError("systemctl is unavailable")
+    require_firewall_guard_owner(backup)
+    for name in FIREWALL_GUARD_UNITS:
+        run([systemctl, "stop", name], allowed=(0, 1, 3, 4, 5))
+        run([systemctl, "disable", name], allowed=(0, 1, 3, 4, 5))
+        if firewall_guard_state()[name] != {"enabled": False, "active": False}:
+            raise StateError("could not freeze firewall guard before restoring its files")
+
+
 def snapshot(backup: Path) -> None:
     target = backup / "external-state"
     if target.exists() or target.is_symlink():
@@ -425,7 +539,9 @@ def snapshot(backup: Path) -> None:
             "paths": [source_entry(path, item_dir, index) for index, path in enumerate(MANAGED_PATHS)],
             "services": {name: service_state(name) for name in SERVICES},
             "firewall": firewall_state(),
+            "firewall_guard": firewall_guard_state(),
         }
+        require_firewall_guard_idle(state_value["firewall_guard"])
         state_path = temporary / "state.json"
         write_json(state_path, state_value)
         state_hash = hashlib.sha256(state_path.read_bytes()).hexdigest()
@@ -490,8 +606,22 @@ def load_snapshot(backup: Path) -> tuple[Path, dict[str, Any]]:
     if value.get("version") != VERSION:
         raise StateError("unsupported external snapshot version")
     paths = value.get("paths")
-    if not isinstance(paths, list) or [entry.get("path") for entry in paths] != list(MANAGED_PATHS):
+    path_names = [entry.get("path") for entry in paths] if isinstance(paths, list) else None
+    if path_names not in (list(MANAGED_PATHS), list(LEGACY_MANAGED_PATHS)):
         raise StateError("external snapshot path namespace mismatch")
+    if path_names == list(MANAGED_PATHS):
+        guard = value.get("firewall_guard")
+        if not isinstance(guard, dict) or set(guard) != set(FIREWALL_GUARD_UNITS):
+            raise StateError("external snapshot firewall guard namespace mismatch")
+        if any(not isinstance(state, dict) or set(state) != {"enabled", "active"}
+               or any(type(flag) is not bool for flag in state.values())
+               for state in guard.values()):
+            raise StateError("external snapshot firewall guard state is invalid")
+        if any(guard[name]["active"] or guard[name]["enabled"]
+               for name in FIREWALL_GUARD_UNITS[1:]):
+            raise StateError("saved firewall guard was not idle")
+    elif "firewall_guard" in value:
+        raise StateError("legacy external snapshot cannot declare new guard state")
     if set(value.get("services", {})) != set(SERVICES):
         raise StateError("external snapshot service namespace mismatch")
     return directory, value
@@ -726,6 +856,8 @@ def verify(backup: Path) -> None:
         if service_state(name) != saved["services"][name]:
             raise StateError(f"service state mismatch: {name}")
     verify_firewall(saved["firewall"])
+    if "firewall_guard" in saved and firewall_guard_state() != saved["firewall_guard"]:
+        raise StateError("firewall guard state does not match snapshot")
 
 
 def restore(backup: Path) -> None:
@@ -733,7 +865,13 @@ def restore(backup: Path) -> None:
     # Firewall preflight happens before filesystem mutation so an unsupported
     # active UFW installation or changed user rule set leaves everything alone.
     restore_firewall(saved["firewall"])
+    guard_changed = ("firewall_guard" in saved
+                     and firewall_guard_restore_required(directory, saved))
+    if guard_changed:
+        freeze_firewall_guard(backup)
     for entry in saved["paths"]:
+        if entry["path"] in FIREWALL_GUARD_PATHS and not guard_changed:
+            continue
         restore_entry(directory, entry)
     systemctl = command("systemctl")
     if systemctl is None:
@@ -741,6 +879,11 @@ def restore(backup: Path) -> None:
     run([systemctl, "daemon-reload"])
     for name in SERVICES:
         set_service_state(name, saved["services"][name])
+    if guard_changed:
+        # Only restore the path observer. Never launch an old guard service
+        # merely to restore its previous byte identity after a failed update.
+        name = FIREWALL_GUARD_UNITS[0]
+        set_service_state(name, saved["firewall_guard"][name])
     verify(backup)
 
 

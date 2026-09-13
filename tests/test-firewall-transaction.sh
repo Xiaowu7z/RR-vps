@@ -296,6 +296,24 @@ systemctl() {
                 ExecStartPre|ExecStartPost|ExecStop|ExecStopPost|ExecReload)
                     printf '\n'
                     ;;
+                Type) printf 'oneshot\n' ;;
+                RemainAfterExit)
+                    if grep -qx 'RemainAfterExit=yes' "$RR_FIREWALL_SYSTEMD_DIR/$unit"; then
+                        printf 'yes\n'
+                    else
+                        printf 'no\n'
+                    fi
+                    ;;
+                Restart)
+                    if grep -qx 'Restart=on-failure' "$RR_FIREWALL_SYSTEMD_DIR/$unit"; then
+                        printf 'on-failure\n'
+                    else
+                        printf 'no\n'
+                    fi
+                    ;;
+                RestartUSec) printf '5s\n' ;;
+                StartLimitIntervalUSec) printf '0\n' ;;
+                Result) printf 'success\n' ;;
                 Paths)
                     [ "$unit" = rr-firewall-quarantine-guard.path ] || return 2
                     printf '%s (PathExists)\n' "$RR_FIREWALL_QUARANTINE_FILE"
@@ -437,9 +455,13 @@ assert_inflight_crash_is_durably_blocked() {
 setup_netfilter_mock() {
     reset_firewall_quarantine_mock
     MOCK_NETFILTER_ROOT=$(mktemp -d)
-    printf '%s\n' '-P INPUT DROP' > "$MOCK_NETFILTER_ROOT/iptables.filter"
+    printf '%s\n' '-P INPUT DROP' \
+        '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' \
+        > "$MOCK_NETFILTER_ROOT/iptables.filter"
     : > "$MOCK_NETFILTER_ROOT/iptables.nat"
-    printf '%s\n' '-P INPUT DROP' > "$MOCK_NETFILTER_ROOT/ip6tables.filter"
+    printf '%s\n' '-P INPUT DROP' \
+        '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' \
+        > "$MOCK_NETFILTER_ROOT/ip6tables.filter"
     : > "$MOCK_NETFILTER_ROOT/ip6tables.nat"
     MOCK_FAIL_WRITE_BACKEND=""
     MOCK_SKIP_WRITE_BACKEND=""
@@ -1058,6 +1080,26 @@ printf '%s\n' '[0b/9] durable quarantine guard is exact, idle when clear, and sy
     reset_firewall_quarantine_mock
     rr_firewall_install_fail_closed_supervisor || \
         fail 'canonical quarantine supervisor failed installation proof'
+    # A real 7.2.1/7.2.5 installation has the prior canonical oneshot bytes.
+    # Installing 7.2.6 must migrate them, not mistake them for a hostile unit.
+    rr_firewall_render_quarantine_guard_service_legacy > \
+        "$RR_FIREWALL_SYSTEMD_DIR/rr-firewall-quarantine-guard.service"
+    : > "$RR_FIREWALL_TEST_SYSTEMCTL_LOG"
+    rr_firewall_install_fail_closed_supervisor || \
+        fail 'exact legacy guard service did not migrate'
+    cmp -s "$RR_FIREWALL_SYSTEMD_DIR/rr-firewall-quarantine-guard.service" \
+        <(rr_firewall_render_quarantine_guard_service) || \
+        fail 'legacy guard service was not replaced by latched template'
+    python3 - "$RR_FIREWALL_TEST_SYSTEMCTL_LOG" <<'PY' || \
+        fail 'guard migration did not stop the path before service/reload'
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+path = lines.index("stop rr-firewall-quarantine-guard.path")
+service = lines.index("stop rr-firewall-quarantine-guard.service")
+reload = lines.index("daemon-reload")
+assert path < service < reload
+assert not any(line.startswith("reset-failed ") for line in lines)
+PY
     systemctl is-enabled --quiet rr-firewall-quarantine-guard.path && \
         systemctl is-active --quiet rr-firewall-quarantine-guard.path || \
         fail 'quarantine path watcher is not durably enabled and active'
@@ -1094,6 +1136,16 @@ printf '%s\n' '[0b/9] durable quarantine guard is exact, idle when clear, and sy
     assert_supervisor_effective_mutation_rejected ExecStop \
         '{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no }' \
         'foreign supervisor ExecStop'
+    assert_supervisor_effective_mutation_rejected Type simple \
+        'supervisor changed oneshot type'
+    assert_supervisor_effective_mutation_rejected RemainAfterExit no \
+        'supervisor lost successful-convergence latch'
+    assert_supervisor_effective_mutation_rejected Restart no \
+        'supervisor lost failure retry'
+    assert_supervisor_effective_mutation_rejected RestartUSec 0 \
+        'supervisor retry has no backoff'
+    assert_supervisor_effective_mutation_rejected StartLimitIntervalUSec 10s \
+        'supervisor inherits a retry-disabling start limit'
     assert_supervisor_effective_mutation_rejected User nobody \
         'unprivileged supervisor identity'
     assert_supervisor_effective_mutation_rejected RootDirectory /srv/hostile-root \
@@ -1110,6 +1162,42 @@ printf '%s\n' '[0b/9] durable quarantine guard is exact, idle when clear, and sy
         'extra monotonic supervisor schedule'
     assert_supervisor_effective_mutation_rejected TimersCalendar '*-*-* *:*:00' \
         'extra calendar supervisor schedule'
+
+    # Each failure is cleared individually; an unloaded inactive legacy timer
+    # must never make reset-failed fail an otherwise valid migration again.
+    (
+        original_systemctl=$(declare -f systemctl)
+        eval "${original_systemctl/systemctl ()/guard_original_systemctl ()}"
+        failed_guard="$RR_FIREWALL_TEST_ROOT/failed-guard"
+        : > "$failed_guard"
+        systemctl() {
+            if [ "${1:-}" = show ] && [ "${3:-}" = --value ] && \
+               [ "${4:-}" = rr-firewall-quarantine-guard.path ]; then
+                case "${2:-}" in
+                    --property=ActiveState)
+                        if [ -e "$failed_guard" ]; then printf 'failed\n'; else printf 'inactive\n'; fi
+                        return ;;
+                    --property=Result)
+                        if [ -e "$failed_guard" ]; then printf 'unit-start-limit-hit\n'; else printf 'success\n'; fi
+                        return ;;
+                esac
+            fi
+            if [ "${1:-}" = reset-failed ]; then
+                [ "${2:-}" = rr-firewall-quarantine-guard.path ] || return 1
+                [ "${GUARD_RESET_FAIL:-false}" = false ] || return 1
+                rm -f "$failed_guard"
+                return
+            fi
+            guard_original_systemctl "$@"
+        }
+        GUARD_RESET_FAIL=true
+        if rr_firewall_reset_quarantine_guard_failures; then
+            fail 'failed reset was ignored'
+        fi
+        GUARD_RESET_FAIL=false
+        rr_firewall_reset_quarantine_guard_failures || fail 'real path failure was not reset'
+        [ ! -e "$failed_guard" ] || fail 'failed guard state remained after reset'
+    )
 
     mkdir -p "$RR_FIREWALL_SYSTEMD_DIR/rr-firewall-quarantine-guard.service.d"
     printf '%s\n' '[Service]' 'ExecStart=' 'ExecStart=/bin/true' > \
@@ -4250,6 +4338,7 @@ printf '%s\n' '[9/9] portable restore rebuilds only the imported RR desired set'
     for backend in iptables ip6tables; do
         printf '%s\n' \
             '-P INPUT DROP' \
+            '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' \
             '-A INPUT -p tcp --dport 65001 -m comment --comment user-firewall-sentinel -j ACCEPT' \
             '-A INPUT -p tcp --dport 65002 -m comment --comment argo-rr-managed -j ACCEPT' \
             > "$MOCK_NETFILTER_ROOT/${backend}.filter"
@@ -4266,6 +4355,8 @@ printf '%s\n' '[9/9] portable restore rebuilds only the imported RR desired set'
         nat_file="$MOCK_NETFILTER_ROOT/${backend}.nat"
         assert_no_match "$filter_file" '65002'
         assert_no_match "$nat_file" '65004'
+        assert_rule "$filter_file" \
+            '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT'
         assert_rule "$filter_file" \
             '-A INPUT -p tcp --dport 65001 -m comment --comment user-firewall-sentinel -j ACCEPT'
         assert_rule "$nat_file" \

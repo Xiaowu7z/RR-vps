@@ -383,7 +383,9 @@ fi
 EOF
 }
 
-rr_firewall_render_quarantine_guard_service() {
+# The legacy template is accepted only by the migration preflight.  Never
+# install it: PathExists requeues an inactive oneshot while the marker exists.
+rr_firewall_render_quarantine_guard_service_legacy() {
     local guard_script="${RR_FIREWALL_GUARD_SCRIPT:-/usr/local/sbin/rr-firewall-quarantine-guard}"
     cat <<EOF
 [Unit]
@@ -392,6 +394,23 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
+ExecStart=${guard_script}
+EOF
+}
+
+rr_firewall_render_quarantine_guard_service() {
+    local guard_script="${RR_FIREWALL_GUARD_SCRIPT:-/usr/local/sbin/rr-firewall-quarantine-guard}"
+    cat <<EOF
+[Unit]
+Description=RR firewall quarantine convergence guard
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5s
 ExecStart=${guard_script}
 EOF
 }
@@ -458,6 +477,7 @@ rr_firewall_root_directory_chain_is_safe() {
 }
 
 rr_firewall_quarantine_supervisor_effective() {
+    local generation="${1:-current}"
     local systemd_root="${RR_FIREWALL_SYSTEMD_DIR:-/etc/systemd/system}"
     local guard_script="${RR_FIREWALL_GUARD_SCRIPT:-/usr/local/sbin/rr-firewall-quarantine-guard}"
     local marker="${RR_FIREWALL_QUARANTINE_FILE:-${RR_FIREWALL_QUARANTINE_DIR:-/var/lib/rr-vps}/firewall-quarantine}"
@@ -467,12 +487,21 @@ rr_firewall_quarantine_supervisor_effective() {
         [rr-firewall-quarantine-guard.service]=rr_firewall_render_quarantine_guard_service
         [rr-firewall-quarantine-guard.path]=rr_firewall_render_quarantine_guard_path
         [rr-firewall-quarantine-guard.timer]=rr_firewall_render_quarantine_guard_timer)
+    case "$generation" in
+        current|compatible) ;;
+        legacy) renderers[rr-firewall-quarantine-guard.service]=rr_firewall_render_quarantine_guard_service_legacy ;;
+        *) return 1 ;;
+    esac
     rr_firewall_quarantine_guard_file_is_exact "$guard_script" \
         rr_firewall_render_quarantine_guard_script 700 || return 1
     for unit in service path timer; do
         target="$systemd_root/rr-firewall-quarantine-guard.$unit"
-        rr_firewall_quarantine_guard_file_is_exact "$target" \
-            "${renderers[rr-firewall-quarantine-guard.$unit]}" 644 || return 1
+        if ! rr_firewall_quarantine_guard_file_is_exact "$target" \
+                "${renderers[rr-firewall-quarantine-guard.$unit]}" 644; then
+            [ "$generation:$unit" = compatible:service ] && \
+                rr_firewall_quarantine_guard_file_is_exact "$target" \
+                    rr_firewall_render_quarantine_guard_service_legacy 644 || return 1
+        fi
         value=$(systemctl show --property=LoadState --value \
             "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1
         [ "$value" = loaded ] || return 1
@@ -488,6 +517,29 @@ rr_firewall_quarantine_supervisor_effective() {
             "rr-firewall-quarantine-guard.$unit" 2>/dev/null) || return 1
         [ -z "$conditions" ] && [ -z "$asserts" ] || return 1
     done
+    value=$(systemctl show --property=Type --value \
+        rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+    [ "$value" = oneshot ] || return 1
+    value=$(systemctl show --property=RemainAfterExit --value \
+        rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+    if [ "$generation" = current ] || \
+       { [ "$generation" = compatible ] && [ "$value" = yes ]; }; then
+        [ "$value" = yes ] || return 1
+        value=$(systemctl show --property=Restart --value \
+            rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+        [ "$value" = on-failure ] || return 1
+        value=$(systemctl show --property=RestartUSec --value \
+            rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+        case "$value" in 5s|5000000us|5000000) ;; *) return 1 ;; esac
+        value=$(systemctl show --property=StartLimitIntervalUSec --value \
+            rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+        case "$value" in 0|0us) ;; *) return 1 ;; esac
+    else
+        [ "$value" = no ] || return 1
+        value=$(systemctl show --property=Restart --value \
+            rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
+        [ "$value" = no ] || return 1
+    fi
     value=$(systemctl show --property=ExecStart --value \
         rr-firewall-quarantine-guard.service 2>/dev/null) || return 1
     python3 - "$value" "$guard_script" <<'PY' || return 1
@@ -592,21 +644,41 @@ PY
 }
 
 rr_firewall_activate_quarantine_supervisor() {
-    local next=""
     rr_firewall_fail_closed_quarantine_active || return 1
     rr_firewall_quarantine_supervisor_effective || return 1
+    # The retained timer is for on-disk compatibility only.  Starting it after
+    # a successful path activation races the guard's own timer retirement.
+    # Failed convergence is retried by Restart=on-failure; successful oneshots
+    # remain active without a process until the transaction explicitly stops it.
+    systemctl disable --now rr-firewall-quarantine-guard.timer \
+        >/dev/null 2>&1 || return 1
+    rr_firewall_reset_quarantine_guard_failures || return 1
     systemctl enable --now rr-firewall-quarantine-guard.path \
         >/dev/null 2>&1 || return 1
     systemctl is-enabled --quiet rr-firewall-quarantine-guard.path || return 1
     systemctl is-active --quiet rr-firewall-quarantine-guard.path || return 1
-    systemctl enable --now rr-firewall-quarantine-guard.timer \
-        >/dev/null 2>&1 || return 1
-    systemctl is-enabled --quiet rr-firewall-quarantine-guard.timer || return 1
-    systemctl is-active --quiet rr-firewall-quarantine-guard.timer || return 1
-    next=$(systemctl show --property=NextElapseUSecMonotonic --value \
-        rr-firewall-quarantine-guard.timer 2>/dev/null) || return 1
-    case "$next" in ''|0|0us|'n/a') return 1 ;; esac
     systemctl start rr-firewall-quarantine-guard.service >/dev/null 2>&1
+}
+
+rr_firewall_reset_quarantine_guard_failures() {
+    local unit="" state="" result=""
+    for unit in rr-firewall-quarantine-guard.service \
+        rr-firewall-quarantine-guard.path rr-firewall-quarantine-guard.timer; do
+        state=$(systemctl show --property=ActiveState --value "$unit" \
+            2>/dev/null) || return 1
+        result=$(systemctl show --property=Result --value "$unit" \
+            2>/dev/null) || return 1
+        # reset-failed does not load a collected unit.  An ordinary inactive
+        # timer therefore needs no reset; actual failed/rate-limit state does.
+        if [ "$state" = failed ] || [[ "$result" = *limit* ]]; then
+            systemctl reset-failed "$unit" >/dev/null 2>&1 || return 1
+            state=$(systemctl show --property=ActiveState --value "$unit" \
+                2>/dev/null) || return 1
+            result=$(systemctl show --property=Result --value "$unit" \
+                2>/dev/null) || return 1
+            [ "$state" != failed ] && [[ "$result" != *limit* ]] || return 1
+        fi
+    done
 }
 
 rr_firewall_deactivate_quarantine_retry() {
@@ -677,8 +749,12 @@ rr_firewall_quarantine_supervisor_preflight_is_safe() {
         target="$systemd_root/rr-firewall-quarantine-guard.$unit"
         renderer="${renderers[rr-firewall-quarantine-guard.$unit]}"
         if [ -e "$target" ] || [ -L "$target" ]; then
-            rr_firewall_quarantine_guard_file_is_exact \
-                "$target" "$renderer" 644 || return 1
+            if ! rr_firewall_quarantine_guard_file_is_exact \
+                    "$target" "$renderer" 644; then
+                [ "$unit" = service ] && \
+                    rr_firewall_quarantine_guard_file_is_exact "$target" \
+                        rr_firewall_render_quarantine_guard_service_legacy 644 || return 1
+            fi
         fi
         dropin_dir="${target}.d"
         if [ -e "$dropin_dir" ] || [ -L "$dropin_dir" ]; then
@@ -709,7 +785,11 @@ rr_firewall_quarantine_supervisor_preflight_is_safe() {
     done
     case "$loaded_count" in
         0) return 0 ;;
-        3) rr_firewall_quarantine_supervisor_effective ;;
+        # An interruption after writing the new service but before reload can
+        # leave exact current disk bytes with the exact legacy compiled unit.
+        # Accept either complete lifecycle here; post-reload verification is
+        # always current-only before any enable/start.
+        3) rr_firewall_quarantine_supervisor_effective compatible ;;
         *) return 1 ;;
     esac
 }
@@ -727,6 +807,31 @@ rr_firewall_install_fail_closed_supervisor() {
     rr_firewall_root_directory_chain_is_safe "$script_parent" || return 1
     rr_firewall_quarantine_supervisor_preflight_is_safe \
         "$systemd_root" "$guard_script" || return 1
+    # Every firewall writer checks this installation.  An already-current,
+    # correctly armed idle supervisor needs no rewrite or watcher restart;
+    # repeated stop/start cycles would consume the path unit's own start limit.
+    if ! rr_firewall_fail_closed_quarantine_active && \
+       rr_firewall_quarantine_supervisor_effective && \
+       systemctl is-enabled --quiet rr-firewall-quarantine-guard.path && \
+       systemctl is-active --quiet rr-firewall-quarantine-guard.path && \
+       ! systemctl is-enabled --quiet rr-firewall-quarantine-guard.timer && \
+       [ "$(systemctl show --property=ActiveState --value \
+            rr-firewall-quarantine-guard.timer 2>/dev/null)" = inactive ] && \
+       [ "$(systemctl show --property=ActiveState --value \
+            rr-firewall-quarantine-guard.service 2>/dev/null)" = inactive ]; then
+        return 0
+    fi
+    # Validate before stopping anything: stopping an untrusted unit could run
+    # foreign ExecStop hooks.  Stop path first so the old template cannot keep
+    # requeuing while its service is replaced.  The marker and ingress gates
+    # remain intact throughout migration, including interrupted migrations.
+    for unit in path timer service; do
+        if [ "$(systemctl show --property=LoadState --value \
+                "rr-firewall-quarantine-guard.$unit" 2>/dev/null)" = loaded ]; then
+            systemctl stop "rr-firewall-quarantine-guard.$unit" \
+                >/dev/null 2>&1 || return 1
+        fi
+    done
     temporary=$(mktemp "$script_parent/.rr-firewall-quarantine-guard.XXXXXX") || \
         return 1
     if ! rr_firewall_render_quarantine_guard_script > "$temporary" || \
@@ -745,12 +850,11 @@ rr_firewall_install_fail_closed_supervisor() {
     # hostile ExecStartPre or namespace override must never get one execution
     # opportunity merely because the canonical base bytes were just restored.
     rr_firewall_quarantine_supervisor_effective || return 1
+    rr_firewall_reset_quarantine_guard_failures || return 1
+    systemctl disable --now rr-firewall-quarantine-guard.timer \
+        >/dev/null 2>&1 || return 1
     systemctl enable --now rr-firewall-quarantine-guard.path \
         >/dev/null 2>&1 || return 1
-    if ! rr_firewall_fail_closed_quarantine_active; then
-        systemctl disable --now rr-firewall-quarantine-guard.timer \
-            >/dev/null 2>&1 || return 1
-    fi
     [ "$(stat -c '%u:%g:%h:%a' -- "$guard_script" 2>/dev/null)" = \
         0:0:1:700 ] || return 1
     cmp -s -- "$guard_script" <(rr_firewall_render_quarantine_guard_script) || \
@@ -770,7 +874,8 @@ rr_firewall_install_fail_closed_supervisor() {
         return 0
     fi
     ! systemctl is-active --quiet rr-firewall-quarantine-guard.timer && \
-        ! systemctl is-enabled --quiet rr-firewall-quarantine-guard.timer
+        ! systemctl is-enabled --quiet rr-firewall-quarantine-guard.timer && \
+        ! systemctl is-active --quiet rr-firewall-quarantine-guard.service
 }
 
 rr_firewall_systemd_dropin_metadata_is_safe() {
@@ -2327,6 +2432,288 @@ rr_netfilter_rule_state() {
     return 2
 }
 
+# Prove the first match for this one local subscription SYN.  A rule may only
+# be inserted immediately before RR's own exact DROP, or before the built-in
+# INPUT policy.  An administrator's matching DROP/unknown extension is never
+# bypassed.  UFW's normal before-input loopback ACCEPT is followed read-only.
+rr_local_subscription_loopback_plan() {
+    local backend="$1" proto_port="$2" raw="" result=0
+    is_valid_port "$proto_port" || return 1
+    case "$backend" in iptables|ip6tables) ;; *) return 1 ;; esac
+    raw=$(mktemp /tmp/rr-subscription-loopback.XXXXXX) || return 1
+    if ! "$backend" -w 5 -t filter -S > "$raw" 2>/dev/null; then
+        rm -f "$raw"
+        return 1
+    fi
+    python3 - "$raw" "$backend" "$proto_port" "$FIREWALL_BLOCK_COMMENT" <<'PY' || result=$?
+import ipaddress
+import re
+import shlex
+import sys
+
+path, backend, port_text, block_comment = sys.argv[1:]
+address = ipaddress.ip_address("127.0.0.1" if backend == "iptables" else "::1")
+port = int(port_text)
+subscription_port = port
+reply = False
+chains, policies = {}, {}
+for raw in open(path, encoding="utf-8"):
+    tokens = shlex.split(raw)
+    if len(tokens) == 3 and tokens[0] == "-P":
+        policies[tokens[1]] = tokens[2]
+        chains.setdefault(tokens[1], [])
+    elif len(tokens) == 2 and tokens[0] == "-N":
+        chains.setdefault(tokens[1], [])
+    elif len(tokens) >= 4 and tokens[0] == "-A":
+        chains.setdefault(tokens[1], []).append(tokens)
+    else:
+        raise SystemExit(1)
+if policies.get("INPUT") not in {"ACCEPT", "DROP"}:
+    raise SystemExit(1)
+
+def match(tokens):
+    # Establish disjointness before rejecting an unknown extension.  This
+    # keeps ordinary rules for other ports/protocols outside this scope.
+    values, modules, unknown, negate = {}, [], False, False
+    i = 2
+    while i < len(tokens):
+        option = tokens[i]
+        if option == "!":
+            if negate:
+                raise ValueError("double negation")
+            negate = True
+            i += 1
+            continue
+        if i + 1 >= len(tokens):
+            raise ValueError("missing value")
+        value = tokens[i + 1]
+        if option == "-m":
+            modules.append(value)
+            unknown |= negate or value not in {"tcp", "comment", "conntrack", "state", "multiport"}
+        elif option in values:
+            raise ValueError("duplicate selector")
+        else:
+            values[option] = (value, negate)
+        negate = False
+        i += 2
+    if negate:
+        raise ValueError("trailing negation")
+    selectors = {
+        "-i", "--in-interface", "-s", "--source", "-d", "--destination",
+        "-p", "--protocol", "--dport", "--dports", "--ctstate", "--state",
+    }
+    for names in (("-i", "--in-interface"), ("-s", "--source"),
+                  ("-d", "--destination"), ("-p", "--protocol"),
+                  ("--dport", "--dports"), ("--ctstate", "--state"),
+                  ("-j", "--jump", "-g", "--goto")):
+        if sum(name in values for name in names) > 1:
+            raise ValueError("duplicate alias")
+    for option, (value, negated) in values.items():
+        if option in {"-i", "--in-interface"}:
+            applies = "lo".startswith(value[:-1]) if value.endswith("+") else value == "lo"
+        elif option in {"-s", "--source", "-d", "--destination"}:
+            applies = address in ipaddress.ip_network(value, strict=False)
+        elif option in {"-p", "--protocol"}:
+            applies = value in {"tcp", "6", "all", "0"}
+        elif option in {"--ctstate", "--state"}:
+            applies = ("ESTABLISHED" if reply else "NEW") in value.upper().split(",")
+        elif option in {"--dport", "--dports", "--sport", "--sports"}:
+            if option in {"--sport", "--sports"} and not reply:
+                unknown = True
+                continue
+            tested_port = subscription_port if option in {"--sport", "--sports"} else port
+            applies = False
+            for item in value.split(","):
+                interval = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", item)
+                if interval is None:
+                    raise ValueError("port selector")
+                low, high = int(interval[1]), int(interval[2] or interval[1])
+                applies |= low <= tested_port <= high
+        elif option in {"-j", "--jump", "--comment"}:
+            unknown |= negated
+            continue
+        else:
+            unknown = True
+            continue
+        if applies == negated:
+            return None
+    if unknown:
+        raise ValueError("unknown matching selector")
+    target = values.get("-j", values.get("--jump", ("", False)))[0]
+    if not target:
+        raise ValueError("missing jump")
+    exact_drop = (target == "DROP" and values.get("--comment") == (block_comment, False)
+                  and values.get("-p", values.get("--protocol")) == ("tcp", False)
+                  and values.get("--dport") == (port_text, False)
+                  and set(values) <= {"-p", "--protocol", "--dport", "--comment", "-j", "--jump"}
+                  and set(modules) <= {"tcp", "comment"})
+    return target, exact_drop
+
+def walk(chain, ancestry=()):
+    if chain in ancestry or len(ancestry) > 20:
+        raise ValueError("chain cycle")
+    for position, tokens in enumerate(chains.get(chain, []), 1):
+        rule = match(tokens)
+        if rule is None:
+            continue
+        target, exact_drop = rule
+        if target == "ACCEPT":
+            return "ready"
+        if chain == "INPUT" and exact_drop and not reply:
+            return f"insert:{position}"
+        if target == "RETURN":
+            return "return"
+        if target in {"LOG", "NFLOG", "TRACE"}:
+            continue
+        if target in chains and target not in policies:
+            verdict = walk(target, ancestry + (chain,))
+            if verdict == "return":
+                continue
+            return verdict
+        raise ValueError("matching policy blocks loopback")
+    if chain != "INPUT":
+        return "return"
+    if policies[chain] == "ACCEPT":
+        return "ready"
+    if reply:
+        raise ValueError("INPUT policy blocks subscription replies")
+    return f"insert:{len(chains[chain]) + 1}"
+
+try:
+    request_plan = walk("INPUT")
+    # The response has an ephemeral destination, not SUB_PORT.  Prove every
+    # destination-port equivalence class (except the listening port itself)
+    # under ESTABLISHED before adding a request-only allowance.  A custom
+    # default-DROP host lacking a loopback/ESTABLISHED return path is refused.
+    reply_ports = {1, 65535, subscription_port - 1, subscription_port + 1}
+    for rules in chains.values():
+        for tokens in rules:
+            for index, token in enumerate(tokens[:-1]):
+                if token not in {"--dport", "--dports"}:
+                    continue
+                for item in tokens[index + 1].split(","):
+                    interval = re.fullmatch(r"([0-9]+)(?::([0-9]+))?", item)
+                    if interval is None:
+                        continue
+                    for boundary in (int(interval[1]), int(interval[2] or interval[1])):
+                        reply_ports.update((boundary - 1, boundary, boundary + 1))
+    reply = True
+    for port in sorted(reply_ports):
+        if 1 <= port <= 65535 and port != subscription_port and walk("INPUT") != "ready":
+            raise ValueError("subscription reply is not accepted")
+    print(request_plan)
+except (ValueError, RecursionError):
+    print(f"{backend} 本机订阅请求或 ESTABLISHED 回程无法证明可达；请先核对用户回环策略，未新增放行规则。", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    rm -f "$raw"
+    return "$result"
+}
+
+rr_local_subscription_firewall_ready() {
+    local backend="" state=0 seen=false plan=""
+    [ "${SUB_ACCESS_MODE:-local}" = local ] || return 1
+    is_valid_port "${SUB_PORT:-}" || return 1
+    for backend in iptables ip6tables; do
+        if rr_netfilter_backend_state "$backend"; then
+            seen=true
+            plan=$(rr_local_subscription_loopback_plan "$backend" "$SUB_PORT") || return 1
+            [ "$plan" = ready ] || return 1
+        else
+            state=$?
+            [ "$state" -eq 1 ] || return 1
+        fi
+    done
+    [ "$seen" = true ]
+}
+
+rr_reconcile_netfilter_subscription_loopback() {
+    local backend="$1" proto_port="$2" plan="" address="" position=""
+    if ! rr_firewall_writer_gate_is_held; then
+        declare -F rr_update_loopback_migration_is_protected >/dev/null 2>&1 && \
+            rr_update_loopback_migration_is_protected || return 1
+    fi
+    plan=$(rr_local_subscription_loopback_plan "$backend" "$proto_port") || return 1
+    [ "$plan" != ready ] || return 0
+    case "$plan" in insert:*) position="${plan#insert:}" ;; *) return 1 ;; esac
+    [[ "$position" =~ ^[1-9][0-9]*$ ]] || return 1
+    address=127.0.0.1/32
+    [ "$backend" != ip6tables ] || address=::1/128
+    "$backend" -w 5 -t filter -I INPUT "$position" -i lo \
+        -s "$address" -d "$address" -p tcp --dport "$proto_port" \
+        -m comment --comment rr-local-subscription -j ACCEPT >/dev/null 2>&1 || return 1
+    plan=$(rr_local_subscription_loopback_plan "$backend" "$proto_port") || return 1
+    [ "$plan" = ready ]
+}
+
+rr_remove_netfilter_subscription_loopback() {
+    local backend="$1" proto_port="$2" address=127.0.0.1/32 state=0 attempts=0
+    rr_firewall_writer_gate_is_held || return 1
+    [ "$backend" != ip6tables ] || address=::1/128
+    while [ "$attempts" -lt 100 ]; do
+        if "$backend" -w 5 -t filter -C INPUT -i lo -s "$address" -d "$address" \
+            -p tcp --dport "$proto_port" -m comment --comment rr-local-subscription \
+            -j ACCEPT >/dev/null 2>&1; then
+            "$backend" -w 5 -t filter -D INPUT -i lo -s "$address" -d "$address" \
+                -p tcp --dport "$proto_port" -m comment --comment rr-local-subscription \
+                -j ACCEPT >/dev/null 2>&1 || return 1
+            attempts=$((attempts + 1))
+        else
+            state=$?
+            [ "$state" -eq 1 ] && return 0
+            return 1
+        fi
+    done
+    return 1
+}
+
+# Used by the upgrade migration before starting its replacement listener.
+# This enters the same journal, tuple snapshot, persistence and compensation
+# path as normal firewall operations; the external rule is observed unchanged.
+rr_reconcile_local_subscription_loopback() {
+    local desired="" backend="" state=0 seen=false
+    local RR_FIREWALL_LOOPBACK_ONLY=1
+    [ "${SUB_ACCESS_MODE:-local}" = local ] || return 0
+    rr_local_subscription_firewall_ready && return 0
+    if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
+        declare -F rr_update_loopback_migration_is_protected >/dev/null 2>&1 && \
+            rr_update_loopback_migration_is_protected || return 1
+        # Preflight every family before either family can be changed.  The
+        # surrounding update owns the sealed rollback snapshot and lock.
+        for backend in iptables ip6tables; do
+            if rr_netfilter_backend_state "$backend"; then
+                seen=true
+                rr_local_subscription_loopback_plan "$backend" "$SUB_PORT" \
+                    >/dev/null || return 1
+            else
+                state=$?
+                [ "$state" -eq 1 ] || return 1
+            fi
+        done
+        [ "$seen" = true ] || return 1
+        for backend in iptables ip6tables; do
+            if rr_netfilter_backend_state "$backend"; then
+                rr_reconcile_netfilter_subscription_loopback "$backend" \
+                    "$SUB_PORT" || return 1
+            else
+                state=$?
+                [ "$state" -eq 1 ] || return 1
+            fi
+        done
+        RR_FIREWALL_FINALIZE_REQUIRED=true
+        rr_local_subscription_firewall_ready
+        return $?
+    fi
+    if rr_validate_protocol_firewall "$SUB_PORT" tcp closed; then
+        desired=closed
+    elif rr_validate_protocol_firewall "$SUB_PORT" tcp open; then
+        desired=open
+    else
+        return 1
+    fi
+    rr_reconcile_protocol_firewall "$SUB_PORT" tcp "$desired"
+}
+
 rr_reconcile_ufw_protocol_rule() {
     local proto_port="$1" proto_type="$2" desired="$3"
     local desired_action="" desired_status="" desired_comment=""
@@ -2482,7 +2869,15 @@ rr_reconcile_netfilter_protocol_rule() {
     else
         state=$?
     fi
-    [ "$state" -eq 1 ]
+    [ "$state" -eq 1 ] || return 1
+    if [ "$desired" = closed ] && [ "$proto_type" = tcp ] && \
+       [ "${SUB_ACCESS_MODE:-local}" = local ] && \
+       [ "$proto_port" = "${SUB_PORT:-}" ]; then
+        rr_reconcile_netfilter_subscription_loopback "$backend" "$proto_port" || return 1
+    elif [ "$proto_type" = tcp ]; then
+        rr_remove_netfilter_subscription_loopback "$backend" "$proto_port" || return 1
+    fi
+    return 0
 }
 
 # Ordinary firewall changes are a single-key transaction.  The snapshot keeps
@@ -2585,6 +2980,17 @@ def direct_managed_tuple(tokens):
     target_name = option(tokens, "-j", "--jump")
     rule_protocol = option(tokens, "-p", "--protocol")
     rule_port = option(tokens, "--dport")
+    if comment == "rr-local-subscription":
+        address = "127.0.0.1/32" if backend == "iptables" else "::1/128"
+        expected = ["-A", "INPUT", "-i", "lo", "-s", address, "-d", address,
+                    "-p", "tcp", "--dport", port_text, "-m", "comment",
+                    "--comment", comment, "-j", "ACCEPT"]
+        # Kernel -S normalizes addresses before the interface and may add -m tcp.
+        pairs = [(tokens[i], tokens[i + 1]) for i in range(2, len(tokens) - 1, 2)]
+        wanted = [(expected[i], expected[i + 1]) for i in range(2, len(expected), 2)]
+        return (protocol == "tcp" and len(tokens) % 2 == 0
+                and (sorted(pairs) == sorted(wanted)
+                     or sorted(pairs) == sorted(wanted + [("-m", "tcp")])))
     if (comment not in managed or target_name != managed[comment]
             or rule_protocol not in {"tcp", "udp"}
             or rule_port is None
@@ -2742,12 +3148,12 @@ rr_firewall_run_netfilter_saved_tuple() {
     while IFS= read -r -d '' token; do
         arguments+=("$token")
     done < <(python3 - "$line" "$proto_port" "$proto_type" \
-        "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" <<'PY'
+        "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" "$backend" <<'PY'
 import re
 import shlex
 import sys
 
-line, port_text, protocol, allow_comment, block_comment = sys.argv[1:]
+line, port_text, protocol, allow_comment, block_comment, backend = sys.argv[1:]
 managed = {allow_comment: "ACCEPT", block_comment: "DROP"}
 try:
     tokens = shlex.split(line)
@@ -2767,6 +3173,19 @@ rule_protocol = value("-p", "--protocol")
 rule_port = value("--dport")
 comment = value("--comment")
 target = value("-j", "--jump")
+if comment == "rr-local-subscription":
+    address = "127.0.0.1/32" if backend == "iptables" else "::1/128"
+    wanted = [("-i", "lo"), ("-s", address), ("-d", address), ("-p", "tcp"),
+              ("--dport", port_text), ("-m", "comment"),
+              ("--comment", comment), ("-j", "ACCEPT")]
+    pairs = [(tokens[i], tokens[i + 1]) for i in range(2, len(tokens) - 1, 2)]
+    if (protocol != "tcp" or len(tokens) % 2
+            or (sorted(pairs) != sorted(wanted)
+                and sorted(pairs) != sorted(wanted + [("-m", "tcp")]))):
+        raise SystemExit(1)
+    for token in tokens:
+        sys.stdout.buffer.write(token.encode() + b"\0")
+    raise SystemExit(0)
 if (rule_protocol != protocol or rule_port != port_text
         or target != managed.get(comment)
         or re.fullmatch(r"[1-9][0-9]{0,4}", rule_port) is None
@@ -3757,6 +4176,21 @@ for raw in sys.stdin:
         if index + 1 >= len(tokens):
             continue
         comments.append(tokens[index + 1])
+    if "rr-local-subscription" in comments:
+        if tokens[:2] != ["-A", "INPUT"] or len(tokens) % 2:
+            raise SystemExit(2)
+        pairs = [(tokens[i], tokens[i + 1]) for i in range(2, len(tokens), 2)]
+        ports = [value for key, value in pairs if key == "--dport"]
+        if len(ports) != 1 or re.fullmatch(r"[1-9][0-9]{0,4}", ports[0]) is None or int(ports[0]) > 65535:
+            raise SystemExit(2)
+        address = "127.0.0.1/32" if sys.argv[3] == "iptables" else "::1/128"
+        wanted = [("-i", "lo"), ("-s", address), ("-d", address), ("-p", "tcp"),
+                  ("--dport", ports[0]), ("-m", "comment"),
+                  ("--comment", "rr-local-subscription"), ("-j", "ACCEPT")]
+        if sorted(pairs) not in (sorted(wanted), sorted(wanted + [("-m", "tcp")])):
+            raise SystemExit(2)
+        supported_seen = True
+        continue
     owned = [comment for comment in comments if comment in managed]
     if not owned:
         continue
@@ -3803,7 +4237,7 @@ for raw in sys.stdin:
         raise SystemExit(2)
     supported_seen = True
 raise SystemExit(1 if supported_seen else 0)
-' "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT"; then
+' "$FIREWALL_COMMENT" "$FIREWALL_BLOCK_COMMENT" "$backend"; then
                     parse_state=0
                 else
                     parse_state=$?
@@ -4489,10 +4923,17 @@ rr_reconcile_protocol_firewall_locked() {
     local proto_port="$1" proto_type="$2" desired="$3"
     local backend="" state=0 failed=false persist_netfilter=false mode=""
     local raw_preflight_seen=false snapshot="" current="" arm_status=0
+    local local_subscription=false
+    if [ "$proto_type" = tcp ] && [ "${SUB_ACCESS_MODE:-local}" = local ] && \
+       [ "$proto_port" = "${SUB_PORT:-}" ] && \
+       { [ "$desired" = closed ] || [ "${RR_FIREWALL_LOOPBACK_ONLY:-0}" = 1 ]; }; then
+        local_subscription=true
+    fi
 
-    # A release candidate must not insert/reorder INPUT rules or persist a
-    # changed ruleset before it commits.  Transaction mode is a strict
-    # read-only gate; fresh installs and interactive changes still reconcile.
+    # Ordinary protocol reconciliation stays read-only in a release candidate.
+    # Its separately guarded local-subscription migration may insert the exact
+    # loopback exception under the update lock and sealed external snapshot;
+    # external ingress rules and persistence still wait for commit.
     if [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
         rr_validate_protocol_firewall "$proto_port" "$proto_type" "$desired"
         return $?
@@ -4549,6 +4990,27 @@ rr_reconcile_protocol_firewall_locked() {
         }
     fi
 
+    if [ "$local_subscription" = true ]; then
+        for backend in iptables ip6tables; do
+            if rr_netfilter_backend_state "$backend"; then
+                rr_local_subscription_loopback_plan "$backend" "$proto_port" \
+                    >/dev/null || {
+                    printf '本机订阅路径与 %s 用户规则冲突；未修改规则。\n' "$backend" >&2
+                    return 1
+                }
+            else
+                state=$?
+                [ "$state" -eq 1 ] || return 1
+            fi
+        done
+        # UFW owns its before-input chain.  A noncanonical/custom loopback
+        # denial must be repaired by its owner, never bypassed with a raw rule.
+        if [ "$mode" = ufw ] && ! rr_local_subscription_firewall_ready; then
+            printf '%s\n' 'UFW 本机订阅路径不可达；未插入绕过 UFW 的规则。' >&2
+            return 1
+        fi
+    fi
+
     # This is the final read-only boundary.  It records the target tuple and
     # its positions plus a byte-exact seal of every non-target rule before the
     # first UFW/netfilter writer is allowed to run.
@@ -4579,7 +5041,8 @@ rr_reconcile_protocol_firewall_locked() {
         return 1
     fi
 
-    if [ "$mode" = ufw ] || [ "$mode" = dual ]; then
+    if { [ "$mode" = ufw ] || [ "$mode" = dual ]; } && \
+       [ "${RR_FIREWALL_LOOPBACK_ONLY:-0}" != 1 ]; then
         if ! rr_reconcile_ufw_protocol_rule "$proto_port" "$proto_type" "$desired"; then
             printf 'UFW 未能写入或验证 RR %s/%s 规则。\n' "$proto_type" "$proto_port" >&2
             failed=true
@@ -4603,7 +5066,10 @@ rr_reconcile_protocol_firewall_locked() {
             case "$state" in
                 0)
                     persist_netfilter=true
-                    if ! rr_reconcile_netfilter_protocol_rule "$backend" "$proto_port" \
+                    if [ "${RR_FIREWALL_LOOPBACK_ONLY:-0}" = 1 ]; then
+                        rr_reconcile_netfilter_subscription_loopback "$backend" \
+                            "$proto_port" || failed=true
+                    elif ! rr_reconcile_netfilter_protocol_rule "$backend" "$proto_port" \
                         "$proto_type" "$desired"; then
                         printf '%s 未能写入或验证 RR %s/%s 规则。\n' \
                             "$backend" "$proto_type" "$proto_port" >&2
@@ -4621,6 +5087,11 @@ rr_reconcile_protocol_firewall_locked() {
     elif [ "$failed" = false ] && ! rr_netfilter_rr_namespace_is_empty; then
         # Recheck after the UFW writer: authority is valid only while no raw RR
         # filter rule can precede and bypass UFW policy.
+        failed=true
+    fi
+    if [ "$failed" = false ] && [ "$local_subscription" = true ] && \
+       ! rr_local_subscription_firewall_ready; then
+        printf '%s\n' '本机订阅首匹配策略校验失败；正在补偿。' >&2
         failed=true
     fi
 
@@ -4780,6 +5251,19 @@ rr_validate_protocol_firewall() {
 }
 
 rr_local_subscription_loopback_ready() {
+    rr_local_subscription_binding_is_local || return 1
+    python3 - "$SUB_PORT" <<'PY'
+import socket
+import sys
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2):
+        pass
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+rr_local_subscription_binding_is_local() {
     local pid="" state="" argument="" expect_bind=false
     local app_seen=false port_seen=false bind_seen=false
     local proc_root="${RR_PROC_ROOT:-/proc}" cmdline_file=""
@@ -4912,6 +5396,10 @@ rr_validate_local_subscription_firewall_transition() {
         fi
         RR_FIREWALL_FINALIZE_REQUIRED=true
     fi
+    rr_local_subscription_firewall_ready || {
+        printf '%s\n' '热更新本机订阅防火墙路径未就绪；拒绝继续。' >&2
+        return 1
+    }
     return 0
 }
 
@@ -4930,7 +5418,7 @@ open_firewall() {
         [ "$operation_status" -eq 0 ] || return "$operation_status"
     elif [ "${RR_UPDATE_TRANSACTION:-0}" = 1 ]; then
         # v7.1.0 always left a precisely tagged public ACCEPT for SUB_PORT.
-        # The candidate cannot mutate external firewall state before commit,
+        # The candidate cannot mutate public ingress policy before commit,
         # so accept that one legacy state only while the replacement server is
         # demonstrably loopback-only.  A durable post-commit finalizer removes
         # it; every other closed-port caller remains strict.
@@ -4940,6 +5428,7 @@ open_firewall() {
     else
         close_protocol_firewall "$SUB_PORT" "tcp" || operation_status=$?
         [ "$operation_status" -eq 0 ] || return "$operation_status"
+        rr_local_subscription_firewall_ready || return 1
     fi
 }
 
@@ -5530,13 +6019,13 @@ rr_firewall_verify_desired_namespace() {
     # complete raw programs.  Per-tuple validators below then prove every
     # desired rule is effective in the selected authority backend/families.
     python3 - "$snapshot" "$desired" "$FIREWALL_COMMENT" \
-        "$FIREWALL_BLOCK_COMMENT" <<'PY' || return 1
+        "$FIREWALL_BLOCK_COMMENT" "${SUB_ACCESS_MODE:-local}" "${SUB_PORT:-}" <<'PY' || return 1
 import os
 import re
 import shlex
 import sys
 
-snapshot, desired_path, allow_comment, block_comment = sys.argv[1:]
+snapshot, desired_path, allow_comment, block_comment, sub_mode, sub_port = sys.argv[1:]
 protocols = {}
 hops = {}
 for raw in open(desired_path, encoding="utf-8"):
@@ -5642,6 +6131,22 @@ for backend in ("iptables", "ip6tables"):
                 raise SystemExit(1)
             raw_comments = [tokens[i + 1] for i, token in enumerate(tokens[:-1])
                             if token == "--comment"]
+            if "rr-local-subscription" in raw_comments:
+                address = "127.0.0.1/32" if backend == "iptables" else "::1/128"
+                wanted = [("-i", "lo"), ("-s", address), ("-d", address), ("-p", "tcp"),
+                          ("--dport", sub_port), ("-m", "comment"),
+                          ("--comment", "rr-local-subscription"), ("-j", "ACCEPT")]
+                pairs = [(tokens[i], tokens[i + 1]) for i in range(2, len(tokens) - 1, 2)]
+                if (table != "filter" or tokens[:2] != ["-A", "INPUT"]
+                        or len(tokens) % 2 or sub_mode != "local"
+                        or protocols.get((sub_port, "tcp")) != "closed"
+                        or sorted(pairs) not in (sorted(wanted), sorted(wanted + [("-m", "tcp")]))):
+                    raise SystemExit(1)
+                key = (backend, table, "local-subscription")
+                if key in seen:
+                    raise SystemExit(1)
+                seen.add(key)
+                continue
             managed_comments = [comment for comment in raw_comments
                                 if comment in {allow_comment, block_comment}
                                 or comment.startswith("argo-rr-")]
@@ -5700,6 +6205,9 @@ PY
             *) return 1 ;;
         esac
     done < "$desired"
+    if [ "${SUB_ACCESS_MODE:-local}" = local ]; then
+        rr_local_subscription_firewall_ready || return 1
+    fi
 }
 
 rr_firewall_restore_quarantine_snapshot_locked() {

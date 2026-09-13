@@ -167,7 +167,9 @@ case "$command" in
                 fi
                 ;;
             Type)
-                if [ "$unit" = rr-update-recovery.service ] && [ -n "$fragment" ]; then
+                if { [ "$unit" = rr-update-recovery.service ] || \
+                     [ "$unit" = rr-firewall-quarantine-guard.service ]; } && \
+                   [ -n "$fragment" ]; then
                     printf '%s\n' oneshot
                 else
                     printf '%s\n' simple
@@ -176,7 +178,35 @@ case "$command" in
             DynamicUser|PrivateUsers|PrivateMounts|RootEphemeral|ProtectHome|ProtectSystem)
                 printf '%s\n' no
                 ;;
-            RemainAfterExit) printf '%s\n' no ;;
+            RemainAfterExit)
+                if [ -n "$fragment" ] && grep -qx 'RemainAfterExit=yes' "$fragment"; then
+                    printf '%s\n' yes
+                else
+                    printf '%s\n' no
+                fi
+                ;;
+            Restart)
+                if [ -n "$fragment" ] && grep -qx 'Restart=on-failure' "$fragment"; then
+                    printf '%s\n' on-failure
+                else
+                    printf '%s\n' no
+                fi
+                ;;
+            RestartUSec)
+                if [ -n "$fragment" ] && grep -qx 'RestartSec=5s' "$fragment"; then
+                    printf '%s\n' 5s
+                else
+                    printf '%s\n' 100ms
+                fi
+                ;;
+            StartLimitIntervalUSec)
+                if [ -n "$fragment" ] && grep -qx 'StartLimitIntervalSec=0' "$fragment"; then
+                    printf '%s\n' 0
+                else
+                    printf '%s\n' 10s
+                fi
+                ;;
+            Result) printf '%s\n' success ;;
             SystemCallFilter|RestrictAddressFamilies|RestrictNetworkInterfaces|\
             RestrictFileSystems)
                 printf '%s\n' '~'

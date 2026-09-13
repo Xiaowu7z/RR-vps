@@ -150,10 +150,10 @@ printf '%s\n' '15555|127.0.0.1|local||signature|local-http' > "$SUB_BIND_STATE_F
 printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 15555 --bind 127.0.0.1 \
     > "$RR_PROC_ROOT/4242/cmdline"
 is_subscription_pid() { [ "$1" = 4242 ]; }
-rr_local_subscription_loopback_ready || fail 'valid loopback-only worker was rejected'
+rr_local_subscription_binding_is_local || fail 'valid loopback-only binding was rejected'
 printf '%s\0' python3 /usr/local/lib/rr/nexus/sub_server.py 15555 --bind 0.0.0.0 \
     > "$RR_PROC_ROOT/4242/cmdline"
-if rr_local_subscription_loopback_ready; then
+if rr_local_subscription_binding_is_local; then
     fail 'publicly bound subscription worker passed loopback proof'
 fi
 rm -f "$RR_FIREWALL_ACTIVE_TX"
