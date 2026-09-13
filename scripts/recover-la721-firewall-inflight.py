@@ -5,6 +5,10 @@ This is an explicit incident recovery, not a general firewall repair tool.
 It takes real writer locks, verifies the existing policy without changing it,
 backs up the stopped installation, installs one pinned health-check patch,
 and restores the service states recorded before the interrupted operation.
+
+With --repair-loopback, it additionally permits one declared IPv4 loopback
+exception for the local subscription port and its matching saved-file line.
+Original sealed evidence, all other rules and all credentials remain intact.
 """
 
 import datetime
@@ -14,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -233,8 +238,71 @@ def prove_redundant_legacy_allow(program):
     return b"".join(line for line in lines if line != legacy)
 
 
+LOOPBACK_RULE = (b"-A INPUT -s 127.0.0.1/32 -d 127.0.0.1/32 -i lo -p tcp -m tcp "
+                 b"--dport 20382 -m comment --comment rr-la721-loopback -j ACCEPT\n")
+SUBSCRIPTION_DROP = (b"-A INPUT -p tcp -m tcp --dport 20382 -m comment "
+                     b"--comment argo-rr-managed-block -j DROP\n")
+
+
+def rule_tokens(data):
+    return [shlex.split(line.decode("ascii")) for line in data.splitlines() if line.strip()]
+
+
+def loopback_raw_candidate(raw):
+    require(sha(raw) == RAW_PINS["iptables.filter"], "loopback_original_filter_pin")
+    require(raw.splitlines(keepends=True).count(SUBSCRIPTION_DROP) == 1,
+            "loopback_original_drop")
+    return raw.replace(SUBSCRIPTION_DROP, LOOPBACK_RULE + SUBSCRIPTION_DROP, 1)
+
+
+def loopback_persistence_candidate(saved, raw):
+    """Preserve every saved byte except one insertion in a proven filter table."""
+    loopback_raw_candidate(raw)
+    lines = saved.splitlines(keepends=True)
+    table = None
+    tables = set()
+    projected = []
+    insertion = None
+    for index, line in enumerate(lines):
+        require(line.endswith(b"\n"), "saved_firewall_missing_newline")
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            continue
+        if stripped.startswith(b"*"):
+            require(table is None and re.fullmatch(rb"\*[a-z]+", stripped),
+                    "saved_firewall_table_syntax")
+            table = stripped[1:]
+            require(table not in tables, "saved_firewall_duplicate_table")
+            tables.add(table)
+            continue
+        if stripped == b"COMMIT":
+            require(table is not None, "saved_firewall_unmatched_commit")
+            table = None
+            continue
+        require(table is not None, "saved_firewall_outside_table")
+        if table != b"filter":
+            continue
+        chain = re.fullmatch(rb":([A-Z0-9_-]+) (ACCEPT|DROP|-) \[[0-9]+:[0-9]+\]", stripped)
+        if chain:
+            require(chain[2] != b"-", "saved_firewall_custom_chain")
+            projected.append(b"-P " + chain[1] + b" " + chain[2] + b"\n")
+            continue
+        rule = re.sub(rb"^\[[0-9]+:[0-9]+\] ", b"", stripped) + b"\n"
+        require(rule.startswith(b"-A "), "saved_firewall_filter_syntax")
+        projected.append(rule)
+        if rule_tokens(rule) == rule_tokens(SUBSCRIPTION_DROP):
+            require(insertion is None, "saved_firewall_duplicate_drop")
+            insertion = index
+    require(table is None and b"filter" in tables and insertion is not None,
+            "saved_firewall_incomplete_filter")
+    require(rule_tokens(b"".join(projected)) == rule_tokens(raw),
+            "saved_filter_differs_from_incident")
+    lines.insert(insertion, LOOPBACK_RULE)
+    return b"".join(lines)
+
+
 class Recovery:
-    def __init__(self):
+    def __init__(self, repair_loopback=False):
         self.stage = None
         self.phase = "host"
         self.fds = []
@@ -245,6 +313,11 @@ class Recovery:
         self.marker_removed = False
         self.patch_installed = False
         self.success = False
+        self.repair_loopback = repair_loopback
+        self.loopback_touched = False
+        self.loopback_original_saved = None
+        self.loopback_saved_candidate = None
+        self.loopback_live_state = None
 
     def note(self, event, **values):
         line = json.dumps({"event": event, "phase": self.phase, **values}, ensure_ascii=True)
@@ -313,8 +386,10 @@ class Recovery:
         require(os.geteuid() == 0 and os.uname().nodename == HOST, "host_or_uid")
         require(sha(EXPECTED_MARKER) == MARKER_SHA, "internal_marker_pin")
         os.umask(0o077)
-        self.note("RECOVERY_SCOPE", host=HOST, mode="abort_unchanged_orphan_v1",
-                  firewall_writes=False, configuration_replacement=False)
+        self.note("RECOVERY_SCOPE", host=HOST,
+                  mode="abort_orphan_with_scoped_loopback_v2" if self.repair_loopback else "abort_unchanged_orphan_v1",
+                  firewall_writes=self.repair_loopback, configuration_replacement=False,
+                  firewall_exception="ipv4_lo_127_to_127_tcp_20382" if self.repair_loopback else None)
 
     def acquire_locks(self):
         paths = ("/run/rr-vps/locks/update.lock", "/run/lock/rr-update.lock",
@@ -383,6 +458,20 @@ class Recovery:
     def verify_files_and_firewall(self, require_marker=True):
         for pins in (CONFIG_PINS, PERSISTENCE_PINS):
             for path, expected in pins.items():
+                if self.repair_loopback and path == "/etc/iptables/rules.v4":
+                    saved = read_regular(path)
+                    original = saved
+                    if sha(saved) != expected:
+                        require(saved.splitlines(keepends=True).count(LOOPBACK_RULE) == 1,
+                                "saved_loopback_not_exact")
+                        original = saved.replace(LOOPBACK_RULE, b"", 1)
+                    require(sha(original) == expected, "saved_loopback_original_pin")
+                    raw = pinned(EVIDENCE / "firewall/iptables.filter.raw", RAW_PINS["iptables.filter"])
+                    candidate = loopback_persistence_candidate(original, raw)
+                    require(saved in (original, candidate), "saved_loopback_state")
+                    self.loopback_original_saved = original
+                    self.loopback_saved_candidate = candidate
+                    continue
                 pinned(path, expected)
         if require_marker:
             require(pinned(MARKER, MARKER_SHA) == EXPECTED_MARKER, "marker_profile")
@@ -409,6 +498,16 @@ class Recovery:
             sealed = pinned(EVIDENCE / "firewall" / (name + ".raw"), expected)
             backend, table = name.split(".")
             live = self.command([backend, "-w", "3", "-t", table, "-S"], timeout=8)
+            if self.repair_loopback and name == "iptables.filter":
+                candidate = loopback_raw_candidate(sealed)
+                if live == sealed:
+                    self.loopback_live_state = "original"
+                else:
+                    require(rule_tokens(live) == rule_tokens(candidate), "live_loopback_not_exact")
+                    self.loopback_live_state = "repaired"
+                self.note("FIREWALL_SCOPED_CHECK", backend=backend, table=table,
+                          state=self.loopback_live_state, external_policy="unchanged")
+                continue
             require(live == sealed, "live_firewall_changed:" + name)
             self.note("FIREWALL_UNCHANGED", backend=backend, table=table, sha256=expected)
 
@@ -560,6 +659,14 @@ rr_local_subscription_loopback_ready || exit 1
             "verify_subscription": "load_config_with_defaults && subscription_server_running && rr_local_subscription_loopback_ready\n",
         }
         require(operation in bodies, "unsupported_helper")
+        if self.repair_loopback and operation == "verify":
+            # Python checks all sealed hashes, every live rule and saved file,
+            # allowing only the explicitly declared loopback delta. The old
+            # byte-equality predicate cannot represent that authorized repair.
+            self.verify_files_and_firewall()
+            bodies[operation] = bodies[operation].replace(
+                "check raw_evidence rr_restore_verify_firewall_pre_mutation_snapshot /var/lib/rr-vps/firewall-evidence || exit 1",
+                "printf 'READONLY_CHECK name=scoped_firewall_evidence rc=0\\n'")
         source = ('set -o pipefail\nfor module in "$1"/*.sh; do source "$module" || exit 1; done\n' + bodies[operation]).encode()
         try:
             output = self.command(["bash", "--noprofile", "--norc", "-s", "--", str(self.stage / "modules"),
@@ -602,6 +709,61 @@ rr_local_subscription_loopback_ready || exit 1
             "manifest_changed": False, "future_release_must_include_fix": True,
         }).encode(), 0o600)
 
+    def repair_local_subscription_route(self):
+        require(self.repair_loopback and self.stage is not None, "loopback_repair_scope")
+        self.verify_files_and_firewall()
+        require(self.loopback_original_saved is not None, "loopback_saved_preflight")
+        atomic_write(self.stage / "loopback-original-rules.v4", self.loopback_original_saved, 0o600)
+        atomic_write(self.stage / "loopback-candidate-rules.v4", self.loopback_saved_candidate, 0o600)
+        self.loopback_touched = True
+        raw = pinned(EVIDENCE / "firewall/iptables.filter.raw", RAW_PINS["iptables.filter"])
+        if self.loopback_live_state == "original":
+            input_rules = [line for line in raw.splitlines(keepends=True) if line.startswith(b"-A INPUT ")]
+            position = input_rules.index(SUBSCRIPTION_DROP) + 1
+            self.command(["iptables", "-w", "5", "-t", "filter", "-I", "INPUT", str(position),
+                          *shlex.split(LOOPBACK_RULE.decode())[2:]], timeout=10)
+        self.verify_files_and_firewall()
+        require(self.loopback_live_state == "repaired", "loopback_insert_not_verified")
+        saved_path = Path("/etc/iptables/rules.v4")
+        current = read_regular(saved_path)
+        require(current in (self.loopback_original_saved, self.loopback_saved_candidate),
+                "loopback_saved_changed_before_write")
+        if current != self.loopback_saved_candidate:
+            atomic_write(saved_path, self.loopback_saved_candidate, stat.S_IMODE(saved_path.stat().st_mode))
+        self.verify_files_and_firewall()
+        self.note("LOOPBACK_REPAIRED", interface="lo", source="127.0.0.1/32", destination="127.0.0.1/32",
+                  protocol="tcp", port=20382, external_drop="preserved", persistence="updated")
+
+    def rollback_loopback(self):
+        if not self.loopback_touched:
+            return
+        # Services have already been stopped by protect_failure. Never replace
+        # unknown files/rules; each removal is limited to this exact exception.
+        errors = []
+        try:
+            path = Path("/etc/iptables/rules.v4")
+            current = read_regular(path)
+            require(current in (self.loopback_original_saved, self.loopback_saved_candidate),
+                    "loopback_rollback_saved_changed")
+            if current != self.loopback_original_saved:
+                atomic_write(path, self.loopback_original_saved, stat.S_IMODE(path.stat().st_mode))
+        except Exception as error:
+            errors.append(type(error).__name__)
+        try:
+            raw = pinned(EVIDENCE / "firewall/iptables.filter.raw", RAW_PINS["iptables.filter"])
+            live = self.command(["iptables", "-w", "3", "-t", "filter", "-S"], timeout=8)
+            if live != raw:
+                require(rule_tokens(live) == rule_tokens(loopback_raw_candidate(raw)),
+                        "loopback_rollback_live_changed")
+                self.command(["iptables", "-w", "5", "-t", "filter", "-D", "INPUT",
+                              *shlex.split(LOOPBACK_RULE.decode())[2:]], timeout=10)
+            require(self.command(["iptables", "-w", "3", "-t", "filter", "-S"], timeout=8) == raw,
+                    "loopback_rollback_not_verified")
+        except Exception as error:
+            errors.append(type(error).__name__)
+        require(not errors, "loopback_rollback_uncertain:" + ",".join(errors))
+        self.note("LOOPBACK_ROLLBACK", live="original", persistence="original")
+
     def finish_orphan(self):
         # The original writer identity is deliberately not fabricated. Both
         # real locks and unchanged-policy evidence authorize this explicit
@@ -620,7 +782,8 @@ rr_local_subscription_loopback_ready || exit 1
         os.rename(MARKER, archive)
         self.marker_removed = True
         sync_directory(MARKER.parent)
-        self.note("ORPHAN_ABORTED", marker_archive=str(archive), firewall_unchanged=True)
+        self.note("ORPHAN_ABORTED", marker_archive=str(archive), firewall_unchanged=not self.repair_loopback,
+                  external_policy="unchanged")
         for name in GUARD_NAMES:
             self.reset_failed_if_needed(name)
         self.command(["systemctl", "start", "rr-firewall-quarantine-guard.path"])
@@ -639,23 +802,36 @@ rr_local_subscription_loopback_ready || exit 1
         require(nexus_host in {"127.0.0.1", "::1", "localhost"} and
                 isinstance(nexus_port, int) and 1 <= nexus_port <= 65535, "nexus_local_listener_profile")
         deadline = time.monotonic() + 20
+        endpoint_states = {}
         while True:
             values = [self.unit(name) for name in ("sing-box.service", "rr-nexus.service")]
             if all(value.get("ActiveState") == "active" and value.get("SubState") == "running" and
                    int(value.get("MainPID", "0")) > 1 for value in values):
-                try:
-                    for endpoint in (("127.0.0.1", 20382), (nexus_host, nexus_port)):
+                endpoint_states = {}
+                for endpoint in (("127.0.0.1", 20382), (nexus_host, nexus_port)):
+                    try:
                         with socket.create_connection(endpoint, timeout=1):
                             pass
+                        endpoint_states[str(endpoint)] = "connected"
+                    except OSError as error:
+                        endpoint_states[str(endpoint)] = type(error).__name__ + ":" + str(error.errno)
+                if all(state == "connected" for state in endpoint_states.values()):
                     break
-                except OSError:
-                    pass
+            if time.monotonic() >= deadline:
+                for name, value in zip(("sing-box.service", "rr-nexus.service"), values):
+                    self.note("SERVICE_READINESS_FAILED", unit=name,
+                              state={key: value.get(key) for key in ("ActiveState", "SubState", "MainPID", "Result")})
+                self.note("ENDPOINT_READINESS_FAILED", endpoints=endpoint_states)
             require(time.monotonic() < deadline, "services_not_running")
             time.sleep(0.25)
 
     def postverify(self):
         require(not os.path.lexists(MARKER), "marker_reappeared")
         self.verify_files_and_firewall(require_marker=False)
+        if self.repair_loopback:
+            require(self.loopback_live_state == "repaired" and
+                    read_regular("/etc/iptables/rules.v4") == self.loopback_saved_candidate,
+                    "loopback_postverify")
         pinned(ROOT / "modules/60-update.sh", PATCHED_SHA256)
         pinned(ROOT / "manifest.sha256", MANIFEST_SHA)
         require(self.identities() == self.original_identity, "user_identity_changed")
@@ -678,12 +854,15 @@ rr_local_subscription_loopback_ready || exit 1
             "result": "LA721_RECOVERY_COMPLETE", "host": HOST,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "marker_sha256": MARKER_SHA, "identities": "preserved",
-            "configuration": "unchanged", "firewall": "unchanged",
+            "configuration": "unchanged", "firewall": "ipv4_loopback_20382_repaired" if self.repair_loopback else "unchanged",
+            "external_policy": "unchanged",
+            "persistence": "matching_loopback_repair" if self.repair_loopback else "unchanged",
             "health_hotfix_sha256": PATCHED_SHA256,
         }).encode(), 0o600)
         self.success = True
         self.note("LA721_RECOVERY_COMPLETE", backup=str(self.stage), identities="preserved",
-                  firewall="unchanged", persistence="unchanged", health_timer="disabled",
+                  firewall="ipv4_loopback_20382_repaired" if self.repair_loopback else "unchanged",
+                  persistence="matching_loopback_repair" if self.repair_loopback else "unchanged", health_timer="disabled",
                   local_hotfix="readonly-health-hop")
 
     def protect_failure(self):
@@ -714,6 +893,10 @@ rr_local_subscription_loopback_ready || exit 1
                 require(self.unit(name).get("ActiveState") in {"inactive", "failed"}, "failure_stop_unproven")
             except (Exception, KeyboardInterrupt):
                 uncertain = True
+        try:
+            self.rollback_loopback()
+        except (Exception, KeyboardInterrupt):
+            uncertain = True
         self.note("RECOVERY_PROTECTION", original_phase=original_phase, cleanup_uncertain=uncertain,
                   marker_retained=os.path.lexists(MARKER), health_hotfix_retained=self.patch_installed)
 
@@ -730,6 +913,8 @@ rr_local_subscription_loopback_ready || exit 1
             self.step("read_only_policy_and_service_preflight", lambda: self.helper("verify"))
             self.step("stop_quarantine_guard", self.stop_guard)
             self.step("health_observation_hotfix", self.patch_health)
+            if self.repair_loopback:
+                self.step("repair_subscription_loopback", self.repair_local_subscription_route)
             self.step("abort_unchanged_orphan", self.finish_orphan)
             self.step("restore_recorded_services", self.start_services)
             self.step("postverify", self.postverify)
@@ -747,14 +932,14 @@ rr_local_subscription_loopback_ready || exit 1
 
 
 def main():
-    if sys.argv[1:]:
-        print("Usage: python3 recover-la721-firewall-inflight.py", file=sys.stderr)
+    if sys.argv[1:] not in ([], ["--repair-loopback"]):
+        print("Usage: python3 recover-la721-firewall-inflight.py [--repair-loopback]", file=sys.stderr)
         return 2
     def interrupted(signum, _frame):
         raise InterruptedError("signal_" + str(signum))
     signal.signal(signal.SIGHUP, interrupted)
     signal.signal(signal.SIGTERM, interrupted)
-    return Recovery().run()
+    return Recovery(repair_loopback=sys.argv[1:] == ["--repair-loopback"]).run()
 
 
 if __name__ == "__main__":
