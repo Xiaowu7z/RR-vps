@@ -124,6 +124,28 @@ grep -q -- '--dport 2000:3000 -j DNAT --to-destination :42536' "$fixture/live/ip
 sha256sum -c "$fixture/preserved.sha256" >/dev/null || fail 'validation changed evidence/live/desired'
 printf 'PROJECTION_WITH_UNCHANGED_LIVE_FILTER_AND_FOREIGN_NAT_OK\n'
 
+# The scoped loopback exception must leave the production external-policy
+# proof intact. Exercise the actual native parser against repaired live rules.
+python3 - "$repo" "$fixture" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+repo, fixture = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location('la_recovery', repo / 'scripts/recover-la721-firewall-inflight.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+path = fixture / 'live/iptables.filter.raw'
+path.write_bytes(module.loopback_raw_candidate(path.read_bytes()))
+PY
+rr_firewall_verify_desired_namespace "$fixture/projection" "$fixture/desired.namespace" || \
+    fail 'exact loopback exception broke external-policy verification'
+sed -i '/--comment argo-rr-managed-block -j DROP/d' "$fixture/live/iptables.filter.raw"
+if rr_firewall_verify_desired_namespace "$fixture/projection" "$fixture/desired.namespace" >/dev/null 2>&1; then
+    fail 'loopback exception concealed missing external subscription DROP'
+fi
+cp "$recorded/iptables.filter.raw" "$fixture/live/iptables.filter.raw"
+printf 'SCOPED_LOOPBACK_WITH_EXTERNAL_DROP_REQUIRED_OK\n'
+
 # The projection is not a bypass for required rules: the native live predicate
 # still refuses a missing DROP even though the projected snapshot contains it.
 sed -i '/--dport 20382 /d' "$fixture/live/iptables.filter.raw"
