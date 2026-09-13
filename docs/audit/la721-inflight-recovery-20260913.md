@@ -132,3 +132,59 @@ real guard startup and service/listener readiness checks remain required.
 Command logs now identify the systemctl verb and unit names. Focused tests
 cover the normal timer being skipped, real failures being cleared, and reset
 errors or persisting limits still being rejected.
+
+## September 13 continuation: local subscription DROP
+
+The owner's execution of `ded6d5309cf378044955ddb6b429c36b54d3e744`
+passed the policy checks, health hotfix and orphan abort, then failed at
+`restore_recorded_services` with `services_not_running`. Backup directory:
+`/root/rr-recover-la721.q7gnutby`. Its failure protection reported
+`cleanup_uncertain=false`, `marker_retained=true`, and
+`health_hotfix_retained=true`. This is not a completed production recovery.
+
+The byte-pinned IPv4 filter contains a TCP 20382 INPUT DROP without an
+interface restriction or any preceding loopback allowance. It also blocks
+the recovery helper's required connection to `127.0.0.1:20382`. The installed
+`rr_local_subscription_loopback_ready` helper only checks the process binding
+arguments; passing that helper never proved a successful connection. Thus
+preserving the entire original program while requiring this connection was
+an inconsistent recovery contract. The old generic timeout did not record
+which unit or endpoint was unready, so another startup problem is not ruled
+out by the owner's output alone.
+
+The explicit `--repair-loopback` mode expands the original no-write contract
+for this one demonstrated defect. It inserts exactly one IPv4 INPUT ACCEPT
+immediately before the existing DROP: interface `lo`, source and destination
+both `127.0.0.1/32`, TCP destination port 20382. The external DROP remains,
+as do all IPv6 rules, NAT rules and unrelated IPv4 rules. It makes the same
+single-line insertion in `/etc/iptables/rules.v4`; it does not save whole
+live tables. Before any service or rule change, the saved file must have
+the incident's original hash, and its complete filter program must match
+the incident program after parsing save-format policies and counters.
+Unknown saved rules are a preflight refusal, not overwritten assumptions.
+
+Each live/persisted state independently permits the original program or the
+exact scoped repair, covering a partially completed insertion. Removing the
+single permitted persisted line must recover the original file hash. The
+original sealed evidence is never changed or represented as current bytes;
+the Python scope verifier explicitly replaces the old raw-equality predicate
+in this mode. Native external-policy and first-match checks still run and
+still require the external DROP. Ordinary failure protection stops services
+and attempts to restore the original saved file and live rule, refusing to
+overwrite an unknown concurrent change and reporting cleanup uncertainty.
+
+Actual service and TCP connection checks remain required. A timeout now
+prints both unit states and individual endpoint results before protection.
+Successful output explicitly reports the scoped firewall/persistence repair;
+it must not claim those bytes were unchanged. Keep the owner on the locally
+patched 7.2.1 until a formal release includes the health correction.
+
+Local validation for this continuation: the original 14 recovery tests, seven
+independent packet/persistence tests, and nine lifecycle tests pass. Lifecycle
+tests cover all four original/repaired live-and-saved combinations, repeated
+application, partial write failures, service-start failure, unknown concurrent
+saved changes, and real localhost TCP listeners. The native 7.2.1 namespace
+test passes with the added loopback rule and still rejects a missing external
+DROP. `bash scripts/validate.sh` also passes. The packet-rule tests emulate
+kernel rule reads; no production host was accessed and actual recovery still
+requires the owner's execution and final result.
