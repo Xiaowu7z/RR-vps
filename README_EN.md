@@ -8,7 +8,13 @@ RR-vps is a multi-protocol Sing-box management script for Debian and Ubuntu VPS 
 
 > **Disclaimer: This project is provided solely for technical exchange, theoretical study, and research on managing your own servers. It does not provide any network access service. Do not use it for any purpose that violates local laws, your VPS provider's terms of service, or Cloudflare's usage policies. Users bear full responsibility for their own use; the author assumes no liability for any consequences of misuse.**
 
-> Current version: **7.2.4** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+> Current version: **7.2.5** · [Full changelog](CHANGELOG.md) · [GitHub Releases](https://github.com/Xiaowu7z/RR-vps/releases)
+
+### 7.2.5: Argo dependency download recovery
+
+When the GitHub release API returns 403/429 or 5xx, or a network request fails, Cloudflared installation now uses a pinned official Cloudflare release for amd64/arm64. SHA256, exact size, DEB structure and the installed version remain mandatory checks. Denied metadata requests are not repeatedly retried; compatible installed versions are reused and update transactions still cannot download or install missing dependencies.
+
+Invalid successful metadata responses and damaged packages remain rejected. The reported AWS installation failure establishes an API 403, not an AWS infrastructure diagnosis or a successful reinstall. See the [download repair record](docs/audit/cloudflared-download-20260913.md) for the validation scope.
 
 ### 7.2.4: Naive first installation and firewall quarantine recovery
 
@@ -38,7 +44,7 @@ Diagnostics, encrypted `.rrbak` migration, alerts, TOTP/Passkeys, history charts
 
 ## One-command installation
 
-Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. Version 7.2.4 uses the owner-approved policy of three-distribution container CI plus single-host recovery-evidence verification; unperformed real-host checks must not be reported as passed:
+Target systems are listed below. CI covers containers for all three distributions; real-host coverage is stated separately in each release report. The three-host gates for 7.2.3 and earlier are historical evidence. Since 7.2.4, the owner-approved policy combines three-distribution container CI with recovery-evidence verification. Version 7.2.5 preserves the historical receipt and independently verifies the new download fix and its restricted payload changes; unperformed real-host checks must not be reported as passed:
 
 | System | Support | Notes |
 | --- | --- | --- |

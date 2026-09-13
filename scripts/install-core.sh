@@ -3,7 +3,7 @@
 # shellcheck disable=SC2034 # Contract marker consumed by repository validation.
 RR_BOOTSTRAP_VERSION="1"
 RR_REPOSITORY="Xiaowu7z/RR-vps"
-RR_RELEASE_TAG="v7.2.4"
+RR_RELEASE_TAG="v7.2.5"
 RR_BRANCH="main"
 [ -r /etc/rr-update/channel ] && [ "$(tr -d '[:space:]' < /etc/rr-update/channel)" = beta ] && RR_BRANCH="beta"
 RR_SOURCE_REF="$RR_RELEASE_TAG"
@@ -3416,7 +3416,7 @@ rr_fetch_release() {
     fi
     if [ "$bundle_ready" = true ]; then
         actual=$(sha256sum "$STAGE_ROOT/rr-bundle.tar.gz" | awk '{print $1}')
-        if [ "$actual" = "288b4977295cf8de08be08c22a0f678e584a25bb0c0c8218190002eeaf28bbba" ] && \
+        if [ "$actual" = "a2bebc2da7d67dd1db90c5e9dd6df21b195c9a8b356c9ceee892a042cfb8170f" ] && \
            rr_bundle_archive_is_safe "$STAGE_ROOT/rr-bundle.tar.gz" && \
            tar --no-same-owner --no-same-permissions -xzf \
                "$STAGE_ROOT/rr-bundle.tar.gz" -C "$PAYLOAD_DIR" \

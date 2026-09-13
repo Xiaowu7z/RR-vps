@@ -29,6 +29,11 @@ run_install_case() (
     local draft=false prerelease=false
     local duplicate=false download_payload="$payload" package_valid=true
     local installed_tag="$tag"
+    local api_rc=0 api_status=200 expected_success=false expected_fallback=false
+    local api_header_chain=false final_retry_after=""
+    local fallback_tag=2026.9.1
+    local fallback_digest="$digest" fallback_size="${#payload}"
+    local fallback_url="https://github.com/cloudflare/cloudflared/releases/download/${fallback_tag}/${asset}"
 
     case "$mutation" in
         draft) draft=true ;;
@@ -45,10 +50,47 @@ run_install_case() (
         invalid_deb) package_valid=false ;;
         installed_mismatch) installed_tag=2026.8.1 ;;
         duplicate) duplicate=true ;;
-        none) ;;
+        api_403) api_rc=22; api_status=403; expected_fallback=true; expected_success=true ;;
+        api_429) api_rc=22; api_status=429; expected_fallback=true; expected_success=true ;;
+        api_403_redirect)
+            api_rc=22; api_status=403; expected_fallback=true; expected_success=true
+            api_header_chain=true
+            ;;
+        api_429_redirect)
+            api_rc=22; api_status=429; expected_fallback=true; expected_success=true
+            api_header_chain=true; final_retry_after=12
+            ;;
+        api_500) api_rc=22; api_status=500; expected_fallback=true; expected_success=true ;;
+        api_503) api_rc=22; api_status=503; expected_fallback=true; expected_success=true ;;
+        api_timeout) api_rc=28; api_status=000; expected_fallback=true; expected_success=true ;;
+        api_dns) api_rc=6; api_status=000; expected_fallback=true; expected_success=true ;;
+        api_connect) api_rc=7; api_status=000; expected_fallback=true; expected_success=true ;;
+        api_401) api_rc=22; api_status=401 ;;
+        api_404) api_rc=22; api_status=404 ;;
+        api_write_failure) api_rc=23; api_status=000 ;;
+        api_size_limit) api_rc=63; api_status=200 ;;
+        fallback_bad_pin)
+            api_rc=22; api_status=403; expected_fallback=true
+            fallback_digest=$(printf wrong-pinned-checksum | sha256sum | awk '{print $1}')
+            ;;
+        fallback_wrong_size)
+            api_rc=22; api_status=403; expected_fallback=true
+            fallback_size=$((fallback_size + 1))
+            ;;
+        fallback_invalid_deb)
+            api_rc=22; api_status=403; expected_fallback=true; package_valid=false
+            ;;
+        fallback_installed_mismatch)
+            api_rc=22; api_status=403; expected_fallback=true
+            ;;
+        unsupported_arch) SYS_ARCH=riscv64 ;;
+        none) expected_success=true ;;
         *) return 99 ;;
     esac
 
+    if [ "$expected_success" = true ] && [ "$expected_fallback" = true ]; then
+        installed_tag="$fallback_tag"
+    fi
     local first_asset extra_asset=''
     first_asset=$(jq -cn --arg name "$asset" --arg url "$asset_url" --arg digest "$api_digest" \
         --argjson size "${#payload}" \
@@ -61,20 +103,30 @@ run_install_case() (
         "$first_asset" "$extra_asset")
     CF_PAYLOAD="$download_payload"
     CF_CURL_LOG=$(mktemp)
+    CF_FALLBACK_LOG=$(mktemp)
+    CF_POLICY_LOG=$(mktemp)
+    CF_INSTALL_LOG=$(mktemp)
+    trap 'rm -f "$CF_CURL_LOG" "$CF_FALLBACK_LOG" "$CF_POLICY_LOG" "$CF_INSTALL_LOG"' EXIT
     CF_INSTALLED=false
     CF_INSTALLED_TAG="$installed_tag"
     CF_PACKAGE_VALID="$package_valid"
 
     curl() {
-        local output='' argument='' last=''
+        local output='' argument='' last='' headers=''
         printf '%q ' "$@" >> "$CF_CURL_LOG"
         printf '\n' >> "$CF_CURL_LOG"
         while [ "$#" -gt 0 ]; do
             argument="$1"
             shift
-            if [ "$argument" = --output ]; then
+            if [ "$argument" = --output ] || [ "$argument" = -o ]; then
                 [ "$#" -gt 0 ] || return 2
                 output="$1"
+                shift
+                continue
+            fi
+            if [ "$argument" = --dump-header ]; then
+                [ "$#" -gt 0 ] || return 2
+                headers="$1"
                 shift
                 continue
             fi
@@ -82,12 +134,36 @@ run_install_case() (
         done
         [ -n "$output" ] || return 2
         if [ "$last" = "$RR_CLOUDFLARED_RELEASE_API" ]; then
+            if [ -n "$headers" ] && [ "$api_status" != 000 ]; then
+                : > "$headers"
+                if [ "$api_header_chain" = true ]; then
+                    printf 'HTTP/1.1 200 Connection established\r\n\r\n' >> "$headers"
+                    printf 'HTTP/2 302\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 1234567890\r\nretry-after: 60\r\n\r\n' >> "$headers"
+                fi
+                # HTTP/2 omits the reason phrase; the bare status ends in CRLF.
+                printf 'HTTP/2 %s\r\n' "$api_status" >> "$headers"
+                if [ "$api_header_chain" = false ]; then
+                    printf 'x-ratelimit-remaining: 0\r\n' >> "$headers"
+                fi
+                [ -z "$final_retry_after" ] || printf 'retry-after: %s\r\n' "$final_retry_after" >> "$headers"
+                printf '\r\n' >> "$headers"
+            fi
             printf '%s' "$CF_METADATA" > "$output"
+            return "$api_rc"
         else
-            [ "$last" = "$url" ] || return 3
+            if [ "$last" != "$url" ] && [ "$last" != "$fallback_url" ]; then
+                printf 'Unexpected download origin: %s\n' "$last" >> "$CF_POLICY_LOG"
+                return 3
+            fi
             printf '%s' "$CF_PAYLOAD" > "$output"
         fi
     }
+    rr_cloudflared_fallback_release() {
+        printf '%s\n' "$*" >> "$CF_FALLBACK_LOG"
+        case "${1:-}" in amd64|arm64) ;; *) return 1 ;; esac
+        printf '%s\n' "$fallback_tag" "$fallback_url" "$fallback_digest" "$fallback_size"
+    }
+    apt-get() { printf 'Unexpected apt invocation\n' >> "$CF_POLICY_LOG"; return 99; }
     dpkg-deb() { [ "$CF_PACKAGE_VALID" = true ]; }
     dpkg() {
         [ "${1:-}" = -i ] || return 1
@@ -99,8 +175,8 @@ run_install_case() (
         printf 'cloudflared version %s (built test)\n' "$CF_INSTALLED_TAG"
     }
 
-    if install_cloudflared >/dev/null 2>&1; then
-        [ "$mutation" = none ] || {
+    if install_cloudflared > "$CF_INSTALL_LOG" 2>&1; then
+        [ "$expected_success" = true ] || {
             echo "Unsafe cloudflared case was accepted: $mutation" >&2
             return 1
         }
@@ -112,29 +188,57 @@ run_install_case() (
         grep -Fq -- '--max-time 120' "$CF_CURL_LOG"
         grep -Fq -- "--max-filesize ${#payload}" "$CF_CURL_LOG"
     else
-        [ "$mutation" != none ] || {
-            echo 'Valid cloudflared release metadata was rejected.' >&2
+        [ "$expected_success" = false ] || {
+            printf 'Valid cloudflared acquisition was rejected: %s\n' "$mutation" >&2
+            cat "$CF_INSTALL_LOG" >&2
             return 1
         }
-        [ "$CF_INSTALLED" = false ] || [ "$mutation" = installed_mismatch ]
+        [ "$CF_INSTALLED" = false ] || [ "$mutation" = installed_mismatch ] || \
+            [ "$mutation" = fallback_installed_mismatch ]
     fi
-    rm -f "$CF_CURL_LOG"
+    [ ! -s "$CF_POLICY_LOG" ]
+    if [ "$api_header_chain" = true ]; then
+        ! grep -Fq -- '1234567890' "$CF_INSTALL_LOG"
+        ! grep -Fq -- '60 秒' "$CF_INSTALL_LOG"
+        if [ -n "$final_retry_after" ]; then
+            grep -Fq -- '12 秒' "$CF_INSTALL_LOG"
+        fi
+    fi
+    if [ "$expected_fallback" = true ]; then
+        [ "$(wc -l < "$CF_FALLBACK_LOG")" -eq 1 ]
+        [ "$(wc -l < "$CF_CURL_LOG")" -eq 2 ]
+        grep -Fq -- "$fallback_url" "$CF_CURL_LOG"
+    else
+        [ ! -s "$CF_FALLBACK_LOG" ]
+    fi
+    if [ "$mutation" = unsupported_arch ]; then
+        [ ! -s "$CF_CURL_LOG" ]
+    else
+        local api_call
+        api_call=$(head -n 1 "$CF_CURL_LOG")
+        [[ "$api_call" == *"--dump-header "* ]]
+        [[ "$api_call" == *"--proto =https"* ]]
+        [[ "$api_call" == *"--tlsv1.2"* ]]
+        [[ "$api_call" != *"--retry-all-errors"* ]]
+        [[ "$api_call" != *"--retry 3"* ]]
+        [ "$(grep -Fc -- "$RR_CLOUDFLARED_RELEASE_API" "$CF_CURL_LOG")" -eq 1 ]
+    fi
 )
 
-printf '[1/10] exact release, asset URL, checksum and installed version\n'
+printf '[1/14] exact release, asset URL, checksum and installed version\n'
 run_install_case none
 
-printf '[2/10] unstable, old, duplicate and unbound releases fail closed\n'
+printf '[2/14] unstable, old, duplicate and unbound releases fail closed\n'
 for case_name in draft prerelease old wrong_url duplicate; do
     run_install_case "$case_name"
 done
 
-printf '[3/10] checksum, package and post-install gates fail closed\n'
+printf '[3/14] checksum, package and post-install gates fail closed\n'
 for case_name in missing_checksum ambiguous_checksum api_mismatch download_mismatch invalid_deb installed_mismatch; do
     run_install_case "$case_name"
 done
 
-printf '[4/10] token-file version boundary\n'
+printf '[4/14] token-file version boundary\n'
 (
     load_modules
     CF_VERSION=2025.3.9
@@ -385,7 +489,7 @@ cf_write_current_unit() {
     chmod 644 "$RR_CLOUDFLARED_SERVICE_FILE"
 }
 
-printf '[5/10] current fixed unit hides the token and proves exact ownership\n'
+printf '[5/14] current fixed unit hides the token and proves exact ownership\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -410,7 +514,7 @@ printf '[5/10] current fixed unit hides the token and proves exact ownership\n'
     grep -Fq 'ProtectSystem=strict' "$RR_CLOUDFLARED_SERVICE_FILE"
 )
 
-printf '[6/10] absent service creation preserves a pre-provisioned safe token\n'
+printf '[6/14] absent service creation preserves a pre-provisioned safe token\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -424,7 +528,7 @@ printf '[6/10] absent service creation preserves a pre-provisioned safe token\n'
     ! grep -Fq -- "$secret" "$RR_CLOUDFLARED_SERVICE_FILE"
 )
 
-printf '[7/10] exact current service refresh is byte-and-metadata idempotent\n'
+printf '[7/14] exact current service refresh is byte-and-metadata idempotent\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -556,7 +660,7 @@ EOF
     [ "$(cat "$CF_SYSTEMCTL_LOG")" = 'enable --now cloudflared' ]
 )
 
-printf '[8/10] exact RR 7.1 legacy unit migrates token atomically\n'
+printf '[8/14] exact RR 7.1 legacy unit migrates token atomically\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -746,7 +850,7 @@ printf '[8/10] exact RR 7.1 legacy unit migrates token atomically\n'
     [ "$(cf_snapshot "$RR_CLOUDFLARED_SERVICE_FILE")" = "$unit_staged" ]
 )
 
-printf '[9/10] third-party units and stale tokens are rejected with zero writes\n'
+printf '[9/14] third-party units and stale tokens are rejected with zero writes\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -1076,7 +1180,7 @@ EOF
     [ ! -s "$CF_SYSTEMCTL_ALL_LOG" ]
 )
 
-printf '[10/10] unsafe token evidence and effective-unit drift fail closed\n'
+printf '[10/14] unsafe token evidence and effective-unit drift fail closed\n'
 (
     cf_setup
     trap 'rm -rf "$CF_ROOT"' EXIT
@@ -1309,6 +1413,71 @@ printf '[10/10] unsafe token evidence and effective-unit drift fail closed\n'
         [ "$(cf_snapshot "$RR_CLOUDFLARED_SERVICE_FILE")" = "$unit_before" ]
         [ "$CF_UNIT_ACTIVE" = true ]
         [ ! -s "$CF_SYSTEMCTL_LOG" ]
+    done
+)
+
+printf '[11/14] API limits and transport failures use the verified official fallback\n'
+for case_name in api_403 api_429 api_403_redirect api_429_redirect \
+    api_500 api_503 api_timeout api_dns api_connect; do
+    run_install_case "$case_name"
+done
+
+printf '[12/14] fallback never masks bad metadata, bad artifacts or unsupported hosts\n'
+for case_name in api_401 api_404 api_write_failure api_size_limit fallback_bad_pin fallback_wrong_size \
+    fallback_invalid_deb fallback_installed_mismatch unsupported_arch; do
+    run_install_case "$case_name"
+done
+
+printf '[13/14] production fallback pins bind both architectures to one official release\n'
+(
+    load_modules
+    [ "$(rr_cloudflared_fallback_release amd64)" = "$(printf '%s\n' \
+        2026.9.1 \
+        https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64.deb \
+        3be76adc4185d36a0bfb4c2dd8663292f0ed363797f2180333b513b43c81d419 \
+        19160216)" ]
+    [ "$(rr_cloudflared_fallback_release arm64)" = "$(printf '%s\n' \
+        2026.9.1 \
+        https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-arm64.deb \
+        2a870d5bf6ea74d16c0923b804eabbf4943f1fd7c63a5c20fd41cc66b629c725 \
+        17667370)" ]
+    for arch in riscv64 i386 '' '../amd64'; do
+        rejected_output=''
+        if rejected_output=$(rr_cloudflared_fallback_release "$arch"); then
+            echo "Unsupported fallback architecture was accepted: $arch" >&2
+            exit 1
+        fi
+        [ -z "$rejected_output" ]
+    done
+)
+
+printf '[14/14] compatible installed binaries and update transactions never acquire packages\n'
+(
+    load_modules
+    SYS_ARCH=amd64
+    CF_ACTIVITY_LOG=$(mktemp)
+    trap 'rm -f "$CF_ACTIVITY_LOG"' EXIT
+    curl() { printf 'curl\n' >> "$CF_ACTIVITY_LOG"; return 99; }
+    dpkg() { printf 'dpkg\n' >> "$CF_ACTIVITY_LOG"; return 99; }
+    apt-get() { printf 'apt-get\n' >> "$CF_ACTIVITY_LOG"; return 99; }
+    rr_cloudflared_fallback_release() { printf 'fallback\n' >> "$CF_ACTIVITY_LOG"; return 99; }
+    cloudflared() {
+        [ -n "$CF_VERSION" ] || return 127
+        printf 'cloudflared version %s\n' "$CF_VERSION"
+    }
+    for RR_UPDATE_TRANSACTION in 0 1; do
+        for CF_VERSION in 2025.4.0 2026.9.1; do
+            install_cloudflared >/dev/null 2>&1
+            [ ! -s "$CF_ACTIVITY_LOG" ]
+        done
+    done
+    RR_UPDATE_TRANSACTION=1
+    for CF_VERSION in '' 2025.3.9; do
+        if install_cloudflared >/dev/null 2>&1; then
+            echo "Transaction attempted to accept a missing/old cloudflared: $CF_VERSION" >&2
+            exit 1
+        fi
+        [ ! -s "$CF_ACTIVITY_LOG" ]
     done
 )
 

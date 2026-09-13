@@ -13,12 +13,13 @@ concurrency:
   cancel-in-progress: false
 
 # Keep this workflow path for installed 7.2.1 update guards. Its declared
-# scope is owner-reported Debian recovery evidence bound to this candidate;
-# the three deleted VPS hosts are no longer an available validation target.
+# scope preserves the pinned historical Debian recovery receipt and verifies
+# reviewed current-candidate hashes and restricted changes separately. It does
+# not claim a live VPS test for later versions or contact the deleted hosts.
 jobs:
   evidence:
     if: github.ref == 'refs/heads/main'
-    name: Verify approved owner recovery evidence and candidate hashes
+    name: Verify approved historical recovery evidence and current candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -34,6 +35,6 @@ jobs:
             | tee "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
           {
             printf 'Candidate commit: `%s`\n\n' "$GITHUB_SHA"
-            printf '%s\n\n' 'Scope: owner-reported Debian 12 repair, identity preservation and no Nexus installation; candidate artifacts are verified against that recorded evidence. This workflow does not run a three-host VPS test or establish client connectivity.'
+            printf '%s\n\n' 'Scope: the owner-reported Debian 12 repair receipt stays bound to its original 7.2.4 bundle and helper. Current release hashes and restricted Cloudflared-only changes are checked separately; full exact-commit CI is independently required. This workflow does not attest to a 7.2.5 AWS installation, run a VPS test or establish client connectivity.'
             cat "$RUNNER_TEMP/rr-owner-recovery-evidence.txt"
           } >> "$GITHUB_STEP_SUMMARY"
