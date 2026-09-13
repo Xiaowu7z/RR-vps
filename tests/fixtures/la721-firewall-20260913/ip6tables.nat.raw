@@ -1,0 +1,6 @@
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-A PREROUTING -p udp -m udp --dport 2000:3000 -j DNAT --to-destination :42536
+-A PREROUTING -p udp -m udp --dport 23635:23846 -m comment --comment argo-rr-HY2 -j REDIRECT --to-ports 15551

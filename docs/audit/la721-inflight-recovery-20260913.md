@@ -74,4 +74,38 @@ release gates; publishing this dedicated recovery helper is not that release.
 The recovery branch does not move `main`, the Latest release, or existing
 immutable tags. No live server access is available to the implementers. Local
 regression tests cannot be reported as a successful production recovery; the
-owner's eventual execution output is the production result.
+owner’s eventual execution output is the production result.
+
+## Additional evidence: legacy TCP 22049 rule
+
+The owner's first recovery attempt passed locks, all installed-file checks,
+transaction state, byte-identical live rules and backup. It stopped before
+service changes at the full desired-namespace check. The subsequent complete
+rule listing matches all four diagnostic SHA256 values and is retained as a
+test fixture. Replaying the actual 7.2.1 verifier reproduces the failure before
+any per-port live check: each filter table contains one extra tagged ACCEPT
+for TCP 22049, outside the current desired namespace.
+
+Both INPUT policies are ACCEPT. All other INPUT rules in these exact programs
+match individual, different ports; no broader matches or custom chain jumps
+are present. The 22049 rule therefore has no effect on the accept/drop result:
+its matching packets would also be accepted by the default policy. This is
+proved explicitly by a restrictive parser, then bound to the incident's four
+raw-program hashes. An unknown extra rule is not covered by this proof.
+
+The revised helper creates a private validation copy with only those two
+proven-redundant lines removed. It does not edit the live firewall, sealed
+evidence, desired configuration or persisted rules. The native complete
+namespace check uses that equivalent copy; its subsequent per-port and
+first-match validators continue to read the original live programs. A missing
+live subscription DROP or overlapping NAT rule remains a failure. The extra
+IPv6 DNAT from UDP 2000–3000 to 42536 remains intact and is disjoint from HY2's
+23635–23846 range.
+
+The focused tests replay the original failure and revised verification using
+actual production parsers and emulated kernel reads of the exact owner tables.
+They test missing live DROP and overlapping foreign NAT rejection, verify no
+writer is called, and compare every TCP/UDP destination-port decision before
+and after the private transformation. Later read-only service checks are now
+reported together, so a separate unmet startup requirement is visible in the
+same output instead of being hidden behind the first failed predicate.

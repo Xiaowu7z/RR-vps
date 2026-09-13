@@ -205,6 +205,34 @@ def atomic_write(path, data, mode):
             os.unlink(temporary)
 
 
+def prove_redundant_legacy_allow(program):
+    """Canonicalize one semantically redundant rule in a private proof copy.
+
+    For TCP/22049 the sole matching INPUT rule accepts, and removing it also
+    accepts by the chain policy. For every other packet it cannot match.
+    Reject any broader match, custom chain, alternative policy, or second
+    overlapping rule: an arbitrary extra tagged rule is never exempted.
+    The caller additionally binds all four original programs to incident SHAs.
+    """
+    lines = program.splitlines(keepends=True)
+    policies = [b"-P INPUT ACCEPT\n", b"-P FORWARD ACCEPT\n", b"-P OUTPUT ACCEPT\n"]
+    require(lines[:3] == policies, "legacy_allow_requires_accept_policies")
+    legacy = (b"-A INPUT -p tcp -m tcp --dport 22049 -m comment "
+              b"--comment argo-rr-managed -j ACCEPT\n")
+    require(lines.count(legacy) == 1, "legacy_allow_requires_exact_single_rule")
+    grammar = re.compile(rb"-A INPUT -p (tcp|udp) -m \1 --dport ([1-9][0-9]{0,4})"
+                         rb"(?: -m comment --comment [A-Za-z0-9_-]+)? -j (?:ACCEPT|DROP)\n")
+    for line in lines[3:]:
+        if line == legacy:
+            continue
+        match = grammar.fullmatch(line)
+        require(match is not None and int(match[2]) <= 65535,
+                "legacy_allow_unproven_other_rule")
+        require(match[1] != b"tcp" or match[2] != b"22049",
+                "legacy_allow_overlapping_rule")
+    return b"".join(line for line in lines if line != legacy)
+
+
 class Recovery:
     def __init__(self):
         self.stage = None
@@ -451,25 +479,52 @@ class Recovery:
                 os.fsync(source.fileno())
         sync_directory(self.stage)
 
+    def prepare_policy_projection(self):
+        require(self.stage is not None, "policy_projection_requires_backup")
+        desired = pinned(EVIDENCE / "desired.namespace", DESIRED_SHA)
+        require(not any(line.startswith((b"protocol|open|22049|", b"protocol|closed|22049|"))
+                        for line in desired.splitlines()), "legacy_port_is_desired")
+        root = self.stage / "policy-projection"
+        root.mkdir(mode=0o700)
+        (root / "firewall").mkdir(mode=0o700)
+        receipt = {}
+        for name, expected in RAW_PINS.items():
+            raw = pinned(EVIDENCE / "firewall" / (name + ".raw"), expected)
+            projected = prove_redundant_legacy_allow(raw) if name.endswith(".filter") else raw
+            atomic_write(root / "firewall" / (name + ".raw"), projected, 0o600)
+            receipt[name] = {"original_sha256": expected, "projection_sha256": sha(projected)}
+        atomic_write(root / "proof.json", json.dumps({
+            "proof": "redundant_tcp_22049_accept_under_disjoint_accept_policy",
+            "scope": "private_validation_copy_only", "live_rules_modified": False,
+            "sealed_evidence_modified": False, "programs": receipt,
+        }).encode(), 0o600)
+        self.note("LEGACY_RULE_EQUIVALENCE", port=22049, protocol="tcp",
+                  families=["IPv4", "IPv6"], live_rules_modified=False)
+
     def helper(self, operation):
         require(self.stage is not None, "helper_requires_backup")
         bodies = {
             "verify": r'''
-check() { local name="$1"; shift; "$@" >/dev/null 2>&1; local rc=$?; printf 'READONLY_CHECK name=%s rc=%s\n' "$name" "$rc"; [ "$rc" = 0 ]; }
+check() { local rr_la_check_name="$1"; shift; "$@" >/dev/null 2>&1; local rr_la_check_rc=$?; printf 'READONLY_CHECK name=%s rc=%s\n' "$rr_la_check_name" "$rr_la_check_rc"; [ "$rr_la_check_rc" = 0 ]; }
+runtime_idle() { "$@"; local rr_la_probe_rc=$?; [ "$rr_la_probe_rc" = 1 ]; }
 check config load_config_with_defaults || exit 1
 [ "$SUB_ACCESS_MODE" = local ] && [ "$SUB_PORT" = 20382 ] && [ "$SUB_ROOT" = /tmp/sub_server ] || exit 1
 check marker rr_firewall_load_inflight_marker || exit 1
 check raw_evidence rr_restore_verify_firewall_pre_mutation_snapshot /var/lib/rr-vps/firewall-evidence || exit 1
-check desired_policy rr_firewall_verify_desired_namespace /var/lib/rr-vps/firewall-evidence /var/lib/rr-vps/firewall-evidence/desired.namespace || exit 1
-check supervisor rr_firewall_quarantine_supervisor_effective || exit 1
-check singbox_unit rr_singbox_service_guards_are_effective || exit 1
-check singbox_certificate rr_singbox_certificate_start_gate || exit 1
-check singbox_config "$SINGBOX_BIN" check -c /etc/sing-box/config.json || exit 1
-check nexus_unit nexus_service_effective_identity_is_exact || exit 1
-check nexus_guards nexus_service_effective_guards_are_exact || exit 1
-managed_singbox_running && exit 1
-subscription_server_running && exit 1
-exit 0
+rr_la_failed=0
+# Only the namespace syntax pass reads the private, equivalence-proven copy.
+# Every per-port and first-match check in this function still reads real live
+# backends. The original config, sealed evidence and rule programs stay intact.
+check desired_policy rr_firewall_verify_desired_namespace "$2" /var/lib/rr-vps/firewall-evidence/desired.namespace || rr_la_failed=1
+check supervisor rr_firewall_quarantine_supervisor_effective || rr_la_failed=1
+check singbox_unit rr_singbox_service_guards_are_effective || rr_la_failed=1
+check singbox_certificate rr_singbox_certificate_start_gate || rr_la_failed=1
+check singbox_config "$SINGBOX_BIN" check -c /etc/sing-box/config.json || rr_la_failed=1
+check nexus_unit nexus_service_effective_identity_is_exact || rr_la_failed=1
+check nexus_guards nexus_service_effective_guards_are_exact || rr_la_failed=1
+check singbox_idle runtime_idle managed_singbox_running || rr_la_failed=1
+check subscription_idle runtime_idle subscription_server_running || rr_la_failed=1
+exit "$rr_la_failed"
 ''',
             "start_subscription": r'''
 load_config_with_defaults || exit 1
@@ -484,15 +539,16 @@ rr_local_subscription_loopback_ready || exit 1
         require(operation in bodies, "unsupported_helper")
         source = ('set -o pipefail\nfor module in "$1"/*.sh; do source "$module" || exit 1; done\n' + bodies[operation]).encode()
         try:
-            output = self.command(["bash", "--noprofile", "--norc", "-s", "--", str(self.stage / "modules")],
+            output = self.command(["bash", "--noprofile", "--norc", "-s", "--", str(self.stage / "modules"),
+                                   str(self.stage / "policy-projection")],
                                   input_data=source, timeout=180)
         except Refused:
             # Print only labels emitted by this script, never arbitrary module
             # output or a configuration/credential-bearing subprocess error.
             data = (self.stage / "commands.log").read_text(errors="replace")[-16000:]
             checks = re.findall(r"(?m)^READONLY_CHECK name=([a-z_]+) rc=([0-9]+)$", data)
-            if checks:
-                self.note("RECOVERY_PREDICATE", name=checks[-1][0], rc=int(checks[-1][1]))
+            for name, rc in checks:
+                self.note("RECOVERY_PREDICATE", name=name, rc=int(rc))
             raise
         for line in output.decode(errors="replace").splitlines():
             match = re.fullmatch(r"READONLY_CHECK name=([a-z_]+) rc=([0-9]+)", line)
@@ -645,6 +701,7 @@ rr_local_subscription_loopback_ready || exit 1
             self.step("unchanged_firewall_evidence", self.verify_files_and_firewall)
             self.step("stopped_service_state", self.verify_stopped_units)
             self.step("backup", self.backup)
+            self.step("prove_legacy_rule_equivalence", self.prepare_policy_projection)
             self.step("read_only_policy_and_service_preflight", lambda: self.helper("verify"))
             self.step("stop_quarantine_guard", self.stop_guard)
             self.step("health_observation_hotfix", self.patch_health)

@@ -5,6 +5,7 @@ import fcntl
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +44,99 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(m.sha(m.transform_bytes(source)), m.PATCHED_SHA256)
         with self.assertRaises(ValueError):
             m.transform_bytes(source + b"\n")
+
+    def test_legacy_projection_preserves_every_tcp_udp_port_decision(self):
+        fixture = REPO / "tests/fixtures/la721-firewall-20260913"
+        def decisions(program, proto):
+            # Independent evaluator for the concrete simple incident rules.
+            # Walk backwards so the first matching rule wins over later rules.
+            tokens = [shlex.split(line) for line in program.decode().splitlines()]
+            policy = next(row[2] for row in tokens if row[:2] == ["-P", "INPUT"])
+            result = [policy] * 65536
+            for row in reversed(tokens):
+                if row[:2] == ["-A", "INPUT"] and row[row.index("-p") + 1] == proto:
+                    result[int(row[row.index("--dport") + 1])] = row[row.index("-j") + 1]
+            return result
+        for backend in ("iptables", "ip6tables"):
+            original = (fixture / (backend + ".filter.raw")).read_bytes()
+            projected = m.prove_redundant_legacy_allow(original)
+            self.assertEqual(original.count(b"--dport 22049 "), 1)
+            self.assertNotIn(b"--dport 22049 ", projected)
+            for proto in ("tcp", "udp"):
+                self.assertEqual(decisions(original, proto), decisions(projected, proto))
+            self.assertEqual(decisions(projected, "tcp")[20382], "DROP")
+
+    def test_legacy_projection_refuses_changed_policy_and_overlap(self):
+        original = (REPO / "tests/fixtures/la721-firewall-20260913/iptables.filter.raw").read_bytes()
+        legacy = next(line for line in original.splitlines(keepends=True) if b"--dport 22049 " in line)
+        bad_programs = [
+            original.replace(b"-P INPUT ACCEPT", b"-P INPUT DROP"),
+            original.replace(b"-P INPUT ACCEPT", b"-P INPUT QUEUE"),
+            original + legacy,
+            original.replace(legacy, b""),
+            original + b"-A INPUT -p tcp -m tcp --dport 22049 -j DROP\n",
+            original + b"-A INPUT -p tcp -m tcp --dport 22049 -j ACCEPT\n",
+            original + b"-A INPUT -j CUSTOM_CHAIN\n",
+            original + b"-A INPUT -p tcp -m multiport --dports 22048:22050 -j DROP\n",
+            original.replace(legacy, legacy.replace(b"-j ACCEPT", b"-j DROP")),
+        ]
+        for program in bad_programs:
+            with self.subTest(program=program[-90:]):
+                with self.assertRaises(m.Refused):
+                    m.prove_redundant_legacy_allow(program)
+
+    def test_projection_is_private_and_keeps_original_evidence(self):
+        fixture = REPO / "tests/fixtures/la721-firewall-20260913"
+        evidence = self.root / "evidence"
+        before = {}
+        for original in fixture.iterdir():
+            relative = original.name if original.name == "desired.namespace" else "firewall/" + original.name
+            path = self.file("evidence/" + relative, original.read_bytes())
+            before[path] = path.read_bytes()
+        stage = self.root / "stage"
+        stage.mkdir(mode=0o700)
+        r = self.recovery()
+        r.stage = stage
+        with patch.object(m, "EVIDENCE", evidence):
+            r.prepare_policy_projection()
+        self.assertTrue((stage / "policy-projection/proof.json").is_file())
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+        for name in m.RAW_PINS:
+            original = (evidence / "firewall" / (name + ".raw")).read_bytes()
+            projected = (stage / "policy-projection/firewall" / (name + ".raw")).read_bytes()
+            self.assertEqual(projected, m.prove_redundant_legacy_allow(original) if name.endswith(".filter") else original)
+
+    def test_helper_checks_private_projection_and_reports_later_failures(self):
+        stage = self.root / "stage"
+        (stage / "modules").mkdir(parents=True, mode=0o700)
+        expected = stage / "policy-projection"
+        module = """
+SUB_ACCESS_MODE=local SUB_PORT=20382 SUB_ROOT=/tmp/sub_server SINGBOX_BIN=/usr/bin/true
+load_config_with_defaults() { return 0; }
+rr_firewall_load_inflight_marker() { return 0; }
+rr_restore_verify_firewall_pre_mutation_snapshot() { return 0; }
+rr_firewall_verify_desired_namespace() { [ "$1" = 'PROJECTION' ]; }
+rr_firewall_quarantine_supervisor_effective() { return 1; }
+rr_singbox_service_guards_are_effective() { return 0; }
+rr_singbox_certificate_start_gate() { return 0; }
+nexus_service_effective_identity_is_exact() { return 0; }
+nexus_service_effective_guards_are_exact() { return 0; }
+managed_singbox_running() { return 1; }
+subscription_server_running() { return 1; }
+""".replace("PROJECTION", str(expected))
+        self.file("stage/modules/fixture.sh", module.encode())
+        r = self.recovery()
+        r.stage = stage
+        events = []
+        r.note = lambda event, **values: events.append((event, values))
+        with self.assertRaises(m.Refused):
+            r.helper("verify")
+        results = {values["name"]: values["rc"] for event, values in events if event == "RECOVERY_PREDICATE"}
+        self.assertEqual(results["desired_policy"], 0)
+        self.assertEqual(results["supervisor"], 1)
+        self.assertEqual(results["nexus_guards"], 0)
+        self.assertEqual(results["subscription_idle"], 0)
 
     def test_read_refuses_untrusted_files_and_parents(self):
         good = self.file("good", b"original")

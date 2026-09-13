@@ -1,0 +1,8 @@
+hop|HY2|15551|23635:23846
+protocol|closed|20382|tcp
+protocol|open|14640|tcp
+protocol|open|15551|udp
+protocol|open|24747|udp
+protocol|open|28759|tcp
+protocol|open|443|tcp
+protocol|open|80|tcp
